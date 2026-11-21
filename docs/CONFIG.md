@@ -256,7 +256,6 @@ Architecture-gated default-on kernel routes (exact arch only; other arches keep 
 | `kernel.gfx1100_fa2_split_verify` | exact gfx1100 | `false` / `HIPFIRE_GFX1100_FA2_SPLIT_VERIFY=0`; parent `kernel.verify_attn=false` / `HIPFIRE_VERIFY_ATTN=0` | Uses FA2 split-KV S8 only inside the existing dense Qwen H24/KV4/HD256, Q8/Q8 VMM-KV, sequential B4..32 long-context verifier envelope; admission, capture and Redline guards are unchanged. Its split partial/merge reduction order is not byte-identical to the incumbent route; promotion is backed by logit KLD, a hard30 task tie and canonical-XTS DFlash A/B evidence. |
 | `kernel.gemma4_ple_branch_batched_prefill` | `auto`: exact gfx1100 and gfx1201 | `false` / `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=0` | Exact-arithmetic batched PLE branch projections; gfx1101, gfx1102, gfx1151, gfx1200 stay off. Separate from `kernel.gemma4_ple_batched_prefill` (default off). |
 | `kernel.gfx11_q8_fa2_wide` | `auto`: exact gfx1100 and gfx1151 (not gfx1100-only) | `false` / `HIPFIRE_GFX11_Q8_FA2_WIDE=0` | Whole-chunk Q8/Q8 FA2 prefill; requires `kernel.gfx11_fa2_prefill`. gfx1151 enabled deliberately in commit `ae9c5cf9d12a5a63ae60630637d22d00a4fc964e` via the twin CU-mode dispatch (same arithmetic, byte-identical). |
-| `kernel.gfx12_fp8_stream` | exact gfx1201 | `false` / `HIPFIRE_GFX12_FP8_STREAM=0` | RMSNorm+rotate producer → MQ4v2 FP8 pre-pass fusion; byte-identical outputs; other arches off. |
 | `kernel.pm_decode` | `auto`: exact gfx1201 | `false` / `HIPFIRE_PM_DECODE=0` | Loads the embedded, oracle-accepted PeaceMaker twins of the five W1 decode projection modules (`fused_qkvza_hfq4g256_mq4v2`, `fused_qkv_hfq4g256_mq4v2`, `fused_gate_up_hfq4g256_mq4v2`, `gemv_hfq4g256_multirow_default_mq4v2`, `gemv_hfq4g256_residual_mq4v2`) instead of compiling them with hipcc. Each image is pinned by bundle and ELF SHA-256 and refused on mismatch. Byte-identical outputs; the hipcc modules stay in the kernel pack for the opt-out; other arches never load the twins. |
 
 See [`env-vars.md`](env-vars.md) for the full per-variable rows.
@@ -1881,11 +1880,10 @@ daemon after changing them.
 
 | Scope | Keys |
 |---|---|
-| Exact gfx1201 | `kernel.gfx12_mq4v2_fp8_gateup`, `kernel.gfx12_mq4v2_fp8_resid`, `kernel.gfx12_mq4v2_fp8_qkvza`, `kernel.gfx12_mq4v2_fp8_qkv` (the four family flags), `kernel.gfx12_mq4v2_fp8_v2` (staged-tile v2; the four family flags remain prerequisites), `kernel.gfx12_gdn_pre_fused`, `kernel.gfx12_silu_quant_fused`, `kernel.gfx12_producer_quant_fused`, `kernel.g12_norm`, `kernel.g12_a4c2`, `kernel.gfx12_fa2_prefill`, `kernel.gfx12_fa_packet`, `kernel.attn_qresident` (exact H24/KV4/D256 native-fp8-KV shapes), `kernel.attn_qresident_v2` (only where the Q-resident route is selected), `kernel.gfx12_fa_prep_fused`, `kernel.gfx12_fa_prep_fp8q` |
+| Exact gfx1201 | `kernel.gfx12_mq4v2_fp8_gateup`, `kernel.gfx12_mq4v2_fp8_resid`, `kernel.gfx12_mq4v2_fp8_qkvza`, `kernel.gfx12_mq4v2_fp8_qkv` (the four family flags), `kernel.gfx12_mq4v2_fp8_v2` (staged-tile v2; the four family flags remain prerequisites), `kernel.g12_a4c2`, `kernel.gfx12_fa2_prefill`, `kernel.attn_qresident` (exact H24/KV4/D256 native-fp8-KV shapes), `kernel.gfx12_fa_prep_fused`, `kernel.gfx12_fa_prep_fp8q` |
 | Exact gfx1100 / gfx1151 / gfx1201 | `kernel.gfx12_gdn_chunk_scan`, `kernel.iu4_prefill`, `kernel.verify_attn` |
-| Exact gfx1100 / gfx1151 | `kernel.gfx11_fa2_prefill`, `kernel.gfx11_producer_quant_fused` |
-| Exact gfx1201 / gfx1151 | `kernel.g12_dec_norm` |
-| Exact gfx1100 | `kernel.gfx1100_dec_norm`, `kernel.gfx11_iu4_shape` |
+| Exact gfx1100 / gfx1151 | `kernel.gfx11_fa2_prefill` |
+| Exact gfx1100 | `kernel.gfx11_iu4_shape` |
 
 `kernel.gfx11_a4_candidates` (default `"2"`; `"1"`, `"2"`, `"4"` or `"8"`) sets
 the number of activation-quantization candidates searched inside the fused
@@ -2669,10 +2667,43 @@ branch) or a misspelled key is unknown and fails the load with
 | `developer.v2b_zba_scatter` | `v2b_zba_scatter` | 0.4.0 | 0.5.0 | none; the V2B Z|beta|alpha SET always scatters where admitted |
 | `developer.v2c_addepi` | `v2c_addepi` | 0.4.0 | 0.5.0 | none; the V2C ADD always takes the residual-touch entry |
 | `developer.verify_v64` | `verify_v64` | 0.4.5 | 0.5.0 | none; the verify GEMM always takes the wave64 variant where admitted |
+| `kernel.gfx12_gdn_pre_fused` | `gfx12_gdn_pre_fused` | 0.4.0 | 0.5.0 | none; exact gfx1201 always runs the fused GDN preamble (byte-identical) |
+| `developer.gfx12_gdn_pre_fused` | `gfx12_gdn_pre_fused` | 0.4.0 | 0.5.0 | none; exact gfx1201 always runs the fused GDN preamble (byte-identical) |
+| `kernel.gfx12_silu_quant_fused` | `gfx12_silu_quant_fused` | 0.4.0 | 0.5.0 | none; exact gfx1201 IU4 always fuses the quantiser into the SwiGLU producer (bit-identical) |
+| `developer.gfx12_silu_quant_fused` | `gfx12_silu_quant_fused` | 0.4.0 | 0.5.0 | none; exact gfx1201 IU4 always fuses the quantiser into the SwiGLU producer (bit-identical) |
+| `kernel.gfx12_producer_quant_fused` | `gfx12_producer_quant_fused` | 0.4.0 | 0.5.0 | none; exact gfx1201 always fuses the quantiser into the admitted producers (bit-identical) |
+| `developer.gfx12_producer_quant_fused` | `gfx12_producer_quant_fused` | 0.4.0 | 0.5.0 | none; exact gfx1201 always fuses the quantiser into the admitted producers (bit-identical) |
+| `kernel.g12_norm` | `g12_norm` | 0.4.0 | 0.5.0 | none; exact gfx1201 always launches the _v2 norm producers (bit-identical) |
+| `developer.g12_norm` | `g12_norm` | 0.4.0 | 0.5.0 | none; exact gfx1201 always launches the _v2 norm producers (bit-identical) |
+| `kernel.g12_dec_norm` | `g12_dec_norm` | 0.4.0 | 0.5.0 | none; exact gfx1201 and gfx1151 always launch the multi-workgroup decode norms (bit-identical) |
+| `developer.g12_dec_norm` | `g12_dec_norm` | 0.4.0 | 0.5.0 | none; exact gfx1201 and gfx1151 always launch the multi-workgroup decode norms (bit-identical) |
+| `kernel.gfx1100_dec_norm` | `gfx1100_dec_norm` | 0.4.0 | 0.5.0 | none; exact gfx1100 always launches the multi-workgroup decode norms (bit-identical) |
+| `developer.gfx1100_dec_norm` | `gfx1100_dec_norm` | 0.4.0 | 0.5.0 | none; exact gfx1100 always launches the multi-workgroup decode norms (bit-identical) |
+| `kernel.gfx11_producer_quant_fused` | `gfx11_producer_quant_fused` | 0.4.0 | 0.5.0 | none; exact gfx1100 and gfx1151 always fuse the quantiser into the admitted producers (bit-identical) |
+| `developer.gfx11_producer_quant_fused` | `gfx11_producer_quant_fused` | 0.4.0 | 0.5.0 | none; exact gfx1100 and gfx1151 always fuse the quantiser into the admitted producers (bit-identical) |
+| `kernel.gfx12_fp8_stream` | `gfx12_fp8_stream` | 0.4.0 | 0.5.0 | none; exact gfx1201 always fuses the MQ4v2 FP8 pre-pass into the producers (byte-identical) |
+| `developer.gfx12_fp8_stream` | `gfx12_fp8_stream` | 0.4.0 | 0.5.0 | none; exact gfx1201 always fuses the MQ4v2 FP8 pre-pass into the producers (byte-identical) |
+| `kernel.gfx12_fa_packet` | `gfx12_fa_packet` | 0.4.0 | 0.5.0 | none; exact gfx1201 always takes the packet-minimal Q128 FA2 body (exact arithmetic) |
+| `developer.gfx12_fa_packet` | `gfx12_fa_packet` | 0.4.0 | 0.5.0 | none; exact gfx1201 always takes the packet-minimal Q128 FA2 body (exact arithmetic) |
+| `kernel.attn_qresident_v2` | `attn_qresident_v2` | 0.4.0 | 0.5.0 | none; the gfx1201 Q-resident FA2 route always takes the v2 schedule (bit-exact) |
+| `developer.attn_qresident_v2` | `attn_qresident_v2` | 0.4.0 | 0.5.0 | none; the gfx1201 Q-resident FA2 route always takes the v2 schedule (bit-exact) |
+| `kernel.draft_shared_qkv_rotation` | `draft_shared_qkv_rotation` | 0.4.2 | 0.5.0 | none; exact gfx1100 always rotates the draft Q/K/V input once (bit-identical) |
+| `developer.draft_shared_qkv_rotation` | `draft_shared_qkv_rotation` | 0.4.2 | 0.5.0 | none; exact gfx1100 always rotates the draft Q/K/V input once (bit-identical) |
+| `kernel.draft_shared_ffn_rotation` | `draft_shared_ffn_rotation` | 0.4.2 | 0.5.0 | none; exact gfx1100 always rotates the draft FFN input once (bit-identical) |
+| `developer.draft_shared_ffn_rotation` | `draft_shared_ffn_rotation` | 0.4.2 | 0.5.0 | none; exact gfx1100 always rotates the draft FFN input once (bit-identical) |
+| `kernel.draft_shared_ctx_kv_rotation` | `draft_shared_ctx_kv_rotation` | 0.4.2 | 0.5.0 | none; exact gfx1100 always rotates the draft context input once (bit-identical) |
+| `developer.draft_shared_ctx_kv_rotation` | `draft_shared_ctx_kv_rotation` | 0.4.2 | 0.5.0 | none; exact gfx1100 always rotates the draft context input once (bit-identical) |
+| `developer.gdn_kkt_batched` | `gdn_kkt_batched` | 0.4.0 | 0.5.0 | none; exact gfx1201 always runs one KKT launch per layer (byte-identical) |
+| `developer.gfx1151_gdn_scan` | `gfx1151_gdn_scan` | 0.4.0 | 0.5.0 | none; exact gfx1151 always runs gdn_chunk_scan_gfx1151 for F32 scan output (bit-exact) |
+| `developer.gfx1151_xlds` | `gfx1151_xlds` | 0.4.2 | 0.5.0 | none; exact gfx1151 always takes the 1..=16-row GEMM twins where admitted (identical outputs) |
+| `developer.qwen4_gdn_chain_fuse` | `qwen4_gdn_chain_fuse` | 0.4.3 | 0.5.0 | none; exact gfx1201 always runs the fused dense-GDN producer (byte-identical) |
+| `developer.batched_head` | `batched_head` | 0.4.5 | 0.5.0 | none; exact gfx1201 multi-slot decode always batches the LM head (byte-identical) |
+| `developer.raon_gfx1100_down_producer` | `raon_gfx1100_down_producer` | 0.4.5 | 0.5.0 | none; exact gfx1100 always runs the fused grouped down producer (bytewise the chain) |
+| `developer.qwen4_ep_vocab_shard` | `qwen4_ep_vocab_shard` | 0.4.5 | 0.5.0 | none; EP2 over two gfx1201 cards always shards the LM head where admitted (bitwise the whole head) |
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 314 schema keys, plus the `developer.<name>` namespace.
+**Count:** 301 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -2755,21 +2786,15 @@ branch) or a misspelled key is unknown and fails the load with
 | `image.decode` | `image_decode` | `HIPFIRE_IMAGE_DECODE` | stable |
 | `kernel.a4_slab` | `a4_slab` | `HIPFIRE_A4_SLAB` | experimental |
 | `kernel.attn_qresident` | `attn_qresident` | `HIPFIRE_ATTN_QRESIDENT` | stable |
-| `kernel.attn_qresident_v2` | `attn_qresident_v2` | `HIPFIRE_ATTN_QRESIDENT_V2` | stable |
 | `kernel.calib_force_bf16` | `calib_force_bf16` | `HIPFIRE_CALIB_BF16` | experimental |
 | `kernel.cb_verify_pm` | `cb_verify_pm` | `HIPFIRE_CB_VERIFY_PM` | experimental |
 | `kernel.deterministic` | `deterministic` | `HIPFIRE_DETERMINISTIC` | experimental |
 | `kernel.dot2_gemv` | `dot2_gemv` | `HIPFIRE_DOT2_GEMV` | experimental |
 | `kernel.draft_collapse_off` | `draft_collapse_off` | `HIPFIRE_DRAFT_COLLAPSE_OFF` | experimental |
-| `kernel.draft_shared_ctx_kv_rotation` | `draft_shared_ctx_kv_rotation` | `HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION` | stable |
-| `kernel.draft_shared_ffn_rotation` | `draft_shared_ffn_rotation` | `HIPFIRE_DRAFT_SHARED_FFN_ROTATION` | stable |
-| `kernel.draft_shared_qkv_rotation` | `draft_shared_qkv_rotation` | `HIPFIRE_DRAFT_SHARED_QKV_ROTATION` | stable |
 | `kernel.flash_partials_batch` | `flash_partials_batch` | `HIPFIRE_FLASH_PARTIALS_BATCH` | experimental |
 | `kernel.fp16` | `fp16` | `HIPFIRE_FP16` | stable |
 | `kernel.fp8_wmma` | `fp8_wmma` | `HIPFIRE_FP8_WMMA` | experimental |
 | `kernel.g12_a4c2` | `g12_a4c2` | `HIPFIRE_G12_A4C2` | stable |
-| `kernel.g12_dec_norm` | `g12_dec_norm` | `HIPFIRE_G12_DEC_NORM` | stable |
-| `kernel.g12_norm` | `g12_norm` | `HIPFIRE_G12_NORM` | stable |
 | `kernel.gate_up_bt` | `gate_up_bt` | `HIPFIRE_GATE_UP_BT` | experimental |
 | `kernel.gate_up_nosync` | `gate_up_nosync` | `HIPFIRE_GATE_UP_NOSYNC` | experimental |
 | `kernel.gcn5_wave64_hybrid` | `gcn5_wave64_hybrid` | `HIPFIRE_GCN5_WAVE64_HYBRID` | experimental |
@@ -2780,7 +2805,6 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.gemma4_q8_fused_prefill` | `gemma4_q8_fused_prefill` | `HIPFIRE_GEMMA4_Q8_FUSED_PREFILL` | experimental |
 | `kernel.gemv_dp4a` | `gemv_dp4a` | `HIPFIRE_GEMV_DP4A` | stable |
 | `kernel.gemv_prefetch` | `gemv_prefetch` | `HIPFIRE_GEMV_PREFETCH` | stable |
-| `kernel.gfx1100_dec_norm` | `gfx1100_dec_norm` | `HIPFIRE_GFX1100_DEC_NORM` | stable |
 | `kernel.gfx1100_dflash_snapshot_overlap` | `gfx1100_dflash_snapshot_overlap` | `HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP` | stable |
 | `kernel.gfx1100_fa2_split_verify` | `gfx1100_fa2_split_verify` | `HIPFIRE_GFX1100_FA2_SPLIT_VERIFY` | stable |
 | `kernel.gfx11_a4_candidates` | `gfx11_a4_candidates` | `HIPFIRE_GFX11_A4_CANDIDATES` | experimental |
@@ -2788,23 +2812,17 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.gfx11_fa2_prefill` | `gfx11_fa2_prefill` | `HIPFIRE_GFX11_FA2_PREFILL` | stable |
 | `kernel.gfx11_iu4_gridspec` | `gfx11_iu4_gridspec` | `HIPFIRE_GFX11_IU4_GRIDSPEC` | stable |
 | `kernel.gfx11_iu4_shape` | `gfx11_iu4_shape` | `HIPFIRE_GFX11_IU4_SHAPE` | experimental |
-| `kernel.gfx11_producer_quant_fused` | `gfx11_producer_quant_fused` | `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED` | stable |
 | `kernel.gfx11_q8_fa2_wide` | `gfx11_q8_fa2_wide` | `HIPFIRE_GFX11_Q8_FA2_WIDE` | experimental |
 | `kernel.gfx12_fa2_prefill` | `gfx12_fa2_prefill` | `HIPFIRE_GFX12_FA2_PREFILL` | stable |
-| `kernel.gfx12_fa_packet` | `gfx12_fa_packet` | `HIPFIRE_GFX12_FA_PACKET` | stable |
 | `kernel.gfx12_fa_prep_fp8q` | `gfx12_fa_prep_fp8q` | `HIPFIRE_GFX12_FA_PREP_FP8Q` | stable |
 | `kernel.gfx12_fa_prep_fused` | `gfx12_fa_prep_fused` | `HIPFIRE_GFX12_FA_PREP_FUSED` | stable |
-| `kernel.gfx12_fp8_stream` | `gfx12_fp8_stream` | `HIPFIRE_GFX12_FP8_STREAM` | stable |
 | `kernel.gfx12_gdn_chunk_scan` | `gfx12_gdn_chunk_scan` | `HIPFIRE_GFX12_GDN_CHUNK_SCAN` | stable |
-| `kernel.gfx12_gdn_pre_fused` | `gfx12_gdn_pre_fused` | `HIPFIRE_GFX12_GDN_PRE_FUSED` | stable |
 | `kernel.gfx12_mq4v2_fp8_gateup` | `gfx12_mq4v2_fp8_gateup` | `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP` | stable |
 | `kernel.gfx12_mq4v2_fp8_qkv` | `gfx12_mq4v2_fp8_qkv` | `HIPFIRE_GFX12_MQ4V2_FP8_QKV` | stable |
 | `kernel.gfx12_mq4v2_fp8_qkvza` | `gfx12_mq4v2_fp8_qkvza` | `HIPFIRE_GFX12_MQ4V2_FP8_QKVZA` | stable |
 | `kernel.gfx12_mq4v2_fp8_resid` | `gfx12_mq4v2_fp8_resid` | `HIPFIRE_GFX12_MQ4V2_FP8_RESID` | stable |
 | `kernel.gfx12_mq4v2_fp8_v2` | `gfx12_mq4v2_fp8_v2` | `HIPFIRE_GFX12_MQ4V2_FP8_V2` | stable |
 | `kernel.gfx12_mq4v2_gateup_k5120` | `gfx12_mq4v2_gateup_k5120` | `HIPFIRE_GFX12_MQ4V2_GATEUP_K5120` | experimental |
-| `kernel.gfx12_producer_quant_fused` | `gfx12_producer_quant_fused` | `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` | stable |
-| `kernel.gfx12_silu_quant_fused` | `gfx12_silu_quant_fused` | `HIPFIRE_GFX12_SILU_QUANT_FUSED` | stable |
 | `kernel.gfx942_gemv_v2` | `gfx942_gemv_v2` | `HIPFIRE_GFX942_GEMV_V2` | experimental |
 | `kernel.gfx942_gemv_v3` | `gfx942_gemv_v3` | `HIPFIRE_GFX942_GEMV_V3` | experimental |
 | `kernel.gfx942_lds_gemv` | `gfx942_lds_gemv` | `HIPFIRE_GFX942_LDS_GEMV` | experimental |

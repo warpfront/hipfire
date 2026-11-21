@@ -529,8 +529,8 @@ impl RankExec {
         }
     }
 
-    /// This rank's vocabulary-shard exchange (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`; `None`: the switch
-    /// is off or the load declined it, so a sharded plan is refused).
+    /// This rank's vocabulary-shard exchange (EP2 over two exact gfx1201 cards; `None`: the load
+    /// declined it, so a sharded plan is refused).
     pub(crate) fn with_vocab(mut self, vocab: Option<Arc<VocabExchange>>) -> Self {
         self.vocab = vocab;
         self
@@ -2617,7 +2617,7 @@ impl EpMeshLanes {
             }
             None => false,
         };
-        // The vocabulary-sharded verify (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`): armed when the mesh
+        // The vocabulary-sharded verify (EP2 over two exact gfx1201 cards): armed when the mesh
         // attached its exchange and the forward is eager (no replay recording or graph capture:
         // the exchange is host-ordered and never replayed); the root then seals
         // `VerifyPlan::vocab_shard` for every step the exchange's buffers hold whose sampled

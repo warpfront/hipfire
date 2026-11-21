@@ -190,7 +190,7 @@ pub struct Qwen4EpPeer {
     split: Option<TrunkSplitRank>,
     /// Trunk-shard fused all-reduce mailboxes (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`).
     ar_hc: Option<Arc<ArHcExchange>>,
-    /// The vocabulary-shard exchange (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`).
+    /// The vocabulary-shard exchange (EP2 over two exact gfx1201 cards).
     vocab: Option<Arc<VocabExchange>>,
 }
 
@@ -1410,8 +1410,7 @@ pub struct Qwen4EpMesh {
     split: Option<TrunkSplitRank>,
     /// Rank 0's handle of the trunk-shard fused all-reduce mailboxes; `None` when off.
     ar_hc: Option<Arc<ArHcExchange>>,
-    /// The vocabulary-shard exchange (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`); `None` when off or
-    /// declined.
+    /// The vocabulary-shard exchange (EP2 over two exact gfx1201 cards); `None` when declined.
     vocab: Option<Arc<VocabExchange>>,
     ranks: usize,
     /// The EP reserve-sharing plan receipt every rank agreed on at attach;
@@ -1441,8 +1440,8 @@ impl Qwen4EpMesh {
         self.reserve.as_ref()
     }
 
-    /// The EP2 vocabulary-shard exchange (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`); `None` when the switch
-    /// is off or the load declined it.
+    /// The EP2 vocabulary-shard exchange (two exact gfx1201 cards); `None` when the load
+    /// declined it.
     pub fn vocab_exchange(&self) -> Option<&Arc<VocabExchange>> {
         self.vocab.as_ref()
     }
@@ -2101,15 +2100,13 @@ impl Qwen4Bundle {
             );
         }
 
-        // 2e. Vocabulary-sharded target LM head (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`, X1): every rank
+        // 2e. Vocabulary-sharded target LM head (X1): every rank
         // allocates its exchange buffers (the packed shard logits and top-1 ids rank 0 reads
         // through peer pointers, the candidate table) and its event now, before P2P is enabled
-        // below (ROCm does not map later allocations). A forced switch on a load that cannot run
-        // it refuses the attach; the default only declines.
+        // below (ROCm does not map later allocations). A load that cannot run it declines.
         let vocab_exchange: Option<Arc<VocabExchange>> = {
             let vocab = self.config.vocab_size;
             let decision = ep_vocab_shard::attach_decision(
-                ep_vocab_shard::vocab_shard_switch(),
                 crate::weights::trunk_shard::default_applies(),
                 ranks,
                 vocab,
@@ -2120,22 +2117,21 @@ impl Qwen4Bundle {
             // attached exchange refuses the attach.
             let draft_shard = match ep_vocab_shard::draft_attach_decision(
                 ep_vocab_shard::draft_vocab_shard_switch(),
-                matches!(decision, Ok(AttachDecision::Attach)),
+                decision == AttachDecision::Attach,
             ) {
                 Ok(decision) => decision == AttachDecision::Attach,
                 Err(error) => return Err(release_rank0(gpu, error)),
             };
             match decision {
-                Err(error) => return Err(release_rank0(gpu, error)),
-                Ok(AttachDecision::Off) => None,
-                Ok(AttachDecision::Declined(reason)) => {
+                AttachDecision::Off => None,
+                AttachDecision::Declined(reason) => {
                     eprintln!(
                         "qwen4 EP: vocabulary-sharded head declined ({reason}); both ranks keep \
                          the whole head"
                     );
                     None
                 }
-                Ok(AttachDecision::Attach) => {
+                AttachDecision::Attach => {
                     let exchange = match VocabExchange::new(vocab, ep_vocab_shard::VOCAB_SHARD_ROWS)
                     {
                         Ok(exchange) => Arc::new(exchange.with_draft_rows(if draft_shard {
@@ -2171,8 +2167,7 @@ impl Qwen4Bundle {
                     }
                     eprintln!(
                         "qwen4 EP: vocabulary-sharded target head on (each rank projects and scans \
-                         {} of {vocab} head rows; HIPFIRE_QWEN4_EP_VOCAB_SHARD=0 restores the whole \
-                         head on both); MQ2 draft head shard {}",
+                         {} of {vocab} head rows); MQ2 draft head shard {}",
                         exchange.width(),
                         if draft_shard {
                             "on (HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD=0 restores the whole draft head)"

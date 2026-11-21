@@ -269,7 +269,7 @@ fn try_gfx12_fp8_stream_sigmoid_prepared(
 /// entry symbol. Deliberately AWQ-only like the `_gfx12` twin: the arm of
 /// record has AWQ sidecars, while every failed predicate keeps the
 /// established sigmoid → rotate/quant chain byte-for-byte. Gated by
-/// `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED` on gfx1100/gfx1151.
+/// exact gfx1100/gfx1151.
 fn try_gfx11_sigmoid_rotate_quant_fused_prepared(
     gpu: &mut Gpu,
     wo: &WeightRef<'_>,

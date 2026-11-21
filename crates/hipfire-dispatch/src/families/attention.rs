@@ -2448,7 +2448,7 @@ fn dispatch_attend(
                         return Ok(());
                     }
                     // v2 is the bit-exact reschedule of the same body;
-                    // `kernel.attn_qresident_v2=false` restores v1.
+                    // on exact gfx1201 only.
                     if gpu.flags.attn_qresident_v2 {
                         hip!(gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
                             io.q,

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Byte oracle and timing of the batched multi-slot lm_head (`HIPFIRE_BATCHED_HEAD`):
+//! Byte oracle and timing of the batched multi-slot lm_head (exact gfx1201 multi-slot decode):
 //! `Gpu::gemv_mq4g256v2_multirow_r2_xbatch_pm` over B = 1..=8 rotated rows at the
 //! A3B head shape (M = 248,320 rows, K = 2,048) against the singleton head GEMV
 //! (`Gpu::gemv_mq4g256v2` once per row on `x[b]` / `y[b]` sub-views, which is

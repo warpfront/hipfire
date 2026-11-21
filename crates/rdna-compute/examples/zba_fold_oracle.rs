@@ -13,8 +13,7 @@
 //! unit weight and a synthetic AWQ scale), the layout the `_b1s` bundle and the
 //! merged QKV + Z-fold launch require; the oracle fails when the merged launch is
 //! not admitted. Needs `Gpu::a4_slab_active` (default env on gfx1201: no
-//! `HIPFIRE_A4_SLAB=0`, `HIPFIRE_G12_IU4_B1_CONTROL`, `HIPFIRE_G12_A4C2=0`
-//! or `HIPFIRE_G12_NORM=0`).
+//! `HIPFIRE_A4_SLAB=0`, `HIPFIRE_G12_IU4_B1_CONTROL` or `HIPFIRE_G12_A4C2=0`).
 //!
 //! ```text
 //! cargo run --release -p rdna-compute --features lab --example zba_fold_oracle
@@ -183,7 +182,7 @@ fn main() {
             gpu.scratch.int4_mmq_slab_at(p)
         };
         if !slab {
-            eprintln!("n={n}: FAIL producer did not mark slab activations (HIPFIRE_G12_NORM=0?)");
+            eprintln!("n={n}: FAIL producer did not mark slab activations");
             std::process::exit(2);
         }
 

@@ -1237,7 +1237,7 @@ pub struct LaneRows<'a> {
     pub exact: bool,
 }
 
-/// A vocabulary shard of the step's LM head (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`): the rank projects
+/// A vocabulary shard of the step's LM head (EP2 over two exact gfx1201 cards): the rank projects
 /// and scans only the head rows `[base, base + width)`. The step's logits are PACKED
 /// `[rows][width]` in the first `rows * width` elements of [`LaneOutputs::logits`] and the top-1
 /// ids are LOCAL to the shard (`0..width`); the caller adds `base` where it merges.

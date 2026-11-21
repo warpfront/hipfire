@@ -7,7 +7,7 @@
 //! compared bytewise (F32 `x_rot` bits, E4M3 codes, F32 half sums, F32 row
 //! scales) on synthetic rows spanning zero/tiny/mid/large/saturating scales.
 //!
-//! Run: `HIPFIRE_GFX12_FP8_STREAM=1 <bin>` on exact gfx1201. Exit 1 on any
+//! Run: `<bin>` on exact gfx1201. Exit 1 on any
 //! byte mismatch. Both the plain and AWQ twins are covered.
 
 fn row_scale(r: usize) -> f32 {

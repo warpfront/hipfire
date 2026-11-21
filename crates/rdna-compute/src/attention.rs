@@ -6893,7 +6893,7 @@ impl Gpu {
     /// writing the existing Q scratch once before the KT64 loop consumes it.
     /// Widened batches use a 3-D grid: z enumerates equal-length 512-row
     /// runs and x restarts inside each run. Block 256, 49408 B dynamic LDS.
-    /// Default route on exact gfx1201; `kernel.gfx12_fa_packet=false` opts out.
+    /// Exact gfx1201 only.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_fp8_e4m3_fa2_gqa_packet_gfx1201(
         &mut self,
@@ -7080,8 +7080,7 @@ impl Gpu {
 
     /// Bit-exact reschedule of [`Self::attention_fp8_e4m3_fa2_gqa_qresident_gfx1201`]
     /// (same grid, block and outputs; 49,936 B dynamic LDS: two double-buffered
-    /// KT48 K/V tiles). Default on exact gfx1201 behind
-    /// `kernel.attn_qresident_v2`; `false` restores v1.
+    /// KT48 K/V tiles). Exact gfx1201 only.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
         &mut self,
