@@ -5305,6 +5305,105 @@ mod tests {
         assert_eq!(flags_for(layer).qwen4_moe_ep_a8, Some(false));
     }
 
+    /// Each typed key of a Qwen4 tier-C S5b flag (HIPF-487) reaches its own
+    /// `FeatureFlags` field and no other: flipping one key against its gfx1201
+    /// default changes exactly that field.
+    #[test]
+    fn qwen4_s5b_keys_reach_their_own_field() {
+        use hipfire_config::ConfigValue::{Bool, Integer};
+        let project = |f: &FeatureFlags| -> Vec<String> {
+            [
+                f.qwen4_gdn_conv_qknorm,
+                f.qwen4_gdn_i8_fuse,
+                f.qwen4_hc_up_tile,
+                f.qwen4_hc_up_v2,
+                f.qwen4_hc_row_fold,
+                f.qwen4_moe_combine_zinit,
+                f.qwen4_moe_combine_inline_order,
+                f.qwen4_moe_down_r4,
+                f.qwen4_moe_scatter_scan,
+                f.qwen4_router_fast,
+                f.qwen4_shared_down_fuse,
+                f.qwen4_ffn_clear_absorb,
+                f.qwen4_ffn_clear_absorb_rows,
+                f.qwen4_decode_zba_x3,
+                f.qwen4_decode_head_fuse,
+                f.qwen4_ple_fuse,
+                f.qwen4_gdn_lanes,
+                f.qwen4_qsa_lanes,
+                f.qwen4_lane_hc_allrows,
+                f.qwen4_lane_allrows,
+                f.qwen4_lane_allrows_moe,
+                f.qwen4_lane_prepare_async,
+                f.qwen4_ep_pmask_implicit_zero,
+                f.qwen4_draft_glue_fold,
+                f.qwen4_draft_topk8_rows,
+            ]
+            .iter()
+            .map(bool::to_string)
+            .chain([f.qwen4_hc_fuse.to_string()])
+            .collect()
+        };
+        let flags_for = |layer: ConfigLayer| {
+            let resolved = resolve([NamedLayer {
+                source: ConfigSource::GlobalUser {
+                    path: "config.toml".into(),
+                },
+                layer,
+            }])
+            .unwrap();
+            FeatureFlags::from_process_config(
+                "gfx1201",
+                &ProcessConfig::from_resolved(&resolved).unwrap(),
+            )
+        };
+        let defaults = project(&flags_for(ConfigLayer::default()));
+        assert_eq!(
+            defaults,
+            project(&FeatureFlags::from_lookup("gfx1201", |_| Err(())))
+        );
+        let keys = [
+            "kernel.qwen4_gdn_conv_qknorm",
+            "kernel.qwen4_gdn_i8_fuse",
+            "kernel.qwen4_hc_up_tile",
+            "kernel.qwen4_hc_up_v2",
+            "kernel.qwen4_hc_row_fold",
+            "kernel.qwen4_moe_combine_zinit",
+            "kernel.qwen4_moe_combine_inline_order",
+            "kernel.qwen4_moe_down_r4",
+            "kernel.qwen4_moe_scatter_scan",
+            "kernel.qwen4_router_fast",
+            "kernel.qwen4_shared_down_fuse",
+            "kernel.qwen4_ffn_clear_absorb",
+            "kernel.qwen4_ffn_clear_absorb_rows",
+            "kernel.qwen4_decode_zba_x3",
+            "kernel.qwen4_decode_head_fuse",
+            "kernel.qwen4_ple_fuse",
+            "kernel.qwen4_gdn_lanes",
+            "kernel.qwen4_qsa_lanes",
+            "kernel.qwen4_lane_hc_allrows",
+            "kernel.qwen4_lane_allrows",
+            "kernel.qwen4_lane_allrows_moe",
+            "kernel.qwen4_lane_prepare_async",
+            "kernel.qwen4_ep_pmask_implicit_zero",
+            "kernel.qwen4_draft_glue_fold",
+            "kernel.qwen4_draft_topk8_rows",
+        ];
+        for (i, key) in keys.into_iter().enumerate() {
+            let flipped = defaults[i] != "true";
+            let mut layer = ConfigLayer::default();
+            layer.set(key, Bool(flipped)).unwrap();
+            let mut expect = defaults.clone();
+            expect[i] = flipped.to_string();
+            assert_eq!(project(&flags_for(layer)), expect, "{key}");
+        }
+        let mut layer = ConfigLayer::default();
+        layer.set("kernel.qwen4_hc_fuse", Integer(3)).unwrap();
+        let mut expect = defaults.clone();
+        expect[keys.len()] = "3".to_owned();
+        assert_eq!(project(&flags_for(layer)), expect);
+    }
+
     /// Each HIPF-430 stage 2 field reads its own env spelling, and only that one: setting one
     /// name to a non-default value changes exactly its field (no crossed or dropped wires).
     #[test]
