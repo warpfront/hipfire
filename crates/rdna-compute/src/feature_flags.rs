@@ -474,6 +474,12 @@ pub struct FeatureFlags {
     /// exact wave64 MoE router on exact gfx1100 256-expert models, `Approx` the approximate wave64
     /// router, `Off` the baseline router. gfx1151 and gfx1201 ignore it.
     pub gfx1100_router_w64: RouterW64Mode,
+    /// `memory.page_eviction` (`HIPFIRE_PAGE_EVICTION`): `None` is auto, resolved per device by
+    /// [`Self::page_eviction_enabled`].
+    pub page_eviction: Option<bool>,
+    /// `memory.widened_pbs_grow_only` (`HIPFIRE_WIDENED_PBS_GROW_ONLY`) with `off` applied;
+    /// [`Self::widened_pbs_grow_only_enabled`] adds the discrete-only gate.
+    pub widened_pbs_grow_only: bool,
     /// Selects the exact-gfx1151 1..=16-row MQ4V2 and
     /// HFQ4G256/MQ4G256 v1 WMMA GEMMs (`*_gfx1151_xlds`: 4 waves x 16 rows per
     /// block, X slab staged in LDS) for gate_up/qkvza/qkv/residual (residual also
@@ -1374,6 +1380,9 @@ impl FeatureFlags {
             gate_up_ldsstage: parse_bool("HIPFIRE_GATEUP_LDSSTAGE").unwrap_or(arch == "gfx1100"),
             gfx1100_q8x_verify: parse_bool("HIPFIRE_GFX1100_Q8X_VERIFY").unwrap_or(arch == "gfx1100"),
             gfx1100_router_w64: parse_router_w64("HIPFIRE_GFX1100_ROUTER_W64"),
+            page_eviction: exact_tri("HIPFIRE_PAGE_EVICTION"),
+            widened_pbs_grow_only: matches!(arch, "gfx1100" | "gfx1201")
+                && value("HIPFIRE_WIDENED_PBS_GROW_ONLY").ok().as_deref() != Some("off"),
             gfx1151_xlds: arch == "gfx1151",
             mq4v2_gfx1150_bt: parse_bool("HIPFIRE_MQ4V2_GFX1150_BT")
                 .unwrap_or(arch == "gfx1150"),
@@ -1754,6 +1763,16 @@ impl FeatureFlags {
         } else {
             0
         }
+    }
+
+    /// `memory.page_eviction`: auto (unset) follows the device's unified-memory flag.
+    pub fn page_eviction_enabled(&self, uma: bool) -> bool {
+        self.page_eviction.unwrap_or(uma)
+    }
+
+    /// Discrete-only: UMA devices keep the conservative lifecycle.
+    pub fn widened_pbs_grow_only_enabled(&self, uma: bool) -> bool {
+        self.widened_pbs_grow_only && !uma
     }
 
     /// H3: the retiled operand-swapped HC up+mix read tail
@@ -2294,6 +2313,8 @@ impl FeatureFlags {
             gate_up_ldsstage: false,
             gfx1100_q8x_verify: false,
             gfx1100_router_w64: RouterW64Mode::Exact,
+            page_eviction: None,
+            widened_pbs_grow_only: false,
             gfx1151_xlds: false,
             mq4v2_gfx1150_bt: false,
             mq4v2_gfx1150_iu4: false,
@@ -2981,6 +3002,38 @@ mod tests {
         assert_eq!(mode("approx"), RouterW64Mode::Approx);
         let unset = FeatureFlags::from_lookup("gfx1100", |_| Err(()));
         assert_eq!(unset.gfx1100_router_w64, RouterW64Mode::Exact);
+    }
+
+    #[test]
+    fn page_eviction_auto_follows_uma_unless_typed() {
+        let flags = |raw: Option<&'static str>| {
+            FeatureFlags::from_lookup("gfx1100", |name| match (name, raw) {
+                ("HIPFIRE_PAGE_EVICTION", Some(raw)) => Ok(raw.to_owned()),
+                _ => Err(()),
+            })
+        };
+        assert!(flags(None).page_eviction_enabled(true));
+        assert!(!flags(None).page_eviction_enabled(false));
+        assert!(!flags(Some("0")).page_eviction_enabled(true));
+        assert!(flags(Some("1")).page_eviction_enabled(false));
+    }
+
+    #[test]
+    fn widened_pbs_grow_only_is_discrete_gfx1100_and_gfx1201_unless_off() {
+        for arch in ["gfx1100", "gfx1201"] {
+            let on = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert!(on.widened_pbs_grow_only_enabled(false), "{arch}");
+            assert!(!on.widened_pbs_grow_only_enabled(true), "{arch} UMA");
+            let off = FeatureFlags::from_lookup(arch, |name| match name {
+                "HIPFIRE_WIDENED_PBS_GROW_ONLY" => Ok("off".to_owned()),
+                _ => Err(()),
+            });
+            assert!(!off.widened_pbs_grow_only_enabled(false), "{arch} off");
+        }
+        for arch in ["gfx1151", "gfx1200", "gfx942", "unknown"] {
+            let flags = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert!(!flags.widened_pbs_grow_only_enabled(false), "{arch}");
+        }
     }
 
     /// H4/H3/H8a flags are exact gfx1151 / gfx1201: unset, H4 is level 3 on

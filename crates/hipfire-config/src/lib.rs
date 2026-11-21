@@ -924,6 +924,24 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_OOM_GUARD",
         "Memory preflight OOM guard. Default auto: on for unified-memory APU architectures (GPU allocations come out of system RAM, so an overshoot can globally OOM the desktop), off for discrete GPUs, and for GPU-less processes decided by host swap state. Set true to force on, false to force off (HIPFIRE_OOM_GUARD)."
     ),
+    process_auto_bool_field!(
+        "memory.page_eviction",
+        "page_eviction",
+        Memory,
+        true,
+        "HIPFIRE_PAGE_EVICTION",
+        "Drop the model file's page cache after each tensor read. Default auto: on for unified-memory GPUs (avoids OOM against hipMalloc staging), off for discrete GPUs (fadvise-per-tensor forces a full disk re-read on every load). Set true to force eviction, false to keep the page cache (HIPFIRE_PAGE_EVICTION)."
+    ),
+    process_field!(
+        "memory.widened_pbs_grow_only",
+        "widened_pbs_grow_only",
+        Memory,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(&["auto", "off"]),
+        true,
+        "HIPFIRE_WIDENED_PBS_GROW_ONLY",
+        "Owns large PBS buffers across requests instead of bouncing them through the pool. Default auto: on for discrete gfx1100 and gfx1201, off for UMA and other architectures. Set off to keep the conservative lifecycle (HIPFIRE_WIDENED_PBS_GROW_ONLY)."
+    ),
     field!(
         "model.deepseek4_experts_per_token",
         "deepseek4_experts_per_token",
@@ -4947,6 +4965,22 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "promoted to a typed key (HIPF-489); HIPFIRE_QWEN4_HC_FUSE is unchanged",
         replacement: "kernel.qwen4_hc_fuse",
+    },
+    RetiredConfigKey {
+        key: "developer.page_eviction",
+        legacy_key: "developer.page_eviction",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-489); HIPFIRE_PAGE_EVICTION is unchanged",
+        replacement: "memory.page_eviction",
+    },
+    RetiredConfigKey {
+        key: "developer.widened_pbs_grow_only",
+        legacy_key: "developer.widened_pbs_grow_only",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-489); HIPFIRE_WIDENED_PBS_GROW_ONLY is unchanged",
+        replacement: "memory.widened_pbs_grow_only",
     },
     RetiredConfigKey {
         key: "developer.qwen4_lane_append_share",
@@ -9281,6 +9315,14 @@ fn promoted_flag_env_value(legacy_key: &str, raw: &str) -> Option<ConfigValue> {
             Ok(level) => ConfigValue::Integer(i64::from(level.min(3))),
             Err(_) => ConfigValue::Null,
         },
+        "page_eviction" => ConfigValue::Bool(raw != "0"),
+        "widened_pbs_grow_only" => {
+            let mode = match raw {
+                "0" => "off",
+                _ => "auto",
+            };
+            ConfigValue::String(mode.to_owned())
+        }
         _ => return None,
     })
 }
@@ -10347,8 +10389,9 @@ mod tests {
             .filter(|f| promoted_flag_env_value(f.legacy_key, "").is_some())
             .collect();
         // 9 kernel-side (stage 1) + 28 arch-crate / runtime (stage 2) + 2 tier-B kernel-side
-        // (HIPF-438) + 4 tier-B arch-crate / runtime (HIPF-437) + 2 kernel-side (HIPF-489).
-        assert_eq!(promoted.len(), 45);
+        // (HIPF-438) + 4 tier-B arch-crate / runtime (HIPF-437) + 2 kernel-side (HIPF-489)
+        // + 2 memory-side (HIPF-489 case 6).
+        assert_eq!(promoted.len(), 47);
         for f in promoted {
             let dev = developer_key_for_env(f.env_compat.unwrap()).unwrap();
             let err = ConfigLayer::default().set_cli(&dev, "1").unwrap_err();
@@ -10357,6 +10400,24 @@ mod tests {
                 "{dev}: {err:?}"
             );
             assert!(err.to_string().contains(f.key), "{dev}: {err}");
+        }
+    }
+
+    #[test]
+    fn page_eviction_and_widened_arms_keep_their_legacy_meaning() {
+        for (raw, want) in [("0", false), ("1", true), ("", true)] {
+            assert_eq!(
+                promoted_flag_env_value("page_eviction", raw),
+                Some(ConfigValue::Bool(want)),
+                "{raw:?}"
+            );
+        }
+        for (raw, want) in [("0", "off"), ("1", "auto"), ("", "auto"), ("off", "auto")] {
+            assert_eq!(
+                promoted_flag_env_value("widened_pbs_grow_only", raw),
+                Some(ConfigValue::String(want.to_owned())),
+                "{raw:?}"
+            );
         }
     }
 

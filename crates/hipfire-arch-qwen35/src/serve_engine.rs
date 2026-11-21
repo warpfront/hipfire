@@ -1096,10 +1096,7 @@ impl Rig {
         // default `evict_page_cache=true` drops the mmap in prepare(), and
         // post-weight tensor reads (e.g. vision weights) panic on None.
         hfq.set_evict_page_cache(
-            hipfire_config::developer_var("HIPFIRE_PAGE_EVICTION")
-                .ok()
-                .map(|v| v != "0")
-                .unwrap_or_else(|| gpu.is_uma()),
+            rdna_compute::FeatureFlags::process().page_eviction_enabled(gpu.is_uma()),
         );
         // The capture gate and the CPU-exec coverage line are model-scoped: this
         // slots path loads weights directly (not through
