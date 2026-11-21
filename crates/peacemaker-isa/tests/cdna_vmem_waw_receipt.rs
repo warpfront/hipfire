@@ -69,6 +69,22 @@ fn ordered_vmem_waw_receipt_binds_exact_sources_binary_and_guarded_results() {
             include_bytes!("../../peacemaker-cdna/src/enc/mubuf.rs").as_slice(),
         ),
     ] {
+        if field == "bundle_codec_source_sha256" && oracle[field] != sha(source) {
+            // The raw receipt stays as the MI300X run recorded it. Later edits to
+            // `bundle.rs` that cannot change gfx942 encoding are listed here, each
+            // with its reason; any other change still fails until the oracle reruns.
+            const AMENDMENTS: [(&str, &str); 1] = [(
+                "cd862ad802652c336e43c256e7c6de9a478a7b8a9d8d92d8674fd62ba7636dbd",
+                "adds the `Arch::Gfx1150` arm to `arch_name` (#1172); gfx942 encoding \
+                 unchanged; accepted without an MI300X rerun by Kaden, 2026-11-21",
+            )];
+            let current = sha(source);
+            assert!(
+                AMENDMENTS.iter().any(|(digest, _)| *digest == current),
+                "{field}: {current} is neither the recorded source nor a listed amendment"
+            );
+            continue;
+        }
         assert_eq!(oracle[field], sha(source), "{field}");
     }
     assert_eq!(oracle["kernels"], 519);
