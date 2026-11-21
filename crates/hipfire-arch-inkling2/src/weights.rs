@@ -330,6 +330,12 @@ impl GgufF32 {
     }
 }
 
+/// The cross-pass `q` name is the one that is not the `kv` name; both end in
+/// `_queries`, so a suffix test on `_queries` alone classifies both as q.
+fn is_cross_pass_q_query(name: &str) -> bool {
+    !name.ends_with("kv_queries")
+}
+
 impl WeightSource for GgufF32 {
     fn f32(&self, hfq: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
         // map HFQ (checkpoint) name -> GGUF name, with per-GGUF-name cache.
@@ -451,7 +457,8 @@ impl WeightSource for GgufF32 {
         if hfq == "model.llm.middle_cycle_cross_pass_queries"
             || hfq == "model.llm.middle_cycle_cross_pass_kv_queries"
         {
-            let is_q = hfq.ends_with("_queries");
+            // Both names end in "_queries"; only the kv one is not q.
+            let is_q = is_cross_pass_q_query(hfq);
             let e = 2304usize;
             let mut q_rows: Vec<f32> = Vec::with_capacity(24 * e);
             let mut kv_rows: Vec<f32> = Vec::with_capacity(24 * e);
@@ -482,6 +489,20 @@ impl WeightSource for GgufF32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cross_pass_query_names_classify_q_and_kv() {
+        assert!(is_cross_pass_q_query(
+            "model.llm.middle_cycle_cross_pass_queries"
+        ));
+        assert!(is_cross_pass_q_query("model.cross_pass_messages.queries"));
+        assert!(!is_cross_pass_q_query(
+            "model.llm.middle_cycle_cross_pass_kv_queries"
+        ));
+        assert!(!is_cross_pass_q_query(
+            "model.cross_pass_messages.kv_queries"
+        ));
+    }
 
     #[test]
     fn expected_expert_count_for_mini() {
