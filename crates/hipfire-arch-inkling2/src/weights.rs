@@ -117,7 +117,9 @@ impl Inkling2Weights {
             ));
         }
         let result = (shape, vals);
-        self.f32_cache.borrow_mut().insert(name.to_string(), result.clone());
+        self.f32_cache
+            .borrow_mut()
+            .insert(name.to_string(), result.clone());
         Ok(result)
     }
 
@@ -170,6 +172,40 @@ mod tests {
         "local_layer_ids":[0,1,2,3,4,6,7,8,9,10,12,13,14,15,16,18,19,20,21,22],
         "loop_config":{"core_start":6,"core_end":18,"num_passes":3,"gate_rank":64,"is_varloop":false}
     }}}"#;
+
+    #[test]
+    #[ignore = "print decoded qt44 stats to compare with GGUF"]
+    fn inspect_qt44_decode() {
+        use hipfire_runtime::hfq::HfqFile;
+        let hfq = HfqFile::open(std::path::Path::new(
+            r"D:\hipfire-models\inkling2-mini-mq4.hfq",
+        ))
+        .expect("open");
+        let w = Inkling2Weights::load(
+            &hfq,
+            &crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap(),
+        )
+        .unwrap();
+        for name in [
+            "model.llm.layers.0.attn.wk_dv.weight",
+            "model.llm.layers.0.attn.wq_du.weight",
+        ] {
+            let (shape, v) = w.f32(name).unwrap();
+            let min = v.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mean: f64 = v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
+            eprintln!("{name}: shape={shape:?} min={min} max={max} mean={mean}");
+            let first: Vec<String> = v[..8].iter().map(|x| format!("{:.5}", x)).collect();
+            eprintln!("  first8={:?}", first);
+            if name.ends_with("wk_dv.weight") {
+                let mut s = String::new();
+                for x in &v {
+                    s.push_str(&format!("{}\n", x.to_bits()));
+                }
+                std::fs::write(r"D:\hipfire-models\decoded-wk.txt", s).unwrap();
+            }
+        }
+    }
 
     #[test]
     #[ignore = "requires the 14 GB inkling2-mini-mq4.hfq artifact"]
