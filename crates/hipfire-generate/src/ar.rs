@@ -895,6 +895,7 @@ pub enum GenerationRoute {
     LlamaSpec,
     GlimmerAr,
     GlimmerSpec,
+    InklingAr,
     PipelineParallel,
     DotsOcr,
     Unknown,
@@ -928,6 +929,7 @@ impl GenerationRoute {
         Self::LlamaSpec,
         Self::GlimmerAr,
         Self::GlimmerSpec,
+        Self::InklingAr,
         Self::PipelineParallel,
         Self::DotsOcr,
         Self::Unknown,
@@ -1051,6 +1053,7 @@ impl GenerationRoute {
             Self::LlamaSpec => "llama_spec",
             Self::GlimmerAr => "glimmer_ar",
             Self::GlimmerSpec => "glimmer_spec",
+            Self::InklingAr => "inkling_ar",
             Self::PipelineParallel => "pipeline_parallel",
             Self::DotsOcr => "dots_ocr",
             Self::Unknown => "unknown",
@@ -1457,6 +1460,7 @@ define_route_start!(llama_ar_route_start, 0);
 define_route_start!(llama_spec_route_start, 0);
 define_route_start!(glimmer_ar_route_start, 14);
 define_route_start!(glimmer_spec_route_start, 14);
+define_route_start!(inkling_ar_route_start, 24);
 define_route_start!(pipeline_parallel_route_start, 5);
 define_route_start!(dots_ocr_route_start, 8);
 define_route_start!(unknown_route_start, 255);
@@ -1489,6 +1493,7 @@ define_route_terminal!(llama_ar_route_terminal, GenerationRoute::LlamaAr);
 define_route_terminal!(llama_spec_route_terminal, GenerationRoute::LlamaSpec);
 define_route_terminal!(glimmer_ar_route_terminal, GenerationRoute::GlimmerAr);
 define_route_terminal!(glimmer_spec_route_terminal, GenerationRoute::GlimmerSpec);
+define_route_terminal!(inkling_ar_route_terminal, GenerationRoute::InklingAr);
 define_route_terminal!(
     pipeline_parallel_route_terminal,
     GenerationRoute::PipelineParallel
@@ -1620,6 +1625,11 @@ pub fn generation_route_adapter(route: GenerationRoute) -> Option<GenerationRout
             route,
             start: glimmer_spec_route_start,
             terminal: glimmer_spec_route_terminal,
+        },
+        GenerationRoute::InklingAr => GenerationRouteAdapter {
+            route,
+            start: inkling_ar_route_start,
+            terminal: inkling_ar_route_terminal,
         },
         GenerationRoute::PipelineParallel => GenerationRouteAdapter {
             route,
@@ -1972,6 +1982,11 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
                 GenerationRoute::GlimmerAr
             };
         }
+        // Inkling-2-Mini (arch 24). One route: plain GPU AR over
+        // `forward_token_gpu`. No spec variant: the carrier admits no
+        // drafter/MTP/n-gram, so a speculator must NOT change the route —
+        // an arch-24 turn is always plain AR.
+        24 => return GenerationRoute::InklingAr,
         8 => return GenerationRoute::DotsOcr,
         _ => {}
     }
@@ -2650,17 +2665,6 @@ pub fn generate(
     // prefills and decodes under it, and it drops on every return, error and
     // unwind, so a caller outside the daemon is covered too.
     let _ple_serving = m.ple_serving_guard();
-    // Inkling-2-Mini (arch 24) has a loader/bundle but no generate route yet.
-    // Fail closed with a clean correlated error instead of falling through to
-    // the LLaMA downcast (which would panic).
-    if m.arch_id == 24 {
-        write_error(
-            stdout,
-            id,
-            "inkling2: generation is not implemented yet (loader-only skeleton)",
-        );
-        return;
-    }
     // ── Producer-route authority (Task 6) ──────────────────────────────
     // Resolve the selected generation route BEFORE sampler RNG reset and
     // every stateful branch. Non-empty tools are denied for unsafe routes
@@ -3173,6 +3177,45 @@ pub fn generate(
         }
         GenerationRoute::Gemma4Ar => {
             unreachable!("gemma4 dispatches through generation_early_route before this match")
+        }
+        GenerationRoute::InklingAr => {
+            // Arch 24 (Inkling-2-Mini). Single-GPU AR over the 48-visit GPU
+            // forward. No spec, no batch, no tools/stop/min_tokens on this
+            // route (refused upstream by the capability gates).
+            let _ = (
+                budget_alert_at_tok,
+                budget_alert_text,
+                assistant_prefix,
+                think_mode,
+                cactus_delta,
+                logprobs_top_k,
+                enable_thinking,
+                reasoning_effort,
+                user_explicit_sampling,
+            );
+            let _ = (stop, min_tokens);
+            crate::dense::generate_inkling(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                temp,
+                top_p,
+                top_k,
+                min_p,
+                max_tokens,
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
+                max_think_tokens,
+                tools,
+                messages_history,
+                request_seed,
+            );
+            return;
         }
         GenerationRoute::MapleAr => {
             // Arch 15 DOES honour the
