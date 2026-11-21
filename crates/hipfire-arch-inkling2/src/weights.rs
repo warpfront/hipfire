@@ -432,6 +432,8 @@ impl WeightSource for GgufF32 {
                     "attn.v_sconv.weight" | "attn.v_sconv.static_w" => {
                         format!("{b}attn_v_conv.weight")
                     }
+                    "attn.k_sconv.weight_proj" => format!("{b}attn_k_conv_proj.weight"),
+                    "attn.v_sconv.weight_proj" => format!("{b}attn_v_conv_proj.weight"),
                     "attn_sconv.weight" => format!("{b}attn_post_conv.weight"),
                     "mlp_sconv.weight" => format!("{b}ffn_post_conv.weight"),
                     "mlp.gate.weight" => format!("{b}ffn_gate_inp.weight"),

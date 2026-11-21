@@ -190,6 +190,49 @@ pub fn relative_bias(
     out
 }
 
+/// Full-layer dynamic short convolution with static + input-dependent taps.
+/// Mirrors llama.cpp `convolve(..., dynamic)` and the validated Python ref:
+/// `cur` is `[n_kv*head_dim]`, `static_w` is `[n_kv*head_dim, kernel]`
+/// (converted torch view), `proj` is `[n_kv*kernel, n_embd]` and `input` is
+/// the K/V input used for the dynamic weights. `past` is `[kernel-1, n_kv*hd]`.
+pub fn convolve_dynamic(
+    cur: &[f32],
+    static_w: &[f32],
+    proj_w: &[f32],
+    input: &[f32],
+    past: &[f32],
+    n_kv: usize,
+    head_dim: usize,
+    kernel: usize,
+    n_embd: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let channels = n_kv * head_dim;
+    // static_w torch view is [channels, kernel].
+    let mut x = vec![0.0f32; kernel * channels];
+    if past.len() >= (kernel - 1) * channels {
+        x[..(kernel - 1) * channels].copy_from_slice(&past[..(kernel - 1) * channels]);
+    }
+    x[(kernel - 1) * channels..].copy_from_slice(&cur[..channels]);
+    // dynamic weights: proj @ input -> [n_kv, kernel] (row = lag + head*kernel).
+    let dyn_w = matvec(proj_w, input, n_kv * kernel, n_embd);
+    let mut out = vec![0.0f32; channels];
+    for h in 0..n_kv {
+        for d in 0..head_dim {
+            let ch = h * head_dim + d;
+            let mut acc = 0.0f32;
+            for lag in 0..kernel {
+                // static tap `lag` over history[lag] (converted domain, tap k-1=current)
+                acc += static_w[ch * kernel + lag] * x[lag * channels + ch];
+                // dynamic weight for (head h, lag) multiplies history[kernel-1-lag]
+                acc += dyn_w[h * kernel + lag] * x[(kernel - 1 - lag) * channels + ch];
+            }
+            out[ch] = (acc + cur[ch]) / ((2 * kernel + 1) as f32).sqrt();
+        }
+    }
+    let new_past = x[channels..].to_vec();
+    (out, new_past)
+}
+
 /// Softmax attention with a zero-value sink logit, mirroring both
 /// `eager_attention_forward` (concat `[scores, sink]`, softmax, drop the sink
 /// column) and llama.cpp (subtract sink from the bias, pass a zero sink to
