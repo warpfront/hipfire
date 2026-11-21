@@ -414,8 +414,8 @@ impl Gpu {
         if self.functions.contains_key(kernel) {
             return self
                 .compiler
-                .code_objects()
-                .check_function_image(kernel, &variant.bytes)
+                .code_objects_mut()
+                .check_function_image(kernel, &variant.bytes.as_slice().into())
                 .map_err(|reason| {
                     HipError::new(
                         0,

@@ -5067,8 +5067,8 @@ impl Gpu {
         if self.functions.contains_key(func_name) {
             return self
                 .compiler
-                .code_objects()
-                .check_function_image(func_name, image.as_bytes())
+                .code_objects_mut()
+                .check_function_image(func_name, &image)
                 .map_err(|reason| hip_bridge::HipError::new(0, &reason));
         }
         self.scratch.route_load.admit_unplanned(
