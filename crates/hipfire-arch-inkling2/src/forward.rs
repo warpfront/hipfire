@@ -853,6 +853,650 @@ fn load_controllers<W: crate::weights::WeightSource>(
     Ok([load("attn")?, load("k")?, load("v")?, load("mlp")?])
 }
 
+/// Persistent per-visit-stream state for the cached (multi-token) CPU path.
+///
+/// One slot per visit (48 for Mini), NOT per physical layer: core physical
+/// layers revisit the same weights up to three times, but each visit keeps its
+/// own KV rows and conv history. `forward_token` / `decode_visit`
+/// (single-token, no cache) are untouched by this machinery; at `pos == 0` on
+/// a fresh state the cached path must reproduce them bit for bit.
+pub struct VisitSlot {
+    /// Recurrent short-conv history, carried across tokens.
+    pub conv: ConvState,
+    /// K rows per KV head, `[n_row * head_dim]`-contiguous per head, so each Q
+    /// head's `attention_softmax_with_sink` reads its `kv_h = h / 3` values
+    /// without re-packing. Row `j` holds the key at `start_pos + j`.
+    pub k: Vec<Vec<f32>>,
+    /// V rows (post-RMSNorm values), same layout as `k`.
+    pub v: Vec<Vec<f32>>,
+    /// Absolute position of cache row 0 (bumps on SWA eviction).
+    pub start_pos: usize,
+    /// Row cap: `sliding_window` on SWA visits, `max_seq` on full visits.
+    pub cap: usize,
+}
+
+impl VisitSlot {
+    /// Append one token's clipped K (`[nkv * d]`) and normed V (`[nkv * d]`),
+    /// evicting the oldest rows past `cap` (SWA ring). `pos` must be exactly
+    /// the next position (`start_pos + rows`); anything else is a caller bug.
+    fn push_token(&mut self, kc: &[f32], vc: &[f32], d: usize, pos: usize) -> Result<(), String> {
+        let nkv = self.k.len();
+        if kc.len() != nkv * d || vc.len() != nkv * d {
+            return Err("inkling2: cache append shape mismatch".to_string());
+        }
+        let have = self.k[0].len() / d;
+        if pos != self.start_pos + have {
+            return Err(format!(
+                "inkling2: cache append out of order: pos={pos} have={have} start={}",
+                self.start_pos
+            ));
+        }
+        for h in 0..nkv {
+            self.k[h].extend_from_slice(&kc[h * d..(h + 1) * d]);
+            self.v[h].extend_from_slice(&vc[h * d..(h + 1) * d]);
+        }
+        if have + 1 > self.cap {
+            let drop = have + 1 - self.cap;
+            for h in 0..nkv {
+                self.k[h].drain(..drop * d);
+                self.v[h].drain(..drop * d);
+            }
+            self.start_pos += drop;
+        }
+        Ok(())
+    }
+}
+
+/// Whole-model incremental decode state: 48 visit slots plus the position.
+/// The AttnRes block stream is deliberately NOT here: blocks are rebuilt
+/// within each token (upstream graph intermediates), so `forward_token_cached`
+/// keeps them local exactly like `forward_token` does.
+pub struct CpuDecodeState {
+    pub slots: Vec<VisitSlot>,
+    /// Next position to decode (all slots advance in lockstep).
+    pub pos: usize,
+    pub max_seq: usize,
+}
+
+impl CpuDecodeState {
+    /// Allocate empty slots sized for `max_seq` positions (tests use 128; the
+    /// 32768 GPU sizing belongs to the GPU brief, not here).
+    pub fn new(cfg: &crate::config::Inkling2Config, max_seq: usize) -> Result<Self, String> {
+        if max_seq == 0 {
+            return Err("inkling2: max_seq must be >= 1".to_string());
+        }
+        let nkv = cfg.n_head_kv;
+        let d = cfg.head_dim;
+        let mut slots = Vec::with_capacity(cfg.loop_cfg.n_slot());
+        for visit in 0..cfg.loop_cfg.n_slot() {
+            let phys = cfg.loop_cfg.layer_phys(visit);
+            let swa = cfg.swa_layers[phys];
+            let cap = if swa { cfg.sliding_window } else { max_seq };
+            // Reserve the test-relevant rows; SWA's 1024-row cap only binds
+            // past max_seq, which the per-token guard below refuses anyway.
+            let reserve = cap.min(max_seq) * d;
+            let mut k = Vec::with_capacity(nkv);
+            let mut v = Vec::with_capacity(nkv);
+            for _ in 0..nkv {
+                let kk = Vec::with_capacity(reserve);
+                let vv = Vec::with_capacity(reserve);
+                k.push(kk);
+                v.push(vv);
+            }
+            slots.push(VisitSlot {
+                conv: ConvState::default(),
+                k,
+                v,
+                start_pos: 0,
+                cap,
+            });
+        }
+        Ok(Self {
+            slots,
+            pos: 0,
+            max_seq,
+        })
+    }
+}
+
+/// Relative-bias term for one query/key pair at `dist = pos - key_pos`:
+/// gather the bias-table column, then fold in the sink. Upstream
+/// (`inkling2.cpp:357-360`) pads the table with one extra ZERO column at index
+/// `n_extent`, and `llama-kv-cache.cpp:2017-2018` maps every
+/// `distance >= extent` to that column — so the out-of-extent term is
+/// `0.0 - sink`, NOT a clamp to `n_extent - 1` (identical for `pos < 1024`,
+/// correct past it).
+#[inline]
+fn rel_bias_for_dist(
+    table: &[f32],
+    rh: &[f32],
+    n_rel: usize,
+    n_extent: usize,
+    dist: usize,
+    sink_h: f32,
+) -> f32 {
+    let dot = if dist < n_extent {
+        (0..n_rel)
+            .map(|rr| table[rr * n_extent + dist] * rh[rr])
+            .sum()
+    } else {
+        0.0
+    };
+    dot - sink_h
+}
+
+/// Run one full decoder visit against the persistent cache: identical math to
+/// `decode_visit` except the attention core, which appends the current token's
+/// K/V rows to `slot` and attends over the visit's window with
+/// distance-gathered relative bias. SWA visits attend
+/// `pos.saturating_sub(1023)..=pos` (at most 1024 keys); full visits attend
+/// `0..=pos`. `tau` is evaluated at the current `pos` for full layers.
+pub fn decode_visit_cached<W: crate::weights::WeightSource>(
+    w: &W,
+    cfg: &crate::config::Inkling2Config,
+    slot: &mut VisitSlot,
+    blocks: &mut Vec<Vec<f32>>,
+    x: &[f32],
+    visit: usize,
+    pos: usize,
+    messages: Option<&([Vec<f32>; 4], [ControllerWeights; 4])>,
+) -> Result<Vec<f32>, String> {
+    let phys = cfg.loop_cfg.layer_phys(visit);
+    let p = format!("model.llm.layers.{phys}.");
+    let swa = cfg.swa_layers[phys];
+    let g = |s: &str| w.f32(&format!("{p}{s}")).map(|x| x.1);
+
+    // --- attention inputs: AttnRes mix (if this visit has a query) ---
+    // (Same as decode_visit: within-token recurrence, no cache involved.)
+    let (base_q, base_k, base_v) = if phys == 0 {
+        (x.to_vec(), x.to_vec(), x.to_vec())
+    } else {
+        let attn_q = format!("model.llm.attn_res.attn_queries.{}", phys - 1);
+        let (shape, q) = w.f32(&attn_q)?;
+        let query_rows = if shape.len() == 1 {
+            1
+        } else {
+            shape[0] as usize
+        };
+        let mixed = oracle::mix(blocks, x, &q, cfg.n_embd, query_rows);
+        let row = |j: usize| mixed[j * cfg.n_embd..(j + 1) * cfg.n_embd].to_vec();
+        if query_rows >= 3 {
+            (row(0), row(1), row(2))
+        } else {
+            let r = row(0);
+            (r.clone(), r.clone(), r)
+        }
+    };
+    let (q_ctrl, k_ctrl, v_ctrl) = match messages {
+        Some((msgs, ctrls)) => {
+            let apply = |base: &[f32], j: usize, c: &ControllerWeights| {
+                oracle::control(
+                    base,
+                    &msgs[j],
+                    &c.down,
+                    &c.gain,
+                    &c.forget,
+                    cfg.n_embd,
+                    cfg.loop_cfg.gate_rank,
+                )
+            };
+            (
+                apply(&base_q, 0, &ctrls[0]),
+                apply(&base_k, 1, &ctrls[1]),
+                apply(&base_v, 2, &ctrls[2]),
+            )
+        }
+        None => (base_q.clone(), base_k.clone(), base_v.clone()),
+    };
+    let (q_inp, k_inp, v_inp) = if swa {
+        (
+            rmsnorm_gain(&q_ctrl, &g("attn_norm.weight")?, cfg.rms_norm_eps),
+            rmsnorm_gain(&k_ctrl, &g("attn_norm.weight")?, cfg.rms_norm_eps),
+            rmsnorm_gain(&v_ctrl, &g("attn_norm.weight")?, cfg.rms_norm_eps),
+        )
+    } else {
+        (
+            rmsnorm_gain(&q_ctrl, &g("q_input_norm.weight")?, cfg.rms_norm_eps),
+            rmsnorm_gain(&k_ctrl, &g("k_input_norm.weight")?, cfg.rms_norm_eps),
+            rmsnorm_gain(&v_ctrl, &g("v_input_norm.weight")?, cfg.rms_norm_eps),
+        )
+    };
+
+    // --- attention projections + convs (SWA static; full dynamic deferred) ---
+    let d = cfg.head_dim;
+    let nh = cfg.n_head;
+    let nkv = cfg.n_head_kv;
+    let ekv = nkv * d;
+    let eattn = nh * d;
+    let q = oracle::matvec(&g("attn.wq_du.weight")?, &q_inp, eattn, cfg.n_embd);
+    let k_raw = oracle::matvec(&g("attn.wk_dv.weight")?, &k_inp, ekv, cfg.n_embd);
+    let v_raw = oracle::matvec(&g("attn.wv_dv.weight")?, &v_inp, ekv, cfg.n_embd);
+    let r = oracle::matvec(&g("attn.wr_du.weight")?, &q_inp, nh * cfg.n_rel, cfg.n_embd);
+    let k_conv_name = if w.f32(&format!("{p}attn.k_sconv.weight")).is_ok() {
+        format!("{p}attn.k_sconv.weight")
+    } else {
+        format!("{p}attn.k_sconv.static_w")
+    };
+    let v_conv_name = if w.f32(&format!("{p}attn.v_sconv.weight")).is_ok() {
+        format!("{p}attn.v_sconv.weight")
+    } else {
+        format!("{p}attn.v_sconv.static_w")
+    };
+    let (k_conv, v_conv): (Vec<f32>, Vec<f32>);
+    if !swa {
+        let (sw_k_shape, sw_k) = w.f32(&format!("{p}attn.k_sconv.static_w"))?;
+        let (sw_v_shape, sw_v) = w.f32(&format!("{p}attn.v_sconv.static_w"))?;
+        let torch_conv = |shape: &[usize], v: &[f32]| -> Vec<f32> {
+            let kk = cfg.conv_kernel;
+            let ch = v.len() / kk;
+            let already_torch = shape.len() >= 2 && shape[0] == ch;
+            let mut t = vec![0.0f32; v.len()];
+            for c in 0..ch {
+                for l in 0..kk {
+                    t[c * kk + l] = if already_torch {
+                        v[c * kk + l]
+                    } else {
+                        v[(kk - 1 - l) * ch + c]
+                    };
+                }
+            }
+            t
+        };
+        let wkt = torch_conv(&sw_k_shape, &sw_k);
+        let wvt = torch_conv(&sw_v_shape, &sw_v);
+        let kproj = g("attn.k_sconv.weight_proj")?;
+        let vproj = g("attn.v_sconv.weight_proj")?;
+        let (kc2, kp2) = oracle::convolve_dynamic(
+            &k_raw,
+            &wkt,
+            &kproj,
+            &k_inp,
+            &slot.conv.k_past,
+            nkv,
+            d,
+            cfg.conv_kernel,
+            cfg.n_embd,
+        );
+        let (vc2, vp2) = oracle::convolve_dynamic(
+            &v_raw,
+            &wvt,
+            &vproj,
+            &v_inp,
+            &slot.conv.v_past,
+            nkv,
+            d,
+            cfg.conv_kernel,
+            cfg.n_embd,
+        );
+        slot.conv.k_past = kp2;
+        slot.conv.v_past = vp2;
+        k_conv = kc2;
+        v_conv = vc2;
+    } else {
+        let k_conv_w = load_conv(w, &k_conv_name, cfg.conv_kernel)?;
+        let v_conv_w = load_conv(w, &v_conv_name, cfg.conv_kernel)?;
+        let (kc2, kp2) = oracle::convolve_static(
+            &k_raw,
+            &k_conv_w,
+            &slot.conv.k_past,
+            1,
+            ekv,
+            cfg.conv_kernel,
+        );
+        let (vc2, vp2) = oracle::convolve_static(
+            &v_raw,
+            &v_conv_w,
+            &slot.conv.v_past,
+            1,
+            ekv,
+            cfg.conv_kernel,
+        );
+        slot.conv.k_past = kp2;
+        slot.conv.v_past = vp2;
+        k_conv = kc2;
+        v_conv = vc2;
+    }
+
+    // Per-channel clip scale is a real checkpoint tensor; a miss is a load
+    // error, not "clip without the learned scale".
+    let q_clip = w.f32(&format!("{p}attn.q_l2_clip.scale"))?.1;
+    let qc = oracle::clip(&q, Some(&q_clip), cfg.qk_clip, d);
+    let kc = oracle::clip(&k_conv, None, cfg.qk_clip, d);
+    let vc: Vec<f32> = (0..nkv)
+        .flat_map(|h| oracle::rmsnorm(&v_conv[h * d..(h + 1) * d], cfg.rms_norm_eps))
+        .collect();
+    let rel_clip = w.f32(&format!("{p}attn.rel_l2_clip.scale"))?.1;
+    let mut rc = oracle::clip(&r, Some(&rel_clip), cfg.rel_clip, cfg.n_rel);
+    if !swa {
+        // full-layer tau multiplies Q (per-head below) and R.
+        let t = oracle::tau(pos, cfg.log_floor, cfg.log_alpha);
+        for v in rc.iter_mut() {
+            *v *= t;
+        }
+    }
+
+    let sinks = oracle::matvec(&g("attn.attn_sink_proj.weight")?, &q_inp, nh, cfg.n_embd);
+    let rel_table = g("attn.rel_logits_proj.proj")?;
+    // The current token's rows join the cache first, so the query always sees
+    // its own key at distance 0 (at pos 0 the cache holds exactly one row and
+    // the scores below reduce to decode_visit's single-key form bit for bit).
+    slot.push_token(&kc, &vc, d, pos)?;
+    let lo = if swa {
+        pos.saturating_sub(cfg.sliding_window.saturating_sub(1))
+    } else {
+        0
+    };
+    let rows = slot.k[0].len() / d;
+    if lo < slot.start_pos {
+        return Err(format!(
+            "inkling2: attention window [{lo}..={pos}] older than cache start {}",
+            slot.start_pos
+        ));
+    }
+    let skip = lo - slot.start_pos;
+    let m = rows
+        .checked_sub(skip)
+        .ok_or_else(|| "inkling2: cache window underflow".to_string())?;
+    if m == 0 {
+        return Err("inkling2: empty attention window".to_string());
+    }
+    let mut attn_out = vec![0.0f32; eattn];
+    for h in 0..nh {
+        let rh = &rc[h * cfg.n_rel..(h + 1) * cfg.n_rel];
+        let mut qh = qc[h * d..(h + 1) * d].to_vec();
+        if !swa {
+            let t = oracle::tau(pos, cfg.log_floor, cfg.log_alpha);
+            for v in &mut qh {
+                *v *= t;
+            }
+        }
+        let kv = h / (nh / nkv);
+        let kcache = &slot.k[kv];
+        let mut scores = Vec::with_capacity(m);
+        for j in 0..m {
+            let dist = pos - (slot.start_pos + skip + j);
+            let bias = rel_bias_for_dist(&rel_table, rh, cfg.n_rel, cfg.n_extent, dist, sinks[h]);
+            let kh = &kcache[(skip + j) * d..(skip + j + 1) * d];
+            scores.push(
+                qh.iter().zip(kh).map(|(a, b)| a * b).sum::<f32>() / (d as f32).sqrt() + bias,
+            );
+        }
+        let vcache = &slot.v[kv];
+        let wv = oracle::attention_softmax_with_sink(&scores, 0.0, &vcache[skip * d..], m, d);
+        attn_out[h * d..(h + 1) * d].copy_from_slice(&wv);
+    }
+    let gate = oracle::matvec(&g("attn.gate_attn.weight")?, &q_inp, eattn, cfg.n_embd);
+    for i in 0..eattn {
+        attn_out[i] *= oracle::sigmoid(gate[i]);
+    }
+    let proj = oracle::matvec(&g("attn.wo_ud.weight")?, &attn_out, cfg.n_embd, eattn);
+    let (attn_res, ap) = oracle::convolve_static(
+        &proj,
+        &load_conv(w, &format!("{p}attn_sconv.weight"), cfg.conv_kernel)?,
+        &slot.conv.attn_out_past,
+        1,
+        cfg.n_embd,
+        cfg.conv_kernel,
+    );
+    slot.conv.attn_out_past = ap;
+
+    // AttnRes block bookkeeping: first visit of a block pushes inpSA, others add residual.
+    let inp_sa = x.to_vec();
+    // Upstream tests `ip % block`, i.e. the physical layer of this pass.
+    let cur = if phys % cfg.attn_res_block == 0 {
+        blocks.push(inp_sa);
+        attn_res
+    } else {
+        inp_sa.iter().zip(&attn_res).map(|(a, b)| a + b).collect()
+    };
+
+    // --- MoE with AttnRes mix on FFN input ---
+    // Every layer carries an FFN query upstream, so a miss is a load error.
+    let ffn_mix_q = format!("model.llm.attn_res.mlp_queries.{phys}");
+    let (_, fq) = w.f32(&ffn_mix_q)?;
+    let mut ffn_in = oracle::mix(blocks, &cur, &fq, cfg.n_embd, 1);
+    // FFN message controller (index 3 = LOOP_CTRL_FFN), applied before norm.
+    if let Some((msgs, ctrls)) = messages {
+        ffn_in = oracle::control(
+            &ffn_in,
+            &msgs[3],
+            &ctrls[3].down,
+            &ctrls[3].gain,
+            &ctrls[3].forget,
+            cfg.n_embd,
+            cfg.loop_cfg.gate_rank,
+        );
+    }
+    let ffn_normed = rmsnorm_gain(&ffn_in, &g("mlp_norm.weight")?, cfg.rms_norm_eps);
+    let router = g("mlp.gate.weight")?;
+    let bias = g("mlp.gate.bias").ok();
+    // Route first, decode only the selected experts (lazy) — a 48-visit run
+    // touches ~384 experts instead of all 6144.
+    let expert_prefix = format!("{p}mlp.experts.");
+    let moe = decode_moe_lazy(
+        &ffn_normed,
+        &router,
+        bias.as_deref(),
+        cfg.n_embd,
+        cfg.inter,
+        cfg.n_expert_used,
+        cfg.route_scale,
+        cfg.situ_beta,
+        cfg.situ_linear_beta,
+        &mut |e| {
+            let gu = w
+                .f32(&format!("{expert_prefix}{e}.gate_up_proj.weight"))
+                .expect("expert gate_up")
+                .1;
+            let dn = w
+                .f32(&format!("{expert_prefix}{e}.down_proj.weight"))
+                .expect("expert down")
+                .1;
+            (gu, dn)
+        },
+    );
+    let (moe_conv, fp) = oracle::convolve_static(
+        &moe,
+        &load_conv(w, &format!("{p}mlp_sconv.weight"), cfg.conv_kernel)?,
+        &slot.conv.ffn_out_past,
+        1,
+        cfg.n_embd,
+        cfg.conv_kernel,
+    );
+    slot.conv.ffn_out_past = fp;
+    // llama.cpp build_layer: `ffn_inp = cur` (post-attention stream), then
+    // `cur = MoE(mix(ffn_inp))`, `return cur + ffn_inp`. The residual base is
+    // the post-attention `cur`, NOT the mixed/controlled `ffn_in`.
+    Ok(cur.iter().zip(&moe_conv).map(|(a, b)| a + b).collect())
+}
+
+/// Run all 48 visits for one token against the persistent cache, from token
+/// embedding to final normalized hidden state. Same visit schedule as
+/// `forward_token` (prelude once, core for `num_passes` passes with cross-pass
+/// messages, post-loop once); the only cross-token state is each slot's conv
+/// history and KV rows. `pos` must equal `state.pos` (lockstep advance).
+pub fn forward_token_cached<W: crate::weights::WeightSource>(
+    w: &W,
+    cfg: &crate::config::Inkling2Config,
+    state: &mut CpuDecodeState,
+    token_embed: &[f32],
+    pos: usize,
+) -> Result<Vec<f32>, String> {
+    if pos != state.pos {
+        return Err(format!(
+            "inkling2: cached decode out of order: pos={pos} state.pos={}",
+            state.pos
+        ));
+    }
+    if pos >= state.max_seq {
+        return Err(format!(
+            "inkling2: pos {pos} exceeds cached max_seq {}",
+            state.max_seq
+        ));
+    }
+    if state.slots.len() != cfg.loop_cfg.n_slot() {
+        return Err("inkling2: decode state slot count mismatch".to_string());
+    }
+    // build_inputs: token embedding, RMSNormed (token path only).
+    let tok_norm = w.f32("model.llm.embed_norm.weight")?.1;
+    let mut x = rmsnorm_gain(token_embed, &tok_norm, cfg.rms_norm_eps);
+
+    let mut blocks: Vec<Vec<f32>> = Vec::new();
+    let mut visit = 0usize;
+
+    // Prelude layers 0..core_start (6).
+    for _ in 0..cfg.loop_cfg.core_start {
+        let out = decode_visit_cached(
+            w,
+            cfg,
+            &mut state.slots[visit],
+            &mut blocks,
+            &x,
+            visit,
+            pos,
+            None,
+        )?;
+        x = out;
+        visit += 1;
+    }
+    let prelude_x = x.clone();
+    let prelude_blocks = blocks.clone();
+
+    let msg_queries = pack_message_queries(w, cfg)?;
+    let core_len = cfg.loop_cfg.core_end - cfg.loop_cfg.core_start;
+
+    // Loop passes. pass 0 has no messages; later passes use the previous
+    // pass's bank (blocks after the first core block + its output).
+    let mut prev_blocks = prelude_blocks.clone();
+    let mut prev_out = prelude_x.clone();
+    for pass in 0..cfg.loop_cfg.num_passes {
+        x = prelude_x.clone();
+        blocks = prelude_blocks.clone();
+        // Messages/bank come from the previous pass (pass 0: none).
+        let bank: Vec<Vec<f32>> = if pass > 0 {
+            prev_blocks
+                .iter()
+                .skip(prelude_blocks.len() + 1)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for i in 0..core_len {
+            let phys = cfg.loop_cfg.core_start + i;
+            let message = if pass > 0 {
+                // mix() appends `cur` itself: states = [bank..., prev_out].
+                let msgs: Vec<Vec<f32>> = msg_queries[i]
+                    .iter()
+                    .map(|q| oracle::mix(&bank, &prev_out, q, cfg.n_embd, 1))
+                    .collect();
+                let msgs_arr: [Vec<f32>; 4] = [
+                    msgs[0].clone(),
+                    msgs[1].clone(),
+                    msgs[2].clone(),
+                    msgs[3].clone(),
+                ];
+                let ctrls = load_controllers(w, phys, cfg)?;
+                Some((msgs_arr, ctrls))
+            } else {
+                None
+            };
+            let out = decode_visit_cached(
+                w,
+                cfg,
+                &mut state.slots[visit],
+                &mut blocks,
+                &x,
+                visit,
+                pos,
+                message.as_ref(),
+            )?;
+            x = out;
+            visit += 1;
+        }
+        prev_blocks = blocks.clone();
+        prev_out = x.clone();
+    }
+
+    // Post-loop layers core_end..n_phys once.
+    for _ in cfg.loop_cfg.core_end..cfg.n_phys {
+        let out = decode_visit_cached(
+            w,
+            cfg,
+            &mut state.slots[visit],
+            &mut blocks,
+            &x,
+            visit,
+            pos,
+            None,
+        )?;
+        x = out;
+        visit += 1;
+    }
+    debug_assert_eq!(visit, cfg.loop_cfg.n_slot());
+    let _ = &visit;
+    state.pos = pos + 1;
+
+    // Final norm.
+    // build_output: mix the collected AttnRes blocks with the output query,
+    // then final RMSNorm. `blocks` still holds all visit block states.
+    let out_q = w.f32("model.llm.attn_res.output_query")?;
+    x = oracle::mix(&blocks, &x, &out_q.1, cfg.n_embd, 1);
+    let final_norm = w.f32("model.llm.norm.weight")?.1;
+    Ok(rmsnorm_gain(&x, &final_norm, cfg.rms_norm_eps))
+}
+
+/// Greedy incremental decode on the CPU reference path: prefill `prompt_ids`
+/// (LM head only on the last prompt token), then emit `n` tokens by argmax.
+/// `max_seq` sizes the full-layer caches (tests use 128). This is a reference,
+/// not the daemon path.
+pub fn generate_cpu<W: crate::weights::WeightSource>(
+    w: &W,
+    cfg: &crate::config::Inkling2Config,
+    prompt_ids: &[u32],
+    n: usize,
+    max_seq: usize,
+) -> Result<Vec<u32>, String> {
+    if prompt_ids.is_empty() {
+        return Err("inkling2: empty prompt".to_string());
+    }
+    if prompt_ids.len() + n > max_seq {
+        return Err(format!(
+            "inkling2: prompt ({}) + n ({n}) exceeds max_seq {max_seq}",
+            prompt_ids.len()
+        ));
+    }
+    let embed = w.f32("model.llm.embed.weight")?.1;
+    if embed.len() % cfg.n_embd != 0 {
+        return Err("inkling2: embed table size mismatch".to_string());
+    }
+    let vocab_rows = embed.len() / cfg.n_embd;
+    let row = |id: u32| -> Result<Vec<f32>, String> {
+        if (id as usize) >= vocab_rows {
+            return Err(format!("inkling2: token id {id} out of range"));
+        }
+        Ok(embed[id as usize * cfg.n_embd..(id as usize + 1) * cfg.n_embd].to_vec())
+    };
+    let mut state = CpuDecodeState::new(cfg, max_seq)?;
+    let mut hidden = Vec::new();
+    for (i, &id) in prompt_ids.iter().enumerate() {
+        hidden = forward_token_cached(w, cfg, &mut state, &row(id)?, i)?;
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let logits = lm_head_logits(w, cfg, &hidden)?;
+        let (id, _) = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .ok_or_else(|| "inkling2: empty logits".to_string())?;
+        out.push(id as u32);
+        let pos = state.pos;
+        hidden = forward_token_cached(w, cfg, &mut state, &row(id as u32)?, pos)?;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1763,5 +2407,82 @@ mod tests {
 
     fn oracle_close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn cache_slot_append_window_and_evict() {
+        // Synthetic slot: 1 KV head, d=2, cap=4.
+        let mut slot = VisitSlot {
+            conv: ConvState::default(),
+            k: vec![Vec::new()],
+            v: vec![Vec::new()],
+            start_pos: 0,
+            cap: 4,
+        };
+        for pos in 0..6usize {
+            let kc = vec![pos as f32, 100.0 + pos as f32];
+            let vc = vec![-(pos as f32), 200.0 + pos as f32];
+            slot.push_token(&kc, &vc, 2, pos).unwrap();
+        }
+        // 6 rows capped at 4 -> rows hold positions 2..=5.
+        assert_eq!(slot.start_pos, 2);
+        assert_eq!(slot.k[0].len(), 4 * 2);
+        assert_eq!(slot.v[0].len(), 4 * 2);
+        assert_eq!(slot.k[0][..2], [2.0, 102.0]);
+        assert_eq!(slot.k[0][6..8], [5.0, 105.0]);
+        assert_eq!(slot.v[0][6..8], [-5.0, 205.0]);
+        // Out-of-order append refuses instead of silently misaligning.
+        assert!(slot.push_token(&[0.0, 0.0], &[0.0, 0.0], 2, 3).is_err());
+    }
+
+    #[test]
+    fn rel_bias_gather_matches_table_and_zero_column() {
+        // n_rel=2, n_extent=3: table[rr][dist].
+        let table = vec![
+            1.0, 2.0, 4.0, // rr=0
+            0.5, -1.0, 8.0, // rr=1
+        ];
+        let rh = vec![2.0, 4.0];
+        // dist 0: 2*1.0 + 4*0.5 = 4, minus sink.
+        assert!(oracle_close(
+            rel_bias_for_dist(&table, &rh, 2, 3, 0, 1.0),
+            3.0
+        ));
+        // dist 1: 2*2.0 + 4*(-1.0) = 0, minus sink.
+        assert!(oracle_close(
+            rel_bias_for_dist(&table, &rh, 2, 3, 1, 0.25),
+            -0.25
+        ));
+        // dist >= n_extent: upstream zero column -> 0.0 - sink (NOT a clamp
+        // to n_extent-1, which here would read 2*4.0 + 4*8.0 = 40).
+        assert!(oracle_close(
+            rel_bias_for_dist(&table, &rh, 2, 3, 3, 0.5),
+            -0.5
+        ));
+        assert!(oracle_close(
+            rel_bias_for_dist(&table, &rh, 2, 3, 9999, 0.5),
+            -0.5
+        ));
+    }
+
+    #[test]
+    fn decode_state_slots_size_by_mask() {
+        let cfg = crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
+        let st = CpuDecodeState::new(&cfg, 128).unwrap();
+        assert_eq!(st.slots.len(), 48);
+        assert_eq!(st.pos, 0);
+        assert_eq!(st.max_seq, 128);
+        for (visit, slot) in st.slots.iter().enumerate() {
+            let phys = cfg.loop_cfg.layer_phys(visit);
+            let want = if cfg.swa_layers[phys] { 1024 } else { 128 };
+            assert_eq!(slot.cap, want, "visit {visit} (phys {phys})");
+            assert_eq!(slot.k.len(), cfg.n_head_kv);
+            assert_eq!(slot.v.len(), cfg.n_head_kv);
+            assert_eq!(slot.start_pos, 0);
+        }
+        // Full-visit count is 8: phys 5 once, phys 11/17 three times each,
+        // phys 23 once (core [6,18) x3 passes).
+        let full = st.slots.iter().filter(|s| s.cap == 128).count();
+        assert_eq!(full, 8);
     }
 }
