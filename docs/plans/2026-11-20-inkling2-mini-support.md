@@ -1,9 +1,10 @@
-# Inkling-2-Mini support plan (planning only — no code changed)
+# Inkling-2-Mini support plan (implementation in progress)
 
-Status: plan only (2026-11-20, release day for `thinkingmachines/Inkling-2-Mini`).
-Upstream model was released the same day; re-verify every cited fact before
-building. Prior research notes were treated as leads and spot-checked against
-this checkout; where I could not verify, I say so.
+Status: **implementation in progress** (started 2026-11-20, release day for
+`thinkingmachines/Inkling-2-Mini`). This file is the original plan; the current
+state, exact test commands and split-friendly next steps live in the companion
+[implementation log](2026-11-21-inkling2-implementation-log.md). Read that log
+first before continuing the work.
 
 Promoted 2026-11-20 from the gitignored `docs/plans/local/` scratch copy to the
 tracked `docs/plans/` path on `feat/inkling2-mini-support` (base `origin/beta`
@@ -12,6 +13,13 @@ https://github.com/warpfront/hipfire/pull/1192; it is WIP and must not be
 merged until the implementation is done and verified. Live verification results
 and resolved decisions are recorded in §8; the rest is the original plan unless
 marked.
+
+**Current summary (2026-11-21):** quantizer + 13.9 GB arch-24 HFQ work;
+typed config/loop-schedule crate; CPU reference forward whose visit-0 and
+visit-5 intermediates match the validated llama.cpp oracle to ~1e-5; arch-24
+HFQ loads on the RX 7900 XTX via the new carrier skeleton (`generate` fail-closes
+cleanly). Not done: GPU forward/kernels, generation route, full-model parity
+re-measurement, served validation. The model loads but cannot generate yet.
 
 ## 0a. Reference implementation (merged — verified 2026-11-20)
 

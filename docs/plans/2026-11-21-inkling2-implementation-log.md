@@ -238,26 +238,56 @@ debug CLI + release daemon:
 The GPU VRAM plan and kernel inventory research docs are vendored under
 `docs/plans/inkling2-research/`.
 
-## Parity bisect status (2026-11-21)
+## Parity bisect status (2026-11-21 — updated at intermediate stop)
 
-The validated Python reference (vendored `ref-visits.md`) hits the oracle with
-r=1.0000 and dumps per-visit hiddens + sub-components. My Rust forward on the
-same F32 weights still diverges from **visit 0** (corr 0.56). Fixed from the
-reference's findings: per-head clip, GQA `h//3`, MoE residual base, final
-output mix, conv tap order, GGUF dim reversal (the `.bin` carries file-order
-labels with torch-order bytes). 27 unit tests pass. Full-logit parity remains
-open; per-visit traces are dumped at `D:\hipfire-models\rust-visits-tok0\` and
-compared with `compare_visits.py`.
+The validated Python reference (vendored `ref-visits.md`) hits the llama.cpp
+oracle at r=1.0000 and dumps per-visit hiddens + sub-components. Using it, the
+Rust `decode_visit` was debugged **operator by operator** on the exact F32
+weights via `GgufF32` (the `.bin` carries file-order dim labels but torch-order
+bytes; the shim reverses dims at read). Latest measured result:
 
-## Current end state (2026-11-21)
+- **visit 0** (SWA): every intermediate (`x_in`, `q_inp`, `k/v_inp`, `q/k/v/r_raw`,
+  `k/v_conv`, `q/k/v/r_clip`, `vc`, `sinks`, `rel_bias`, `attn_heads`, `wo_out`,
+  `cur_attn`, `ffn_mix`, `ffn_normed`, `router_logits`, selected experts,
+  `moe_raw`, `moe_conv`, `visit_out`) matches the reference to **~1e-5**.
+- **visit 5** (first full-attention layer, dynamic conv): every intermediate
+  matches to **~1e-5** after the last fix (`D:\hipfire-models\ref-visits\tok0\`
+  has `ref_visit5_*.txt` and `rust_visit5_*.txt`; `cmp_visit5.py` diffs them).
+- Bugs found and fixed this session: per-head clip, GQA block grouping `h//3`,
+  MoE residual base, final output mix, conv tap order (tap `k-1` = current),
+  AttnRes query off-by-one (HFQ `attn_queries.0` feeds block 1, not 0),
+  `decode_visit` loading conv weights raw instead of via `load_conv`, full-layer
+  dynamic K/V convs, and the `static_w` double-flip between HFQ (verbatim,
+  needs flip) and GgufF32 (already converted). **28 unit tests pass.**
 
-Done: a working quantizer path and a 13.9 GB arch-24 HFQ artifact;
-typed config parsing; a **24-test** CPU-oracle crate (MoE renorm + sink
-attention corrected against the research reports); a validated HFQ weight
-index (`weights.rs`, tested against the real 14 GB artifact); a built reference
-oracle with reproducible golden outputs; three research reports vendored under
-`docs/plans/inkling2-research/`. Not done: the loader bundle, CPU/GPU forward,
-and generation route — the artifact cannot be served yet.
+**Not yet re-measured after the visit-5 fix**: the full 48-visit trace. The last
+`dump_visits_f32` run was interrupted while capturing; its late-visit numbers
+are stale and must not be quoted. Re-run `dump_visits_f32` +
+`compare_visits.py` to get the true full-model parity curve. Full-logit parity
+on the MQ4 artifact is still expected to show the quantization gap.
+
+## Current end state (2026-11-21 — intermediate stop)
+
+**Branch** `feat/inkling2-mini-support` (fork `raufaser`), draft PR
+https://github.com/warpfront/hipfire/pull/1192. ~50 local commits, clean tree,
+attribution + crate-map checks pass.
+
+Done:
+- Working quantizer + 13.9 GB arch-24 HFQ artifact (6790 tensors).
+- Typed config, 24/48 loop schedule, validation traps, HFQ weight index.
+- CPU reference forward: all 48 visits, controllers, cross-pass messages,
+  dynamic convs, MoE, LM head. Visit 0 and visit 5 verified to ~1e-5 against
+  the validated oracle; full-model re-measurement pending (above).
+- **Loader/carrier skeleton**: arch 24 loads on the RX 7900 XTX (gfx1100,
+  25.8 GB VRAM) via `hipfire run`; `generate` returns a clean fail-closed
+  "inkling2: generation is not implemented yet" (no panic).
+- Research vendored under `docs/plans/inkling2-research/` (6 docs: 3 math
+  cross-checks, tensor mapping, reference visits, calibration, carrier spec,
+  VRAM plan, kernel inventory).
+
+Not done: GPU forward/kernels, generation route (`GenerationRoute::InklingAr`),
+multi-token KV cache, full-model parity re-measurement, served validation.
+**The model loads but cannot generate yet.**
 
 **Artifact fix (2026-11-21):** the quantizer's generic `.scale`-sibling rule
 had silently dropped the 48 L2-clip tensors (`q_l2_clip.scale` /
@@ -280,24 +310,34 @@ attention uses dynamic K/V convs (`k_sconv.static_w` + `k_sconv.weight_proj`);
 SWA uses static `k_sconv.weight`. Per-expert tensors are
 `...mlp.experts.{E}.{gate_up_proj,down_proj}.weight`.
 
-## Next steps, in order
+## Next steps, in order (for the next session — split-friendly)
 
-1. **DONE** — NVFP4/MXFP8 quantizer ingest (see above).
-2. **DONE** — CPU oracle scalar/operator set: `rmsnorm`, `clip`, `tau`,
-   `matvec`, `control`, `mix`, `convolve_static`, `relative_bias`, `situ`,
-   `sigmoid_topk`, `softcap` (21 tests). Not yet covered: full attention with
-   softmax/sink, the dynamic-conv tap path, and the MoE expert combine.
-3. **Arch crate wiring**: `arch.rs`, `arch_model.rs`, `carrier.rs`, `forward.rs`
-   mirroring `hipfire-arch-toy`; register `arch_mapping.rs` rows for
-   `inkling2_loop` / `inkling2_loop_text` → 24 and the class-substring row;
-   add `InklingCarrier` to `hipfire-loader/src/lib.rs::REGISTRY`.
-4. **Generation route**: `GenerationRoute::InklingAr` in `hipfire-generate/src/ar.rs`
-   and `generate_inkling` in `dense.rs`. No batch/slot/PP/EP/Redline in Phase 1.
-5. **Tokenizer/template**: load the 201k BPE; port `chat_template.jinja`
-   (`reasoning_effort` default 0.9, strict canonical tool JSON).
-6. **Validation**: `serve_harness.py battery` and `chain` on committed prompts;
-   capture a KLD/`.kldseq` pin for the text-only route; GPU smoke on gfx1100.
-7. Only then consider the upstream PR.
+1. **Re-measure full-model parity** (quick, unblocks everything): run
+   `cargo test -p hipfire-arch-inkling2 dump_visits_f32 -- --ignored` then
+   `python3 <temp>/compare_visits.py`. Visit 0 and 5 already match to ~1e-5;
+   expect the whole curve near 1.0 on the F32 path. Then run `dump_raw_logits_token0`
+   and compare to `oracle-logits-tok0.txt` — this finally separates forward
+   correctness from MQ4 quantization loss.
+2. **GPU forward** (largest slice, can be a separate worker): implement device
+   weight upload + per-visit state (VRAM plan: 48 visit slots, conv width 6656,
+   SWA-aware KV) and the 13 operators mapped in `inkling2-research/kernel-inventory.md`.
+   Most reuse existing `rdna-compute` HIP kernels (rmsnorm, dynamic conv,
+   attention sliding+sink, SiTU MoE, softcap); NEW are controller fuse, mix,
+   rel-bias gather, L2 clip. Gate each operator against the CPU oracle.
+3. **Generation route** (depends on 2): add `GenerationRoute::InklingAr` and a
+   `generate_inkling` producer; remove the arch-24 guard in `ar.rs::generate`.
+   No batch/slot/PP/EP/Redline in Phase 1.
+4. **MQ4L calibration** if step 1 shows a quant gap: follow
+   `inkling2-research/calibration-plan.md` (Lloyd needs no imatrix; imatrix only
+   for AWQ/graded tiers; ≥12% E4M3 gain gate per family).
+5. **Validation**: `serve_harness.py battery` + `chain`; capture a KLD/`.kldseq`
+   pin; served A/B on gfx1100.
+6. PR #1192 stays **draft** until 1–5 are done and verified.
+
+## Split suggestion
+Step 1 is self-contained and fast — do it first in any session. Steps 2 and 4
+are independent research/implementation tracks that can run in parallel
+workers, feeding results back via `docs/plans/local/`. Step 3 requires step 2.
 
 ## Known issues / risks
 
