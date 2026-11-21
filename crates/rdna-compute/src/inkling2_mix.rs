@@ -381,6 +381,7 @@ impl Gpu {
     /// caller-owned `normed`, then run all `query_rows` against it. The
     /// per-call path joins nothing and allocates nothing: both buffers are
     /// caller-owned (brief 03 stages them in its state).
+    #[allow(clippy::too_many_arguments)]
     pub fn inkling2_mix_f32_gpu(
         &mut self,
         bank: &GpuTensor,

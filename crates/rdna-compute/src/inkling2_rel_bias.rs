@@ -256,10 +256,11 @@ impl Gpu {
     ///
     /// `rel` is head-major `[n_heads, n_rel]` (the `rc` rows `forward.rs`
     /// builds), `table` is `[n_rel, n_extent]`, `sink` is `[n_heads]`,
-    /// `dist` holds `n_kv` little-endian `i32` distances (`dist[k] =
-    /// pos - key_pos`, any `pos >= 0`), `out` is `[n_heads, n_kv]`.
+    /// `dist` holds `n_kv` little-endian `i32` distances (`dist[k] = pos -
+    /// key_pos`, any `pos >= 0`), `out` is `[n_heads, n_kv]`.
     /// Launch shape mirrors the element-parallel tail kernels in `norm.rs`:
     /// `launch_maybe_blob` (graph-safe kernargs) on a 1-D grid.
+    #[allow(clippy::too_many_arguments)]
     pub fn inkling2_rel_bias_gather_f32(
         &mut self,
         rel: &GpuTensor,
