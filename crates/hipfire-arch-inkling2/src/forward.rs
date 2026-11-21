@@ -599,7 +599,8 @@ pub fn decode_visit<W: crate::weights::WeightSource>(
 
     // AttnRes block bookkeeping: first visit of a block pushes inpSA, others add residual.
     let inp_sa = x.to_vec();
-    let cur = if visit % cfg.attn_res_block == 0 {
+    // Upstream tests `ip % block`, i.e. the physical layer of this pass.
+    let cur = if phys % cfg.attn_res_block == 0 {
         blocks.push(inp_sa);
         attn_res
     } else {
