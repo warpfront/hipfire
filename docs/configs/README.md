@@ -74,6 +74,7 @@ concatenation operation; merge the desired keys or use `hipfire config set`
 | `HIPFIRE_MTP_NGRAM=1` | `speculation.mtp_ngram = "on"` |
 | `HIPFIRE_MTP_NGRAM_COPY=1` | `speculation.mtp_ngram_copy = "on"` |
 | `HIPFIRE_DFLASH_LOOKUP=1` | `speculation.dflash_lookup = "on"` |
+| `HIPFIRE_VERIFY_GRAPH=0` | `kernel.verify_graph = false` |
 | `HIPFIRE_PROMPT_CACHE_CAP=64` | `memory.prompt_cache_capacity = 64` |
 | `HIPFIRE_DEVICES=3` | `hardware.devices = "3"`; startup resolves PCI-order card 3 and applies `ROCR_VISIBLE_DEVICES=<its UUID, or ROCr ordinal>` with `HIP_VISIBLE_DEVICES=0` |
 | `HIPFIRE_REPLAY_BACKEND=redline` | `replay.backend = "redline"` |
@@ -87,7 +88,6 @@ experimental `HIPFIRE_FOO=value` maps mechanically to
 
 ```toml
 [developer]
-verify_graph = false       # HIPFIRE_VERIFY_GRAPH=0
 dspark_profile = true      # HIPFIRE_DSPARK_PROFILE=1
 ```
 

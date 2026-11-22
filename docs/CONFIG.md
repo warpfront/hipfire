@@ -2759,7 +2759,9 @@ branch) or a misspelled key is unknown and fails the load with
 |---|---|---|---|
 | `attention.ck_runtime_lib` | `ck_runtime_lib` | `HIPFIRE_FLASH_ATTN_CK_LIB` | experimental |
 | `attention.ck_workspace_bytes` | `ck_workspace_bytes` | `HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES` | experimental |
+| `attention.fa_qresident_pm` | `fa_qresident_pm` | `HIPFIRE_FA_QRESIDENT_PM` | experimental |
 | `attention.flash` | `flash_mode` | `HIPFIRE_ATTN_FLASH` | stable |
+| `attention.flash_prefill` | `flash_prefill` | `HIPFIRE_FLASH_PREFILL` | experimental |
 | `attention.qwen4_qsa_pooled_bf16` | `qwen4_qsa_pooled_bf16` | `HIPFIRE_QWEN4_QSA_POOLED_BF16` | experimental |
 | `attention.qwen4_qsa_wmma_gather` | `qwen4_qsa_wmma_gather` | `HIPFIRE_QWEN4_QSA_WMMA_GATHER` | experimental |
 | `attention.raon_mirror_q8` | `raon_mirror_q8` | `HIPFIRE_RAON_MIRROR_Q8` | experimental |
@@ -2838,18 +2840,26 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.a4_slab` | `a4_slab` | `HIPFIRE_A4_SLAB` | experimental |
 | `kernel.attn_qresident` | `attn_qresident` | `HIPFIRE_ATTN_QRESIDENT` | stable |
 | `kernel.calib_force_bf16` | `calib_force_bf16` | `HIPFIRE_CALIB_BF16` | experimental |
+| `kernel.cb_verify_chunk128` | `cb_verify_chunk128` | `HIPFIRE_CB_VERIFY_CHUNK128` | experimental |
 | `kernel.cb_verify_pm` | `cb_verify_pm` | `HIPFIRE_CB_VERIFY_PM` | experimental |
+| `kernel.conv_qknorm` | `conv_qknorm` | `HIPFIRE_CONV_QKNORM` | experimental |
+| `kernel.deepseek4_attn_topk_direct` | `deepseek4_attn_topk_direct` | `HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT` | experimental |
+| `kernel.deepseek4_graph` | `deepseek4_graph` | `HIPFIRE_DEEPSEEK4_GRAPH` | experimental |
+| `kernel.deepseek4_wo_q8_wmma` | `deepseek4_wo_q8_wmma` | `HIPFIRE_DEEPSEEK4_WO_Q8_WMMA` | experimental |
 | `kernel.deterministic` | `deterministic` | `HIPFIRE_DETERMINISTIC` | experimental |
 | `kernel.dot2_gemv` | `dot2_gemv` | `HIPFIRE_DOT2_GEMV` | experimental |
 | `kernel.draft_collapse_off` | `draft_collapse_off` | `HIPFIRE_DRAFT_COLLAPSE_OFF` | experimental |
 | `kernel.fa2_lloydv_q16` | `fa2_lloydv_q16` | `HIPFIRE_FA2_LLOYDV_Q16` | experimental |
 | `kernel.flash_partials_batch` | `flash_partials_batch` | `HIPFIRE_FLASH_PARTIALS_BATCH` | experimental |
+| `kernel.fn_lane_pm_rows` | `fn_lane_pm_rows` | `HIPFIRE_FN_LANE_PM_ROWS` | experimental |
 | `kernel.fp16` | `fp16` | `HIPFIRE_FP16` | stable |
 | `kernel.fp8_wmma` | `fp8_wmma` | `HIPFIRE_FP8_WMMA` | experimental |
 | `kernel.g12_a4c2` | `g12_a4c2` | `HIPFIRE_G12_A4C2` | stable |
 | `kernel.gate_up_bt` | `gate_up_bt` | `HIPFIRE_GATE_UP_BT` | experimental |
 | `kernel.gate_up_nosync` | `gate_up_nosync` | `HIPFIRE_GATE_UP_NOSYNC` | experimental |
+| `kernel.gateup_ldsstage` | `gateup_ldsstage` | `HIPFIRE_GATEUP_LDSSTAGE` | experimental |
 | `kernel.gcn5_wave64_hybrid` | `gcn5_wave64_hybrid` | `HIPFIRE_GCN5_WAVE64_HYBRID` | experimental |
+| `kernel.gdn_compact2` | `gdn_compact2` | `HIPFIRE_GDN_COMPACT2` | experimental |
 | `kernel.gemma4_batched_embedding_prefill` | `gemma4_batched_embedding_prefill` | `HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL` | experimental |
 | `kernel.gemma4_ple_activation_fused_prefill` | `gemma4_ple_activation_fused_prefill` | `HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL` | experimental |
 | `kernel.gemma4_ple_batched_prefill` | `gemma4_ple_batched_prefill` | `HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL` | experimental |
@@ -2859,16 +2869,20 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.gemv_prefetch` | `gemv_prefetch` | `HIPFIRE_GEMV_PREFETCH` | stable |
 | `kernel.gfx1100_dflash_snapshot_overlap` | `gfx1100_dflash_snapshot_overlap` | `HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP` | stable |
 | `kernel.gfx1100_fa2_split_verify` | `gfx1100_fa2_split_verify` | `HIPFIRE_GFX1100_FA2_SPLIT_VERIFY` | stable |
+| `kernel.gfx1100_q8x_verify` | `gfx1100_q8x_verify` | `HIPFIRE_GFX1100_Q8X_VERIFY` | experimental |
 | `kernel.gfx1100_router_w64` | `gfx1100_router_w64` | `HIPFIRE_GFX1100_ROUTER_W64` | experimental |
+| `kernel.gfx1100_wmma_verify_attn` | `gfx1100_wmma_verify_attn` | `HIPFIRE_GFX1100_WMMA_VERIFY_ATTN` | experimental |
 | `kernel.gfx11_a4_candidates` | `gfx11_a4_candidates` | `HIPFIRE_GFX11_A4_CANDIDATES` | experimental |
 | `kernel.gfx11_a8_prefill` | `gfx11_a8_prefill` | `HIPFIRE_GFX11_A8_PREFILL` | experimental |
 | `kernel.gfx11_fa2_prefill` | `gfx11_fa2_prefill` | `HIPFIRE_GFX11_FA2_PREFILL` | stable |
 | `kernel.gfx11_iu4_gridspec` | `gfx11_iu4_gridspec` | `HIPFIRE_GFX11_IU4_GRIDSPEC` | stable |
 | `kernel.gfx11_iu4_shape` | `gfx11_iu4_shape` | `HIPFIRE_GFX11_IU4_SHAPE` | experimental |
+| `kernel.gfx11_mmq_x128` | `gfx11_mmq_x128` | `HIPFIRE_GFX11_MMQ_X128` | experimental |
 | `kernel.gfx11_q8_fa2_wide` | `gfx11_q8_fa2_wide` | `HIPFIRE_GFX11_Q8_FA2_WIDE` | experimental |
 | `kernel.gfx12_fa2_prefill` | `gfx12_fa2_prefill` | `HIPFIRE_GFX12_FA2_PREFILL` | stable |
 | `kernel.gfx12_fa_prep_fp8q` | `gfx12_fa_prep_fp8q` | `HIPFIRE_GFX12_FA_PREP_FP8Q` | stable |
 | `kernel.gfx12_fa_prep_fused` | `gfx12_fa_prep_fused` | `HIPFIRE_GFX12_FA_PREP_FUSED` | stable |
+| `kernel.gfx12_gate_up_tile_loop` | `gfx12_gate_up_tile_loop` | `HIPFIRE_GFX12_GATE_UP_TILE_LOOP` | experimental |
 | `kernel.gfx12_mq4v2_fp8_gateup` | `gfx12_mq4v2_fp8_gateup` | `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP` | stable |
 | `kernel.gfx12_mq4v2_fp8_qkv` | `gfx12_mq4v2_fp8_qkv` | `HIPFIRE_GFX12_MQ4V2_FP8_QKV` | stable |
 | `kernel.gfx12_mq4v2_fp8_qkvza` | `gfx12_mq4v2_fp8_qkvza` | `HIPFIRE_GFX12_MQ4V2_FP8_QKVZA` | stable |
@@ -2899,8 +2913,12 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.moe_grouped_m2` | `moe_grouped_m2` | `HIPFIRE_MOE_GROUPED_M2` | experimental |
 | `kernel.moe_hfq6_i8` | `moe_hfq6_i8` | `HIPFIRE_MOE_HFQ6_I8` | experimental |
 | `kernel.moe_hfq6_v2` | `moe_hfq6_v2` | `HIPFIRE_MOE_HFQ6_V2` | experimental |
+| `kernel.moe_mq6_admit` | `moe_mq6_admit` | `HIPFIRE_MOE_MQ6_ADMIT` | experimental |
+| `kernel.mq3v25_a4` | `mq3v25_a4` | `HIPFIRE_MQ3V25_A4` | experimental |
+| `kernel.mq4v2_gate_up_tight_grid` | `mq4v2_gate_up_tight_grid` | `HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID` | experimental |
 | `kernel.mq4v2_gateup_k5120` | `mq4v2_gateup_k5120` | `HIPFIRE_MQ4V2_GATEUP_K5120` | stable |
 | `kernel.mq6_i8` | `mq6_i8` | `HIPFIRE_MQ6_I8` | experimental |
+| `kernel.mq6_rows_split` | `mq6_rows_split` | `HIPFIRE_MQ6_ROWS_SPLIT` | experimental |
 | `kernel.npu_spillover` | `npu_spillover` | `HIPFIRE_NPU_SPILLOVER` | experimental |
 | `kernel.pm_decode` | `pm_decode` | `HIPFIRE_PM_DECODE` | experimental |
 | `kernel.prefill_batched` | `prefill_batched` | `HIPFIRE_PREFILL_BATCHED` | stable |
@@ -2953,6 +2971,7 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.rdna3_rmsnorm_split` | `rdna3_rmsnorm_split` | `HIPFIRE_RDNA3_RMSNORM_SPLIT` | experimental |
 | `kernel.rdna3_rmsnorm_vecsum` | `rdna3_rmsnorm_vecsum` | `HIPFIRE_RDNA3_RMSNORM_VECSUM` | experimental |
 | `kernel.rdna3_rmsnorm_wavegrid` | `rdna3_rmsnorm_wavegrid` | `HIPFIRE_RDNA3_RMSNORM_WAVEGRID` | experimental |
+| `kernel.residual_ldsstage` | `residual_ldsstage` | `HIPFIRE_RESIDUAL_LDSSTAGE` | experimental |
 | `kernel.rmsnorm_mq_tight_lds` | `rmsnorm_mq_tight_lds` | `HIPFIRE_RMSNORM_MQ_TIGHT_LDS` | experimental |
 | `kernel.rocblas_all_archs` | `rocblas_all_archs` | `HIPFIRE_ROCBLAS_ALL_ARCHS` | experimental |
 | `kernel.rocblas_off` | `rocblas_off` | `HIPFIRE_ROCBLAS_OFF` | stable |
@@ -2961,6 +2980,8 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.t5_gpu` | `t5_gpu` | `HIPFIRE_T5_GPU` | experimental |
 | `kernel.v2b_a4_epi` | `v2b_a4_epi` | `HIPFIRE_V2B_A4_EPI` | experimental |
 | `kernel.verify_attn` | `verify_attn` | `HIPFIRE_VERIFY_ATTN` | stable |
+| `kernel.verify_graph` | `verify_graph` | `HIPFIRE_VERIFY_GRAPH` | experimental |
+| `kernel.wmma_batch_tiles` | `wmma_batch_tiles` | `HIPFIRE_WMMA_BATCH_TILES` | experimental |
 | `kernel.wo_mmq` | `wo_mmq` | `HIPFIRE_WO_MMQ` | experimental |
 | `memory.embed_host` | `embed_host` | `HIPFIRE_EMBED_HOST` | stable |
 | `memory.gpu_layer_budget` | `gpu_layer_budget` | `HIPFIRE_GPU_LAYER_BUDGET` | stable |
@@ -3062,6 +3083,7 @@ branch) or a misspelled key is unknown and fails the load with
 | `speculation.dflash_prefill_device` | `dflash_prefill_device` | `HIPFIRE_DFLASH_PREFILL_DEVICE` | experimental |
 | `speculation.dflash_prefill_scatter_fast` | `dflash_prefill_scatter_fast` | `HIPFIRE_DFLASH_PREFILL_SCATTER_FAST` | experimental |
 | `speculation.dspark_confidence` | `dspark_conf_threshold` |  | experimental |
+| `speculation.gfx1100_draft_vocab` | `gfx1100_draft_vocab` | `HIPFIRE_GFX1100_DRAFT_VOCAB` | experimental |
 | `speculation.glimmer_spec_profit_guard` | `glimmer_spec_profit_guard` | `HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD` | experimental |
 | `speculation.mode` | `speculation` | `HIPFIRE_SPECULATION` | stable |
 | `speculation.mtp` | `mtp_mode` | `HIPFIRE_MTP_MODE` | stable |

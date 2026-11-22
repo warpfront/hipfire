@@ -245,9 +245,9 @@ fn dflash_moe_draft_ffn_graph_eligible(
 pub(crate) fn dflash_verify_graph_env_eligible(
     arch: &str,
     output_dtype: rdna_compute::DType,
-    env_value: Option<&str>,
+    verify_graph: Option<bool>,
 ) -> bool {
-    if env_value == Some("0") {
+    if verify_graph == Some(false) {
         return false;
     }
     let is_mq_v2 = matches!(
@@ -259,17 +259,17 @@ pub(crate) fn dflash_verify_graph_env_eligible(
             | rdna_compute::DType::MQ2G256V2
     );
     if arch == "gfx1100" && is_mq_v2 {
-        return env_value == Some("1");
+        return verify_graph == Some(true);
     }
     if arch == "gfx1100" && output_dtype == rdna_compute::DType::MQ4G256 {
         // Direct batched HIP is faster for the measured Qwen MQ4 workload;
         // keep graph available as an explicit diagnostic opt-in.
-        return env_value == Some("1");
+        return verify_graph == Some(true);
     }
     if arch == "gfx1201" && output_dtype == rdna_compute::DType::MQ4G256 {
         // Paired 11.5K DFlash runs on R9700 show graph replay slower than the
         // direct tiled-flash path; keep it available as an explicit diagnostic.
-        return env_value == Some("1");
+        return verify_graph == Some(true);
     }
     true
 }
@@ -6210,11 +6210,10 @@ pub(crate) fn dflash_verify_hip_graph_route_ok(
     );
     // See `dflash_verify_graph_env_eligible`: exact gfx1100 MQ*V2 / MQ4G256 and
     // exact gfx1201 MQ4G256 are default-off for HipGraph only.
-    let verify_graph_env = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH").ok();
     dflash_verify_graph_env_eligible(
         gpu.arch.as_str(),
         target.weights.output.gpu_dtype,
-        verify_graph_env.as_deref(),
+        gpu.flags.verify_graph,
     ) && matches!(
             target.weights.embd_format,
             hipfire_runtime::llama::EmbeddingFormat::HFQ4G256
@@ -13308,12 +13307,12 @@ mod tests {
             assert!(!dflash_verify_graph_env_eligible(
                 "gfx1100",
                 dtype,
-                Some("0")
+                Some(false)
             ));
             assert!(dflash_verify_graph_env_eligible(
                 "gfx1100",
                 dtype,
-                Some("1")
+                Some(true)
             ));
         }
 
@@ -13333,12 +13332,12 @@ mod tests {
         assert!(!dflash_verify_graph_env_eligible(
             "gfx1151",
             DType::MQ3G256V2,
-            Some("0")
+            Some(false)
         ));
         assert!(dflash_verify_graph_env_eligible(
             "gfx1151",
             DType::MQ3G256V2,
-            Some("1")
+            Some(true)
         ));
         assert!(dflash_verify_graph_env_eligible(
             "gfx1201",
@@ -13360,12 +13359,12 @@ mod tests {
         assert!(!dflash_verify_graph_env_eligible(
             "gfx1100",
             DType::MQ4G256,
-            Some("0")
+            Some(false)
         ));
         assert!(dflash_verify_graph_env_eligible(
             "gfx1100",
             DType::MQ4G256,
-            Some("1")
+            Some(true)
         ));
 
         // Exact gfx1201 + legacy MQ4G256: default-off; =0 force-off; =1 opt-in.
@@ -13377,12 +13376,12 @@ mod tests {
         assert!(!dflash_verify_graph_env_eligible(
             "gfx1201",
             DType::MQ4G256,
-            Some("0")
+            Some(false)
         ));
         assert!(dflash_verify_graph_env_eligible(
             "gfx1201",
             DType::MQ4G256,
-            Some("1")
+            Some(true)
         ));
 
         // Sibling arches keep default-on for legacy MQ4; =0 still force-off.
@@ -13399,7 +13398,7 @@ mod tests {
         assert!(!dflash_verify_graph_env_eligible(
             "gfx1200",
             DType::MQ4G256,
-            Some("0")
+            Some(false)
         ));
         assert!(dflash_verify_graph_env_eligible(
             "gfx1201",

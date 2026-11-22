@@ -1680,12 +1680,7 @@ fn dispatch_attend(
                 let contiguous_prefix =
                     is_contiguous_prefill_prefix(io.pos, io.batch_size, io.max_ctx_len);
                 #[cfg(feature = "flash-attn-ck")]
-                let flash_force_off = matches!(
-                    hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
-                        .ok()
-                        .as_deref(),
-                    Some("0") | Some("off") | Some("false")
-                );
+                let flash_force_off = gpu.flags.flash_prefill == Some(false);
                 #[cfg(feature = "flash-attn-ck")]
                 if !flash_force_off
                     && plan.v_mode_bits == 8
@@ -1735,12 +1730,7 @@ fn dispatch_attend(
                 let ct = io.givens_cos.unwrap();
                 let st = io.givens_sin.unwrap();
                 let fp = io.flash_partials.unwrap();
-                let flash_force_off = matches!(
-                    hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
-                        .ok()
-                        .as_deref(),
-                    Some("0") | Some("off") | Some("false")
-                );
+                let flash_force_off = gpu.flags.flash_prefill == Some(false);
                 // gfx1201 FA2 prefill with fwht3 K (default on;
                 // `HIPFIRE_GFX12_FA2_PREFILL=0` opts out). K stays in the fwht3 layout
                 // (100 B/head); F4b: the launcher pre-converts Q into f16
@@ -2017,14 +2007,7 @@ fn dispatch_attend(
                 let flash_default_on = gpu.arch.starts_with("gfx11")
                     || gfx12_query16_route_ok
                     || gfx12_fa2_long_ctx_ok;
-                let flash_optin = match hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
-                    .ok()
-                    .as_deref()
-                {
-                    Some("0") | Some("off") | Some("false") => false,
-                    Some("1") | Some("on") | Some("true") => true,
-                    _ => flash_default_on,
-                };
+                let flash_optin = gpu.flags.flash_prefill.unwrap_or(flash_default_on);
                 let flash_min_ctx: usize =
                     hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_MIN_CTX")
                         .ok()
@@ -3378,34 +3361,5 @@ mod tests {
                 key
             );
         }
-    }
-
-    #[test]
-    fn hipfire_flash_prefill_zero_disables_both_native_and_ck() {
-        // Fix 2: HIPFIRE_FLASH_PREFILL=0 must force native even when a CK
-        // capability is available. Dispatch now evaluates flash_optin before
-        // attempting CK, so one precedence rule governs both backends.
-        fn flash_optin(env: Option<&str>, default_on: bool) -> bool {
-            match env {
-                Some("0") | Some("off") | Some("false") => false,
-                Some("1") | Some("on") | Some("true") => true,
-                _ => default_on,
-            }
-        }
-        // gfx11 default is on, but force-off wins
-        assert!(!flash_optin(Some("0"), true));
-        assert!(!flash_optin(Some("off"), true));
-        assert!(!flash_optin(Some("false"), true));
-        // Simulate CK gating: CK only runs when flash_optin is true
-        let ck_available = true;
-        let ck_would_run = flash_optin(Some("0"), true) && ck_available;
-        assert!(
-            !ck_would_run,
-            "HIPFIRE_FLASH_PREFILL=0 must select native even when CK capability exists"
-        );
-        // Opt-in still works
-        assert!(flash_optin(Some("1"), false));
-        assert!(flash_optin(None, true));
-        assert!(!flash_optin(None, false));
     }
 }

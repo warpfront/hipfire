@@ -16,6 +16,7 @@ tp_use_rccl = true
 mmq = "auto"
 prefill_batched = true
 lm_head_f16 = "auto"
+verify_graph = false       # HIPFIRE_VERIFY_GRAPH=0
 
 [experimental.graph]
 # Replaces the former graph environment controls.
@@ -36,5 +37,4 @@ gfx11_weight_load_policy = "buffer"
 [developer]
 # Flat escape hatch for experiments that do not yet have stable schema keys.
 # Boolean TOML values are exposed to legacy-shaped internal consumers as 1/0.
-verify_graph = false       # HIPFIRE_VERIFY_GRAPH=0
 dspark_profile = true      # HIPFIRE_DSPARK_PROFILE=1

@@ -8143,8 +8143,9 @@ pub fn route_entries_sealed(
     }
     // `pm_decode` is a closed route axis (accepted twins replace their HIP
     // entries below). Memory/host policy and MoE-router fields select no kernel
-    // of a closed route (HIPF-489), so they are exempt; every other flag must be
-    // the builtin default.
+    // of a closed route (HIPF-489), and the DeepSeek V4 levers select no kernel
+    // of the Qwen closed routes (HIPF-488), so they are exempt; every other flag
+    // must be the builtin default.
     let mut default_flags = default_feature_flags(input.arch)?;
     default_flags.pm_decode = input.flags.pm_decode;
     default_flags.page_eviction = input.flags.page_eviction;
@@ -8155,6 +8156,9 @@ pub fn route_entries_sealed(
         input.flags.qwen4_expert_hotset_census_reserve;
     default_flags.qwen4_s1_tier = input.flags.qwen4_s1_tier;
     default_flags.gfx1100_router_w64 = input.flags.gfx1100_router_w64;
+    default_flags.deepseek4_graph = input.flags.deepseek4_graph;
+    default_flags.deepseek4_attn_topk_direct = input.flags.deepseek4_attn_topk_direct;
+    default_flags.deepseek4_wo_q8_wmma = input.flags.deepseek4_wo_q8_wmma;
     if format!("{:?}", input.flags) != format!("{default_flags:?}") {
         return refuse(format!("non-default feature flags on {}", input.arch));
     }
@@ -14994,6 +14998,10 @@ extern "C" __global__ void NAMED(int* p) {}
                 flags.qwen4_expert_hotset_census_reserve = Some(false);
                 flags.qwen4_s1_tier = Some(false);
                 flags.gfx1100_router_w64 = crate::feature_flags::RouterW64Mode::Approx;
+                // HIPF-488: DeepSeek V4 levers select no kernel of the Qwen route.
+                flags.deepseek4_graph = Some(false);
+                flags.deepseek4_attn_topk_direct = Some(true);
+                flags.deepseek4_wo_q8_wmma = Some(false);
             }
             let mut input = RouteKernelInput {
                 arch: "gfx1201",

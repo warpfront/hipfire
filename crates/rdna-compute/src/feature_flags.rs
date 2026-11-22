@@ -925,6 +925,39 @@ pub struct FeatureFlags {
     /// reduction. `None` = on for four ranks, off for a pair. Kept: TP2 opt-in
     /// (+0.6% decode, below the default bar) and TP4 kill switch.
     pub tp_peer_push: Option<bool>,
+    /// Kept tier-C kernel-side levers whose readers sit outside this file
+    /// (HIPF-488). Tri-states are `None` when unset (or `auto`); the use site
+    /// owns its arch / shape default.
+    /// `HIPFIRE_VERIFY_GRAPH` / `kernel.verify_graph` (untrimmed exact `1` / `0`):
+    /// DFlash / MTP verify HIP graph; see `dflash_verify_graph_env_eligible`.
+    pub verify_graph: Option<bool>,
+    /// `HIPFIRE_MOE_MQ6_ADMIT` / `kernel.moe_mq6_admit` (lower-case `1`/`on`/`true`,
+    /// `0`/`off`/`false`): MQ6 experts in the batched Qwen3.5 MoE prefill. `None` = gfx11*/gfx12*.
+    pub moe_mq6_admit: Option<bool>,
+    /// `HIPFIRE_DEEPSEEK4_GRAPH` / `kernel.deepseek4_graph` (untrimmed exact `1` / `0`):
+    /// DeepSeek V4 decode graph. `None` = gfx11*/gfx12*.
+    pub deepseek4_graph: Option<bool>,
+    /// `HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT` / `kernel.deepseek4_attn_topk_direct`
+    /// (env: `0` off, any other value on). `None` = exact gfx1151 at 64+ rows.
+    pub deepseek4_attn_topk_direct: Option<bool>,
+    /// `HIPFIRE_DEEPSEEK4_WO_Q8_WMMA` / `kernel.deepseek4_wo_q8_wmma` (env: `0` off,
+    /// any other value on). `None` = exact gfx1151, M >= 64, 64+ rows.
+    pub deepseek4_wo_q8_wmma: Option<bool>,
+    /// `HIPFIRE_CONV_QKNORM` / `kernel.conv_qknorm`: only `0` is off (kill switch of
+    /// the arch-gated fused conv + QK-norm decode).
+    pub conv_qknorm: bool,
+    /// `HIPFIRE_GDN_COMPACT2` / `kernel.gdn_compact2`: only `0` is off (kill switch of
+    /// the arch-gated compact 2:1 DeltaNet decode).
+    pub gdn_compact2: bool,
+    /// `HIPFIRE_FLASH_PREFILL` / `attention.flash_prefill` (lower-case `1`/`on`/`true`,
+    /// `0`/`off`/`false`). `None` = each route's own default.
+    pub flash_prefill: Option<bool>,
+    /// `HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID` / `kernel.mq4v2_gate_up_tight_grid` (untrimmed
+    /// exact `1` / `0`). `None` = exact gfx1151 or gfx1201.
+    pub mq4v2_gate_up_tight_grid: Option<bool>,
+    /// `HIPFIRE_GFX1100_DRAFT_VOCAB` / `speculation.gfx1100_draft_vocab` (untrimmed
+    /// exact `1` / `0`). `None` = exact gfx1100.
+    pub gfx1100_draft_vocab: Option<bool>,
     /// `HIPFIRE_MTP_AR_FLOOR` / `speculation.mtp_ar_floor`.
     pub mtp_ar_floor: bool,
     /// `HIPFIRE_QWEN4_EXPERT_STAGE` / `memory.qwen4_expert_stage`.
@@ -1617,6 +1650,16 @@ impl FeatureFlags {
             tp_exchange: value("HIPFIRE_TP_EXCHANGE").ok(),
             tp_peer_alternating: exact_tri("HIPFIRE_TP_PEER_ALTERNATING"),
             tp_peer_push: exact_tri("HIPFIRE_TP_PEER_PUSH"),
+            verify_graph: exact_tri("HIPFIRE_VERIFY_GRAPH"),
+            moe_mq6_admit: exact_tri("HIPFIRE_MOE_MQ6_ADMIT"),
+            deepseek4_graph: exact_tri("HIPFIRE_DEEPSEEK4_GRAPH"),
+            deepseek4_attn_topk_direct: exact_tri("HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT"),
+            deepseek4_wo_q8_wmma: exact_tri("HIPFIRE_DEEPSEEK4_WO_Q8_WMMA"),
+            conv_qknorm: on_unless_zero("HIPFIRE_CONV_QKNORM"),
+            gdn_compact2: on_unless_zero("HIPFIRE_GDN_COMPACT2"),
+            flash_prefill: exact_tri("HIPFIRE_FLASH_PREFILL"),
+            mq4v2_gate_up_tight_grid: exact_tri("HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID"),
+            gfx1100_draft_vocab: exact_tri("HIPFIRE_GFX1100_DRAFT_VOCAB"),
             mtp_ar_floor: on_unless_zero("HIPFIRE_MTP_AR_FLOOR"),
             qwen4_expert_stage: value("HIPFIRE_QWEN4_EXPERT_STAGE").ok(),
             qwen4_mtp_draft_rounds: exact_tri("HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS"),
@@ -2460,6 +2503,16 @@ impl FeatureFlags {
             tp_exchange: None,
             tp_peer_alternating: None,
             tp_peer_push: None,
+            verify_graph: None,
+            moe_mq6_admit: None,
+            deepseek4_graph: None,
+            deepseek4_attn_topk_direct: None,
+            deepseek4_wo_q8_wmma: None,
+            conv_qknorm: true,
+            gdn_compact2: true,
+            flash_prefill: None,
+            mq4v2_gate_up_tight_grid: None,
+            gfx1100_draft_vocab: None,
             mtp_ar_floor: false,
             qwen4_expert_stage: None,
             qwen4_mtp_draft_rounds: None,
@@ -5074,6 +5127,28 @@ mod tests {
                 format!("{:?}", f.qwen4_d2_mixed_cpwait),
                 format!("{:?}", f.qwen4_expert_hotset_census_reserve),
                 format!("{:?}", f.qwen4_s1_tier),
+                format!("{:?}", f.verify_graph),
+                format!("{:?}", f.moe_mq6_admit),
+                format!("{:?}", f.deepseek4_graph),
+                format!("{:?}", f.deepseek4_attn_topk_direct),
+                format!("{:?}", f.deepseek4_wo_q8_wmma),
+                f.conv_qknorm.to_string(),
+                f.gdn_compact2.to_string(),
+                format!("{:?}", f.flash_prefill),
+                format!("{:?}", f.mq4v2_gate_up_tight_grid),
+                format!("{:?}", f.gfx1100_draft_vocab),
+                f.residual_ldsstage.to_string(),
+                f.gate_up_ldsstage.to_string(),
+                format!("{:?}", f.gfx11_mmq_x128),
+                f.cb_verify_chunk128.to_string(),
+                f.wmma_batch_tiles.to_string(),
+                f.fn_lane_pm_rows.to_string(),
+                f.gfx1100_q8x_verify.to_string(),
+                f.gfx12_gate_up_tile_loop.to_string(),
+                f.mq6_rows_split.to_string(),
+                f.gfx1100_wmma_verify_attn.to_string(),
+                format!("{:?}", f.mq3v25_a4),
+                f.fa_qresident_pm.to_string(),
             ]
         };
         let flags_for = |layer: ConfigLayer| {
@@ -5125,6 +5200,36 @@ mod tests {
                 "Some(false)",
             ),
             ("memory.qwen4_s1_tier", Bool(true), "Some(true)"),
+            ("kernel.verify_graph", Bool(true), "Some(true)"),
+            ("kernel.moe_mq6_admit", Bool(false), "Some(false)"),
+            ("kernel.deepseek4_graph", Bool(false), "Some(false)"),
+            (
+                "kernel.deepseek4_attn_topk_direct",
+                Bool(true),
+                "Some(true)",
+            ),
+            ("kernel.deepseek4_wo_q8_wmma", Bool(false), "Some(false)"),
+            ("kernel.conv_qknorm", Bool(false), "false"),
+            ("kernel.gdn_compact2", Bool(false), "false"),
+            ("attention.flash_prefill", Bool(true), "Some(true)"),
+            (
+                "kernel.mq4v2_gate_up_tight_grid",
+                Bool(false),
+                "Some(false)",
+            ),
+            ("speculation.gfx1100_draft_vocab", Bool(true), "Some(true)"),
+            ("kernel.residual_ldsstage", Bool(true), "true"),
+            ("kernel.gateup_ldsstage", Bool(true), "true"),
+            ("kernel.gfx11_mmq_x128", Bool(false), "Some(false)"),
+            ("kernel.cb_verify_chunk128", Bool(false), "false"),
+            ("kernel.wmma_batch_tiles", Bool(false), "false"),
+            ("kernel.fn_lane_pm_rows", Bool(true), "true"),
+            ("kernel.gfx1100_q8x_verify", Bool(true), "true"),
+            ("kernel.gfx12_gate_up_tile_loop", Bool(false), "false"),
+            ("kernel.mq6_rows_split", Bool(false), "false"),
+            ("kernel.gfx1100_wmma_verify_attn", Bool(true), "true"),
+            ("kernel.mq3v25_a4", Bool(false), "Some(false)"),
+            ("attention.fa_qresident_pm", Bool(false), "false"),
         ]
         .into_iter()
         .enumerate()

@@ -2763,7 +2763,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         "HIPFIRE_VERIFY_ATTN",
-        "Run speculative-verify attention (1..=32 rows, non-tree) through VerifyAttn: on gfx1201 and gfx1100 the GQA-shared split-K twin of the batched flash tile + reduce (on gfx1100 also of the multi-row R4/R8 Q8 tile), on gfx1151 the context-parallel twin of the single-slot WMMA flash prefill (default on exact gfx1201, gfx1100 and gfx1151; byte-identical output; set to false or HIPFIRE_VERIFY_ATTN=0 to opt out to attention_flash_*_tile_batched / attention_flash_q8_0_rows{4,8}_d8 / attention_q8_0_flash_prefill_wmma)."
+        "Run speculative-verify attention (1..=32 rows, non-tree) through VerifyAttn: on gfx1201 and gfx1100 the GQA-shared split-K twin of the batched flash tile + reduce (on gfx1100 also of the multi-row R4/R8 Q8 tile), on gfx1151 the context-parallel twin of the single-slot WMMA flash prefill (default on exact gfx1201, gfx1100 and gfx1151; these twins are byte-identical, but on gfx1100 the 1..=8-row WMMA split-K child, kernel.gfx1100_wmma_verify_attn, is numeric and KLD-gated; set to false or HIPFIRE_VERIFY_ATTN=0 to opt out to attention_flash_*_tile_batched / attention_flash_q8_0_rows{4,8}_d8 / attention_q8_0_flash_prefill_wmma)."
     ),
     process_bool_field!(
         "kernel.gfx1100_fa2_split_verify",
@@ -3319,6 +3319,203 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS",
         "Qwen4 MTP draft top-8 over rows: auto (default) is on exact gfx1201 only; true / false force it."
+    ),
+    // Kept tier-C kernel-side levers (HIPF-488, HIPF-396 tier C S5b). Each env keeps
+    // its legacy reader grammar (`promoted_flag_env_value`); `auto` keeps the
+    // per-arch / per-shape default at the use site.
+    process_field!(
+        "kernel.verify_graph",
+        "verify_graph",
+        Kernel,
+        DefaultValue::String("auto"),
+        ValueRule::AutoBool,
+        true,
+        "HIPFIRE_VERIFY_GRAPH",
+        "HIP-graph replay of the DFlash / MTP batched verify forward: auto (default) is on except exact gfx1100 MQ*G256V2 / MQ4G256 and exact gfx1201 MQ4G256 output heads (measured slower or wrong there); true also enables those; false forces the direct verify everywhere."
+    ),
+    process_field!(
+        "kernel.moe_mq6_admit",
+        "moe_mq6_admit",
+        Kernel,
+        DefaultValue::String("auto"),
+        ValueRule::AutoBool,
+        true,
+        "HIPFIRE_MOE_MQ6_ADMIT",
+        "Admit MQ6 routed experts to the batched Qwen3.5 MoE prefill: auto (default) is on for gfx11* and gfx12*; true / false force it."
+    ),
+    process_field!(
+        "kernel.deepseek4_graph",
+        "deepseek4_graph",
+        Kernel,
+        DefaultValue::String("auto"),
+        ValueRule::AutoBool,
+        true,
+        "HIPFIRE_DEEPSEEK4_GRAPH",
+        "HIP-graph capture of the DeepSeek V4 decode step: auto (default) is on for gfx11* and gfx12*; true forces it on older archs (untested); false runs direct dispatch."
+    ),
+    process_field!(
+        "kernel.deepseek4_attn_topk_direct",
+        "deepseek4_attn_topk_direct",
+        Kernel,
+        DefaultValue::String("auto"),
+        ValueRule::AutoBool,
+        true,
+        "HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT",
+        "DeepSeek V4 direct top-k sparse attention prefill on the replicated F32 ratio-4 compressor (eager only): auto (default) is on exact gfx1151 at 64+ rows; true forces it at any arch / row count; false keeps the gather route. Env: 0 is off, any other value is on."
+    ),
+    process_field!(
+        "kernel.deepseek4_wo_q8_wmma",
+        "deepseek4_wo_q8_wmma",
+        Kernel,
+        DefaultValue::String("auto"),
+        ValueRule::AutoBool,
+        true,
+        "HIPFIRE_DEEPSEEK4_WO_Q8_WMMA",
+        "DeepSeek V4 grouped Q8 wo projection on the strided WMMA kernel (K % 32 == 0): auto (default) is on exact gfx1151 at M >= 64 and 64+ rows; true forces it; false keeps the scalar per-row kernel. Env: 0 is off, any other value is on."
+    ),
+    process_bool_field!(
+        "kernel.conv_qknorm",
+        "conv_qknorm",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_CONV_QKNORM",
+        "Fused DeltaNet conv + QK-norm decode on Q8 state with key_dim 128 (default on exact gfx1201, gfx1100 and gfx1151; gfx1101 via the campaign switch); false keeps the unfused chain. Env: only 0 is off."
+    ),
+    process_bool_field!(
+        "kernel.gdn_compact2",
+        "gdn_compact2",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_GDN_COMPACT2",
+        "Compact 2:1 DeltaNet QK decode (each Q/K head serves two value heads, Q8 state; default on exact gfx1201, gfx1100 and gfx1151); false materializes the repeated Q/K. Env: only 0 is off."
+    ),
+    process_field!(
+        "attention.flash_prefill",
+        "flash_prefill",
+        Attention,
+        DefaultValue::String("auto"),
+        ValueRule::AutoBool,
+        true,
+        "HIPFIRE_FLASH_PREFILL",
+        "Flash (WMMA) prefill attention: auto (default) is on for gfx11* and, on exact gfx1201, inside the query16 / long-context FA2 envelopes; true opts in wherever the kernel is admitted; false forces the native prefill attention (and skips the CK route)."
+    ),
+    process_field!(
+        "kernel.mq4v2_gate_up_tight_grid",
+        "mq4v2_gate_up_tight_grid",
+        Kernel,
+        DefaultValue::String("auto"),
+        ValueRule::AutoBool,
+        true,
+        "HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID",
+        "Half-size launch grid for the MQ4G256V2 fused gate/up GEMV: auto (default) is on exact gfx1151 and gfx1201 (the measured archs); true / false force it."
+    ),
+    process_field!(
+        "speculation.gfx1100_draft_vocab",
+        "gfx1100_draft_vocab",
+        Speculation,
+        DefaultValue::String("auto"),
+        ValueRule::AutoBool,
+        true,
+        "HIPFIRE_GFX1100_DRAFT_VOCAB",
+        "Compressed 65,536-row MTP draft lm_head sliced from the trunk lm_head: auto (default) is on exact gfx1100 only; true also enables it elsewhere (untested); false keeps the full-vocab draft."
+    ),
+    process_auto_bool_field!(
+        "kernel.residual_ldsstage",
+        "residual_ldsstage",
+        Kernel,
+        true,
+        "HIPFIRE_RESIDUAL_LDSSTAGE",
+        "LDS-staged MQ residual GEMM for DFlash verify (K % 512 == 0): auto (default) is on exact gfx1100 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.gateup_ldsstage",
+        "gateup_ldsstage",
+        Kernel,
+        true,
+        "HIPFIRE_GATEUP_LDSSTAGE",
+        "LDS-staged packed gate/up GEMM (1..=16 rows, K % 512 == 0): auto (default) is on exact gfx1100 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.gfx11_mmq_x128",
+        "gfx11_mmq_x128",
+        Kernel,
+        true,
+        "HIPFIRE_GFX11_MMQ_X128",
+        "Per-128 MMQ prefill tile: auto (default) is on exact gfx1100 and gfx1151; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.cb_verify_chunk128",
+        "cb_verify_chunk128",
+        Kernel,
+        true,
+        "HIPFIRE_CB_VERIFY_CHUNK128",
+        "128-row chunked continuous-batch verify GEMM (with kernel.wmma_batch_tiles): auto (default) is on exact gfx1201 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.wmma_batch_tiles",
+        "wmma_batch_tiles",
+        Kernel,
+        true,
+        "HIPFIRE_WMMA_BATCH_TILES",
+        "Batch-tiled WMMA verify GEMM for 17..64 rows (K % 256 == 0): auto (default) is on exact gfx1201 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.fn_lane_pm_rows",
+        "fn_lane_pm_rows",
+        Kernel,
+        true,
+        "HIPFIRE_FN_LANE_PM_ROWS",
+        "PeaceMaker few-row lane GEMV kernels: auto (default) is on exact gfx1151 only (the arch with the kernel artifacts); true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.gfx1100_q8x_verify",
+        "gfx1100_q8x_verify",
+        Kernel,
+        true,
+        "HIPFIRE_GFX1100_Q8X_VERIFY",
+        "Q8X multi-row verify GEMV: auto (default) is on exact gfx1100 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.gfx12_gate_up_tile_loop",
+        "gfx12_gate_up_tile_loop",
+        Kernel,
+        true,
+        "HIPFIRE_GFX12_GATE_UP_TILE_LOOP",
+        "Tile-loop gate/up producer: auto (default) is on exact gfx1201 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.mq6_rows_split",
+        "mq6_rows_split",
+        Kernel,
+        true,
+        "HIPFIRE_MQ6_ROWS_SPLIT",
+        "Stream-split MQ6 few-row verify GEMV: auto (default) is on exact gfx1201 and gfx1100 (the archs with a split geometry); true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.gfx1100_wmma_verify_attn",
+        "gfx1100_wmma_verify_attn",
+        Kernel,
+        true,
+        "HIPFIRE_GFX1100_WMMA_VERIFY_ATTN",
+        "WMMA split-K child of VerifyAttn for 1..=8 rows (numeric, KLD-gated): auto (default) is on exact gfx1100 only; true / false force it. kernel.verify_attn=false also opts out."
+    ),
+    process_auto_bool_field!(
+        "kernel.mq3v25_a4",
+        "mq3v25_a4",
+        Kernel,
+        true,
+        "HIPFIRE_MQ3V25_A4",
+        "Symmetric MQ3G256V2 W3A4 prefill: auto (default) is on exact gfx1100 and gfx1201, the archs with a consumer (it also needs kernel.iu4_prefill); false keeps the F16 route; true cannot enable it on other archs."
+    ),
+    process_auto_bool_field!(
+        "attention.fa_qresident_pm",
+        "fa_qresident_pm",
+        Attention,
+        true,
+        "HIPFIRE_FA_QRESIDENT_PM",
+        "PeaceMaker twin of the fp8 Q-resident FA2 prefill: auto (default) is on exact gfx1201 only (the arch with the embedded artifact); true / false force it."
     ),
     process_bool_field!(
         "attention.qwen4_qsa_wmma_gather",
@@ -5138,6 +5335,190 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS is unchanged",
         replacement: "kernel.qwen4_draft_topk8_rows",
+    },
+    RetiredConfigKey {
+        key: "developer.verify_graph",
+        legacy_key: "developer.verify_graph",
+        shipped_in: "0.1.8",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_VERIFY_GRAPH is unchanged",
+        replacement: "kernel.verify_graph",
+    },
+    RetiredConfigKey {
+        key: "developer.moe_mq6_admit",
+        legacy_key: "developer.moe_mq6_admit",
+        shipped_in: "0.2.0",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_MOE_MQ6_ADMIT is unchanged",
+        replacement: "kernel.moe_mq6_admit",
+    },
+    RetiredConfigKey {
+        key: "developer.deepseek4_graph",
+        legacy_key: "developer.deepseek4_graph",
+        shipped_in: "0.2.0",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_DEEPSEEK4_GRAPH is unchanged",
+        replacement: "kernel.deepseek4_graph",
+    },
+    RetiredConfigKey {
+        key: "developer.deepseek4_attn_topk_direct",
+        legacy_key: "developer.deepseek4_attn_topk_direct",
+        shipped_in: "0.2.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT is unchanged",
+        replacement: "kernel.deepseek4_attn_topk_direct",
+    },
+    RetiredConfigKey {
+        key: "developer.deepseek4_wo_q8_wmma",
+        legacy_key: "developer.deepseek4_wo_q8_wmma",
+        shipped_in: "0.2.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_DEEPSEEK4_WO_Q8_WMMA is unchanged",
+        replacement: "kernel.deepseek4_wo_q8_wmma",
+    },
+    RetiredConfigKey {
+        key: "developer.conv_qknorm",
+        legacy_key: "developer.conv_qknorm",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_CONV_QKNORM is unchanged",
+        replacement: "kernel.conv_qknorm",
+    },
+    RetiredConfigKey {
+        key: "developer.gdn_compact2",
+        legacy_key: "developer.gdn_compact2",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_GDN_COMPACT2 is unchanged",
+        replacement: "kernel.gdn_compact2",
+    },
+    RetiredConfigKey {
+        key: "developer.flash_prefill",
+        legacy_key: "developer.flash_prefill",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_FLASH_PREFILL is unchanged",
+        replacement: "attention.flash_prefill",
+    },
+    RetiredConfigKey {
+        key: "developer.mq4v2_gate_up_tight_grid",
+        legacy_key: "developer.mq4v2_gate_up_tight_grid",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID is unchanged",
+        replacement: "kernel.mq4v2_gate_up_tight_grid",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx1100_draft_vocab",
+        legacy_key: "developer.gfx1100_draft_vocab",
+        shipped_in: "0.4.4",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_GFX1100_DRAFT_VOCAB is unchanged",
+        replacement: "speculation.gfx1100_draft_vocab",
+    },
+    RetiredConfigKey {
+        key: "developer.residual_ldsstage",
+        legacy_key: "developer.residual_ldsstage",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_RESIDUAL_LDSSTAGE is unchanged",
+        replacement: "kernel.residual_ldsstage",
+    },
+    RetiredConfigKey {
+        key: "developer.gateup_ldsstage",
+        legacy_key: "developer.gateup_ldsstage",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_GATEUP_LDSSTAGE is unchanged",
+        replacement: "kernel.gateup_ldsstage",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx11_mmq_x128",
+        legacy_key: "developer.gfx11_mmq_x128",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_GFX11_MMQ_X128 is unchanged",
+        replacement: "kernel.gfx11_mmq_x128",
+    },
+    RetiredConfigKey {
+        key: "developer.cb_verify_chunk128",
+        legacy_key: "developer.cb_verify_chunk128",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_CB_VERIFY_CHUNK128 is unchanged",
+        replacement: "kernel.cb_verify_chunk128",
+    },
+    RetiredConfigKey {
+        key: "developer.wmma_batch_tiles",
+        legacy_key: "developer.wmma_batch_tiles",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_WMMA_BATCH_TILES is unchanged",
+        replacement: "kernel.wmma_batch_tiles",
+    },
+    RetiredConfigKey {
+        key: "developer.fn_lane_pm_rows",
+        legacy_key: "developer.fn_lane_pm_rows",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_FN_LANE_PM_ROWS is unchanged",
+        replacement: "kernel.fn_lane_pm_rows",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx1100_q8x_verify",
+        legacy_key: "developer.gfx1100_q8x_verify",
+        shipped_in: "0.4.4",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_GFX1100_Q8X_VERIFY is unchanged",
+        replacement: "kernel.gfx1100_q8x_verify",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx12_gate_up_tile_loop",
+        legacy_key: "developer.gfx12_gate_up_tile_loop",
+        shipped_in: "0.4.4",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_GFX12_GATE_UP_TILE_LOOP is unchanged",
+        replacement: "kernel.gfx12_gate_up_tile_loop",
+    },
+    RetiredConfigKey {
+        key: "developer.mq6_rows_split",
+        legacy_key: "developer.mq6_rows_split",
+        shipped_in: "0.4.4",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_MQ6_ROWS_SPLIT is unchanged",
+        replacement: "kernel.mq6_rows_split",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx1100_wmma_verify_attn",
+        legacy_key: "developer.gfx1100_wmma_verify_attn",
+        shipped_in: "0.4.4",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_GFX1100_WMMA_VERIFY_ATTN is unchanged",
+        replacement: "kernel.gfx1100_wmma_verify_attn",
+    },
+    RetiredConfigKey {
+        key: "developer.mq3v25_a4",
+        legacy_key: "developer.mq3v25_a4",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_MQ3V25_A4 is unchanged",
+        replacement: "kernel.mq3v25_a4",
+    },
+    RetiredConfigKey {
+        key: "developer.fa_qresident_pm",
+        legacy_key: "developer.fa_qresident_pm",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-488); HIPFIRE_FA_QRESIDENT_PM is unchanged",
+        replacement: "attention.fa_qresident_pm",
+    },
+    RetiredConfigKey {
+        key: "developer.deepseek4_indexer_wmma",
+        legacy_key: "deepseek4_indexer_wmma",
+        shipped_in: "0.2.0",
+        removed_in: "0.5.0",
+        reason: "the DeepSeek V4 indexer WMMA switch was removed (HIPF-488)",
+        replacement: "none; the indexer takes its WMMA route wherever ArchCaps::has_wmma holds",
     },
     RetiredConfigKey {
         key: "developer.qwen4_qsa_wmma_gather",
@@ -9820,14 +10201,22 @@ fn promoted_flag_env_value(legacy_key: &str, raw: &str) -> Option<ConfigValue> {
         | "dflash_prefill_device"
         | "dflash_prefill_scatter_fast"
         | "route_plan"
-        | "t5_gpu" => ConfigValue::Bool(raw != "0"),
+        | "t5_gpu"
+        | "conv_qknorm"
+        | "gdn_compact2" => ConfigValue::Bool(raw != "0"),
+        // `.map(|s| s != "0").unwrap_or(shape default)`: set to anything but `0` forces on.
+        "deepseek4_attn_topk_direct" | "deepseek4_wo_q8_wmma" => ConfigValue::Bool(raw != "0"),
         // Untrimmed exact `1` / `0`; anything else is the conditional default.
         "ep_peer_allreduce"
         | "ep_peer_allreduce_decode"
         | "qwen4_mtp_draft_rounds"
         | "qwen4_expert_drop_zero"
         | "tp_peer_alternating"
-        | "tp_peer_push" => match raw {
+        | "tp_peer_push"
+        | "verify_graph"
+        | "deepseek4_graph"
+        | "mq4v2_gate_up_tight_grid"
+        | "gfx1100_draft_vocab" => match raw {
             "1" => ConfigValue::Bool(true),
             "0" => ConfigValue::Bool(false),
             _ => ConfigValue::String("auto".to_owned()),
@@ -9855,9 +10244,27 @@ fn promoted_flag_env_value(legacy_key: &str, raw: &str) -> Option<ConfigValue> {
         | "qwen4_lane_prepare_async"
         | "qwen4_ep_pmask_implicit_zero"
         | "qwen4_draft_glue_fold"
-        | "qwen4_draft_topk8_rows" => match raw {
+        | "qwen4_draft_topk8_rows"
+        | "residual_ldsstage"
+        | "gateup_ldsstage"
+        | "gfx11_mmq_x128"
+        | "cb_verify_chunk128"
+        | "wmma_batch_tiles"
+        | "fn_lane_pm_rows"
+        | "gfx1100_q8x_verify"
+        | "gfx12_gate_up_tile_loop"
+        | "mq6_rows_split"
+        | "gfx1100_wmma_verify_attn"
+        | "mq3v25_a4"
+        | "fa_qresident_pm" => match raw {
             "1" | "true" | "TRUE" | "on" | "ON" => ConfigValue::Bool(true),
             "0" | "false" | "FALSE" | "off" | "OFF" => ConfigValue::Bool(false),
+            _ => ConfigValue::String("auto".to_owned()),
+        },
+        // Lower-case `0`/`off`/`false` and `1`/`on`/`true`; anything else is auto.
+        "moe_mq6_admit" | "flash_prefill" => match raw {
+            "1" | "on" | "true" => ConfigValue::Bool(true),
+            "0" | "off" | "false" => ConfigValue::Bool(false),
             _ => ConfigValue::String("auto".to_owned()),
         },
         // Trimmed exact `1` / `0`; anything else is the load-conditional default.
@@ -10540,7 +10947,7 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
                 "diagnostic.kernel.gfx11_weight_load_policy",
                 ConfigValue::String("buffer".to_owned()),
             ),
-            ("developer.verify_graph", ConfigValue::Bool(false)),
+            ("kernel.verify_graph", ConfigValue::Bool(false)),
             ("developer.dspark_profile", ConfigValue::Bool(true)),
         ],
         "hip" => vec![("replay.backend", ConfigValue::String("hip".to_owned()))],
@@ -10936,6 +11343,10 @@ mod tests {
                 "dflash_prefill_scatter_fast",
                 "route_plan",
                 "t5_gpu",
+                "conv_qknorm",
+                "gdn_compact2",
+                "deepseek4_attn_topk_direct",
+                "deepseek4_wo_q8_wmma",
             ] {
                 let want = parse_developer_bool(Some(raw), true);
                 assert_eq!(on(key, raw).as_deref() == Some("1"), want, "{key}={raw:?}");
@@ -10998,8 +11409,28 @@ mod tests {
                 "qwen4_ep_pmask_implicit_zero",
                 "qwen4_draft_glue_fold",
                 "qwen4_draft_topk8_rows",
+                "residual_ldsstage",
+                "gateup_ldsstage",
+                "gfx11_mmq_x128",
+                "cb_verify_chunk128",
+                "wmma_batch_tiles",
+                "fn_lane_pm_rows",
+                "gfx1100_q8x_verify",
+                "gfx12_gate_up_tile_loop",
+                "mq6_rows_split",
+                "gfx1100_wmma_verify_attn",
+                "mq3v25_a4",
+                "fa_qresident_pm",
             ] {
                 assert_eq!(on(key, raw).as_deref(), Some(mq6_i8), "{key}={raw:?}");
+            }
+            let lower_tri = match raw {
+                "1" | "on" | "true" => "1",
+                "0" | "off" | "false" => "0",
+                _ => "auto",
+            };
+            for key in ["moe_mq6_admit", "flash_prefill"] {
+                assert_eq!(on(key, raw).as_deref(), Some(lower_tri), "{key}={raw:?}");
             }
             for key in [
                 "ep_peer_allreduce",
@@ -11008,6 +11439,10 @@ mod tests {
                 "qwen4_expert_drop_zero",
                 "tp_peer_alternating",
                 "tp_peer_push",
+                "verify_graph",
+                "deepseek4_graph",
+                "mq4v2_gate_up_tight_grid",
+                "gfx1100_draft_vocab",
             ] {
                 let want = match raw {
                     "1" => "1",
@@ -11056,8 +11491,9 @@ mod tests {
         // 9 kernel-side (stage 1) + 28 arch-crate / runtime (stage 2) + 2 tier-B kernel-side
         // (HIPF-438) + 4 tier-B arch-crate / runtime (HIPF-437) + 2 kernel-side (HIPF-489)
         // + 2 memory-side (HIPF-489 case 6) + 4 Qwen4 gfx1100 package keys
-        // (HIPF-489 case 6 part B) + 22 Qwen4 tier-C S5b (HIPF-487).
-        assert_eq!(promoted.len(), 73);
+        // (HIPF-489 case 6 part B) + 22 Qwen4 tier-C S5b (HIPF-487)
+        // + 22 tier-C kernel-side (HIPF-488).
+        assert_eq!(promoted.len(), 95);
         for f in promoted {
             let dev = developer_key_for_env(f.env_compat.unwrap()).unwrap();
             let err = ConfigLayer::default().set_cli(&dev, "1").unwrap_err();

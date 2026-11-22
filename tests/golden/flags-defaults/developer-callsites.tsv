@@ -42,7 +42,6 @@ developer_callsite	*	HIPFIRE_CHUNK_DUMP_LAYERS#developer_var=-
 developer_callsite	*	HIPFIRE_CHUNK_DUMP_RAW#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_COHERE_DEBUG#developer_var_os=is_some
 developer_callsite	*	HIPFIRE_COMP_DUMP#developer_var=ok.and_then.filter.map
-developer_callsite	*	HIPFIRE_CONV_QKNORM#developer_var=-
 developer_callsite	*	HIPFIRE_CONV_QKNORM_SHAPE#developer_var=-
 developer_callsite	*	HIPFIRE_CONV_QKNORM_SHAPE#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_CONV_SCALAR_PREP#developer_var=-
@@ -58,7 +57,6 @@ developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN_ILP4#developer_bool=false
 developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN_PER_POS#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN_SCOREGRID_LARGE_SERIAL#developer_bool=false
 developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN_SCOREGRID_XLANE#developer_bool=false
-developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT#developer_var=map.unwrap_or(gpu.arch == "gfx1151" && rows >= 64)
 developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN_TWIN#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN_WARP#developer_bool=false
 developer_callsite	*	HIPFIRE_DEEPSEEK4_CACHE_TRACE#developer_var=ok.as_deref.==Some("1")
@@ -79,13 +77,11 @@ developer_callsite	*	HIPFIRE_DEEPSEEK4_F32_TRACE#developer_var=is_ok
 developer_callsite	*	HIPFIRE_DEEPSEEK4_FUSED_ROUTE_ACT#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU#developer_var=as_deref
 developer_callsite	*	HIPFIRE_DEEPSEEK4_GFX942_E8_ROCBLAS#developer_bool=false
-developer_callsite	*	HIPFIRE_DEEPSEEK4_GRAPH#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_DEEPSEEK4_INDEXER_TOPK_BLOCK1024#developer_bool=false
 developer_callsite	*	HIPFIRE_DEEPSEEK4_INDEXER_TOPK_BOUNDED#developer_bool=false
 developer_callsite	*	HIPFIRE_DEEPSEEK4_INDEXER_TOPK_SERIAL#developer_bool=false
 developer_callsite	*	HIPFIRE_DEEPSEEK4_INDEXER_TOPK_TWOSTAGE_MIN#developer_var=ok.and_then.unwrap_or(1024)
 developer_callsite	*	HIPFIRE_DEEPSEEK4_INDEXER_TOPK_UNROLLED#developer_bool=false
-developer_callsite	*	HIPFIRE_DEEPSEEK4_INDEXER_WMMA#developer_var=map.unwrap_or(true)
 developer_callsite	*	HIPFIRE_DEEPSEEK4_LAYER_NORM#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_8W#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_CND#developer_var=as_deref.==Ok("1")
@@ -108,7 +104,6 @@ developer_callsite	*	HIPFIRE_DEEPSEEK4_STAGE_LAYERS#developer_var=ok.map.filter.
 developer_callsite	*	HIPFIRE_DEEPSEEK4_STAGE_NORM#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_TOP_K#developer_var=ok.and_then.unwrap_or(0)
 developer_callsite	*	HIPFIRE_DEEPSEEK4_WO_MULTIROW#developer_var=ok.and_then.filter.unwrap_or(0)
-developer_callsite	*	HIPFIRE_DEEPSEEK4_WO_Q8_WMMA#developer_var=map.unwrap_or(default_wmma)
 developer_callsite	*	HIPFIRE_DENSE_TP_ROUTE#developer_var=ok
 developer_callsite	*	HIPFIRE_DFLASH_CHAT#developer_var=ok.as_deref.==Some("0")
 developer_callsite	*	HIPFIRE_DFLASH_CYCLE_TRACE#developer_var=ok.filter
@@ -205,7 +200,6 @@ developer_callsite	*	HIPFIRE_FA_PERTOKEN_MIN_CTX#developer_var=ok.and_then.unwra
 developer_callsite	*	HIPFIRE_FIXED_TIER#developer_var=-
 developer_callsite	*	HIPFIRE_FIXED_TIER#developer_var=is_ok
 developer_callsite	*	HIPFIRE_FIXED_TIER#developer_var=ok
-developer_callsite	*	HIPFIRE_FLASH_PREFILL#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_FLASH_PREFILL_BC#developer_var=ok.and_then.unwrap_or(16)
 developer_callsite	*	HIPFIRE_FLASH_PREFILL_BR#developer_var=ok.and_then.unwrap_or(8)
 developer_callsite	*	HIPFIRE_FLASH_PREFILL_MIN_CTX#developer_var=ok.and_then.unwrap_or(10240)
@@ -229,7 +223,6 @@ developer_callsite	*	HIPFIRE_G942_TRUNK_GEMV#developer_bool=false
 developer_callsite	*	HIPFIRE_GDN_BLK#developer_var=ok.and_then.map.unwrap_or(128)
 developer_callsite	*	HIPFIRE_GDN_CHUNKED#developer_var=map.unwrap_or(false)
 developer_callsite	*	HIPFIRE_GDN_CHUNK_SIZE#developer_var=ok.and_then.unwrap_or(16)
-developer_callsite	*	HIPFIRE_GDN_COMPACT2#developer_var=-
 developer_callsite	*	HIPFIRE_GDN_COMPACT2_SHAPE#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_GDN_MOE_PRE_FUSED#developer_typed_bool=-
 developer_callsite	*	HIPFIRE_GDN_QK_INDEXED#developer_typed_bool=-
@@ -250,7 +243,6 @@ developer_callsite	*	HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR#developer_bool=false
 developer_callsite	*	HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR2#developer_bool=false
 developer_callsite	*	HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH#developer_bool=false
 developer_callsite	*	HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO#developer_bool=false
-developer_callsite	*	HIPFIRE_GFX1100_DRAFT_VOCAB#developer_bool=gpu_arch == "gfx1100"
 developer_callsite	*	HIPFIRE_GFX1100_MQ4_WIDE_PREFILL#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_GFX1100_PACKED_MQ4_PREFILL#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_GFX1101_GFX1100_CAMPAIGN#developer_var=as_deref.==Ok("1")
@@ -392,7 +384,6 @@ developer_callsite	*	HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE#developer_bool=false
 developer_callsite	*	HIPFIRE_MOE_GATE_UP_WG2#developer_bool=false
 developer_callsite	*	HIPFIRE_MOE_GRADED#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_MOE_HOT_FRAC#developer_var=ok.and_then.map.unwrap_or(0.2)
-developer_callsite	*	HIPFIRE_MOE_MQ6_ADMIT#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_MOE_ROUTER_FUSED_PREFILL#developer_typed_bool=-
 developer_callsite	*	HIPFIRE_MOE_ROUTER_SHARED_FUSE#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_MOE_ROUTER_TOPK_MULTIROW#developer_typed_bool=-
@@ -404,7 +395,6 @@ developer_callsite	*	HIPFIRE_MOE_TIER_MAP#developer_var=-
 developer_callsite	*	HIPFIRE_MQ2_DOWN_ROWS#developer_var=as_deref
 developer_callsite	*	HIPFIRE_MQ3_DOWN_ROWS#developer_var=as_deref
 developer_callsite	*	HIPFIRE_MQ4V2_DOWN_TIGHT_GRID#developer_var=as_deref.==Ok("1")
-developer_callsite	*	HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID#developer_var=as_deref
 developer_callsite	*	HIPFIRE_MQ4V2_RESIDUAL_R1#developer_var=map.unwrap_or(true)
 developer_callsite	*	HIPFIRE_MQ6V2_DOWN_TIGHT_GRID#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_MQ6V2_GATE_UP_TIGHT_GRID#developer_var=as_deref
@@ -616,8 +606,6 @@ developer_callsite	*	HIPFIRE_VAE_TRANSPOSE#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_VCN_DEBUG#developer_var=is_ok
 developer_callsite	*	HIPFIRE_VCN_DRM_NODE#developer_var=-
 developer_callsite	*	HIPFIRE_VCN_LIBVA_PATH#developer_var=unwrap_or_else
-developer_callsite	*	HIPFIRE_VERIFY_GRAPH#developer_var=as_deref.!=Ok("0")
-developer_callsite	*	HIPFIRE_VERIFY_GRAPH#developer_var=ok
 developer_callsite	*	HIPFIRE_VERIFY_GRAPH_TIMING#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_VISION_HOST_MAPPED#developer_bool=false
 developer_callsite	*	HIPFIRE_VISION_SIDECAR#developer_var=-

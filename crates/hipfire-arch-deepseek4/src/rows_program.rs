@@ -880,8 +880,9 @@ fn compressed_attention_rows<'a>(
             state.compressor_cache_placement,
             CompressorCachePlacement::Replicated
         )
-        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT")
-            .map(|s| s != "0")
+        && gpu
+            .flags
+            .deepseek4_attn_topk_direct
             .unwrap_or(gpu.arch == "gfx1151" && rows >= 64);
 
     // Compressor projections of the window (the B3 pack may have run them).
@@ -1036,12 +1037,7 @@ fn compressed_attention_rows<'a>(
             rope_theta: cfg.compress_rope_theta,
             route: attention::SparseIndexRoute::Batched {
                 cache,
-                wmma: h_idx == 64
-                    && d_idx == 128
-                    && (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
-                    && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_WMMA")
-                        .map(|s| s != "0")
-                        .unwrap_or(true),
+                wmma: h_idx == 64 && d_idx == 128 && gpu.arch_caps.has_wmma(),
                 x_f16: &pbs.wmma_x_scratch_f16,
                 n_compressed: if capture_safe {
                     &pbs.n_compressed_4_arr

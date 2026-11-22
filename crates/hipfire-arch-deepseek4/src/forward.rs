@@ -2079,7 +2079,6 @@ pub fn decode_step_with_graph(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
-    use std::sync::OnceLock;
     // Mapping and any launch-geometry bucket transition must complete before
     // HipGraph/Redline decides whether to capture or replay this step.
     ensure_compressor_capacity(cfg, state, gpu, (position as usize).saturating_add(1))?;
@@ -2089,20 +2088,9 @@ pub fn decode_step_with_graph(
     // those on every replay → byte-equivalent against direct dispatch out to
     // 200+ steps on gfx1151 (graph_drift_check). Default ON for RDNA3+
     // (gfx11xx/gfx12xx) where graph capture is mature; opt out with
-    // `HIPFIRE_DEEPSEEK4_GRAPH=0`. Force on for older archs with
-    // `HIPFIRE_DEEPSEEK4_GRAPH=1` (untested — beware kernarg-bake regressions).
-    static GRAPH_OPT_ENV: OnceLock<Option<bool>> = OnceLock::new();
-    let env_override = *GRAPH_OPT_ENV.get_or_init(|| {
-        match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GRAPH")
-            .ok()
-            .as_deref()
-        {
-            Some("1") => Some(true),
-            Some("0") => Some(false),
-            _ => None,
-        }
-    });
-    let graph_on = env_override.unwrap_or_else(|| {
+    // `HIPFIRE_DEEPSEEK4_GRAPH=0` / `kernel.deepseek4_graph = false`. Force on for
+    // older archs with `=1` / `true` (untested — beware kernarg-bake regressions).
+    let graph_on = gpu.flags.deepseek4_graph.unwrap_or_else(|| {
         let a = gpu.arch.as_str();
         a.starts_with("gfx11") || a.starts_with("gfx12")
     });

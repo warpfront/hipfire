@@ -1536,11 +1536,10 @@ fn mtp_verify_graph_eligible(
     if gpu.flags.graph_forward == Some(false) {
         return false;
     }
-    let verify_graph_env = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH").ok();
     if !crate::speculative::dflash_verify_graph_env_eligible(
         gpu.arch.as_str(),
         weights.output.gpu_dtype,
-        verify_graph_env.as_deref(),
+        gpu.flags.verify_graph,
     ) {
         return false;
     }

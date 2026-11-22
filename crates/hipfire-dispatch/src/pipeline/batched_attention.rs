@@ -2049,12 +2049,7 @@ pub fn batch_chunk_fa_attend(
             && kv_cache.tier_inputs().v_mode_bits == 8
             && kv_cache.uses_vmm_backend()
             && !gpu.flash_attn_ck_loaded()
-            && !matches!(
-                hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
-                    .ok()
-                    .as_deref(),
-                Some("0") | Some("off") | Some("false")
-            )
+            && gpu.flags.flash_prefill != Some(false)
             && ctx.workload == DispatchWorkload::Standard
             && config.n_heads == 24
             && config.n_kv_heads == 4

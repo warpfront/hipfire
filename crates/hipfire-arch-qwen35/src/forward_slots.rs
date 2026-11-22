@@ -107,9 +107,7 @@ use hipfire_dispatch::families::fused_qkv::{
     fused_gate_up_key_for, fused_qkv_key_for, fused_qkvza_key_for,
 };
 use hipfire_dispatch::families::gemm::residual_gemm_key_for;
-use hipfire_dispatch::families::moe::{
-    gated_moe_prefill_admissible, mq6_batched_admit_enabled_from_env,
-};
+use hipfire_dispatch::families::moe::{gated_moe_prefill_admissible, mq6_batched_admit_enabled};
 use hipfire_dispatch::pipeline::batched::{
     q8_prefill_wmma_enabled, run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key,
     run_plain_gemm_key, run_residual_gemm_key,
@@ -964,12 +962,7 @@ fn slots_residual_proj(
 /// (`prefill_batch_pbs_eligible`, qwen35.rs) via the same env-keyed helper.
 fn require_batchable_moe_ffn(gpu: &Gpu, ffn: &MoeFfnWeights) -> HipResult<()> {
     let arch = gpu.arch.as_str();
-    let admit_mq6 = mq6_batched_admit_enabled_from_env(
-        hipfire_config::developer_var("HIPFIRE_MOE_MQ6_ADMIT")
-            .ok()
-            .as_deref(),
-        arch,
-    );
+    let admit_mq6 = mq6_batched_admit_enabled(gpu.flags.moe_mq6_admit, arch);
     let dtypes = moe_prefill_dtypes(ffn).ok_or_else(|| {
         HipError::new(
             0,
@@ -2863,15 +2856,10 @@ fn q8_flash_prefill_wmma_eligible(gpu: &Gpu, head_dim: usize, batch_size: usize)
     if batch_size <= 1 {
         return false;
     }
-    let default_on = gpu.arch.starts_with("gfx11");
-    let flash_optin = match hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
-        .ok()
-        .as_deref()
-    {
-        Some("0") | Some("off") | Some("false") => false,
-        Some("1") | Some("on") | Some("true") => true,
-        _ => default_on,
-    };
+    let flash_optin = gpu
+        .flags
+        .flash_prefill
+        .unwrap_or(gpu.arch.starts_with("gfx11"));
     if !flash_optin {
         return false;
     }
