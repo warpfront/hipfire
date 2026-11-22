@@ -49,7 +49,57 @@ pub const DOWN_K_LOGICAL: usize = 1152;
 pub const DOWN_K_PADDED: usize = 1280;
 
 /// SWA sliding-window rows kept per SWA visit; full visits keep `max_seq`.
+/// SWA rows are a physical ring: past this many tokens the oldest row is
+/// evicted on write (slot `pos % rows`, true positions in `visit_pos_tags`).
 pub const SWA_WINDOW_ROWS: usize = 1024;
+
+/// Physical slot for `pos` in a ring of `rows` rows. Below the ring size
+/// this is the identity (`slot == pos`).
+pub fn swa_slot(pos: usize, rows: usize) -> usize {
+    pos % rows
+}
+
+/// Trailing window length held at `pos` in a ring of `rows` rows.
+pub fn swa_window_len(pos: usize, rows: usize) -> usize {
+    (pos + 1).min(rows)
+}
+
+/// Logical window at `pos`: per-row physical slots in oldest-to-newest order
+/// plus the relative-bias distances, both read from the position tags (the
+/// slot index no longer implies position once the ring wraps). Fails closed
+/// on a tag mismatch (out-of-order write) instead of mis-addressing keys.
+pub fn swa_gather_map(
+    tags: &[u32],
+    pos: usize,
+    rows: usize,
+) -> Result<(Vec<i32>, Vec<i32>), String> {
+    if rows == 0 {
+        return Err("inkling2: SWA ring has 0 rows".to_string());
+    }
+    if tags.len() != rows {
+        return Err(format!(
+            "inkling2: SWA tags len {} != rows {rows}",
+            tags.len()
+        ));
+    }
+    let n_kv = swa_window_len(pos, rows);
+    let start = pos + 1 - n_kv;
+    let mut slots = Vec::with_capacity(n_kv);
+    let mut dists = Vec::with_capacity(n_kv);
+    for k in 0..n_kv {
+        let key_pos = start + k;
+        let slot = swa_slot(key_pos, rows);
+        let tag = tags[slot] as usize;
+        if tag != key_pos {
+            return Err(format!(
+                "inkling2: SWA tag mismatch at slot {slot}: tag {tag} != key_pos {key_pos}"
+            ));
+        }
+        slots.push(slot as i32);
+        dists.push((pos - key_pos) as i32);
+    }
+    Ok((slots, dists))
+}
 
 /// Loader slack carried in the VRAM accounting (qwen35 precedent).
 pub const VRAM_SLACK_BYTES: u64 = 128 << 20;
@@ -675,6 +725,11 @@ pub struct Inkling2GpuState {
     pub visit_cap: Vec<usize>,
     /// Row budget per visit (full visits: max_seq, SWA: min(max_seq, 1024)).
     pub visit_rows: Vec<usize>,
+    /// True `key_pos` per physical KV row (host-side, zero VRAM). The slot
+    /// index no longer implies position once an SWA ring wraps, so the
+    /// relative-bias distance (`pos - key_pos`) is read from these tags.
+    /// Full visits maintain them too (tag == slot there); SWA visits wrap.
+    pub visit_pos_tags: Vec<Vec<u32>>,
     pub seq_pos: usize,
     pub max_seq: usize,
     pub kv_bytes: u64,
@@ -704,6 +759,7 @@ impl Inkling2GpuState {
         let mut conv = Vec::with_capacity(n_slot);
         let visit_cap = vec![0usize; n_slot];
         let mut visit_rows = Vec::with_capacity(n_slot);
+        let mut visit_pos_tags = Vec::with_capacity(n_slot);
         let mut kv_bytes = 0u64;
         let mut conv_bytes = 0u64;
         // Local cleanup on mid-alloc failure (weights have their own tx).
@@ -734,6 +790,7 @@ impl Inkling2GpuState {
                 max_seq.min(SWA_WINDOW_ROWS)
             };
             visit_rows.push(rows);
+            visit_pos_tags.push(vec![0u32; rows]);
             let mut k_row = Vec::with_capacity(n_kv);
             let mut v_row = Vec::with_capacity(n_kv);
             for _ in 0..n_kv {
@@ -789,6 +846,7 @@ impl Inkling2GpuState {
             conv,
             visit_cap,
             visit_rows,
+            visit_pos_tags,
             seq_pos: 0,
             max_seq,
             kv_bytes,
@@ -796,7 +854,7 @@ impl Inkling2GpuState {
         })
     }
 
-    /// Zero the 48 conv states, reset KV cursors and `seq_pos`. KV payloads
+    /// Zero the 48 conv states, reset KV cursors, tags and `seq_pos`. KV payloads
     /// are not zeroed: cursors gate every read, and brief 03 owns the
     /// write-before-read invariant.
     pub fn reset_session_state(&mut self, gpu: &mut Gpu) -> Result<(), String> {
@@ -806,6 +864,11 @@ impl Inkling2GpuState {
         }
         for c in self.visit_cap.iter_mut() {
             *c = 0;
+        }
+        for tags in self.visit_pos_tags.iter_mut() {
+            for t in tags.iter_mut() {
+                *t = 0;
+            }
         }
         self.seq_pos = 0;
         Ok(())
