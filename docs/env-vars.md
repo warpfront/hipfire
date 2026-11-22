@@ -1198,7 +1198,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1688
+**Count:** 1689
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1248,6 +1248,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_BASELINE_PROMPT_MODE` | scripts/baseline_quant_smoke.sh | harness |
 | `HIPFIRE_BASELINE_WIDE_MARGIN` | scripts/baseline_quant_smoke.sh | harness |
 | `HIPFIRE_BATCHED_HEAD_VERIFY` | crates/hipfire-arch-qwen35/src/forward_slots.rs | developer |
+| `HIPFIRE_BATCH_LANE_MODEL` | crates/hipfire-arch-qwen35/tests/batch_lane_prefill_hw.rs | harness |
 | `HIPFIRE_BENCH_AB` | benchmarks/scripts/bench_dflash_27b_gfx906.sh | harness |
 | `HIPFIRE_BENCH_BACKEND` | scripts/kernel-tune-loop.sh | harness |
 | `HIPFIRE_BENCH_MAX` | scripts/adaptive_b_bench.sh, scripts/qwen36_bench.sh | harness |

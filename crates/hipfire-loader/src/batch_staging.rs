@@ -176,13 +176,30 @@ pub fn stage_continuous_batch(
                                                     batch_lane_capacity
                                                 );
                             }
+                            // The lane seeds' GDN stream carry is provisioned here, so its
+                            // allocation failure falls back to sequential like the rest.
                             match hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchState::new(
                                 gpu,
                                 &config_clone,
                                 requested,
                                 batch_lane_capacity,
                                 repeat_cap,
-                            ) {
+                            )
+                            .and_then(|mut s| {
+                                let b = m.qwen35().unwrap();
+                                match hipfire_arch_qwen35::qwen35::provision_gdn_stream(
+                                    gpu,
+                                    &b.weights,
+                                    &b.config,
+                                    &mut s.dn_state,
+                                ) {
+                                    Ok(()) => Ok(s),
+                                    Err(e) => {
+                                        let _ = s.free_gpu(gpu);
+                                        Err(e)
+                                    }
+                                }
+                            }) {
                                 Ok(batch_state) => {
                                     m.qwen35_mut().unwrap().qwen35_decode_batch = Some(batch_state);
                                     out.slots = requested;
