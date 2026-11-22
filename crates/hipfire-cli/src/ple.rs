@@ -20,7 +20,7 @@ use hipfire_registry::{
     FLASH_NEXT_XTS_LEGACY_FILE, PLE_EXACT_FORMAT,
 };
 use hipfire_runtime::ple_convert::{self, DeriveReport, PleProgress, SplitReport};
-use hipfire_runtime::verified_cache::VerifiedCache;
+use hipfire_runtime::verified_cache::{StatKey, VerifiedCache};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -818,7 +818,9 @@ pub(crate) fn is_shared_slot(entry: &ModelEntry, key: &str, sidecar: &Sidecar) -
 /// is already the same file is left alone. A different one is replaced
 /// (atomically, through a temporary link) only when it is a dangling symlink or
 /// verifies against the same pin; any other file is somebody else's sidecar
-/// (e.g. a private `hipfire ple split` output) and is never touched.
+/// (e.g. a private `hipfire ple split` output) and is never touched. A
+/// hard-linked alias (the inode of the verified `canonical`) then gets its own
+/// proof record ([`record_alias_proof`]): proof lookups key the path they open.
 fn install_shared_alias(
     cache: &VerifiedCache,
     canonical: &Path,
@@ -829,7 +831,7 @@ fn install_shared_alias(
     match fs::symlink_metadata(alias) {
         Ok(link) => {
             if crate::same_installed_file(alias, canonical) {
-                return Ok(());
+                return record_alias_proof(cache, canonical, alias, sidecar);
             }
             let dangling = link.file_type().is_symlink() && fs::metadata(alias).is_err();
             if !dangling
@@ -880,6 +882,33 @@ fn install_shared_alias(
         alias.display(),
         canonical.display()
     );
+    record_alias_proof(cache, canonical, alias, sidecar)
+}
+
+/// Record `alias`'s proof as the pin of the verified shared file `canonical`, but only
+/// when `alias` is a hard link to that same inode (a symlink resolves to `canonical`,
+/// which already has its record) and `canonical`'s record still proves the pin at its
+/// current stat. Nothing is hashed, and a file that is not that inode is never recorded.
+fn record_alias_proof(
+    cache: &VerifiedCache,
+    canonical: &Path,
+    alias: &Path,
+    sidecar: &Sidecar,
+) -> Result<()> {
+    let Some(pin) = sidecar.sha256.as_deref() else {
+        return Ok(());
+    };
+    let link =
+        fs::symlink_metadata(alias).with_context(|| format!("inspecting {}", alias.display()))?;
+    if link.file_type().is_symlink() {
+        return Ok(());
+    }
+    let target =
+        fs::metadata(canonical).with_context(|| format!("inspecting {}", canonical.display()))?;
+    let stat = StatKey::of(&target);
+    if StatKey::of(&link) == stat && cache.satisfies(canonical, &stat, pin) {
+        cache.remember(alias, stat, pin);
+    }
     Ok(())
 }
 
@@ -2133,5 +2162,67 @@ mod tests {
         assert_eq!(selection(&["--ple", "all"]), Some(PleSelection::All));
         assert_eq!(selection(&["--ple", "none"]), Some(PleSelection::Skip));
         assert!(Cli::try_parse_from(["hipfire", "pull", "m", "--ple", "q5"]).is_err());
+    }
+
+    /// `hipfire pull`'s PLE step over a verified shared rows file: the base-named
+    /// alias it hard-links gets a proof record (so proof-requiring checks accept
+    /// `<base>.ple-q4`), and an unrelated pre-existing file at that path is refused
+    /// and never recorded.
+    #[cfg(unix)]
+    #[test]
+    fn pull_records_the_proof_of_the_hard_linked_shared_alias_only() {
+        use sha2::{Digest, Sha256};
+        let root =
+            std::env::temp_dir().join(format!("hipfire-ple-alias-proof-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let models = root.join("models");
+        fs::create_dir_all(&models).unwrap();
+        let cache = VerifiedCache::in_home(&root);
+        let rows = b"synthetic shared q4 rows";
+        let shared = Sidecar {
+            file: "qwen3.8-flash-next.ple-q4".into(),
+            sha256: Some(format!("{:x}", Sha256::digest(rows))),
+            size_bytes: Some(rows.len() as u64),
+        };
+        let mut entry = split_entry(false, false);
+        entry.ple.insert("q4".into(), shared.clone());
+        let base = models.join(&entry.file);
+        let canonical = models.join(&shared.file);
+        let alias = ple_sidecar_path(&base, PleFormat::Q4);
+        fs::write(&canonical, rows).unwrap();
+        let proof =
+            |path: &Path| cache.verified_digest(path, &StatKey::of(&fs::metadata(path).unwrap()));
+        let pull = || {
+            fetch_ple_sidecar(
+                &cache,
+                &entry,
+                PleFormat::Q4,
+                &shared,
+                &models,
+                &base,
+                false,
+            )
+        };
+
+        // An unrelated file already at the alias is refused and gets no record.
+        fs::write(&alias, b"private split output").unwrap();
+        assert!(pull().is_err());
+        assert_eq!(fs::read(&alias).unwrap(), b"private split output");
+        assert_eq!(proof(&alias), None);
+
+        // Without it, the pull verifies the shared rows, hard-links the alias and
+        // records both; a later pull over the linked alias keeps that proof.
+        fs::remove_file(&alias).unwrap();
+        pull().unwrap();
+        assert!(crate::same_installed_file(&alias, &canonical));
+        assert_eq!(proof(&canonical).as_deref(), shared.sha256.as_deref());
+        assert!(!fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(proof(&alias).as_deref(), shared.sha256.as_deref());
+        pull().unwrap();
+        assert_eq!(proof(&alias).as_deref(), shared.sha256.as_deref());
+        let _ = fs::remove_dir_all(&root);
     }
 }
