@@ -144,7 +144,7 @@ jobs:
         run: |
           set -euo pipefail
           git diff --name-only "${{ steps.pr.outputs.base_sha }}...${{ steps.pr.outputs.head_sha }}" \
-            | python3 scripts/hw-gate/select.py --pr-body pr-body.md --github-output "$GITHUB_OUTPUT" --json select.json
+            | python3 scripts/hw-gate/bucket_select.py --pr-body pr-body.md --github-output "$GITHUB_OUTPUT" --json select.json
           cat select.json
       - uses: actions/upload-artifact@v4
         with:

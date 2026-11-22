@@ -10,11 +10,11 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-SELECT_PY = Path(__file__).resolve().parents[1] / "select.py"
+SELECT_PY = Path(__file__).resolve().parents[1] / "bucket_select.py"
 
 
 def run_select(stdin_text: str, *extra_args: str) -> subprocess.CompletedProcess:
-    """Run select.py with stdin_text piped to stdin, return CompletedProcess."""
+    """Run bucket_select.py with stdin_text piped to stdin, return CompletedProcess."""
     cmd = [sys.executable, str(SELECT_PY), *extra_args]
     return subprocess.run(
         cmd,
