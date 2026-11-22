@@ -3664,15 +3664,231 @@ pub fn prefill_trunk_and_mtp_cache_parts<F>(
     start_pos: usize,
     route: MtpPromptRoute,
     turn_boundary: Option<usize>,
-    mut on_committed_boundary: F,
+    on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
+where
+    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize, bool) -> HipResult<()>,
+{
+    prefill_trunk_and_mtp_cache_parts_impl(
+        gpu,
+        target,
+        head,
+        state,
+        prompt_tokens,
+        start_pos,
+        route,
+        turn_boundary,
+        false,
+        on_committed_boundary,
+    )
+    .map(|(timings, pending)| {
+        debug_assert!(pending.is_none(), "eager prefill never leaves fill debt");
+        timings
+    })
+}
+
+/// Head-fill debt left by a deferring prefill: the LAST ordinary outer chunk's
+/// fill (and nothing else). It owns the capture window (rows `0..=len` of the
+/// pairing buffer: row `i` is the partner of tail token `i`), the fill scratch
+/// and the tail tokens, so completing it later runs exactly the slices the eager
+/// path would have run (same grid, kernels and rows). Trunk state and logits
+/// are final when this exists; head KV is valid only up to the last completed
+/// fill. It must be completed or discarded before any head proposal, rewind,
+/// reset or unload (the drafter enforces that).
+pub struct PendingMtpFill {
+    prompt_hidden: GpuTensor,
+    scratch: Option<Qwen35MtpHeadBatchedScratch>,
+    rot: Option<GpuTensor>,
+    tokens: Vec<u32>,
+    /// Offset of the tail inside the fill (origin of the slice grid).
+    off: usize,
+    start_pos: usize,
+    head_rows: usize,
+}
+
+impl PendingMtpFill {
+    /// Rows of head fill still owed.
+    pub fn rows(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Exclusive end position of the committed prefix once this fill lands.
+    pub fn committed_pos(&self) -> usize {
+        self.start_pos + self.off + self.tokens.len()
+    }
+
+    /// Run the owed fill, wait for it, release the window and scratch. Returns
+    /// the fill's wall seconds. The resources are released on error too.
+    pub fn complete(
+        mut self,
+        gpu: &mut Gpu,
+        head: &Qwen35MtpHead,
+        state: &mut MtpSpecState,
+        weights: &Qwen35Weights,
+    ) -> HipResult<f64> {
+        let t = Instant::now();
+        let result = mtp_fill_chunk(
+            gpu,
+            head,
+            state,
+            weights,
+            self.scratch.as_mut(),
+            self.rot.as_ref(),
+            &self.prompt_hidden,
+            &self.tokens,
+            self.off,
+            self.start_pos,
+            self.head_rows,
+        )
+        .and_then(|()| gpu.hip.device_synchronize());
+        self.release(gpu);
+        result.map(|()| t.elapsed().as_secs_f64())
+    }
+
+    /// Drop the debt without filling (reset / unload / failure path).
+    pub fn discard(self, gpu: &mut Gpu) {
+        let _ = gpu.hip.device_synchronize();
+        self.release(gpu);
+    }
+
+    fn release(self, gpu: &mut Gpu) {
+        if let Some(rot) = self.rot {
+            let _ = gpu.free_tensor(rot);
+        }
+        if let Some(scratch) = self.scratch {
+            scratch.free_gpu(gpu);
+        }
+        let _ = gpu.free_tensor(self.prompt_hidden);
+    }
+}
+
+/// The head fill of one outer trunk chunk, shared by the eager path and
+/// [`PendingMtpFill::complete`] so both run the identical slices. `hidden` is
+/// the pairing window (row `i` pairs `chunk[i]`), `chunk_off` the chunk's
+/// offset inside the fill (slices end on multiples of `head_rows` from the
+/// fill start, independent of the trunk chunk boundaries).
+#[allow(clippy::too_many_arguments)]
+fn mtp_fill_chunk(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    weights: &Qwen35Weights,
+    scratch: Option<&mut Qwen35MtpHeadBatchedScratch>,
+    rot: Option<&GpuTensor>,
+    hidden: &GpuTensor,
+    chunk: &[u32],
+    chunk_off: usize,
+    start_pos: usize,
+    head_rows: usize,
+) -> HipResult<()> {
+    let dim = head.config.n_embd;
+    let end = chunk_off + chunk.len();
+    if let (Some(scratch), Some(rot)) = (scratch, rot) {
+        let mut slice_off = chunk_off;
+        while slice_off < end {
+            let slice_end = ((slice_off / head_rows + 1) * head_rows).min(end);
+            let slice = &chunk[slice_off - chunk_off..slice_end - chunk_off];
+            let slice_hidden = hidden.sub_offset((slice_off - chunk_off) * dim, slice.len() * dim);
+            let positions: Vec<i32> = (start_pos + slice_off..start_pos + slice_end)
+                .map(|position| position as i32)
+                .collect();
+            mtp_head::mtp_head_forward_block_batched(
+                gpu,
+                head,
+                scratch,
+                &mut state.mtp_kv,
+                slice,
+                &slice_hidden,
+                &positions,
+                slice.len(),
+                weights,
+                Some(rot),
+                true,
+            )?;
+            slice_off = slice_end;
+        }
+    } else {
+        for (i, &token) in chunk.iter().enumerate() {
+            let hidden_row = hidden.sub_offset(i * dim, dim);
+            mtp_head::mtp_head_forward_block_only(
+                gpu,
+                head,
+                &state.mtp_scratch,
+                &mut state.mtp_kv,
+                token,
+                &hidden_row,
+                None,
+                start_pos + chunk_off + i,
+                weights,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// [`prefill_trunk_and_mtp_cache_with_boundary`] that leaves the LAST outer
+/// chunk's head fill owed ([`PendingMtpFill`]) so the caller can return the
+/// trunk's first token first. The committed-boundary callback still runs at
+/// the final boundary (the DeltaNet snapshot must be taken before the single
+/// seal), so a checkpoint at the prompt end can exist while its head fill is
+/// owed; the drafter withholds every consumer until the debt is settled.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_trunk_and_mtp_cache_with_boundary_deferred<F>(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    prompt_tokens: &[u32],
+    start_pos: usize,
+    route: MtpPromptRoute,
+    turn_boundary: Option<usize>,
+    defer_tail: bool,
+    on_committed_boundary: F,
+) -> HipResult<(TrunkSpinePrefillTimings, Option<PendingMtpFill>)>
+where
+    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize, bool) -> HipResult<()>,
+{
+    let mut parts = MtpPrefillTarget {
+        weights: &target.weights,
+        config: &target.config,
+        kv_cache: &mut target.kv_cache,
+        dn_state: &mut target.dn_state,
+        scratch: &target.scratch,
+    };
+    prefill_trunk_and_mtp_cache_parts_impl(
+        gpu,
+        &mut parts,
+        head,
+        state,
+        prompt_tokens,
+        start_pos,
+        route,
+        turn_boundary,
+        defer_tail,
+        on_committed_boundary,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefill_trunk_and_mtp_cache_parts_impl<F>(
+    gpu: &mut Gpu,
+    target: &mut MtpPrefillTarget<'_>,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    prompt_tokens: &[u32],
+    start_pos: usize,
+    route: MtpPromptRoute,
+    turn_boundary: Option<usize>,
+    defer_tail: bool,
+    mut on_committed_boundary: F,
+) -> HipResult<(TrunkSpinePrefillTimings, Option<PendingMtpFill>)>
 where
     F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize, bool) -> HipResult<()>,
 {
     let Some(head_rows) =
         mtp_prompt_fill_scratch_rows(prompt_tokens.len(), qwen35::prefill_max_batch(gpu))
     else {
-        return Ok(TrunkSpinePrefillTimings::default());
+        return Ok((TrunkSpinePrefillTimings::default(), None));
     };
     // Trunk outer-chunk ceiling. ArRoute copies AR's serve prefill caller
     // (`hipfire-generate` `ar.rs`, no-eviction branch) and queries it before
@@ -3798,6 +4014,7 @@ where
         None
     };
 
+    let mut deferred_tail: Option<(usize, usize)> = None;
     let result = (|| -> HipResult<TrunkSpinePrefillTimings> {
         let mut trunk_prefill_secs = 0.0f64;
         let mut mtp_prompt_fill_secs = 0.0f64;
@@ -3877,73 +4094,49 @@ where
             }
             trunk_prefill_secs += t_trunk.elapsed().as_secs_f64();
 
-            let t_mtp_fill = Instant::now();
-            if let (Some(scratch), Some(rot)) =
-                (mtp_prefill_scratch.as_mut(), mtp_prefill_rot.as_ref())
-            {
-                // Slices end on multiples of `head_rows` from the fill start,
-                // independent of the trunk chunk boundaries.
-                let mut slice_off = off;
-                while slice_off < end {
-                    let slice_end = ((slice_off / head_rows + 1) * head_rows).min(end);
-                    let slice = &prompt_tokens[slice_off..slice_end];
-                    let slice_hidden =
-                        prompt_hidden.sub_offset((slice_off - off) * dim, slice.len() * dim);
-                    let positions: Vec<i32> = (start_pos + slice_off..start_pos + slice_end)
-                        .map(|position| position as i32)
-                        .collect();
-                    mtp_head::mtp_head_forward_block_batched(
-                        gpu,
-                        head,
-                        scratch,
-                        &mut state.mtp_kv,
-                        slice,
-                        &slice_hidden,
-                        &positions,
-                        slice.len(),
-                        &target.weights,
-                        Some(rot),
-                        true,
-                    )?;
-                    slice_off = slice_end;
-                }
+            // The last outer chunk's head fill is the only debt a deferring
+            // caller leaves ([`PendingMtpFill`]); every earlier chunk fills
+            // exactly as before, on the same slice grid. The tail's window
+            // (rows 0..=len) must stay intact, so its carry-to-row-0 is skipped.
+            if defer_tail && end == prompt_tokens.len() {
+                deferred_tail = Some((off, chunk.len()));
             } else {
-                for (i, &token) in chunk.iter().enumerate() {
-                    let hidden_row = prompt_hidden.sub_offset(i * dim, dim);
-                    mtp_head::mtp_head_forward_block_only(
-                        gpu,
-                        head,
-                        &state.mtp_scratch,
-                        &mut state.mtp_kv,
-                        token,
-                        &hidden_row,
-                        None,
-                        chunk_start_pos + i,
-                        &target.weights,
-                    )?;
+                let t_mtp_fill = Instant::now();
+                mtp_fill_chunk(
+                    gpu,
+                    head,
+                    state,
+                    target.weights,
+                    mtp_prefill_scratch.as_mut(),
+                    mtp_prefill_rot.as_ref(),
+                    &prompt_hidden,
+                    chunk,
+                    off,
+                    start_pos,
+                    head_rows,
+                )?;
+                mtp_prompt_fill_secs += t_mtp_fill.elapsed().as_secs_f64();
+                // Carry the chunk's last hidden (row `chunk.len()`) to row 0: it
+                // partners the next chunk's first token and, after the last
+                // chunk, seeds `prev_hidden`. Ordered after the fill on the
+                // active stream when there is one.
+                match gpu.active_stream.as_ref() {
+                    Some(stream) => gpu.hip.memcpy_dtod_async_at(
+                        &prompt_hidden.buf,
+                        0,
+                        &prompt_hidden.buf,
+                        chunk.len() * dim_bytes,
+                        dim_bytes,
+                        stream,
+                    )?,
+                    None => gpu.hip.memcpy_dtod_at(
+                        &prompt_hidden.buf,
+                        0,
+                        &prompt_hidden.buf,
+                        chunk.len() * dim_bytes,
+                        dim_bytes,
+                    )?,
                 }
-            }
-            mtp_prompt_fill_secs += t_mtp_fill.elapsed().as_secs_f64();
-            // Carry the chunk's last hidden (row `chunk.len()`) to row 0: it
-            // partners the next chunk's first token and, after the last
-            // chunk, seeds `prev_hidden`. Ordered after the fill on the
-            // active stream when there is one.
-            match gpu.active_stream.as_ref() {
-                Some(stream) => gpu.hip.memcpy_dtod_async_at(
-                    &prompt_hidden.buf,
-                    0,
-                    &prompt_hidden.buf,
-                    chunk.len() * dim_bytes,
-                    dim_bytes,
-                    stream,
-                )?,
-                None => gpu.hip.memcpy_dtod_at(
-                    &prompt_hidden.buf,
-                    0,
-                    &prompt_hidden.buf,
-                    chunk.len() * dim_bytes,
-                    dim_bytes,
-                )?,
             }
 
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
@@ -3964,9 +4157,20 @@ where
             .dn_state
             .seal_streams(gpu, start_pos + prompt_tokens.len())?;
 
+        // `prev_hidden` = hidden of the last prompt position. Eager: the carry
+        // above left it in row 0. Deferred tail: the window is untouched (the
+        // retained fill still needs row 0 as its first partner), so read row
+        // `len` directly. Either way it is set before the capture window can
+        // be released, and `prev_hidden_pos` is the trunk's, not the head's.
+        let src_row = deferred_tail.map_or(0, |(_, len)| len);
         let last = prompt_tokens.len() - 1;
-        gpu.hip
-            .memcpy_dtod_at(&state.prev_hidden.buf, 0, &prompt_hidden.buf, 0, dim_bytes)?;
+        gpu.hip.memcpy_dtod_at(
+            &state.prev_hidden.buf,
+            0,
+            &prompt_hidden.buf,
+            src_row * dim_bytes,
+            dim_bytes,
+        )?;
         state.prev_hidden_pos = Some(start_pos + last);
         Ok(TrunkSpinePrefillTimings {
             trunk_prefill_secs,
@@ -3974,6 +4178,20 @@ where
         })
     })();
 
+    if let (Ok(timings), Some((tail_off, tail_len))) = (&result, deferred_tail) {
+        // Hand the retained window, the fill scratch and the tail tokens to the
+        // caller; nothing is freed here.
+        let pending = PendingMtpFill {
+            prompt_hidden,
+            scratch: mtp_prefill_scratch,
+            rot: mtp_prefill_rot,
+            tokens: prompt_tokens[tail_off..tail_off + tail_len].to_vec(),
+            off: tail_off,
+            start_pos,
+            head_rows,
+        };
+        return Ok((*timings, Some(pending)));
+    }
     if let Some(rot) = mtp_prefill_rot {
         let _ = gpu.free_tensor(rot);
     }
@@ -3981,7 +4199,7 @@ where
         scratch.free_gpu(gpu);
     }
     let _ = gpu.free_tensor(prompt_hidden);
-    result
+    result.map(|timings| (timings, None))
 }
 
 /// Explicit DS4-shaped Qwen MTP spec step.

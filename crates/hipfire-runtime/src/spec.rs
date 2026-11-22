@@ -839,6 +839,25 @@ pub trait Speculator {
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String>;
 
+    /// Opt the NEXT [`Self::prefill`] into a two-stage transaction: the first
+    /// token and all trunk state are final when it returns, while a bounded
+    /// tail of drafter-private prompt work may stay owed until
+    /// [`Self::finish_prefill`]. One-shot (consumed by that prefill). Callers
+    /// that never opt in keep the original contract: `prefill` returns with
+    /// nothing owed. Default: no-op.
+    fn defer_prefill_tail(&mut self, _on: bool) {}
+
+    /// Settle the work a deferring [`Self::prefill`] left owed. Idempotent;
+    /// default `Ok(())` (nothing owed). Call it as soon as the first token's
+    /// bytes are on the wire and before any further use of the speculator.
+    fn finish_prefill(
+        &mut self,
+        _gpu: &mut Gpu,
+        _target: &mut dyn SpecTarget,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Whether this speculator's verify is distribution-correct at temp>0 (so the
     /// daemon may route temp>0 requests through it for the spec speedup). Default
     /// `false` — greedy-only drafters keep temp>0 on the AR sampler, and a
@@ -1659,6 +1678,23 @@ pub trait MtpDrafter {
         self.mtp_reset(gpu)
     }
 
+    /// Opt the NEXT [`Self::mtp_prefill`] into leaving its last outer chunk's
+    /// head fill owed (see [`Self::mtp_finish_prefill`]). One-shot: consumed by
+    /// that prefill. Default: no debt is ever left.
+    fn mtp_defer_prefill_tail(&mut self, _on: bool) {}
+
+    /// Settle fill debt a deferring [`Self::mtp_prefill`] left. Idempotent; a
+    /// no-op when there is none. Every drafter entry that reads or writes head
+    /// state settles (or, for reset/free, discards) the debt itself, so a caller
+    /// that never calls this cannot observe an incomplete head.
+    fn mtp_finish_prefill(
+        &mut self,
+        _gpu: &mut Gpu,
+        _target: &mut dyn SpecTarget,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Release all GPU buffers the drafter owns.
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu);
 
@@ -1801,6 +1837,14 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
             cache_hit,
             abort,
         )
+    }
+
+    fn defer_prefill_tail(&mut self, on: bool) {
+        self.arch.mtp_defer_prefill_tail(on);
+    }
+
+    fn finish_prefill(&mut self, gpu: &mut Gpu, target: &mut dyn SpecTarget) -> Result<(), String> {
+        self.arch.mtp_finish_prefill(gpu, target)
     }
 
     fn step(

@@ -15,10 +15,10 @@
 
 use crate::mtp_head::{MtpKvMode, Qwen35MtpHead};
 use crate::mtp_spec::{
-    prefill_trunk_and_mtp_cache, prefill_trunk_and_mtp_cache_with_boundary, sample_from_logits,
-    spec_step_mtp_compressed_serial_with_k,
+    prefill_trunk_and_mtp_cache, prefill_trunk_and_mtp_cache_with_boundary_deferred,
+    sample_from_logits, spec_step_mtp_compressed_serial_with_k,
     spec_step_mtp_compressed_serial_with_takeover_candidates, MtpPromptRoute, MtpSamplingConfig,
-    MtpSpecResult, MtpSpecState, PENALTY_REPEAT_CAP,
+    MtpSpecResult, MtpSpecState, PendingMtpFill, PENALTY_REPEAT_CAP,
 };
 use crate::speculative::{
     take_dn_boundary_checkpoint, take_turn_checkpoint, DeltaNetSnapshot, ModelSlot, TurnCheckpoint,
@@ -80,6 +80,13 @@ pub fn mtp_requested_k(spec: &hipfire_runtime::loader_api::SpecLoadCfg) -> usize
         .clamp(1, 10)
 }
 
+/// Head fill a deferring prefill left owed, and whether that prefill added a
+/// prompt-end checkpoint to the ring (which the owed fill guards).
+struct OwedFill {
+    fill: PendingMtpFill,
+    ring_added: bool,
+}
+
 /// qwen35 MTP drafter. `state` is allocated on the first `mtp_prefill` (it needs
 /// `&mut Gpu` + the concrete `ModelSlot`, neither available at load-time
 /// construction). Sampling is installed once per request via
@@ -128,6 +135,10 @@ pub struct Qwen35MtpDrafter {
     /// Trunk route for prompt fill, forced advance and terminal-repair replay,
     /// resolved once at construction from [`hipfire_config::mtp_own_prefill`].
     prompt_route: MtpPromptRoute,
+    /// One-shot opt-in of the next prefill to leave its tail fill owed.
+    defer_prefill_tail: bool,
+    /// Head fill the last deferring prefill left owed (see [`OwedFill`]).
+    owed_fill: Option<OwedFill>,
 }
 
 impl Qwen35MtpDrafter {
@@ -165,6 +176,8 @@ impl Qwen35MtpDrafter {
             turn_boundary: None,
             pinned_boundary: None,
             prompt_route,
+            defer_prefill_tail: false,
+            owed_fill: None,
         }
     }
     /// Borrow the live MTP spec state (`None` before the first `mtp_prefill`
@@ -425,6 +438,76 @@ impl Qwen35MtpDrafter {
             snapshot.free_gpu(gpu);
         }
     }
+
+    /// Head-fill rows a deferring prefill still owes (0 when settled).
+    /// Attestation hook for the deferred-tail oracle and the daemon's
+    /// "no debt at a request terminal" invariant.
+    pub fn owed_fill_rows(&self) -> usize {
+        self.owed_fill.as_ref().map_or(0, |owed| owed.fill.rows())
+    }
+
+    /// Checkpoint position the owed fill withholds, if its prompt-end snapshot
+    /// was taken by the deferring prefill.
+    fn withheld_checkpoint(&self) -> Option<usize> {
+        self.owed_fill
+            .as_ref()
+            .filter(|owed| owed.ring_added)
+            .map(|owed| owed.fill.committed_pos())
+    }
+
+    /// Drop the ring entry the deferring prefill added at the prompt end.
+    fn drop_owed_checkpoint(&mut self, gpu: &mut Gpu, position: usize) {
+        if let Some(index) = self.checkpoints.iter().rposition(|(p, _)| *p == position) {
+            let (_, snapshot) = self.checkpoints.remove(index);
+            snapshot.free_gpu(gpu);
+        }
+    }
+
+    /// Discard owed head fill without running it (new cold prefill, reset,
+    /// unload, abort, failure): the prompt-end checkpoint it guarded goes too.
+    fn discard_owed_fill(&mut self, gpu: &mut Gpu) {
+        if let Some(owed) = self.owed_fill.take() {
+            let position = owed.fill.committed_pos();
+            let ring_added = owed.ring_added;
+            owed.fill.discard(gpu);
+            if ring_added {
+                self.drop_owed_checkpoint(gpu, position);
+            }
+        }
+    }
+
+    /// Run owed head fill (idempotent). On failure the debt and the checkpoint
+    /// it guarded are dropped and the error returned; the caller fails closed.
+    fn settle_owed_fill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+    ) -> Result<(), String> {
+        if self.owed_fill.is_none() {
+            return Ok(());
+        }
+        let slot = match Self::slot(target) {
+            Ok(slot) => slot,
+            Err(error) => {
+                self.discard_owed_fill(gpu);
+                return Err(error);
+            }
+        };
+        let Some(state) = self.state.as_mut() else {
+            self.discard_owed_fill(gpu);
+            return Err("qwen35 MTP: owed prompt fill without drafter state".into());
+        };
+        let owed = self.owed_fill.take().expect("checked above");
+        let position = owed.fill.committed_pos();
+        let ring_added = owed.ring_added;
+        if let Err(error) = owed.fill.complete(gpu, &self.head, state, &slot.weights) {
+            if ring_added {
+                self.drop_owed_checkpoint(gpu, position);
+            }
+            return Err(format!("qwen35 MTP deferred prompt fill: {error}"));
+        }
+        Ok(())
+    }
 }
 
 impl MtpDrafter for Qwen35MtpDrafter {
@@ -438,6 +521,14 @@ impl MtpDrafter for Qwen35MtpDrafter {
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
+        // A new prefill supersedes any owed fill of a dead request (cold), or
+        // continues the trunk state it belongs to (warm): settle first.
+        if cache_hit {
+            self.settle_owed_fill(gpu, target)?;
+        } else {
+            self.discard_owed_fill(gpu);
+        }
+        let defer_tail = std::mem::take(&mut self.defer_prefill_tail);
         self.last_window = None;
         if abort() {
             return Ok(PrefillOutcome::Aborted);
@@ -483,7 +574,9 @@ impl MtpDrafter for Qwen35MtpDrafter {
             boundary: self.turn_boundary.take(),
             pin: self.pinned_boundary,
         };
-        let prefill = prefill_trunk_and_mtp_cache_with_boundary(
+        let end_pos = start_pos + fill_tokens.len();
+        let ring_had_end = checkpoints.iter().any(|(position, _)| *position == end_pos);
+        let prefill = prefill_trunk_and_mtp_cache_with_boundary_deferred(
             gpu,
             slot,
             &self.head,
@@ -492,6 +585,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
             start_pos,
             prompt_route,
             turn.boundary,
+            defer_tail,
             |gpu, dn_state, kv, position, at_turn| {
                 // The ring covers prompt rows only: `[0..position]` of the
                 // canonical prompt this request resumed or cold-seeded.
@@ -527,8 +621,17 @@ impl MtpDrafter for Qwen35MtpDrafter {
         );
         self.checkpoints = checkpoints;
         self.pinned_boundary = turn.pin;
-        prefill.map_err(|e| format!("mtp prefill: {e}"))?;
+        let (_timings, owed) = prefill.map_err(|e| format!("mtp prefill: {e}"))?;
+        if let Some(fill) = owed {
+            let ring_added = !ring_had_end
+                && self
+                    .checkpoints
+                    .iter()
+                    .any(|(position, _)| *position == fill.committed_pos());
+            self.owed_fill = Some(OwedFill { fill, ring_added });
+        }
         if abort() {
+            self.discard_owed_fill(gpu);
             return Ok(PrefillOutcome::Aborted);
         }
 
@@ -570,6 +673,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
         eos: u32,
         _grammar: Option<&mut dyn SpecGrammar>,
     ) -> Result<MtpWindow, String> {
+        self.settle_owed_fill(gpu, target)?;
         // qwen35 enforces tool-call grammar post-hoc in the emission layer; the
         // in-step grammar handle is unused here. `k` is the per-call budget from
         // MtpSpeculator (already clamped by remaining max_emit); the fixed-window
@@ -708,6 +812,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
         start_pos: usize,
         abort: &dyn Fn() -> bool,
     ) -> Result<bool, String> {
+        self.settle_owed_fill(gpu, target)?;
         self.last_window = None;
         // Forced tokens must land in BOTH the trunk and the MTP head KV /
         // prev_hidden. Plain spec_advance only moves trunk state, leaving an
@@ -740,6 +845,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
         window_seed: u32,
         consumed: &[u32],
     ) -> Result<bool, String> {
+        self.settle_owed_fill(gpu, target)?;
         let Some((saved_start, saved_seed)) = self.last_window.take() else {
             return Ok(false);
         };
@@ -785,6 +891,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
     }
 
     fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.discard_owed_fill(gpu);
         self.last_window = None;
         self.tp_reset_pending = self.tp.is_some();
         self.stats = MtpRequestStats::default();
@@ -801,6 +908,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
     }
 
     fn mtp_reset_for_realign(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.discard_owed_fill(gpu);
         self.last_window = None;
         self.tp_reset_pending = self.tp.is_some();
         self.clear_checkpoints(gpu);
@@ -816,16 +924,35 @@ impl MtpDrafter for Qwen35MtpDrafter {
         self.turn_boundary = boundary;
     }
 
+    fn mtp_defer_prefill_tail(&mut self, on: bool) {
+        self.defer_prefill_tail = on;
+    }
+
+    fn mtp_finish_prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+    ) -> Result<(), String> {
+        self.settle_owed_fill(gpu, target)
+    }
+
+    // While head fill is owed, a checkpoint at the prompt end exists in the ring
+    // (its DeltaNet snapshot had to precede the seal) but must not be advertised:
+    // its head frontier is not valid until the fill lands.
     fn mtp_checkpoint_positions(&self) -> Vec<usize> {
+        let withheld = self.withheld_checkpoint();
         self.checkpoints
             .iter()
             .map(|(position, _)| *position)
+            .filter(|position| Some(*position) != withheld)
             .collect()
     }
 
     fn mtp_checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        let withheld = self.withheld_checkpoint();
         self.checkpoints
             .iter()
+            .filter(|(position, _)| Some(*position) != withheld)
             .map(|(position, snapshot)| (*position, snapshot.prefix_hash))
             .collect()
     }
@@ -836,6 +963,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
         target: &mut dyn SpecTarget,
         position: usize,
     ) -> Result<usize, String> {
+        self.settle_owed_fill(gpu, target)?;
         self.last_window = None;
         let Some(index) = self
             .checkpoints
@@ -859,6 +987,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
         let mut this = *self;
+        this.discard_owed_fill(gpu);
         if this.tp.is_some() {
             // The per-rank verify scratch is unreachable from one `Gpu`; a
             // mesh drafter must go through `mtp_free_multi`, so say so loudly
@@ -885,6 +1014,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
         }
         if let Some(dev) = gpus.devices.first_mut() {
             let _ = dev.bind_thread();
+            this.discard_owed_fill(dev);
             this.clear_checkpoints(dev);
             if let Some(state) = this.state {
                 state.free_gpu(dev);

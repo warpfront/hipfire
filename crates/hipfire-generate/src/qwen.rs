@@ -5624,6 +5624,12 @@ pub fn generate_spec(
     // Prompt phase: the speculators' prompt-prefill chunk loops report
     // `prefill_progress` only here, never from the mid-request realign,
     // forced-advance or repair re-prefills below.
+    // Two-stage prefill (MTP): the speculator may leave the last outer chunk's
+    // head fill owed so the first token returns first; settled right after its
+    // bytes are flushed below. Opt-in per call; a pipeline mesh keeps its own.
+    if pp.is_none() {
+        spec.defer_prefill_tail(true);
+    }
     let prefill_outcome = {
         let _prompt_phase = hipfire_runtime::prefill_progress::prompt_phase();
         spec_prefill(
@@ -5640,6 +5646,10 @@ pub fn generate_spec(
             &|| check_abort(&id_for_abort),
         )
     };
+    if pp.is_none() {
+        // One-shot: never leak the opt-in into a later (realign) prefill.
+        spec.defer_prefill_tail(false);
+    }
     let first_token = match classify_spec_prefill(prefill_outcome) {
         Ok(first_token) => first_token,
         Err(terminal) => {
@@ -5846,6 +5856,30 @@ pub fn generate_spec(
         false,
         token_logprob(spec.as_ref(), 0, first_token).as_ref(),
     );
+    // Head prompt fill the speculator left owed behind this first token
+    // (`Speculator::defer_prefill_tail`): the token's bytes are on the wire
+    // (flushed) before the work runs, and it runs before anything forced or
+    // any window, so EOS-first, max_tokens=1 and suppressed first events cannot
+    // skip it. A failure here is after an emitted token: fail closed.
+    if pp.is_none() {
+        let _ = stdout.flush();
+        if let Err(msg) = spec.finish_prefill(gpu, slot) {
+            let ep = spec_rollback_live(
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                gpu,
+                pp.as_deref_mut(),
+                slot,
+                spec.as_mut(),
+            );
+            emit_fail_closed_error(stdout, Some(id), &msg, "gpu", true, &ep);
+            drop(guard);
+            return None;
+        }
+    }
 
     // Count/bake the first token only when the emitter emitted it (same guard
     // as the accept loop). qwen35 always emits a `Committed`; the ds4 emitter
