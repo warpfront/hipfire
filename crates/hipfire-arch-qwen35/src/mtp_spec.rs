@@ -3416,10 +3416,36 @@ pub fn mtp_request_bytes(
     fills_batched: bool,
     requested_k: usize,
 ) -> Result<usize, String> {
+    mtp_request_bytes_for(
+        &gpu.arch,
+        crate::qwen35::prefill_max_batch(gpu),
+        config,
+        trunk_snapshot_bytes,
+        head_config,
+        compressed_vocab,
+        fills_batched,
+        requested_k,
+    )
+}
+
+/// [`mtp_request_bytes`] from the device arch string and its prefill chunk
+/// (no `Gpu`): the same arithmetic, for callers that plan before a device is
+/// opened (`hipfire fit`).
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_request_bytes_for(
+    arch: &str,
+    prefill_max_batch: usize,
+    config: &Qwen35Config,
+    trunk_snapshot_bytes: usize,
+    head_config: &mtp_head::Qwen35MtpHeadConfig,
+    compressed_vocab: Option<usize>,
+    fills_batched: bool,
+    requested_k: usize,
+) -> Result<usize, String> {
     let max_n = crate::mtp_speculator::mtp_drafter_max_n(requested_k);
     let verify_capacity = crate::mtp_speculator::mtp_verify_capacity(max_n);
     let state = MtpSpecState::requested_bytes(
-        &gpu.arch,
+        arch,
         config,
         trunk_snapshot_bytes,
         head_config,
@@ -3427,12 +3453,8 @@ pub fn mtp_request_bytes(
         max_n,
         verify_capacity,
     )?;
-    let fill = mtp_prompt_fill_requested_bytes(
-        config,
-        head_config,
-        fills_batched,
-        crate::qwen35::prefill_max_batch(gpu),
-    );
+    let fill =
+        mtp_prompt_fill_requested_bytes(config, head_config, fills_batched, prefill_max_batch);
     Ok(state.saturating_add(fill))
 }
 

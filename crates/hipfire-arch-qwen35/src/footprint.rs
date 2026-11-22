@@ -521,6 +521,78 @@ pub fn dflash_side_for_file(
     ))
 }
 
+/// Device footprint of an attached native-MTP head, as the load charges it
+/// (S0 census, 2026-11-22: the loader's lazy charge, the head upload and the
+/// ring snapshot; every term from the same functions the load uses).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MtpSide {
+    /// The head file's tensors at device size, each ROCr-rounded.
+    pub head_weights: u64,
+    /// The 65,536-row draft lm_head sliced from the trunk's on exact gfx1100
+    /// (`draft_vocab`); 0 elsewhere or when the head ships its own.
+    pub draft_vocab: u64,
+    /// The speculator's checkpoint ring: one more DeltaNet snapshot beside the
+    /// AR prefill ring's.
+    pub ring_snapshot: u64,
+    /// First request's `MtpSpecState` (rollback snapshot, verify scratch, GDN
+    /// tape, head scratch and Q8 head KV sized for `context_rows`) plus the
+    /// prompt-fill transient: [`crate::mtp_spec::mtp_request_bytes_for`].
+    pub state: u64,
+}
+
+impl MtpSide {
+    /// Everything the head adds on top of the no-head load.
+    pub fn total(&self) -> u64 {
+        self.head_weights + self.draft_vocab + self.ring_snapshot + self.state
+    }
+}
+
+/// [`MtpSide`] for the head at `head` (`base_offset` into a bundled trailer, 0
+/// for a sidecar) beside the trunk `target`, for context `context_rows` (the
+/// provisional window the load sizes the head KV and flash partials at),
+/// chain depth `requested_k` on device `arch`. `draft_vocab_bytes` is the
+/// device size of the sliced draft lm_head the load attaches on this arch
+/// (the caller knows the trunk's lm_head layout), 0 when none.
+pub fn mtp_side_for_file(
+    target: &Qwen35Config,
+    head: &std::path::Path,
+    base_offset: u64,
+    requested_k: usize,
+    context_rows: usize,
+    arch: &str,
+    draft_vocab_bytes: u64,
+) -> Result<MtpSide, String> {
+    let hfq = HfqFile::open_at_offset(head, base_offset)
+        .map_err(|e| format!("MTP head {}: {e}", head.display()))?;
+    let head_weights = charged(hfq.tensor_infos().iter().map(|t| t.data_size));
+    let (head_config, compressed_vocab) =
+        crate::mtp_head::read_mtp_head_sizing(head, base_offset, context_rows)?;
+    let snapshot = usize::try_from(dn_snapshot_device_charge(target))
+        .map_err(|_| "DeltaNet snapshot sizing overflow".to_string())?;
+    // The batched prompt fill is the larger layout and the one every measured
+    // head took; the loader charges it too when the head's dtypes are unknown.
+    let state = crate::mtp_spec::mtp_request_bytes_for(
+        arch,
+        crate::qwen35::prefill_max_batch_planned(arch),
+        target,
+        snapshot,
+        &head_config,
+        compressed_vocab,
+        true,
+        requested_k,
+    )? as u64;
+    Ok(MtpSide {
+        head_weights,
+        draft_vocab: if compressed_vocab.is_none() {
+            draft_vocab_bytes
+        } else {
+            0
+        },
+        ring_snapshot: snapshot as u64,
+        state,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

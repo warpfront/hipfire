@@ -707,7 +707,7 @@ fn analyze_model(
     inputs.draft_charge = owners.draft;
     inputs.checkpoint_charge = owners.checkpoints;
     result.notes.extend(owners.notes);
-    let admitted = match inputs.admit(&path, device) {
+    let mut admitted = match inputs.admit(&path, device) {
         Ok(admitted) => admitted,
         Err(detail) => match inputs.capacity_refusal(&path, device) {
             // An automatic context refused for lack of room is a capacity
@@ -732,6 +732,15 @@ fn analyze_model(
         .as_ref()
         .map(|s| s.model_ctx)
         .or_else(|| source_context(&admitted.source));
+    mtp_fit(
+        &path,
+        &params,
+        &mut inputs,
+        device,
+        &mut admitted,
+        owners.draft,
+        &mut result.notes,
+    );
     let decode = decode_plan(
         &params,
         &DecodeFacts {
@@ -1047,6 +1056,9 @@ fn model_params(
             params["mtp_k"] = json!(k);
         }
     }
+    // run_command's resolve_mtp_sidecar, once the final `mtp_mode` is known:
+    // the registry head file the load would carry (`params["mtp"]`).
+    crate::resolve_mtp_sidecar(&mut params, entry, &paths.models, path, input, tag);
     if params["ngram_draft"].as_bool().is_none() {
         params["ngram_draft"] = json!(runtime.ngram_draft);
     }
@@ -1229,7 +1241,7 @@ fn speculation_owners(
     };
     owners.checkpoints = rings;
     owners.notes.push(format!(
-        "DeltaNet checkpoint rings {} charged against free memory (one snapshot per ring at the device memory ROCr occupies{}); further checkpoints take only memory the admitted context does not need. A native-MTP speculator's ring and state are not projected",
+        "DeltaNet checkpoint rings {} charged against free memory (one snapshot per ring at the device memory ROCr occupies{}); further checkpoints take only memory the admitted context does not need",
         gib(rings),
         if speculator_ring { ", the AR prefill ring plus the DFlash speculator's" } else { ", the AR prefill ring" }
     ));
@@ -1316,6 +1328,80 @@ fn speculation_owners(
         }
     }
     owners
+}
+
+/// Native MTP in the projection. For an explicit `on` on a dense Qwen3.5
+/// load, charge the head the way the load does
+/// ([`hipfire_loader::admission::qwen35_mtp_side`]: head weights, the
+/// gfx1100 draft vocabulary, the speculator's ring snapshot, the first
+/// request's state and prompt-fill transient, head KV sized for the no-head
+/// context) against free memory and re-admit with it. `auto` loads no head on
+/// this producer, so the head is only reported. Nothing is charged when a
+/// DFlash draft is paired (it takes the speculator slot), the mode is off, the
+/// topology is not single-GPU dense Qwen3.5, or no head resolves.
+fn mtp_fit(
+    path: &Path,
+    params: &Value,
+    inputs: &mut AdmissionInputs<'_>,
+    device: &FitDevice,
+    admitted: &mut SourceAdmission,
+    dflash_charge: u64,
+    notes: &mut Vec<String>,
+) {
+    let mode = hipfire_config::MtpMode::parse(params["mtp_mode"].as_str().unwrap_or("auto"));
+    if mode == hipfire_config::MtpMode::Off
+        || admitted.arch_id != 5
+        || !matches!(admitted.topology, EffectiveTopology::Single)
+        || dflash_charge > 0
+    {
+        return;
+    }
+    let sidecar = params["mtp"].as_str().map(Path::new);
+    let Some((head, offset)) = hipfire_loader::admission::qwen35_mtp_head_location(path, sidecar)
+    else {
+        return;
+    };
+    let cap_off = admitted.max_seq;
+    let side = match hipfire_loader::admission::qwen35_mtp_side(
+        &admitted.source,
+        &head,
+        offset,
+        &inputs.options.spec,
+        cap_off,
+        &device.arch,
+    ) {
+        Ok(side) => side,
+        Err(error) => {
+            notes.push(format!(
+                "native MTP head not projected ({error}); no head bytes are charged"
+            ));
+            return;
+        }
+    };
+    let owners = side.head_weights + side.draft_vocab + side.state;
+    let (draft_before, ring_before) = (inputs.draft_charge, inputs.checkpoint_charge);
+    inputs.draft_charge = draft_before + owners;
+    inputs.checkpoint_charge = ring_before + side.ring_snapshot;
+    let on = inputs.admit(path, device);
+    let keep = mode == hipfire_config::MtpMode::On && on.is_ok();
+    notes.push(format!(
+        "native MTP head {} {}: head weights {}, gfx1100 draft vocabulary {}, speculator ring snapshot {}, request state + prompt fill {} (head KV sized for the no-head context of {cap_off} tokens); context {} -> {}",
+        if keep { "charged against free memory" } else { "would cost" },
+        gib(side.total()),
+        gib(side.head_weights),
+        gib(side.draft_vocab),
+        gib(side.ring_snapshot),
+        gib(side.state),
+        cap_off,
+        on.as_ref().map_or("does not fit".to_string(), |a| a.max_seq.to_string()),
+    ));
+    match on {
+        Ok(on) if keep => *admitted = on,
+        _ => {
+            inputs.draft_charge = draft_before;
+            inputs.checkpoint_charge = ring_before;
+        }
+    }
 }
 
 fn source_context(source: &ModelSource) -> Option<usize> {

@@ -553,6 +553,14 @@ pub fn prefill_max_batch(gpu: &Gpu) -> usize {
         .unwrap_or_else(|| prefill_max_batch_for_arch(gpu.arch.as_str(), fp8_chunk512_for_gpu(gpu)))
 }
 
+/// [`prefill_max_batch`] for a device that is not open yet (`hipfire fit`):
+/// the explicit override, else the arch default with the full-FP8 chunk
+/// assumed on exact gfx1201 (every measured dense load admits it).
+pub fn prefill_max_batch_planned(arch: &str) -> usize {
+    explicit_prefill_max_batch()
+        .unwrap_or_else(|| prefill_max_batch_for_arch(arch, arch == "gfx1201"))
+}
+
 /// Ceiling on the TP compensation below; beyond it the prefill kernels stop
 /// gaining and the per-chunk scratch keeps growing.
 const PREFILL_TP_BATCH_CAP: usize = 2048;

@@ -2388,6 +2388,64 @@ pub fn qwen35_checkpoint_rings_charge(
     Ok(hipfire_arch_qwen35::footprint::checkpoint_ring_bytes(snapshot, speculator_ring) as u64)
 }
 
+/// The MTP head that loads beside the Qwen3.5 trunk at `trunk`, as
+/// `(file, base_offset)`, in the loader's order: the bundled `.mq4-mtp`
+/// trailer first, then `sidecar` (the CLI-resolved `params["mtp"]`), else
+/// `<trunk>.mtp` (`with_extension`), when that file exists.
+pub fn qwen35_mtp_head_location(
+    trunk: &std::path::Path,
+    sidecar: Option<&std::path::Path>,
+) -> Option<(std::path::PathBuf, u64)> {
+    if let Ok(Some(offset)) = hipfire_arch_qwen35::mtp_head::detect_bundled_mtp_offset(trunk) {
+        return Some((trunk.to_path_buf(), offset));
+    }
+    let sidecar = sidecar.map_or_else(|| trunk.with_extension("mtp"), std::path::Path::to_path_buf);
+    sidecar.is_file().then_some((sidecar, 0))
+}
+
+/// [`hipfire_arch_qwen35::footprint::MtpSide`]: what the native-MTP head adds
+/// to a load of the Qwen3.5 trunk `source` on a `gpu_arch` device, sized for
+/// `context_rows` of head KV (the provisional window, as the load sizes it).
+/// `hipfire fit` charges it before the load, from the same functions the
+/// loader's lazy charge and the head upload use.
+pub fn qwen35_mtp_side(
+    source: &ModelSource,
+    head: &std::path::Path,
+    base_offset: u64,
+    spec: &SpecLoadCfg,
+    context_rows: usize,
+    gpu_arch: &str,
+) -> Result<hipfire_arch_qwen35::footprint::MtpSide, String> {
+    let (hfq, config) = qwen35_trunk(source)?;
+    // A load that slices a 65,536-row draft lm_head out of the trunk's own
+    // (`hipfire_arch_qwen35::draft_vocab`, on by default on exact gfx1100).
+    let draft_vocab_bytes = if hipfire_arch_qwen35::draft_vocab::enabled_for_arch(gpu_arch) {
+        let meta = hipfire_runtime::loader_api::header_tensor_meta(hfq);
+        [
+            "lm_head.weight",
+            "model.language_model.lm_head.weight",
+            "model.lm_head.weight",
+        ]
+        .iter()
+        .find_map(|name| meta.iter().find(|t| t.name == *name))
+        .and_then(|t| t.dtype.row_bytes(config.dim))
+        .map_or(0, |row| {
+            hip_bridge::device_alloc_charge(65_536 * row) as u64
+        })
+    } else {
+        0
+    };
+    hipfire_arch_qwen35::footprint::mtp_side_for_file(
+        &config,
+        head,
+        base_offset,
+        hipfire_arch_qwen35::mtp_speculator::mtp_requested_k(spec),
+        context_rows,
+        gpu_arch,
+        draft_vocab_bytes,
+    )
+}
+
 /// Only Qwen's single-card cache has the matching VMM KV-row accounting.
 /// The terms are measured, not padded (`vram-ledger/LEDGER.md` §1, the
 /// default `qwen3.8:27b` on a 7900 XTX):
@@ -7132,6 +7190,47 @@ mod tests {
             assert_eq!(device_free_from(carve), Some(40_000 * MIB));
             let discrete = DeviceMemory { uma: false, ..halo };
             assert_eq!(device_free_from(discrete), Some(40_000 * MIB));
+        }
+    }
+
+    /// `hipfire fit`'s head-weight charge against the device bytes a real
+    /// load of the published head takes (MTP-AUTO S0 census, free(no head) -
+    /// free(head) at an identical authored context): 232,783,872 B on gfx1201;
+    /// 411,041,792 B on gfx1100, where the load also slices a 65,536-row draft
+    /// lm_head out of the `mq4-xts` trunk's. The head's allocations above
+    /// 1 MiB match byte for byte; its seven small tensors (104,448 B, charged
+    /// 110,592 B at 4 KiB) come out of ROCr's small-allocation pool, which a
+    /// free-VRAM difference does not see, so the charge exceeds the
+    /// measurement by exactly them. Needs the published files:
+    /// `MTP_SIDE_TEST_TRUNK=<dir>/qwen3.8-27b.mq4-xts` with
+    /// `qwen3.8-27b.mtp` beside it; run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn qwen35_mtp_side_head_weights_match_the_measured_loads() {
+        let trunk = std::path::PathBuf::from(
+            std::env::var("MTP_SIDE_TEST_TRUNK").expect("MTP_SIDE_TEST_TRUNK"),
+        );
+        let (head, offset) = qwen35_mtp_head_location(&trunk, None).expect("head beside the trunk");
+        let source =
+            ModelSource::Hfq(hipfire_runtime::hfq::HfqFile::open(&trunk).expect("open trunk"));
+        let small_pool: u64 = hipfire_runtime::hfq::HfqFile::open_at_offset(&head, offset)
+            .expect("open head")
+            .tensor_infos()
+            .iter()
+            .filter(|t| t.data_size <= 1 << 20)
+            .map(|t| hip_bridge::device_alloc_charge(t.data_size) as u64)
+            .sum();
+        assert_eq!(small_pool, 110_592);
+        let spec = SpecLoadCfg::default();
+        for (arch, measured) in [("gfx1201", 232_783_872u64), ("gfx1100", 411_041_792)] {
+            let side =
+                qwen35_mtp_side(&source, &head, offset, &spec, 32_768, arch).expect("head side");
+            eprintln!("{arch}: {side:?}");
+            assert_eq!(
+                side.head_weights + side.draft_vocab,
+                measured + small_pool,
+                "{arch}"
+            );
         }
     }
 }
