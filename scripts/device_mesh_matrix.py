@@ -378,7 +378,12 @@ def eval_wire(runs, kind, pred):
                  for r in runs for g in r.get("generates", [])]
         texts = wire_texts(runs)
         same = len(texts) >= 2 and all(t == texts[0] for t in texts[1:])
-        return bool(errs) and dones and all(dones), "wire: errors=%d usable=%s identical=%s" % (len(errs), all(dones), same)
+        # A session that broke (e.g. the daemon died at startup) admitted nothing;
+        # all([]) must not read as usable (HIPF-392).
+        broken = next((r["broken"] for r in runs if r.get("broken")), "")
+        note = "wire: errors=%d usable=%s identical=%s" % (len(errs), bool(dones) and all(dones), same)
+        return (bool(errs) and dones and all(dones) and not broken,
+                note + (" broken=%s" % broken if broken else ""))
     if kind == "wire_exactly_one_terminal":
         # G4.6 race contract, per admitted request id: exactly one terminal
         # (done/error; a cancel surfaces as done with finish_reason aborted),
@@ -870,6 +875,9 @@ def execute_row(ctx, row, out, timeout):
     if not good:
         return "failed", "positive: %s" % note, detail
     if row.get("negative_session") or row.get("commands", {}).get("negative"):
+        # The positive half's serve daemon may still hold the GPU reservation;
+        # a negative daemon started now dies at startup (HIPF-392, as HIPF-391).
+        wait_reservations_released(out)
         (ngood, nnote), negatives = run_negatives(ctx, row, mapping, env, timeout)
         detail["logs"] += save_logs(out, row["id"], "negative", negatives)
         detail["negative_note"] = nnote
