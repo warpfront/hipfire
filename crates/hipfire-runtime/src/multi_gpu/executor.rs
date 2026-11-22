@@ -574,6 +574,10 @@ pub(super) struct MeshExecutionState {
     outstanding: Vec<ForwardEpoch>,
     poisoned: bool,
     quarantined: bool,
+    /// The devices are lent by their owner (`Gpus::lend_single`): a quarantine
+    /// marks the state but leaves them in place, so the lender takes them back
+    /// and keeps its own refusal; a quarantine never leaks a lent device.
+    pub(super) lent: bool,
 }
 
 impl MeshExecutionState {
@@ -1216,7 +1220,9 @@ impl DrainBackend for HipBackend<'_> {
         // Reached only after a failed device synchronization (see `drain` and
         // `reset_all`): like `HipDrain`, keep device ownership until teardown
         // because in-flight work may still reference registered VMM/host state.
-        std::mem::forget(std::mem::take(&mut self.gpus.devices));
+        if !self.gpus.mesh_execution.lent {
+            std::mem::forget(std::mem::take(&mut self.gpus.devices));
+        }
     }
 }
 
@@ -2235,8 +2241,11 @@ impl DrainBackend for HipDrain<'_> {
     fn quarantine(&mut self) {
         self.state.quarantined = true;
         // Gpu::drop frees registered VMM/host-mapped state; a failed drain keeps
-        // device ownership until process teardown.
-        std::mem::forget(std::mem::take(self.devices));
+        // device ownership until process teardown (a lent device goes back to
+        // its owner, which never drops it here).
+        if !self.state.lent {
+            std::mem::forget(std::mem::take(self.devices));
+        }
     }
 }
 
@@ -2385,6 +2394,7 @@ impl Gpus {
             tp,
             tp_scratch,
             issuer,
+            lent: self.mesh_execution.lent,
             ..Default::default()
         };
         Ok(())
@@ -2449,6 +2459,11 @@ impl Gpus {
     }
 
     /// Whether the mesh is provisioned and neither poisoned nor quarantined.
+    /// Whether a failed device synchronization quarantined the mesh.
+    pub fn mesh_quarantined(&self) -> bool {
+        self.mesh_execution.quarantined
+    }
+
     pub fn mesh_healthy(&self) -> bool {
         let state = &self.mesh_execution;
         state.mesh_epoch.is_some() && !state.poisoned && !state.quarantined
@@ -2678,7 +2693,10 @@ impl Gpus {
             self.mesh_execution.quarantined = true;
             return Err(format!("TP scratch release failed: {error}"));
         }
-        self.mesh_execution = MeshExecutionState::default();
+        self.mesh_execution = MeshExecutionState {
+            lent: self.mesh_execution.lent,
+            ..Default::default()
+        };
         Ok(())
     }
 }

@@ -134,8 +134,19 @@ impl Job<'_> {
             conversation_tokens,
             asst_turn_cache,
             spec_deferred_seed,
+            speculator,
             ..
         } = m;
+        // The engine's rollback attests the target only; a load with a drafter
+        // keeps its legacy loop, whose rollback resets both.
+        if speculator.is_some() {
+            return Outcome::Declined("a speculator is attached".into());
+        }
+        if let Some(reason) = runner.quarantined() {
+            let message = format!("engine mesh quarantined until restart: {reason}");
+            emit_active_attempt_error(stdout, Some(id), &message, "gpu", false, false);
+            return Outcome::Served;
+        }
         let (Some(state), Some(tokenizer)) = (state.as_deref_mut(), tokenizer.as_ref()) else {
             return Outcome::Declined("the model has no state or tokenizer".into());
         };

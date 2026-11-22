@@ -502,6 +502,8 @@ impl Gpus {
         // again; any unwind in between aborts instead of dropping it twice.
         let mut gpus = Self::single(unsafe { std::ptr::read(gpu) }, n_layers);
         gpus.mesh = mesh.clone();
+        // A quarantine leaves the device here, so it always goes back.
+        gpus.mesh_execution.lent = true;
         let result = body(&mut gpus);
         let lent = gpus.devices.pop();
         assert!(
