@@ -54,6 +54,9 @@ pub(super) struct NpuForward {
     latch: trunk::containment::FaultLatch,
     /// PCI bus id the runtime opened on (host facts in the fault line); `None` when no runtime opened.
     gpu_pci: Option<String>,
+    /// `HIPFIRE_QWEN4_PAIR_CUT_CHECK=1` (developer): compare each pair's staged session cut
+    /// byte for byte with a Split-site re-launch ([`cut_check_oracle`]).
+    cut_check: Option<CutCheck>,
 }
 
 // SAFETY: this private owner exclusively owns the entire railgun HIP Rc graph;
@@ -955,6 +958,9 @@ impl NpuForward {
                 host_ple,
                 pair_logged: false,
                 calibration,
+                cut_check: hipfire_config::developer_var("HIPFIRE_QWEN4_PAIR_CUT_CHECK")
+                    .is_ok_and(|v| v == "1")
+                    .then(CutCheck::default),
                 n_star_cache: None,
                 request_plan: None,
                 request_origin: 0,
@@ -2559,6 +2565,19 @@ impl NpuForward {
         bundle.state.ple_history = history;
         bundle.state.commit_row_capture(tokens.len());
         bundle.state.position = end;
+        if let (Some(check), Some(cut)) = (&mut self.cut_check, shape.cut) {
+            if bundle
+                .pair_session_stage
+                .as_ref()
+                .is_some_and(|stage| stage.position == Some(position + cut))
+            {
+                check.parts = Some(download_cut_parts(gpu, bundle, position + cut).map_err(fail)?);
+                if check.oracle {
+                    // The oracle launch never publishes: its rows after the cut are filler.
+                    return Ok(());
+                }
+            }
+        }
         if shape.cut.is_some() && bundle.pair_boundary_is_ar() {
             bundle
                 .publish_pair_session_boundary(
@@ -3798,6 +3817,10 @@ pub(super) fn run_pair_request(
     // is never recorded, so the eager seal is allowed here.
     bundle.seal_gdn_streams(gpu).map_err(fail)?;
     let mut npu = owner.npu_trunk.take().expect("on owner");
+    let oracle = match npu.cut_check.is_some() {
+        true => cut_check_oracle(&mut npu, owner, bundle, gpu, tokens, banks),
+        false => None,
+    };
     let result = npu.pair(
         owner,
         bundle,
@@ -3812,6 +3835,212 @@ pub(super) fn run_pair_request(
     if let Err(e) = &result {
         npu.contain_fault(e);
     }
+    if let (Ok(()), Some((check, expected))) = (&result, oracle) {
+        let live = npu.cut_check.as_mut().and_then(|c| c.parts.take());
+        report_cut_check(bundle, check, &expected, live.as_deref());
+    }
     owner.npu_trunk = Some(npu);
     result
+}
+
+/// Host state of the pair cut check: the oracle launch is running, and the
+/// parts the last staged cut downloaded (meta, fixed parts, valid row prefixes).
+#[derive(Default)]
+pub(super) struct CutCheck {
+    oracle: bool,
+    parts: Option<Vec<Vec<u8>>>,
+}
+
+/// The staged snapshot at `position` (`SessionState::snapshot_parts` on the AR
+/// route, target state only), downloaded part by part.
+fn download_cut_parts(
+    gpu: &mut Gpu,
+    bundle: &mut Qwen4Bundle,
+    position: usize,
+) -> Result<Vec<Vec<u8>>, String> {
+    use hipfire_runtime::session_cache::{SessionRoute, SessionState, SnapshotParts};
+    let SnapshotParts { meta, layout } =
+        SessionState::snapshot_parts(bundle, SessionRoute::Ar, position)?;
+    gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+    let ranges = layout
+        .fixed
+        .iter()
+        .map(|part| (part.buf, part.offset, part.bytes))
+        .chain(layout.rows.iter().map(|s| (s.buf, 0, s.rows * s.row_bytes)));
+    let mut parts = vec![meta];
+    for (buf, offset, bytes) in ranges {
+        let mut host = vec![0u8; bytes];
+        if bytes > 0 {
+            gpu.hip
+                .memcpy_dtoh_at(&mut host, buf, offset)
+                .map_err(|e| e.to_string())?;
+        }
+        parts.push(host);
+    }
+    Ok(parts)
+}
+
+/// The live state at a Bank-site cut: re-launch the pair from the same entry
+/// state with bank A ending at the cut (`CutSite::Split`, whose stage copies
+/// each layer's live mixer state after bank A), download that stage, then
+/// restore the entry state. Bank B is the real rows after the cut, padded
+/// with prompt tokens to the 512-row bank minimum; it ends no later than the
+/// real pair (or 512 rows past the cut), so it crosses no further session
+/// boundary. Its rows lie after the cut and never reach the compared parts.
+/// Returns the cut row and the oracle parts, or `None` (reason on stderr)
+/// when no oracle applies.
+fn cut_check_oracle(
+    npu: &mut NpuForward,
+    owner: &mut Qwen4GpuForward,
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    banks: [usize; 2],
+) -> Option<(CutCheckRun, Vec<Vec<u8>>)> {
+    let position = bundle.state.position;
+    let shape = PairShape::new(banks, position, bundle.session_next_boundary());
+    let run = CutCheckRun {
+        position,
+        banks,
+        cut: shape.cut?,
+        oracle_b: 0,
+    };
+    let skip = |why: &str| {
+        eprintln!(
+            "npu-trunk cut-check: skip position={position} banks={}+{} cut={}: {why}",
+            banks[0], banks[1], run.cut
+        );
+    };
+    if shape.site() == CutSite::Split {
+        skip("Split site: the stage already copies the live state after bank A");
+        return None;
+    }
+    if !(rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS..=owner.scratch.max_chunk).contains(&run.cut)
+    {
+        skip("cut row is not a valid bank A size");
+        return None;
+    }
+    let oracle_b = (tokens.len() - run.cut).max(rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS);
+    let check: Vec<u32> = tokens[..run.cut]
+        .iter()
+        .chain(
+            tokens[run.cut..]
+                .iter()
+                .chain(tokens.iter().cycle())
+                .take(oracle_b),
+        )
+        .copied()
+        .collect();
+    let ticket = match bundle.state.snapshot(gpu) {
+        Ok(ticket) => ticket,
+        Err(e) => {
+            skip(&format!("entry snapshot: {e}"));
+            return None;
+        }
+    };
+    let check_cut = npu.cut_check.as_mut().expect("cut check on");
+    check_cut.oracle = true;
+    check_cut.parts = None;
+    // Unsampled: the oracle's timing must not reach the rate estimator or trip
+    // the stall guard, which would run the real pair on GPU projections.
+    let sampling = npu.sampling.take();
+    let launched = npu.pair(
+        owner,
+        bundle,
+        gpu,
+        &check,
+        [run.cut, oracle_b],
+        None,
+        None,
+        None,
+        Qwen4OutputPolicy::None,
+    );
+    npu.sampling = sampling;
+    let check_cut = npu.cut_check.as_mut().expect("cut check on");
+    check_cut.oracle = false;
+    let parts = check_cut.parts.take();
+    // The real pair must start from the entry state whatever the oracle did.
+    bundle
+        .state
+        .restore(gpu, ticket)
+        .expect("cut check: restore the pair entry state");
+    match (launched, parts) {
+        (Ok(()), Some(parts)) => Some((CutCheckRun { oracle_b, ..run }, parts)),
+        (Err(e), _) => {
+            skip(&format!("oracle launch failed: {e}"));
+            None
+        }
+        (Ok(()), None) => {
+            skip("oracle launch staged no cut");
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CutCheckRun {
+    position: usize,
+    banks: [usize; 2],
+    cut: usize,
+    oracle_b: usize,
+}
+
+/// One stderr JSON line per checked pair: per part its name, bytes, differing
+/// bytes and first differing byte offset.
+fn report_cut_check(
+    bundle: &Qwen4Bundle,
+    run: CutCheckRun,
+    expected: &[Vec<u8>],
+    live: Option<&[Vec<u8>]>,
+) {
+    let Some(live) = live else {
+        eprintln!(
+            "npu-trunk cut-check: position={} cut={}: the real pair staged no cut",
+            run.position, run.cut
+        );
+        return;
+    };
+    let layout = crate::bundle::StageLayout::of(&bundle.state);
+    let name = |index: usize| -> String {
+        let Some(fixed) = index.checked_sub(1) else {
+            return "meta".into();
+        };
+        let gdn = layout.gdn * layout.gdn_parts;
+        if fixed < gdn {
+            format!(
+                "gdn{}.{}",
+                fixed / layout.gdn_parts,
+                fixed % layout.gdn_parts
+            )
+        } else if fixed < gdn + layout.qsa {
+            format!("qsa{}.selected", fixed - gdn)
+        } else if Some(fixed) == layout.ple_index() {
+            "ple_conv".into()
+        } else if fixed == layout.feedback_index() {
+            "feedback".into()
+        } else {
+            format!("rows{}", fixed - layout.fixed_len())
+        }
+    };
+    let parts: Vec<_> = expected
+        .iter()
+        .zip(live)
+        .enumerate()
+        .map(|(index, (a, b))| {
+            let diff = a.iter().zip(b).filter(|(x, y)| x != y).count() + a.len().abs_diff(b.len());
+            let first = a.iter().zip(b).position(|(x, y)| x != y);
+            serde_json::json!({"part": name(index), "bytes": b.len(), "diff": diff, "first": first})
+        })
+        .collect();
+    let differ = parts.iter().filter(|p| p["diff"] != 0).count();
+    eprintln!(
+        "npu-trunk cut-check: {}",
+        serde_json::json!({
+            "position": run.position, "banks": run.banks, "cut": run.cut,
+            "oracle_banks": [run.cut, run.oracle_b], "parts": expected.len().max(live.len()),
+            "equal": differ == 0 && expected.len() == live.len(), "differ": differ,
+            "detail": parts.iter().filter(|p| p["diff"] != 0).collect::<Vec<_>>(),
+            "sizes": parts.iter().map(|p| p["bytes"].clone()).collect::<Vec<_>>(),
+        })
+    );
 }

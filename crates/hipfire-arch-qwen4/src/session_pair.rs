@@ -10,7 +10,7 @@ pub(crate) struct PairSessionStage {
     pub(crate) fixed: Vec<GpuTensor>,
     meta: Vec<u8>,
     rows: Vec<usize>,
-    pub(super) position: Option<usize>,
+    pub(crate) position: Option<usize>,
 }
 
 impl PairSessionStage {
