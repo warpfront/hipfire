@@ -5957,6 +5957,9 @@ pub fn generate_spec(
     // `!first_token_is_eos` short-circuits the entire spec loop when the prefill's
     // first sampled token was already a terminator (see the guard above).
     let mut terminal_cache_invalidated = false;
+    // The stopping window's repair, left for the next consumer of the live
+    // state together with the deferred pending seed (`spec_defer_terminal_repair`).
+    let mut deferred_repair: Option<hipfire_loader::DeferredWindowRepair> = None;
     // Spec → AR policy at request start (SPEC-AR-FLOOR §7.3 contract 7 as
     // amended by §7.10 and §7.11). The retire policy arms for greedy requests
     // on a speculator with an AR step, and sampled ones when that AR step
@@ -6552,15 +6555,41 @@ pub fn generate_spec(
             // the replayed consumed prefix, with the last consumed token
             // pending for the normal terminal flush / forced advance — the
             // exact state a Realign or terminal reset would reconstruct.
-            let repaired = match spec_repair_terminal_prefix(
-                pp.as_deref_mut(),
-                gpu,
-                spec.as_mut(),
-                slot,
-                position_before,
-                window_seed,
-                &committed_tail[..keep],
-            ) {
+            // A terminal DFlash window on a resident single-card Qwen3.5
+            // target does not run its restore-and-replay forward here: it rides
+            // the deferred pending seed, so `decode_ms` and the `done` event
+            // stop at the last token. The next consumer of the live state runs
+            // it first (`settle_deferred_spec_seed`); a cold prefill, `reset`,
+            // `unload` and `load` drop it with the state it would repair.
+            let defer_repair = spec_defer_terminal_repair(
+                strict_prefix_action,
+                defer_terminal_flush,
+                pp.is_some(),
+                spec.name(),
+                forced_after.is_empty(),
+                spec_should_flush_pending_seed(emit.grammar_violated(), pending_seed_committable),
+            );
+            if defer_repair {
+                deferred_repair = Some(hipfire_loader::DeferredWindowRepair {
+                    window_start: position_before,
+                    window_seed,
+                    consumed: committed_tail[..keep].to_vec(),
+                });
+            }
+            let repair_result = if defer_repair {
+                Ok(true)
+            } else {
+                spec_repair_terminal_prefix(
+                    pp.as_deref_mut(),
+                    gpu,
+                    spec.as_mut(),
+                    slot,
+                    position_before,
+                    window_seed,
+                    &committed_tail[..keep],
+                )
+            };
+            let repaired = match repair_result {
                 Ok(repaired) => repaired,
                 Err(e) => {
                     let ep = spec_rollback_live(
@@ -6592,11 +6621,12 @@ pub fn generate_spec(
                 == Some("1")
             {
                 eprintln!(
-                    "[qwen-cache window-repair] window_start={} consumed={} terminal={} repaired={}",
+                    "[qwen-cache window-repair] window_start={} consumed={} terminal={} repaired={} deferred={}",
                     position_before,
                     keep,
                     strict_prefix_action == SpecStrictPrefixAction::RepairForTerminal,
-                    repaired
+                    repaired,
+                    defer_repair
                 );
             }
             if repaired {
@@ -6850,6 +6880,35 @@ pub fn generate_spec(
         let tx = spec_terminal_pending_seed_tx(seed_token);
         if check_abort(id) {
             let _ = classify_forced_gpu_advance(true);
+            // A repair left for the pending seed has not run: the kept prefix
+            // below is only valid on the repaired state.
+            if let Some(repair) = deferred_repair.take() {
+                let repaired = spec_repair_terminal_prefix(
+                    pp.as_deref_mut(),
+                    gpu,
+                    spec.as_mut(),
+                    slot,
+                    repair.window_start,
+                    repair.window_seed,
+                    &repair.consumed,
+                );
+                if !matches!(repaired, Ok(true)) {
+                    let ep = spec_rollback_live(
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                        pp.as_deref_mut(),
+                        slot,
+                        spec.as_mut(),
+                    );
+                    emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+                    drop(guard);
+                    return None;
+                }
+            }
             // The seed is emitted but not yet fed: same committed boundary as
             // the loop-top cancel.
             let ep = spec_cancel_epilogue_live(
@@ -6875,8 +6934,13 @@ pub fn generate_spec(
             m.spec_deferred_seed = Some(hipfire_loader::DeferredSpecSeed {
                 token: seed_token,
                 position,
+                repair: deferred_repair.take(),
             });
         } else {
+            debug_assert!(
+                deferred_repair.is_none(),
+                "a deferred window repair needs the deferred pending seed to carry it"
+            );
             let abort_latched = std::cell::Cell::new(false);
             let abort_cb = || {
                 if check_abort(id) {
@@ -8866,6 +8930,77 @@ pub fn spec_should_flush_pending_seed(
     pending_seed_committable: bool,
 ) -> bool {
     !grammar_violated && pending_seed_committable
+}
+
+/// Whether the terminal strict-prefix window repair rides the deferred pending
+/// seed ([`LoadedModel::spec_deferred_seed`]) instead of running before `done`.
+///
+/// The repair restores the pre-window snapshot and replays the consumed prefix
+/// through the target; only the next consumer of the live state needs its
+/// result, so a request that stopped inside a window does not hold its `done`
+/// (or count it in `decode_ms`) for it. It defers exactly when the pending
+/// seed does (a resident single-card Qwen3.5 target, a seed that is flushed),
+/// for the qwen35 DFlash speculator whose repair always succeeds or errors,
+/// and only when no forced token follows the window (a forced advance runs
+/// on the repaired state).
+pub fn spec_defer_terminal_repair(
+    action: SpecStrictPrefixAction,
+    defer_terminal_flush: bool,
+    on_mesh: bool,
+    spec_name: &str,
+    forced_after_empty: bool,
+    seed_flush_pending: bool,
+) -> bool {
+    action == SpecStrictPrefixAction::RepairForTerminal
+        && defer_terminal_flush
+        && !on_mesh
+        && spec_name == "dflash"
+        && forced_after_empty
+        && seed_flush_pending
+}
+
+#[cfg(test)]
+mod spec_defer_terminal_repair_tests {
+    use super::{spec_defer_terminal_repair, SpecStrictPrefixAction};
+
+    const TERMINAL: SpecStrictPrefixAction = SpecStrictPrefixAction::RepairForTerminal;
+
+    #[test]
+    fn defers_only_the_terminal_dflash_repair_that_rides_the_deferred_seed() {
+        assert!(spec_defer_terminal_repair(
+            TERMINAL, true, false, "dflash", true, true
+        ));
+        // Not a terminal repair.
+        for action in [
+            SpecStrictPrefixAction::None,
+            SpecStrictPrefixAction::Realign,
+        ] {
+            assert!(!spec_defer_terminal_repair(
+                action, true, false, "dflash", true, true
+            ));
+        }
+        // The pending seed is not deferred (non-qwen35 or multi-GPU target).
+        assert!(!spec_defer_terminal_repair(
+            TERMINAL, false, false, "dflash", true, true
+        ));
+        assert!(!spec_defer_terminal_repair(
+            TERMINAL, true, true, "dflash", true, true
+        ));
+        // The pending seed is not flushed (grammar fail-closed, DS4 empty EOS).
+        assert!(!spec_defer_terminal_repair(
+            TERMINAL, true, false, "dflash", true, false
+        ));
+        // A forced token follows the window: it advances the repaired state.
+        assert!(!spec_defer_terminal_repair(
+            TERMINAL, true, false, "dflash", false, true
+        ));
+        // Other speculators keep the immediate repair (MTP can answer `false`).
+        for name in ["mtp", "dflash2", "ngram"] {
+            assert!(!spec_defer_terminal_repair(
+                TERMINAL, true, false, name, true, true
+            ));
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12071,26 +12206,29 @@ fn spec_cancel_keeps_committed_prefix(m: &LoadedModel) -> bool {
         && m.qwen35().is_some_and(|b| b.kv_cache.compact_offset == 0)
 }
 
-/// Feed the terminal pending seed the last speculative request deferred
-/// ([`LoadedModel::spec_deferred_seed`]): the one-token forced advance its
-/// epilogue would have run, at the same position, so target and drafter end
-/// exactly where an immediate flush leaves them. No-op without a deferred
-/// seed. Every consumer of the live state other than a cold prefill calls this
-/// first.
+/// Run the stopping-window repair and feed the terminal pending seed the last
+/// speculative request deferred ([`LoadedModel::spec_deferred_seed`]): the
+/// restore-and-replay forward and the one-token forced advance its epilogue
+/// would have run, in that order, at the same positions, so target and drafter
+/// end exactly where an immediate repair and flush leave them. No-op without a
+/// deferred seed. Every consumer of the live state other than a cold prefill
+/// calls this first.
 ///
-/// Returns whether the live state survived. A failed advance takes the
-/// fail-closed reset (target, drafter and host record back to position 0), and
-/// this returns `false`: a caller that already planned to reuse the live state
-/// must replan a cold prefill ([`SpecPrefillPlan::unless_live_state_lost`])
+/// Returns whether the live state survived. A failed repair or advance takes
+/// the fail-closed reset (target, drafter and host record back to position 0),
+/// and this returns `false`: a caller that already planned to reuse the live
+/// state must replan a cold prefill ([`SpecPrefillPlan::unless_live_state_lost`])
 /// rather than prefill a suffix onto the reset state.
 pub fn settle_deferred_spec_seed(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) -> bool {
     let Some(seed) = m.spec_deferred_seed.take() else {
         return true;
     };
-    if let Err(e) = feed_deferred_spec_seed(m, gpu, seed) {
+    if let Err(e) = feed_deferred_spec_seed(m, gpu, &seed) {
         eprintln!(
-            "[spec-deferred-seed] feeding token {} at position {} failed: {e}; resetting the conversation",
-            seed.token, seed.position
+            "[spec-deferred-seed] feeding token {} at position {} (window repair {}) failed: {e}; resetting the conversation",
+            seed.token,
+            seed.position,
+            seed.repair.is_some()
         );
         let _ = production_fail_closed_rollback(m, gpu, None, None);
         return false;
@@ -12130,7 +12268,7 @@ impl SpecPrefillPlan {
 fn feed_deferred_spec_seed(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    seed: hipfire_loader::DeferredSpecSeed,
+    seed: &hipfire_loader::DeferredSpecSeed,
 ) -> Result<(), String> {
     if m.seq_pos != seed.position + 1 {
         return Err(format!(
@@ -12146,6 +12284,19 @@ fn feed_deferred_spec_seed(
         .as_mut()
         .ok_or("the speculator is no longer loaded")?;
     let slot = guard.slot()?;
+    // The stopping window first: the seed is the last consumed token, pending
+    // on the repaired state.
+    if let Some(repair) = &seed.repair {
+        if !spec.repair_terminal_prefix(
+            gpu,
+            slot,
+            repair.window_start,
+            repair.window_seed,
+            &repair.consumed,
+        )? {
+            return Err("the speculator could not repair the stopping window".into());
+        }
+    }
     let never = || false;
     if spec.on_forced_advance(gpu, slot, &[seed.token], seed.position, &never)? {
         return Ok(());

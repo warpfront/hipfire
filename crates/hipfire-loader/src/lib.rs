@@ -1177,15 +1177,35 @@ pub fn gemma4_eagle_spec_len(spec: Option<u64>) -> Result<usize, String> {
     }
 }
 
+/// A terminal strict-prefix window repair a speculative request left for the
+/// next consumer of the live state (see [`DeferredSpecSeed::repair`]): the
+/// arguments of `Speculator::repair_terminal_prefix`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredWindowRepair {
+    /// The position the repaired window started at.
+    pub window_start: usize,
+    /// The seed token that window started from.
+    pub window_seed: u32,
+    /// The window's tokens the request consumed before it stopped.
+    pub consumed: Vec<u32>,
+}
+
 /// A speculative request's terminal pending seed whose one-token forward is
 /// deferred to the next consumer of the live state (see
 /// [`LoadedModel::spec_deferred_seed`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeferredSpecSeed {
     /// The seed token (the request's last emitted token).
     pub token: u32,
     /// The position it is fed at; `seq_pos` is `position + 1` while deferred.
     pub position: usize,
+    /// The repair of the stopping window that must run before the seed is fed:
+    /// the request stopped inside a speculative window, so the target and
+    /// drafter still hold the whole window, not the consumed prefix. It is the
+    /// restore-and-replay forward the request would otherwise have run before
+    /// its `done`, at the same position, so state ends exactly where an
+    /// immediate repair leaves it.
+    pub repair: Option<DeferredWindowRepair>,
 }
 
 // ─── LoadedModel ──────────────────────────────────────────────────────
@@ -1269,9 +1289,11 @@ pub struct LoadedModel {
     /// The terminal pending seed of the last speculative request, emitted and
     /// counted in `seq_pos` / `conversation_tokens` but not yet fed to the
     /// target and drafter (`hipfire_generate::qwen::generate_spec` defers that
-    /// one-token forward for a resident single-card Qwen3.5 target). The next
-    /// consumer of the live state feeds it first, unchanged; a cold prefill
-    /// drops it unfed. `None` whenever device state matches the host record.
+    /// one-token forward for a resident single-card Qwen3.5 target), together
+    /// with the stopping window's repair when the request stopped inside a
+    /// DFlash window. The next consumer of the live state runs the repair and
+    /// feeds the seed first, unchanged; a cold prefill drops them unrun.
+    /// `None` whenever device state matches the host record.
     pub spec_deferred_seed: Option<DeferredSpecSeed>,
     pub chat_template: Option<String>,
     /// Where `chat_template` came from after override/embedded/fallback
