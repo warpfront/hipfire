@@ -132,6 +132,12 @@ pub struct MeshRunner {
     next_op: u64,
     /// Submitted, not yet drained epochs of the request in flight, oldest first.
     outstanding: Vec<MeshTicket>,
+    /// An epoch submission failed after it may have enqueued work that no
+    /// ticket covers: nothing counts as drained until a successful reset.
+    unsettled: bool,
+    /// A failed device synchronization quarantined the mesh. Persistent for
+    /// the load: every later request is refused, whoever owns the devices.
+    quarantined: Option<String>,
 }
 
 /// One request's output buffers on the mesh's output owner.
@@ -154,11 +160,25 @@ impl MeshRunner {
             request_id: 0,
             next_op: 1,
             outstanding: Vec::new(),
+            unsettled: false,
+            quarantined: None,
         })
     }
 
     pub fn mesh(&self) -> &DeviceMesh {
         &self.mesh
+    }
+
+    /// Why this load's mesh refuses all work (a failed synchronization).
+    pub fn quarantined(&self) -> Option<&str> {
+        self.quarantined.as_deref()
+    }
+
+    /// Record a quarantine `gpus` reports, so it outlives this request's lend.
+    fn note_quarantine(&mut self, gpus: &Gpus, error: &str) {
+        if gpus.mesh_quarantined() && self.quarantined.is_none() {
+            self.quarantined = Some(error.to_string());
+        }
     }
 
     /// Start a request on `gpus`: provision a one-owner mesh (a multi-owner
@@ -167,6 +187,9 @@ impl MeshRunner {
     pub fn begin(&mut self, family: &dyn MeshFamily, gpus: &mut Gpus) -> Result<MeshRequest> {
         if gpus.mesh.epoch() != self.mesh.epoch() {
             return Err("the request's devices carry a different mesh than the runner".into());
+        }
+        if let Some(reason) = &self.quarantined {
+            return Err(format!("engine mesh quarantined until restart: {reason}"));
         }
         family.admit(gpus)?;
         if gpus.mesh_output_owner().is_none() {
@@ -212,22 +235,36 @@ impl MeshRunner {
     /// returns the drain verdict. A failed drain leaks them: work in flight
     /// may still write them.
     pub fn end(&mut self, request: MeshRequest, gpus: &mut Gpus) -> Result<()> {
+        // ponytail: the two output tensors leak per failed request; reclaim
+        // them after the rollback's attested reset if failures become common.
         if let Err(error) = self.settle(gpus) {
             std::mem::forget(request);
             return Err(error);
         }
-        let gpu = &mut gpus.devices[request.owner];
+        let Some(gpu) = gpus.devices.get_mut(request.owner) else {
+            std::mem::forget(request);
+            return Err("the mesh's devices are gone".into());
+        };
         let _ = gpu.free_tensor(request.logits);
         let _ = gpu.free_tensor(request.top1);
         Ok(())
     }
 
     /// Drain every outstanding epoch with one synchronization of each device.
+    /// An empty ticket list is no proof of an idle device after a failed
+    /// submission (`unsettled`): that refuses until the reset drains it.
     pub fn settle(&mut self, gpus: &mut Gpus) -> Result<()> {
+        if self.unsettled {
+            return Err("an epoch failed mid-submission; the device is not drained".into());
+        }
         if self.outstanding.is_empty() {
             return Ok(());
         }
-        gpus.drain_mesh_epochs(std::mem::take(&mut self.outstanding))
+        let result = gpus.drain_mesh_epochs(std::mem::take(&mut self.outstanding));
+        if let Err(error) = &result {
+            self.note_quarantine(gpus, error);
+        }
+        result
     }
 
     /// Run the next prompt epoch; returns its end and, at the prompt end,
@@ -328,7 +365,11 @@ impl MeshRunner {
     /// and, for a one-owner mesh, provision it again.
     pub fn recover(&mut self, family: &dyn MeshFamily, gpus: &mut Gpus) -> Result<()> {
         self.outstanding.clear();
-        gpus.drain_mesh_edges()?;
+        if let Err(error) = gpus.drain_mesh_edges() {
+            self.note_quarantine(gpus, &error);
+            return Err(error);
+        }
+        self.unsettled = false;
         if gpus.devices.len() != 1 {
             return Err("a multi-owner mesh is recovered by its loader".into());
         }
@@ -354,6 +395,10 @@ impl MeshRunner {
             edge_epochs: edge_epochs(gpus)?,
         };
         let result = family.with_bindings(input, &mut |bindings| gpus.reset_mesh(bindings, &epoch));
+        match &result {
+            Ok(()) => self.unsettled = false,
+            Err(error) => self.note_quarantine(gpus, error),
+        }
         for gpu in gpus.devices.iter_mut() {
             gpu.invalidate_graph_state();
             gpu.replay.invalidate_replay_observation_window();
@@ -415,11 +460,15 @@ impl MeshRunner {
             device_token,
             edge_epochs: edge_epochs(gpus)?,
         };
+        // A submission may enqueue work and then fail before its ticket exists.
+        self.unsettled = true;
         let outstanding = &mut self.outstanding;
         family.with_bindings(input, &mut |bindings| {
             outstanding.push(gpus.submit_mesh_epoch(plan, &epoch, bindings)?);
             Ok(())
-        })
+        })?;
+        self.unsettled = false;
+        Ok(())
     }
 
     fn read_logits(&mut self, request: &MeshRequest, gpus: &mut Gpus) -> Result<Vec<f32>> {
