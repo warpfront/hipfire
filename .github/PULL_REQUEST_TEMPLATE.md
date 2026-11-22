@@ -4,7 +4,7 @@
 
 ## Which surface(s) does this touch?
 
-Tick the surfaces this PR changes so a reviewer can match evidence to the claim map in `docs/VALIDATION.md`. Optional hw-gate automation uses the same buckets (`scripts/hw-gate/select.py`) when it runs.
+Tick the surfaces this PR changes so a reviewer can match evidence to the claim map in `docs/VALIDATION.md`. Optional hw-gate automation uses the same buckets (`scripts/hw-gate/bucket_select.py`) when it runs.
 
 - [ ] **kernel** — `kernels/`, `crates/rdna-compute`, `crates/hipfire-dispatch`, `crates/hip-bridge`, `crates/saddle-core`
 - [ ] **load** — `crates/hipfire-loader`, `crates/hipfire-daemon`, runtime load path (`model_load`, `hfq`, `loader_api`, `config`, `safetensors_source`, `weight_backend`, `multi_gpu`), arch `load*`/`weights*`/`carrier.rs`, `hipfire-config`, `hipfire-registry`, `registry/`, Cargo manifests

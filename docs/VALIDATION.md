@@ -288,7 +288,7 @@ route selection; seat 2: investigation) may assist under their own automation
 identities; a human still owns the approving review. Diffs that touch no
 hardware-relevant surface need no hardware route.
 
-### Bucket selection (`scripts/hw-gate/select.py`)
+### Bucket selection (`scripts/hw-gate/bucket_select.py`)
 
 Changed paths → buckets `load` / `serve` / `kernel` (first match wins per path;
 `serve` and `kernel` also imply `load`):

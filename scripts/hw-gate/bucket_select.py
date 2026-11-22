@@ -352,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
                 body = fh.read()
         except OSError as exc:
             # File access is a usage/runtime issue; body content never raises.
-            print(f"select.py: cannot read --pr-body: {exc}", file=sys.stderr)
+            print(f"bucket_select.py: cannot read --pr-body: {exc}", file=sys.stderr)
             return 2
         request, request_error = parse_pr_request(body)
         result["request"] = request

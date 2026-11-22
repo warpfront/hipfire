@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 
 # Import select module via importlib to avoid package issues
-SELECT_PATH = Path(__file__).parent.parent / "select.py"
+SELECT_PATH = Path(__file__).parent.parent / "bucket_select.py"
 spec = importlib.util.spec_from_file_location("hw_gate_select", str(SELECT_PATH))
 select_mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(select_mod)
@@ -331,7 +331,7 @@ def test_policy_patterns_positive():
         ".github/workflows/ci.yml",
         ".github/workflows/hw-gate.yml",
         ".github/CODEOWNERS",
-        "scripts/hw-gate/select.py",
+        "scripts/hw-gate/bucket_select.py",
         "scripts/hw-gate/review.py",
         "scripts/leanup-thresholds.txt",
         "scripts/layering.txt",
