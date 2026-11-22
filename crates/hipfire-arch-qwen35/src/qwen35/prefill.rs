@@ -6170,19 +6170,17 @@ fn gdn_dense_scan_static_admitted(
 
 /// Resolve the canonical prefill plan of every LA layer from static facts: device, weight
 /// headers, configured Q8/EF state and precision flags. Never from an outer call's rows or
-/// free VRAM. `None`: this state has no stream (FP32/Q4 quantization, or a lane-batched
-/// owner) and ordinary prefill keeps the per-call recurrence. All plans carry one model
-/// recipe id (the shared id, or a fold of the per-layer ids).
+/// free VRAM. `None`: this state has no stream (FP32/Q4 quantization) and ordinary prefill
+/// keeps the per-call recurrence. A lane-batched owner resolves the same plans: its lane
+/// views inherit them with their slice of the owner's lane-major carry. All plans carry one
+/// model recipe id (the shared id, or a fold of the per-layer ids).
 pub(crate) fn resolve_gdn_stream_plans(
     gpu: &Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     dn_state: &DeltaNetState,
 ) -> HipResult<Option<Vec<GdnPrefillPlan>>> {
-    if dn_state.quant != StateQuant::Q8
-        || dn_state.stream.lanes != 1
-        || dn_state.s_matrices.is_empty()
-    {
+    if dn_state.quant != StateQuant::Q8 || dn_state.s_matrices.is_empty() {
         return Ok(None);
     }
     let state = if dn_state.s_ef_residual.is_empty() {
@@ -6312,7 +6310,8 @@ pub(crate) fn resolve_gdn_stream_plans(
 /// prefill: resolved plans (recipe bound into the owner), persistent carry sized for the
 /// plans' microtile, the per-layer model constants and the 64-row edge workspace of the
 /// Scan64 executor (once per owner, never per layer). Idempotent; a recipe cannot change on
-/// a non-empty prefix. A state without a stream (FP32/Q4, lane-batched) is left untouched.
+/// a non-empty prefix. A state without a stream (FP32/Q4) is left untouched; a lane-batched
+/// owner gets a lane-major carry its lane views slice (`DeltaNetState::q8_lane_view`).
 pub fn provision_gdn_stream(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,

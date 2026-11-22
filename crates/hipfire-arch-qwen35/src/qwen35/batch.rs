@@ -12,6 +12,7 @@ use super::forward::Qwen35Scratch;
 use super::prefill::forward_batch_chunk_impl;
 use super::prefill::forward_prefill_batch;
 use super::prefill::moe_grouped_m_total_max;
+use super::prefill::provision_gdn_stream;
 use super::prefill::HiddenCapture;
 use super::prefill::MOE_GROUPED_BLOCK_M;
 use super::weights::DeltaNetState;
@@ -895,6 +896,10 @@ impl Qwen35DecodeBatchState {
                 ),
             ));
         }
+        // Provision the owner, not the lane view: the view then slices the owner's
+        // lane-major carry and inherits its plans and recipe, so `adopt_lane_meta` matches
+        // and no per-request carry is allocated on (and leaked with) the view.
+        provision_gdn_stream(gpu, weights, config, &mut self.dn_state)?;
         let mut kv_lane = self.kv_cache.q8_lane_view(lane, self.lane_capacity)?;
         let mut dn_lane = self.dn_state.q8_lane_view(config, lane, self.max_batch)?;
         forward_prefill_batch(
