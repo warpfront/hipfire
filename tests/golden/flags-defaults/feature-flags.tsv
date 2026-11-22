@@ -2634,7 +2634,7 @@ feature_flags	gfx1150	hfq4_mmq_rdna2=None
 feature_flags	gfx1150	hfq4g128_mmq=true
 feature_flags	gfx1150	hfq4g256_ldsstage_wmma=false
 feature_flags	gfx1150	hidden_scatter_fuse_off=false
-feature_flags	gfx1150	hipcc_extra_flags=""
+feature_flags	gfx1150	hipcc_extra_flags="-DIU4_A4_CANDIDATES=2"
 feature_flags	gfx1150	iu4_prefill=None
 feature_flags	gfx1150	lloyd_f16_gfx11=true
 feature_flags	gfx1150	lloyd_force_baseline=false
