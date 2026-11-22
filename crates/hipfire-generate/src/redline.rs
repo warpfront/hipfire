@@ -4067,7 +4067,7 @@ pub fn railgun_g0_dflash_cycle(
     if hipfire_config::developer_var("HIPFIRE_DFLASH_VERIFY_PM4").as_deref() == Ok("1") {
         return Err("railgun_g0_dflash_cycle refuses HIPFIRE_DFLASH_VERIFY_PM4=1 (retained verify swaps controllers)".into());
     }
-    if hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH").as_deref() != Ok("0") {
+    if gpu.flags.verify_graph != Some(false) {
         return Err("railgun_g0_dflash_cycle requires HIPFIRE_VERIFY_GRAPH=0 (graph launches bypass the funnels)".into());
     }
     if context == 0 || context.saturating_add(4 * DFLASH_VERIFY_PM4_BLOCK) > loaded.physical_cap {

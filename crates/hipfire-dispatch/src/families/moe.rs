@@ -2292,13 +2292,11 @@ pub fn codebook_batched_admit_enabled(arch: &str) -> bool {
     )
 }
 
-/// Whether MQ6 grouped prefill is admitted by the process policy.
-pub fn mq6_batched_admit_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
-    match value {
-        Some("0") | Some("off") | Some("false") => false,
-        Some("1") | Some("on") | Some("true") => true,
-        _ => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
-    }
+/// Whether MQ6 grouped prefill is admitted by the process policy: the explicit
+/// `kernel.moe_mq6_admit` / `HIPFIRE_MOE_MQ6_ADMIT` value (`FeatureFlags::moe_mq6_admit`),
+/// else gfx11* and gfx12*.
+pub fn mq6_batched_admit_enabled(explicit: Option<bool>, arch: &str) -> bool {
+    explicit.unwrap_or(arch.starts_with("gfx11") || arch.starts_with("gfx12"))
 }
 
 pub fn gated_moe_prefill_admissible_for_dtypes(

@@ -355,10 +355,12 @@ fn enabled(gpu: &Gpu) -> bool {
 }
 
 /// Whether a load on device `gpu_arch` slices the draft lm_head
-/// ([`DRAFT_VOCAB_ENV`], default on exact gfx1100 only). `hipfire fit` reads
-/// it to charge the slice before a device is open.
+/// ([`DRAFT_VOCAB_ENV`] / `speculation.gfx1100_draft_vocab`, default on exact
+/// gfx1100 only). `hipfire fit` reads it to charge the slice before a device is open.
 pub fn enabled_for_arch(gpu_arch: &str) -> bool {
-    hipfire_config::developer_bool(DRAFT_VOCAB_ENV, gpu_arch == "gfx1100")
+    rdna_compute::FeatureFlags::process()
+        .gfx1100_draft_vocab
+        .unwrap_or(gpu_arch == "gfx1100")
 }
 
 /// Give `head` a compressed draft lm_head sliced from the trunk lm_head

@@ -177,10 +177,9 @@ fn is_mq4_rot(gpu: &Gpu, dtype: DType) -> bool {
 /// is the certified default on gfx1100 and gfx1201; `HIPFIRE_GDN_COMPACT2=0`
 /// is a fail-closed escape hatch.
 fn gdn_compact2(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> bool {
-    let mode = developer_var("HIPFIRE_GDN_COMPACT2");
     let arch_enabled =
         (gpu.arch_caps.is_gfx1201() || gpu.arch_caps.arch() == "gfx1100" || gfx1151_radiowave(gpu))
-            && mode.as_deref() != Some("0");
+            && gpu.flags.gdn_compact2;
     arch_enabled && q8_state && dims.linear_key_heads * 2 == dims.linear_value_heads
 }
 
@@ -382,12 +381,11 @@ pub fn conv_scalar_prep(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> bool {
 }
 
 pub fn conv_qknorm(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> bool {
-    let mode = developer_var("HIPFIRE_CONV_QKNORM");
     let arch_enabled = (gpu.arch_caps.is_gfx1201()
         || gpu.arch_caps.arch() == "gfx1100"
         || gfx1101_campaign(gpu)
         || gfx1151_radiowave(gpu))
-        && mode.as_deref() != Some("0");
+        && gpu.flags.conv_qknorm;
     arch_enabled && q8_state && dims.linear_key_dim == 128
 }
 

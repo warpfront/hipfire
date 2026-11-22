@@ -16598,13 +16598,10 @@ impl Gpu {
             // Candidate exact shape: M=1024 => [512,8,1], block [32,1,1], LDS 0.
             (m as u32) >> 1
         } else {
-            let tight = match hipfire_config::developer_var("HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID")
-                .as_deref()
-            {
-                Ok("1") => true,
-                Ok("0") => false,
-                _ => self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201(),
-            };
+            let tight = self
+                .flags
+                .mq4v2_gate_up_tight_grid
+                .unwrap_or(self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201());
             if tight {
                 (m as u32) >> 1
             } else {
@@ -24444,9 +24441,7 @@ impl Gpu {
         // B=1024): strided WMMA is ~10x faster than the scalar per-row
         // kernel. Env keeps a one-command fallback for bisects.
         let default_wmma = self.arch == "gfx1151" && k % 32 == 0 && m >= 64 && batch_size >= 64;
-        let use_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_WO_Q8_WMMA")
-            .map(|s| s != "0")
-            .unwrap_or(default_wmma);
+        let use_wmma = self.flags.deepseek4_wo_q8_wmma.unwrap_or(default_wmma);
         if use_wmma && k % 32 == 0 {
             return self.wo_per_group_batched_q8_0_wmma_4w(wo_a, x_in, y_out, g, m, k, batch_size);
         }

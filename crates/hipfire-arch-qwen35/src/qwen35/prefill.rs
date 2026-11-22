@@ -39,7 +39,7 @@ use hipfire_dispatch::families::kv_tier::KvTierPlan;
 use hipfire_dispatch::families::moe::{codebook_batched_admit_enabled, NARROW_VERIFY_MAX_ROWS};
 #[cfg(test)]
 use hipfire_dispatch::families::moe::{
-    codebook_batched_admit_enabled_from_env, mq6_batched_admit_enabled_from_env,
+    codebook_batched_admit_enabled_from_env, mq6_batched_admit_enabled,
 };
 use hipfire_dispatch::pipeline::batched::{
     lloyd_mmq_a4_static_admitted, mq_f16_projection_fast_route, q8_prefill_wmma_enabled,
@@ -4825,10 +4825,8 @@ pub fn qwen35_layer_batch_admissible(
             ) {
                 return Err(HipError::new(0, "DeltaNetMoe topk shape unsupported"));
             }
-            let admit_mq6 = hipfire_dispatch::families::moe::mq6_batched_admit_enabled_from_env(
-                hipfire_config::developer_var("HIPFIRE_MOE_MQ6_ADMIT")
-                    .ok()
-                    .as_deref(),
+            let admit_mq6 = hipfire_dispatch::families::moe::mq6_batched_admit_enabled(
+                rdna_compute::FeatureFlags::process().moe_mq6_admit,
                 arch,
             );
             let dtypes = moe_prefill_dtypes(&l.ffn)
@@ -4902,10 +4900,8 @@ pub fn qwen35_layer_batch_admissible(
             ) {
                 return Err(HipError::new(0, "FullAttnMoe topk shape unsupported"));
             }
-            let admit_mq6 = hipfire_dispatch::families::moe::mq6_batched_admit_enabled_from_env(
-                hipfire_config::developer_var("HIPFIRE_MOE_MQ6_ADMIT")
-                    .ok()
-                    .as_deref(),
+            let admit_mq6 = hipfire_dispatch::families::moe::mq6_batched_admit_enabled(
+                rdna_compute::FeatureFlags::process().moe_mq6_admit,
                 arch,
             );
             let dtypes = moe_prefill_dtypes(&l.ffn)
@@ -6809,14 +6805,10 @@ fn fa_pair_env_admitted(
             if tier_inputs.q8_windowed {
                 return false;
             }
-            let flash_optin = match hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
-                .ok()
-                .as_deref()
-            {
-                Some("0") | Some("off") | Some("false") => false,
-                Some("1") | Some("on") | Some("true") => true,
-                _ => gpu.arch.starts_with("gfx11"),
-            };
+            let flash_optin = gpu
+                .flags
+                .flash_prefill
+                .unwrap_or(gpu.arch.starts_with("gfx11"));
             if !flash_optin {
                 return false;
             }
@@ -9659,19 +9651,19 @@ mod tests {
         // fast-path): every WMMA arch — all gfx11 (RDNA3/3.5, incl. gfx1100 and
         // gfx1151) and all gfx12 (RDNA4) — default-admits MQ6 batched prefill.
         // Non-WMMA archs (gfx942 CDNA, gfx1030 RDNA2) stay default-off.
-        assert!(mq6_batched_admit_enabled_from_env(None, "gfx1201"));
-        assert!(mq6_batched_admit_enabled_from_env(None, "gfx1200"));
-        assert!(mq6_batched_admit_enabled_from_env(None, "gfx1151"));
+        assert!(mq6_batched_admit_enabled(None, "gfx1201"));
+        assert!(mq6_batched_admit_enabled(None, "gfx1200"));
+        assert!(mq6_batched_admit_enabled(None, "gfx1151"));
         // gfx1100 is now ADMITTED by default (the gfx11 widen), where master
         // had it default-off pending channel testing.
-        assert!(mq6_batched_admit_enabled_from_env(None, "gfx1100"));
-        assert!(!mq6_batched_admit_enabled_from_env(None, "gfx942"));
-        assert!(!mq6_batched_admit_enabled_from_env(None, "gfx1030"));
+        assert!(mq6_batched_admit_enabled(None, "gfx1100"));
+        assert!(!mq6_batched_admit_enabled(None, "gfx942"));
+        assert!(!mq6_batched_admit_enabled(None, "gfx1030"));
         // Explicit env overrides still win on every arch.
-        assert!(mq6_batched_admit_enabled_from_env(Some("1"), "gfx1151"));
-        assert!(mq6_batched_admit_enabled_from_env(Some("1"), "gfx1100"));
-        assert!(!mq6_batched_admit_enabled_from_env(Some("0"), "gfx1201"));
-        assert!(!mq6_batched_admit_enabled_from_env(Some("0"), "gfx1100"));
+        assert!(mq6_batched_admit_enabled(Some(true), "gfx1151"));
+        assert!(mq6_batched_admit_enabled(Some(true), "gfx1100"));
+        assert!(!mq6_batched_admit_enabled(Some(false), "gfx1201"));
+        assert!(!mq6_batched_admit_enabled(Some(false), "gfx1100"));
     }
 
     #[test]
@@ -11213,7 +11205,7 @@ mod tests {
                 .any(|d| matches!(d, DType::MQ6G256 | DType::MQ6G256V2));
             batch_pbs_eligible &= hipfire_dispatch::families::moe::gated_moe_prefill_admissible(
                 &dtypes,
-                mq6_batched_admit_enabled_from_env(None, arch),
+                mq6_batched_admit_enabled(None, arch),
                 arch,
             );
             layers.push((
