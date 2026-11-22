@@ -693,7 +693,6 @@ pub(crate) fn route_capabilities(
                 "stop",
                 "logprobs",
                 "top_logprobs",
-                "n",
                 "best_of",
                 "logit_bias",
                 "echo",
@@ -5061,11 +5060,14 @@ mod capabilities_tests {
         assert_eq!(caps["openai_compatible"], true);
         let refused = caps["refused_request_fields"].as_array().unwrap();
         assert!(!refused.iter().any(|v| v == "tools"), "tools are supported");
+        assert!(
+            !refused.iter().any(|v| v == "n"),
+            "n 1..=8 is fanned out by the gateway on every route"
+        );
         for field in [
             "stop",
             "logprobs",
             "top_logprobs",
-            "n",
             "best_of",
             "logit_bias",
             "echo",
