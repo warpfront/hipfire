@@ -2584,7 +2584,9 @@ fn main() {
                         // and unchanged.
                         m.mtp_mode = hipfire_config::mtp_effective_mode_name(
                             &mtp_mode,
-                            m.mtp_measured_ar_floor(),
+                            // The carrier's declared floor, or this load's own
+                            // dense `auto` admission (decided once, in the loader).
+                            m.mtp_auto_armed(),
                         )
                         .to_string();
                         m.mtp_k = mtp_k.unwrap_or(m.mtp_k);

@@ -1225,6 +1225,10 @@ pub struct LoadedModel {
     pub mtp_mode: String,
     pub mtp_k: usize,
     pub mtp_weights_present: bool,
+    /// Set once at load: the dense native-MTP `auto` decision armed the head
+    /// (`hipfire_runtime::config::dense_mtp_auto`). `false` for explicit `on`
+    /// and for every load `auto` declined; never changes after the ack.
+    pub mtp_auto_admitted: bool,
     // Qwen3.5/3.6 native MTP (NextN) head (arch_id=21). Loaded once at model
     // load when a bundled `.mq4-mtp` trailer OR a separate `.mtp` sidecar is
     // present alongside the trunk. Persistent for the life of the model;
@@ -1316,6 +1320,7 @@ impl LoadedModel {
             mtp_mode: "auto".to_string(),
             mtp_k: hipfire_config::MTP_K_DEFAULT,
             mtp_weights_present: false,
+            mtp_auto_admitted: false,
             tokenizer: Some(tokenizer),
             seq_pos: 0,
             max_seq,
@@ -1350,11 +1355,19 @@ impl LoadedModel {
         carrier_for(self.arch_id).is_some_and(|carrier| carrier.mtp_measured_ar_floor())
     }
 
+    /// The producer-capability gate `auto` is resolved with: the carrier's
+    /// declared floor, or this load's own dense-MTP `auto` admission
+    /// ([`hipfire_runtime::config::dense_mtp_auto`], decided once at load).
+    pub fn mtp_auto_armed(&self) -> bool {
+        self.mtp_measured_ar_floor() || self.mtp_auto_admitted
+    }
+
     /// `mtp_mode` after the producer-capability gate
     /// ([`hipfire_config::mtp_effective_mode_name`]): `auto` on a producer
-    /// without a measured AR floor is `"off"`; `on`/`off` are unchanged.
+    /// without a measured AR floor, unless this load's dense admission armed
+    /// it, is `"off"`; `on`/`off` are unchanged.
     pub fn effective_mtp_mode(&self) -> &'static str {
-        hipfire_config::mtp_effective_mode_name(&self.mtp_mode, self.mtp_measured_ar_floor())
+        hipfire_config::mtp_effective_mode_name(&self.mtp_mode, self.mtp_auto_armed())
     }
 
     /// LFM2.5-MoE bundle if this model is arch_id=11, else None.
@@ -2521,6 +2534,160 @@ fn resolve_qwen35_mtp_head_sourced(
     (head_opt, errors)
 }
 
+/// Dense Qwen3.5 `auto`: probe the head against this load's own capacities and
+/// return it only when [`hipfire_runtime::config::dense_mtp_auto`] arms it.
+///
+/// The no-head bundle is already built (`auto` reserved nothing for a head, so
+/// the plan equals the `off` load's). One capacity sequence on this card:
+/// measure the no-head post-load fit; upload the head and its draft vocab;
+/// measure the with-head fit with the lazy owners the head adds (ring snapshot,
+/// request state, prompt-fill transient: the exact charges an explicit load
+/// makes). On a decline the head is freed and the pool drained, leaving exactly
+/// the owners the `off` load has; no owner the bundle already holds is touched.
+fn dense_mtp_auto_attach(
+    bundle: &Qwen35Bundle,
+    ctx: &mut LoadCtx,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    physical_cap: usize,
+    fully_resident: bool,
+) -> Option<(hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, String)> {
+    use hipfire_runtime::config::{dense_mtp_auto, dense_mtp_auto_log_line, DenseMtpAutoFacts};
+    let config = &bundle.config;
+    let dn_state = &bundle.dn_state;
+    let seq = ctx.sequence;
+    let max_seq = ctx.max_seq;
+    let authored = seq.filter(|s| !s.automatic).map(|_| max_seq);
+    let gpu_arch = ctx.gpu.arch.to_string();
+    let k = hipfire_arch_qwen35::mtp_speculator::mtp_requested_k(&ctx.spec);
+    let trunk = Path::new(ctx.path);
+    let sidecar = ctx
+        .mtp_path
+        .clone()
+        .unwrap_or_else(|| trunk.with_extension("mtp"));
+    let head_present = matches!(
+        hipfire_arch_qwen35::mtp_head::detect_bundled_mtp_offset(trunk),
+        Ok(Some(_))
+    ) || sidecar.exists();
+    let refusal = hipfire_arch_qwen35::qwen35::weights::native_mtp_refusal(
+        &bundle.weights.layers,
+        &ctx.gpu.arch,
+        ctx.gpu.flags.fp16_disabled,
+    );
+    let mut facts = DenseMtpAutoFacts {
+        arch_id: 5,
+        gpu_arch: &gpu_arch,
+        // A `serve.vmm_batch` load with lanes runs its requests as AR lanes.
+        singleton: ctx.batch_request.lanes().is_none(),
+        pp: ctx.pp,
+        tp: 1,
+        ep: 1,
+        fully_resident,
+        // A whole-allocated (legacy) cache cannot be refit after the head.
+        text_route_supported: seq.is_some()
+            && bundle.kv_cache.uses_vmm_backend()
+            && bundle.kv_adaptive.is_none()
+            && refusal.is_none(),
+        head_resolved: head_present,
+        other_speculator_attached: false,
+        cap_off: 1,
+        cap_on: 1,
+        // Set after the qualification probe: the placeholder capacities above
+        // would otherwise read as an authored context that is not admitted.
+        authored_max_seq: None,
+        same_placement: true,
+        on_fits: true,
+    };
+    let decline = |facts: &DenseMtpAutoFacts<'_>| {
+        let d = dense_mtp_auto(facts);
+        let line = dense_mtp_auto_log_line(&d, authored, "measured");
+        eprintln!("  {line}");
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOff,
+            format!("MTP off: auto declined ({})", d.reason.label()),
+        );
+    };
+    // Arch-level qualification first: nothing is measured or uploaded for a
+    // load that cannot arm whatever its capacities.
+    let pre = dense_mtp_auto(&facts);
+    if !pre.attach {
+        decline(&facts);
+        return None;
+    }
+    facts.authored_max_seq = authored;
+    let seq = seq.expect("route support requires a sequence hint");
+    let admitted = |fit: usize| -> Option<usize> {
+        if seq.automatic {
+            if fit >= physical_cap {
+                Some(max_seq.min(physical_cap))
+            } else if fit < admission::QWEN35_MIN_AUTO_CONTEXT {
+                None
+            } else {
+                Some(max_seq.min(fit))
+            }
+        } else if max_seq.min(physical_cap) > fit {
+            None
+        } else {
+            Some(max_seq.min(physical_cap))
+        }
+    };
+    let measure = |gpu: &Gpu, lazy: Result<Qwen35LazyCharges, String>| {
+        lazy.and_then(|lazy| {
+            qwen35_post_load_fit(config, &bundle.kv_cache, gpu, physical_cap, lazy)
+        })
+        .ok()
+        .map(|m| m.fit)
+    };
+    let off_fit = measure(
+        &*ctx.gpu,
+        qwen35_lazy_charges(config, dn_state, &*ctx.gpu, false, None),
+    );
+    facts.cap_off = off_fit.and_then(admitted).unwrap_or(0);
+    if facts.cap_off == 0 {
+        decline(&facts);
+        return None;
+    }
+    let (resolved, _errors) = resolve_qwen35_mtp_head_sourced(
+        trunk,
+        ctx.mtp_path.clone(),
+        (config.dim, config.vocab_size),
+        &mut *ctx.gpu,
+        physical_cap,
+        None,
+    );
+    let Some((mut head, source)) = resolved else {
+        facts.head_resolved = false;
+        decline(&facts);
+        return None;
+    };
+    hipfire_arch_qwen35::draft_vocab::attach_trunk_draft_vocab(
+        &mut *ctx.gpu,
+        &mut head,
+        &bundle.weights.output,
+        tokenizer,
+    );
+    let on_fit = measure(
+        &*ctx.gpu,
+        qwen35_lazy_charges(config, dn_state, &*ctx.gpu, true, Some((&head, k))),
+    );
+    let on_admitted = on_fit.and_then(admitted);
+    facts.on_fits = on_admitted.is_some();
+    facts.cap_on = on_admitted.unwrap_or(0);
+    let decision = dense_mtp_auto(&facts);
+    let line = dense_mtp_auto_log_line(&decision, authored, "measured");
+    eprintln!("  {line}");
+    if !decision.attach {
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOff,
+            format!("MTP off: auto declined ({})", decision.reason.label()),
+        );
+        head.free_gpu(&mut *ctx.gpu);
+        ctx.gpu.drain_pool();
+        return None;
+    }
+    eprintln!("  qwen35 MTP: armed by speculation.mtp=auto ({source})");
+    Some((head, source))
+}
+
 /// Build a `LoadedModel` from a carrier `Bundle`, shared fields, and
 /// DFlash state. This is the common body for qwen35 dispatch
 /// where DFlash needs per-arch type info.
@@ -2824,13 +2991,24 @@ fn finish_qwen35_load(
     // (`Some(false)`) stays AR via the gate below. qwen35's admitted list is
     // empty. Worded once in `hipfire_config::mtp_host_spill_decline_line`.
     let mtp_spill_mode = hipfire_config::MtpMode::from_tri_state(ctx.spec.mtp);
-    // Producer capability gate first: qwen35's drafter declares no measured AR
-    // floor (`hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR`), so `auto` keeps
-    // plain AR and the head is never loaded (the retained AR spine keeps its
-    // memory); only an explicit `on` arms it. A floor decline supersedes the
-    // spill decline below (its line would misdescribe the cause).
+    // Producer capability gate first. Dense Qwen3.5 (arch 5) decides `auto`
+    // from this load's own capacities (`dense_mtp_auto`, probed below once the
+    // no-head bundle exists). Qwen3.5 MoE (arch 6) declares no measured AR
+    // floor (`hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR`), so its `auto` keeps
+    // plain AR and the head is never loaded; only an explicit `on` arms it. A
+    // floor decline supersedes the spill decline below (its line would
+    // misdescribe the cause).
+    let mtp_dense_auto =
+        bundle.config.num_experts == 0 && mtp_spill_mode == hipfire_config::MtpMode::Auto;
+    let mtp_fully_resident = host_mapped_expert_blobs == 0
+        && hipfire_config::memory::effective_offload_budgets()
+            == (
+                hipfire_config::memory::OffloadBudget::Full,
+                hipfire_config::memory::OffloadBudget::Full,
+            );
     let mtp_floor_declined = matches!(arch_id, 5 | 6)
         && mtp_spill_mode == hipfire_config::MtpMode::Auto
+        && !mtp_dense_auto
         && !hipfire_config::mtp_mode_admits(
             mtp_spill_mode,
             hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR,
@@ -2885,12 +3063,13 @@ fn finish_qwen35_load(
     }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive,
-    // and a typed mtp the producer-capability gate admits (`on`; `auto` only with a
-    // declared measured AR floor, which qwen35 lacks, so `auto` never loads a head).
+    // and a typed mtp the producer-capability gate admits (`on`; dense `auto` when
+    // `dense_mtp_auto` arms this load; MoE `auto` never loads a head).
     // Bundled first, then the sidecar the CLI resolved
     // (`ctx.mtp_path`), else `<trunk>.mtp`; physical_cap is the KV window. A head
     // whose hidden size or vocab differs from the trunk is refused before upload.
     // On missing/refused/failed: error when forced on (mtp=on), auto logs/falls back.
+    let mut mtp_auto_admitted = false;
     let mtp: Option<(hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, String)> =
         if adaptive_blocks_generic_spec
             || !matches!(arch_id, 5 | 6)
@@ -2901,6 +3080,16 @@ fn finish_qwen35_load(
             || dspark_speculator.is_some()
         {
             None
+        } else if mtp_dense_auto {
+            let attached = dense_mtp_auto_attach(
+                &bundle,
+                &mut *ctx,
+                &tokenizer,
+                physical_cap,
+                mtp_fully_resident,
+            );
+            mtp_auto_admitted = attached.is_some();
+            attached
         } else {
             // `ctx.path` is canonical, so a sidecar beside a symlinked trunk is not
             // its sibling; the CLI resolves that case into `ctx.mtp_path`. Direct
@@ -3163,6 +3352,7 @@ fn finish_qwen35_load(
         )
     };
     model.mtp_weights_present = mtp_present;
+    model.mtp_auto_admitted = mtp_auto_admitted;
     if let Some(message) = fit_refusal {
         // The speculator and bundle are all owned by `model` now:
         // the regular unload path frees every one of them.
@@ -7981,6 +8171,50 @@ mod registry_tests {
             }}"#
         );
         hipfire_runtime::tokenizer::Tokenizer::from_hf_json(&json).expect("test tokenizer")
+    }
+
+    /// The effective `auto` mode: a producer's declared floor, or this load's
+    /// own dense admission (arch 5 only). Explicit `on` / `off` never depend on
+    /// either; a decline (`mtp_auto_admitted` false) is AR for every arch-5 load
+    /// and the slots / VMM lane engines keep reading the carrier floor alone.
+    #[test]
+    fn effective_mtp_mode_truth_table_for_the_dense_auto_admission() {
+        let model = |arch_id: u32, mode: &str, admitted: bool| {
+            let mut m = crate::LoadedModel::skeleton(
+                arch_id,
+                test_tokenizer(),
+                8192,
+                8192,
+                String::new(),
+                None,
+                None,
+            );
+            m.mtp_mode = mode.to_string();
+            m.mtp_auto_admitted = admitted;
+            m
+        };
+        // Qwen3.5 dense declares no floor: auto is AR unless the load admitted it.
+        assert!(!model(5, "auto", false).mtp_measured_ar_floor());
+        assert_eq!(model(5, "auto", false).effective_mtp_mode(), "off");
+        assert_eq!(model(5, "auto", true).effective_mtp_mode(), "auto");
+        assert!(model(5, "auto", true).mtp_auto_armed());
+        assert!(
+            !model(5, "auto", true).mtp_measured_ar_floor(),
+            "the floor stays truthful"
+        );
+        for admitted in [false, true] {
+            assert_eq!(model(5, "on", admitted).effective_mtp_mode(), "on");
+            assert_eq!(model(5, "off", admitted).effective_mtp_mode(), "off");
+        }
+        // MoE and the other producers without a floor stay AR; Qwen4's floor is its own.
+        for arch in [6u32, 9, 13] {
+            assert_eq!(
+                model(arch, "auto", false).effective_mtp_mode(),
+                "off",
+                "arch {arch}"
+            );
+        }
+        assert_eq!(model(16, "auto", false).effective_mtp_mode(), "auto");
     }
 
     fn byte_to_gpt2_char_test(b: u8) -> char {

@@ -995,7 +995,12 @@ fn stage_qwen_vmm_spec(m: &mut LoadedModel, gpu: &mut Gpu, lanes: usize, row_bud
         stage_qwen_vmm_dflash(m, gpu, row_budget);
         return;
     }
-    if !m.mtp_weights_present || m.mtp_mode == "off" {
+    // `auto` armed by a dense load's own admission is a singleton decision:
+    // the VMM lane engine stays AR unless MTP was asked for explicitly.
+    if !m.mtp_weights_present
+        || m.mtp_mode == "off"
+        || (m.mtp_mode == "auto" && !m.mtp_measured_ar_floor())
+    {
         return;
     }
     let cap = m.max_seq.min(VMM_SPEC_LANE_CAP);

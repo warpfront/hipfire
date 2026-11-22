@@ -199,6 +199,206 @@ pub fn retained_redline_default(
         && route == Some(RouteSku::Mq2r)
 }
 
+/// On-context (tokens) at or above which dense native MTP arms under `auto`
+/// whatever it costs relative to the no-head context: a head that still leaves
+/// this much room does not take a usable window away (Kaden's ruling,
+/// 2026-11-22). Not keyed by model, format, card name or price.
+pub const DENSE_MTP_AUTO_CONTEXT_FLOOR: usize = 131_072;
+
+/// Facts the dense native-MTP `auto` decision reads. Every field is a fact of
+/// the load, none a model name, weight-format label, acceptance rate or timing.
+#[derive(Debug, Clone, Copy)]
+pub struct DenseMtpAutoFacts<'a> {
+    /// Architecture id of the loaded model (dense Qwen3.5-class = 5).
+    pub arch_id: u32,
+    /// Exact device arch string (`gfx1100` / `gfx1201`); never a marketing tier.
+    pub gpu_arch: &'a str,
+    /// A singleton, no-slots load.
+    pub singleton: bool,
+    pub pp: usize,
+    pub tp: usize,
+    pub ep: usize,
+    /// Every weight and the KV cache live on the device (no host spill).
+    pub fully_resident: bool,
+    /// The text route the head would run under is an executable one (no
+    /// adaptive KV, no vision-only route).
+    pub text_route_supported: bool,
+    /// A head matching the trunk resolved (bundled trailer or sidecar).
+    pub head_resolved: bool,
+    /// Another speculator (DFlash, DSpark) is attached or declared and loaded.
+    pub other_speculator_attached: bool,
+    /// Context the load admits without the head (from one capacity snapshot).
+    pub cap_off: usize,
+    /// Context the load admits with the head (same snapshot).
+    pub cap_on: usize,
+    /// `Some(n)` when the context was authored (`memory.max_seq` / `--max-seq`).
+    pub authored_max_seq: Option<usize>,
+    /// The with-head plan places every owner the no-head plan does.
+    pub same_placement: bool,
+    /// The with-head plan fits at all (no refusal, no spill).
+    pub on_fits: bool,
+}
+
+/// Why [`dense_mtp_auto`] decided as it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenseMtpAutoReason {
+    /// Not dense arch 5.
+    NotDenseQwen35,
+    /// Not exact gfx1100 / gfx1201.
+    UnsupportedGpu,
+    /// Not a singleton single-GPU (PP/TP/EP) load.
+    Topology,
+    /// Weights or KV spill to the host.
+    NotFullyResident,
+    /// The text route cannot run the head.
+    UnsupportedRoute,
+    /// No head resolved.
+    NoHead,
+    /// Another speculator is attached.
+    OtherSpeculator,
+    /// Zero capacity (either plan) or arithmetic overflow.
+    InvalidCapacity,
+    /// The with-head plan does not fit.
+    OnDoesNotFit,
+    /// The with-head plan places owners differently.
+    PlacementChanged,
+    /// An authored context the head does not admit unchanged.
+    AuthoredNotAdmitted,
+    /// Omitted context: below both the retention line and the absolute floor.
+    BelowRetentionAndFloor,
+    /// Armed: the authored context is admitted unchanged with the head.
+    AdmittedAuthored,
+    /// Armed: the with-head context keeps at least 95 % of the no-head one.
+    AdmittedRetention,
+    /// Armed: the with-head context is at least [`DENSE_MTP_AUTO_CONTEXT_FLOOR`].
+    AdmittedFloor,
+}
+
+impl DenseMtpAutoReason {
+    /// Stable token for the load log line and `hipfire fit`.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotDenseQwen35 => "not-dense-qwen35",
+            Self::UnsupportedGpu => "unsupported-gpu",
+            Self::Topology => "not-single-gpu",
+            Self::NotFullyResident => "not-fully-resident",
+            Self::UnsupportedRoute => "unsupported-route",
+            Self::NoHead => "no-head",
+            Self::OtherSpeculator => "other-speculator",
+            Self::InvalidCapacity => "invalid-capacity",
+            Self::OnDoesNotFit => "head-does-not-fit",
+            Self::PlacementChanged => "placement-changed",
+            Self::AuthoredNotAdmitted => "authored-context-not-admitted",
+            Self::BelowRetentionAndFloor => "below-retention-and-floor",
+            Self::AdmittedAuthored => "authored-context-admitted",
+            Self::AdmittedRetention => "retention>=0.95",
+            Self::AdmittedFloor => "context>=131072",
+        }
+    }
+}
+
+/// The one immutable `auto` verdict of a dense native-MTP load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DenseMtpAutoDecision {
+    pub attach: bool,
+    pub reason: DenseMtpAutoReason,
+    pub cap_off: usize,
+    pub cap_on: usize,
+}
+
+impl DenseMtpAutoDecision {
+    /// Tokens the with-head context sits above (positive) or below (negative)
+    /// the 0.95 retention line `ceil(19 * cap_off / 20)`.
+    pub fn margin_tokens(&self) -> i128 {
+        let line = (19u128 * self.cap_off as u128).div_ceil(20);
+        self.cap_on as i128 - line as i128
+    }
+}
+
+/// Whether dense native MTP arms under `speculation.mtp = auto`.
+///
+/// Order: (1) arch-level qualification: dense arch 5, exact gfx1100/gfx1201,
+/// singleton single-GPU, fully resident, a supported text route, a resolved
+/// head and no other speculator; (2) invalid capacity or a with-head plan that
+/// does not fit declines; (3) an authored context arms only when both plans
+/// admit exactly that context and place the same owners (never clamped to fit);
+/// (4) an omitted context arms when the with-head context keeps at least 95 %
+/// of the no-head one (checked in `u128`, no float) or is at least
+/// [`DENSE_MTP_AUTO_CONTEXT_FLOOR`] tokens, with identical placement. Pure: no
+/// timing, no model, no weight format, no acceptance rate.
+pub fn dense_mtp_auto(f: &DenseMtpAutoFacts<'_>) -> DenseMtpAutoDecision {
+    use DenseMtpAutoReason as R;
+    let decide = |attach: bool, reason: R| DenseMtpAutoDecision {
+        attach,
+        reason,
+        cap_off: f.cap_off,
+        cap_on: f.cap_on,
+    };
+    if f.arch_id != 5 {
+        return decide(false, R::NotDenseQwen35);
+    }
+    if !matches!(f.gpu_arch, "gfx1100" | "gfx1201") {
+        return decide(false, R::UnsupportedGpu);
+    }
+    if !f.singleton || f.pp != 1 || f.tp != 1 || f.ep != 1 {
+        return decide(false, R::Topology);
+    }
+    if !f.fully_resident {
+        return decide(false, R::NotFullyResident);
+    }
+    if !f.text_route_supported {
+        return decide(false, R::UnsupportedRoute);
+    }
+    if !f.head_resolved {
+        return decide(false, R::NoHead);
+    }
+    if f.other_speculator_attached {
+        return decide(false, R::OtherSpeculator);
+    }
+    if f.cap_off == 0 {
+        return decide(false, R::InvalidCapacity);
+    }
+    if !f.on_fits || f.cap_on == 0 {
+        return decide(false, R::OnDoesNotFit);
+    }
+    if !f.same_placement {
+        return decide(false, R::PlacementChanged);
+    }
+    if let Some(authored) = f.authored_max_seq {
+        return if f.cap_off == authored && f.cap_on == authored {
+            decide(true, R::AdmittedAuthored)
+        } else {
+            decide(false, R::AuthoredNotAdmitted)
+        };
+    }
+    if 20u128 * f.cap_on as u128 >= 19u128 * f.cap_off as u128 {
+        decide(true, R::AdmittedRetention)
+    } else if f.cap_on >= DENSE_MTP_AUTO_CONTEXT_FLOOR {
+        decide(true, R::AdmittedFloor)
+    } else {
+        decide(false, R::BelowRetentionAndFloor)
+    }
+}
+
+/// The one load-log line of a dense `auto` verdict, `basis` naming where the
+/// capacities came from (`measured` after load; `planned` from `hipfire fit`).
+pub fn dense_mtp_auto_log_line(
+    d: &DenseMtpAutoDecision,
+    authored: Option<usize>,
+    basis: &str,
+) -> String {
+    format!(
+        "mtp auto: {} reason={} cap_off={} cap_on={} authored={} margin_tokens={} basis={}",
+        if d.attach { "attach" } else { "decline" },
+        d.reason.label(),
+        d.cap_off,
+        d.cap_on,
+        authored.map_or("omitted".to_string(), |n| n.to_string()),
+        d.margin_tokens(),
+        basis
+    )
+}
+
 fn is_qwen35_family(model_arch: &str) -> bool {
     model_arch.eq_ignore_ascii_case("qwen3_5") || model_arch.eq_ignore_ascii_case("qwen3_5_moe")
 }
@@ -1234,5 +1434,161 @@ mod tests {
                 expert
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod dense_mtp_auto_tests {
+    use super::*;
+
+    fn base() -> DenseMtpAutoFacts<'static> {
+        DenseMtpAutoFacts {
+            arch_id: 5,
+            gpu_arch: "gfx1201",
+            singleton: true,
+            pp: 1,
+            tp: 1,
+            ep: 1,
+            fully_resident: true,
+            text_route_supported: true,
+            head_resolved: true,
+            other_speculator_attached: false,
+            cap_off: 262_144,
+            cap_on: 262_144,
+            authored_max_seq: None,
+            same_placement: true,
+            on_fits: true,
+        }
+    }
+
+    fn with(edit: impl FnOnce(&mut DenseMtpAutoFacts<'static>)) -> DenseMtpAutoFacts<'static> {
+        let mut facts = base();
+        edit(&mut facts);
+        facts
+    }
+
+    fn caps(off: usize, on: usize) -> DenseMtpAutoFacts<'static> {
+        with(|f| (f.cap_off, f.cap_on) = (off, on))
+    }
+
+    fn verdict(f: DenseMtpAutoFacts<'_>) -> (bool, DenseMtpAutoReason) {
+        let d = dense_mtp_auto(&f);
+        (d.attach, d.reason)
+    }
+
+    #[track_caller]
+    fn check(f: DenseMtpAutoFacts<'_>, attach: bool, reason: DenseMtpAutoReason) {
+        assert_eq!(verdict(f), (attach, reason));
+    }
+
+    #[test]
+    fn arch_level_qualification_declines_with_a_typed_reason() {
+        use DenseMtpAutoReason as R;
+        type Patch = fn(&mut DenseMtpAutoFacts<'static>);
+        let cases: [(Patch, R); 14] = [
+            (|f| f.arch_id = 4, R::NotDenseQwen35),
+            (|f| f.arch_id = 6, R::NotDenseQwen35),
+            (|f| f.arch_id = 16, R::NotDenseQwen35),
+            (|f| f.gpu_arch = "gfx1101", R::UnsupportedGpu),
+            (|f| f.gpu_arch = "gfx1151", R::UnsupportedGpu),
+            (|f| f.gpu_arch = "gfx942", R::UnsupportedGpu),
+            (|f| f.singleton = false, R::Topology),
+            (|f| f.pp = 2, R::Topology),
+            (|f| f.tp = 2, R::Topology),
+            (|f| f.ep = 2, R::Topology),
+            (|f| f.fully_resident = false, R::NotFullyResident),
+            (|f| f.text_route_supported = false, R::UnsupportedRoute),
+            (|f| f.head_resolved = false, R::NoHead),
+            (|f| f.other_speculator_attached = true, R::OtherSpeculator),
+        ];
+        for (patch, want) in cases {
+            check(with(patch), false, want);
+        }
+        for arch in ["gfx1100", "gfx1201"] {
+            assert!(verdict(with(|f| f.gpu_arch = arch)).0);
+        }
+    }
+
+    #[test]
+    fn invalid_capacity_and_non_fitting_head_decline() {
+        use DenseMtpAutoReason as R;
+        check(with(|f| f.cap_off = 0), false, R::InvalidCapacity);
+        check(with(|f| f.on_fits = false), false, R::OnDoesNotFit);
+        check(with(|f| f.cap_on = 0), false, R::OnDoesNotFit);
+        let moved = with(|f| f.same_placement = false);
+        check(moved, false, R::PlacementChanged);
+        // usize::MAX capacities cannot overflow the cross-multiplication.
+        assert!(dense_mtp_auto(&caps(usize::MAX, usize::MAX)).attach);
+    }
+
+    #[test]
+    fn retention_line_is_exact_at_the_boundary() {
+        use DenseMtpAutoReason as R;
+        // 95 % of 120,000 is exactly 114,000 (below the 131,072 floor).
+        check(caps(120_000, 113_999), false, R::BelowRetentionAndFloor);
+        check(caps(120_000, 114_000), true, R::AdmittedRetention);
+        check(caps(120_000, 114_001), true, R::AdmittedRetention);
+        // Above the floor a shortfall against the line still arms.
+        check(caps(200_000, 189_999), true, R::AdmittedFloor);
+        check(caps(200_000, 190_000), true, R::AdmittedRetention);
+        // Non-multiple of 20: ceil(19 * 262,143 / 20) = 249,036.
+        check(caps(262_143, 249_035), true, R::AdmittedFloor);
+        check(caps(262_143, 249_036), true, R::AdmittedRetention);
+        // ceil(19 * 100,001 / 20) = 95,001.
+        check(caps(100_001, 95_000), false, R::BelowRetentionAndFloor);
+        check(caps(100_001, 95_001), true, R::AdmittedRetention);
+        assert_eq!(dense_mtp_auto(&caps(120_000, 114_000)).margin_tokens(), 0);
+        assert_eq!(dense_mtp_auto(&caps(120_000, 113_999)).margin_tokens(), -1);
+    }
+
+    #[test]
+    fn absolute_floor_arms_a_context_the_retention_rule_declines() {
+        use DenseMtpAutoReason as R;
+        assert_eq!(DENSE_MTP_AUTO_CONTEXT_FLOOR, 131_072);
+        // gfx1100 mq4-xts at omitted max_seq measured 246,158 -> 188,897 (0.767).
+        let gfx1100 = |on| DenseMtpAutoFacts {
+            gpu_arch: "gfx1100",
+            ..caps(246_158, on)
+        };
+        check(gfx1100(188_897), true, R::AdmittedFloor);
+        check(gfx1100(131_072), true, R::AdmittedFloor);
+        check(gfx1100(131_071), false, R::BelowRetentionAndFloor);
+        // The same ratio at a tenth of the context stays AR.
+        check(caps(24_615, 18_889), false, R::BelowRetentionAndFloor);
+    }
+
+    #[test]
+    fn authored_context_arms_only_when_admitted_unchanged_by_both_plans() {
+        use DenseMtpAutoReason as R;
+        let authored = |n, off, on| DenseMtpAutoFacts {
+            authored_max_seq: Some(n),
+            ..caps(off, on)
+        };
+        let (n, big) = (32_768, 262_144);
+        check(authored(n, n, n), true, R::AdmittedAuthored);
+        // The head would shrink the authored context: never clamped to fit.
+        check(authored(n, n, 20_000), false, R::AuthoredNotAdmitted);
+        // The no-head load itself does not admit it.
+        check(authored(n, 20_000, 20_000), false, R::AuthoredNotAdmitted);
+        // The floor and the retention line do not rescue a shrunk authored context.
+        check(authored(big, big, 200_000), false, R::AuthoredNotAdmitted);
+        let refused = DenseMtpAutoFacts {
+            on_fits: false,
+            ..authored(n, n, 0)
+        };
+        check(refused, false, R::OnDoesNotFit);
+    }
+
+    #[test]
+    fn log_line_carries_reason_capacities_margin_and_basis() {
+        let d = dense_mtp_auto(&caps(200_000, 190_500));
+        assert_eq!(
+            dense_mtp_auto_log_line(&d, None, "measured"),
+            "mtp auto: attach reason=retention>=0.95 cap_off=200000 cap_on=190500 authored=omitted margin_tokens=500 basis=measured"
+        );
+        let d = dense_mtp_auto(&caps(100_000, 50_000));
+        assert!(dense_mtp_auto_log_line(&d, Some(8192), "planned").starts_with(
+            "mtp auto: decline reason=below-retention-and-floor cap_off=100000 cap_on=50000 authored=8192 margin_tokens=-45000 basis=planned"
+        ));
     }
 }

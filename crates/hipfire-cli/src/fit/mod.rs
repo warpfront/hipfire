@@ -732,7 +732,7 @@ fn analyze_model(
         .as_ref()
         .map(|s| s.model_ctx)
         .or_else(|| source_context(&admitted.source));
-    mtp_fit(
+    let mtp_fit = mtp_fit(
         &path,
         &params,
         &mut inputs,
@@ -751,6 +751,7 @@ fn analyze_model(
             mtp_measured_ar_floor: matches!(admitted.topology, EffectiveTopology::Single)
                 .then(|| admitted.carrier.map(|c| c.mtp_measured_ar_floor()))
                 .flatten(),
+            mtp_auto: mtp_fit.as_ref(),
             draft_missing: draft_missing.as_ref(),
         },
     );
@@ -1330,15 +1331,25 @@ fn speculation_owners(
     owners
 }
 
-/// Native MTP in the projection. For an explicit `on` on a dense Qwen3.5
-/// load, charge the head the way the load does
+/// The dense native-MTP `auto` verdict of a fit, at planned capacities.
+struct MtpFit {
+    attach: bool,
+    /// The load's own `mtp auto: ...` log line, `basis=planned`.
+    line: String,
+}
+
+/// Native MTP in the projection. For an explicit `on`, or an `auto` dense
+/// Qwen3.5 load, charge the head the way the load does
 /// ([`hipfire_loader::admission::qwen35_mtp_side`]: head weights, the
 /// gfx1100 draft vocabulary, the speculator's ring snapshot, the first
 /// request's state and prompt-fill transient, head KV sized for the no-head
-/// context) against free memory and re-admit with it. `auto` loads no head on
-/// this producer, so the head is only reported. Nothing is charged when a
+/// context) against free memory and re-admit. `on` keeps the with-head plan;
+/// `auto` keeps it only when [`hipfire_runtime::config::dense_mtp_auto`] arms
+/// it at these capacities, the same function the load calls with its measured
+/// ones (`basis=planned` here, `measured` there). Nothing is charged when a
 /// DFlash draft is paired (it takes the speculator slot), the mode is off, the
 /// topology is not single-GPU dense Qwen3.5, or no head resolves.
+#[allow(clippy::too_many_arguments)]
 fn mtp_fit(
     path: &Path,
     params: &Value,
@@ -1347,20 +1358,18 @@ fn mtp_fit(
     admitted: &mut SourceAdmission,
     dflash_charge: u64,
     notes: &mut Vec<String>,
-) {
+) -> Option<MtpFit> {
+    use hipfire_runtime::config::{dense_mtp_auto, dense_mtp_auto_log_line, DenseMtpAutoFacts};
     let mode = hipfire_config::MtpMode::parse(params["mtp_mode"].as_str().unwrap_or("auto"));
     if mode == hipfire_config::MtpMode::Off
         || admitted.arch_id != 5
         || !matches!(admitted.topology, EffectiveTopology::Single)
         || dflash_charge > 0
     {
-        return;
+        return None;
     }
     let sidecar = params["mtp"].as_str().map(Path::new);
-    let Some((head, offset)) = hipfire_loader::admission::qwen35_mtp_head_location(path, sidecar)
-    else {
-        return;
-    };
+    let (head, offset) = hipfire_loader::admission::qwen35_mtp_head_location(path, sidecar)?;
     let cap_off = admitted.max_seq;
     let side = match hipfire_loader::admission::qwen35_mtp_side(
         &admitted.source,
@@ -1375,7 +1384,7 @@ fn mtp_fit(
             notes.push(format!(
                 "native MTP head not projected ({error}); no head bytes are charged"
             ));
-            return;
+            return None;
         }
     };
     let owners = side.head_weights + side.draft_vocab + side.state;
@@ -1383,7 +1392,37 @@ fn mtp_fit(
     inputs.draft_charge = draft_before + owners;
     inputs.checkpoint_charge = ring_before + side.ring_snapshot;
     let on = inputs.admit(path, device);
-    let keep = mode == hipfire_config::MtpMode::On && on.is_ok();
+    let authored = (inputs.max_seq != 0).then_some(inputs.max_seq);
+    let fully_resident = hipfire_config::memory::effective_offload_budgets()
+        == (
+            hipfire_config::memory::OffloadBudget::Full,
+            hipfire_config::memory::OffloadBudget::Full,
+        );
+    let facts = DenseMtpAutoFacts {
+        arch_id: 5,
+        gpu_arch: &device.arch,
+        // A `serve.vmm_batch` load with lanes runs its requests as AR lanes.
+        singleton: !(params.get("serve_vmm_batch").is_some()
+            && usize_param(params, "continuous_batch_size").unwrap_or(1) > 1),
+        pp: 1,
+        tp: 1,
+        ep: 1,
+        fully_resident,
+        text_route_supported: admitted.kv_backend == hipfire_runtime::kv_backend::KvBackend::Vmm,
+        head_resolved: true,
+        other_speculator_attached: false,
+        cap_off,
+        cap_on: on.as_ref().map_or(0, |a| a.max_seq),
+        authored_max_seq: authored,
+        same_placement: true,
+        on_fits: on.is_ok(),
+    };
+    let decision = dense_mtp_auto(&facts);
+    let line = dense_mtp_auto_log_line(&decision, authored, "planned");
+    let keep = match mode {
+        hipfire_config::MtpMode::On => on.is_ok(),
+        _ => decision.attach,
+    };
     notes.push(format!(
         "native MTP head {} {}: head weights {}, gfx1100 draft vocabulary {}, speculator ring snapshot {}, request state + prompt fill {} (head KV sized for the no-head context of {cap_off} tokens); context {} -> {}",
         if keep { "charged against free memory" } else { "would cost" },
@@ -1395,13 +1434,18 @@ fn mtp_fit(
         cap_off,
         on.as_ref().map_or("does not fit".to_string(), |a| a.max_seq.to_string()),
     ));
-    match on {
-        Ok(on) if keep => *admitted = on,
-        _ => {
-            inputs.draft_charge = draft_before;
-            inputs.checkpoint_charge = ring_before;
+    if keep {
+        if let Ok(on) = on {
+            *admitted = on;
         }
+    } else {
+        inputs.draft_charge = draft_before;
+        inputs.checkpoint_charge = ring_before;
     }
+    (mode == hipfire_config::MtpMode::Auto).then_some(MtpFit {
+        attach: decision.attach,
+        line,
+    })
 }
 
 fn source_context(source: &ModelSource) -> Option<usize> {
@@ -1448,6 +1492,9 @@ struct DecodeFacts<'a> {
     /// (`Carrier::mtp_measured_ar_floor`), which lets `auto` MTP attach;
     /// `None` when the carrier is not resolved before load.
     mtp_measured_ar_floor: Option<bool>,
+    /// The dense native-MTP `auto` verdict at this card's planned capacities
+    /// ([`mtp_fit`]); `None` outside dense Qwen3.5 or when no head resolves.
+    mtp_auto: Option<&'a MtpFit>,
     draft_missing: Option<&'a MissingDraft>,
 }
 
@@ -1515,6 +1562,15 @@ fn decode_plan(params: &Value, facts: &DecodeFacts<'_>) -> DecodePlan {
                 chosen("mtp", "speculation.mtp = on".into())
             ),
         )),
+        hipfire_config::MtpMode::Auto if facts.mtp_auto.is_some_and(|auto| auto.attach) => {
+            armed.push((
+                "mtp (auto)".into(),
+                format!(
+                    "speculation.mtp = auto arms the head for this load: {}",
+                    facts.mtp_auto.map(|auto| auto.line.as_str()).unwrap_or_default()
+                ),
+            ))
+        }
         hipfire_config::MtpMode::Auto if facts.mtp_measured_ar_floor == Some(true) => {
             armed.push((
                 "mtp (auto)".into(),
@@ -1561,11 +1617,12 @@ fn decode_plan(params: &Value, facts: &DecodeFacts<'_>) -> DecodePlan {
                 ),
                 _ => format!("dflash {dflash_mode} has no draft for this artifact"),
             };
-            let mtp = match mtp {
-                hipfire_config::MtpMode::Auto => {
-                    "mtp auto keeps AR (this architecture declares no measured AR floor; `--spec mtp` opts in)"
-                }
-                _ => "mtp off",
+            let mtp: String = match mtp {
+                hipfire_config::MtpMode::Auto => match facts.mtp_auto {
+                    Some(auto) => format!("mtp auto keeps AR ({})", auto.line),
+                    None => "mtp auto keeps AR (this architecture declares no measured AR floor; `--spec mtp` opts in)".to_owned(),
+                },
+                _ => "mtp off".to_owned(),
             };
             format!("no speculative route is enabled: {dflash}, {mtp}, ngram off")
         };
@@ -3160,6 +3217,7 @@ mod tests {
             selector,
             from_flag: true,
             mtp_measured_ar_floor: Some(false),
+            mtp_auto: None,
             draft_missing: missing,
         };
         let plan = decode_plan(&missing_load.params, &facts("dflash", Some(missing)));
@@ -3226,6 +3284,7 @@ mod tests {
                 selector,
                 from_flag,
                 mtp_measured_ar_floor: floor,
+                mtp_auto: None,
                 draft_missing: None,
             },
         )
@@ -3249,6 +3308,34 @@ mod tests {
         assert_eq!(auto.route, "ar");
         assert!(auto.reason.contains("no measured AR floor") && auto.reason.contains("--spec mtp"));
         assert!(auto.reason.contains("dflash off") && auto.reason.contains("ngram off"));
+    }
+
+    #[test]
+    fn dense_mtp_auto_verdict_names_the_route_and_the_line() {
+        let params = spec_params("off", "auto", false, "auto");
+        fn facts(auto: Option<&MtpFit>) -> DecodeFacts<'_> {
+            DecodeFacts {
+                selector: "auto",
+                from_flag: false,
+                mtp_measured_ar_floor: Some(false),
+                mtp_auto: auto,
+                draft_missing: None,
+            }
+        }
+        let armed = MtpFit {
+            attach: true,
+            line: "mtp auto: attach reason=context>=131072 cap_off=246158 cap_on=188897 authored=omitted margin_tokens=-44953 basis=planned".into(),
+        };
+        let plan = decode_plan(&params, &facts(Some(&armed)));
+        assert_eq!(plan.route, "mtp (auto)");
+        assert!(plan.reason.contains("basis=planned") && plan.reason.contains("cap_on=188897"));
+        let declined = MtpFit {
+            attach: false,
+            line: "mtp auto: decline reason=below-retention-and-floor cap_off=88666 cap_on=42405 authored=omitted margin_tokens=-41828 basis=planned".into(),
+        };
+        let plan = decode_plan(&params, &facts(Some(&declined)));
+        assert_eq!(plan.route, "ar");
+        assert!(plan.reason.contains("below-retention-and-floor"));
     }
 
     #[test]

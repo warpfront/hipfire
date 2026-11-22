@@ -175,10 +175,13 @@ Route through `docs/VALIDATION.md`. Retired batteries are not current evidence.
    not automatically a win (compute-bound small models vs BW-bound MoE).
 4. **Learned drafter** — family-specific harnesses and `REDLINE.md` only when the
    claim is Redline-related; MTP/DFlash have their own load gates. Native MTP
-   `speculation.mtp = auto` arms only a producer that declares a measured AR
+   `speculation.mtp = auto` arms a producer that declares a measured AR
    floor (`MTP_MEASURED_AR_FLOOR`, surfaced as `Carrier::mtp_measured_ar_floor`,
-   default `false`; only Qwen4 is `true`), so a new arch's native MTP is
-   explicit-only (`on` / `--spec mtp`) until it ships and declares a floor;
+   default `false`; only Qwen4 is `true`) and, separately, a dense Qwen3.5
+   (arch 5) load that `hipfire_runtime::config::dense_mtp_auto` admits at load
+   from its own context capacities (never keyed by model or format). A new
+   arch's native MTP is explicit-only (`on` / `--spec mtp`) until it ships and
+   declares a floor or a load-time admission of its own;
    DFlash needs a draft path / arch_id=20 HFQ. Read loader source for the arm
    you claim.
 
