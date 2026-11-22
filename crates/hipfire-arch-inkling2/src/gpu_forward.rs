@@ -41,13 +41,16 @@
 //!   threads per Q head (h in 0..24, kv_h = h/3). Online softmax over
 //!   `0..n_kv` with the sink folded into `bias` (02's gather subtracts it):
 //!   `m = 0, l = 1`, `score = dot/sqrt(d) + bias[h,k]`.
-//!   Position-correct for any `pos >= 0` (keys `0..pos`, dist `pos - k`).
-//!   K/V caches stay F16 (`INKLING2_KV_DTYPE`); conversion happens on load.
+//!   Position-correct for any `pos >= 0`: logical row `k` reads physical
+//!   slot `slots[k]` (SWA ring; identity below the ring size), dist from
+//!   the position tags. K/V caches stay F16 (`INKLING2_KV_DTYPE`);
+//!   conversion happens on load.
 
 use crate::arch_model::Inkling2Bundle;
 use crate::config::Inkling2Config;
 use crate::gpu::{
-    Inkling2Controller, Inkling2GpuLayer, Inkling2GpuState, Inkling2GpuWeights, INKLING2_CONV_WIDTH,
+    swa_gather_map, swa_slot, Inkling2Controller, Inkling2GpuLayer, Inkling2GpuState,
+    Inkling2GpuWeights, INKLING2_CONV_WIDTH,
 };
 use hip_bridge::KernargBlob;
 use hipfire_runtime::llama::{rotate_x_mq_for, weight_gemv};
@@ -123,6 +126,7 @@ extern "C" __global__ void inkling2_gf_attn_decode_f32(
     const unsigned short* __restrict__ v4, const unsigned short* __restrict__ v5,
     const unsigned short* __restrict__ v6, const unsigned short* __restrict__ v7,
     const float* __restrict__ bias,
+    const int* __restrict__ slots,
     float* __restrict__ out,
     int n_kv, float inv_sqrt_d)
 {
@@ -138,7 +142,10 @@ extern "C" __global__ void inkling2_gf_attn_decode_f32(
     float m = 0.0f, l = 1.0f, o = 0.0f;
     __shared__ float sh[128];
     for (int k = 0; k < n_kv; ++k) {
-        float kd = __half2float(__ushort_as_half(kb[(size_t)k * 128 + d]));
+        // Ring indirection: logical row k lives in physical slot slots[k].
+        // Below the ring size slots[k] == k, identical to direct indexing.
+        int kk = slots[k];
+        float kd = __half2float(__ushort_as_half(kb[(size_t)kk * 128 + d]));
         sh[d] = qd * kd;
         __syncthreads();
         for (int s = 64; s > 0; s >>= 1) {
@@ -150,7 +157,7 @@ extern "C" __global__ void inkling2_gf_attn_decode_f32(
         float a = expf(m - m_new);
         float e = expf(s - m_new);
         l = l * a + e;
-        float vd = __half2float(__ushort_as_half(vb[(size_t)k * 128 + d]));
+        float vd = __half2float(__ushort_as_half(vb[(size_t)kk * 128 + d]));
         o = o * a + e * vd;
         m = m_new;
         __syncthreads();
@@ -221,6 +228,7 @@ fn launch_attn(
     k_cache: &[GpuTensor],
     v_cache: &[GpuTensor],
     bias: &GpuTensor,
+    slots: &GpuTensor,
     out: &GpuTensor,
     n_kv: usize,
     n_head: usize,
@@ -241,6 +249,7 @@ fn launch_attn(
         blob.push_ptr(t.buf.as_ptr());
     }
     blob.push_ptr(bias.buf.as_ptr());
+    blob.push_ptr(slots.buf.as_ptr());
     blob.push_ptr(out.buf.as_ptr());
     blob.push_i32(n_kv as i32);
     blob.push_f32(1.0 / (head_dim as f32).sqrt());
@@ -854,23 +863,42 @@ fn run_visit(
     // Sinks + relative bias (sink folded in by the gather).
     let sinks = step!(at(gpu, &mut tmp, &[nh], "sinks"), "alloc");
     step!(gpu.gemv_f32(&layer.sink, &tmp[qi], &tmp[sinks]), "sink");
-    if pos >= gs.visit_rows[visit] {
+    // KV write + gather map: full visits grow to max_seq and fail closed
+    // past it; SWA visits are an evict-on-write ring (slot `pos % rows`)
+    // holding the trailing `min(pos+1, rows)` keys with true positions in
+    // the per-slot tags. Below the ring size both reduce to the old path
+    // (slot == pos, tag == pos) bit-identically.
+    let rows = gs.visit_rows[visit];
+    if !swa && pos >= rows {
         free_all(gpu, tmp);
         return Err(format!(
-            "inkling2 gpu fwd: visit {visit} KV overflow at pos {pos} (rows {})",
-            gs.visit_rows[visit]
+            "inkling2 gpu fwd: visit {visit} KV overflow at pos {pos} (rows {rows})"
         ));
     }
-    let n_kv = pos + 1;
-    let dist_bytes: Vec<u8> = (0..n_kv)
-        .flat_map(|k| ((pos - k) as i32).to_le_bytes())
-        .collect();
+    let wpos = if swa { swa_slot(pos, rows) } else { pos };
+    gs.visit_pos_tags[visit][wpos] = pos as u32;
+    let (slots, dists) = match swa_gather_map(&gs.visit_pos_tags[visit], pos, rows) {
+        Ok(m) => m,
+        Err(e) => {
+            free_all(gpu, tmp);
+            return Err(format!("inkling2 gpu fwd: {e}"));
+        }
+    };
+    let n_kv = slots.len();
+    let dist_bytes: Vec<u8> = dists.iter().flat_map(|d| d.to_le_bytes()).collect();
     let dist = step!(
         hip(gpu.upload_raw(&dist_bytes, &[dist_bytes.len()]), "dist"),
         "dist"
     );
     tmp.push(dist);
     let di = tmp.len() - 1;
+    let slot_bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let slot_buf = step!(
+        hip(gpu.upload_raw(&slot_bytes, &[slot_bytes.len()]), "slots"),
+        "slots"
+    );
+    tmp.push(slot_buf);
+    let si = tmp.len() - 1;
     let rel_bias = step!(at(gpu, &mut tmp, &[nh, n_kv], "rel_bias"), "alloc");
     {
         let rv = view2(&tmp[r], nh, cfg.n_rel);
@@ -898,13 +926,13 @@ fn run_visit(
     // KV write (F32 -> F16 rows), then decode attention over 0..n_kv.
     for h in 0..nkv {
         let src_k = head_view(&tmp[k_conv], h, hd);
-        let dst_k = gs.k_cache[visit][h].sub_offset(pos * hd, hd);
+        let dst_k = gs.k_cache[visit][h].sub_offset(wpos * hd, hd);
         step!(
             gpu.convert_f32_to_f16_into(&src_k, &dst_k, hd),
             "k cache write"
         );
         let src_v = head_view(&tmp[vc], h, hd);
-        let dst_v = gs.v_cache[visit][h].sub_offset(pos * hd, hd);
+        let dst_v = gs.v_cache[visit][h].sub_offset(wpos * hd, hd);
         step!(
             gpu.convert_f32_to_f16_into(&src_v, &dst_v, hd),
             "v cache write"
@@ -921,6 +949,7 @@ fn run_visit(
                 &gs.k_cache[visit],
                 &gs.v_cache[visit],
                 &tmp[rel_bias],
+                &tmp[si],
                 &tmp[attn_heads],
                 n_kv,
                 nh,
@@ -1702,4 +1731,84 @@ pub fn forward_token_gpu_capture(
         &mut trace,
     )?;
     Ok(cap.expect("cap"))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::gpu::{swa_gather_map, swa_slot, swa_window_len, SWA_WINDOW_ROWS};
+
+    /// Simulate `n` sequential ring writes into a tag array, as `run_visit`
+    /// does (`tags[slot] = pos`), then check the gather map at `pos`.
+    fn written_tags(rows: usize, n: usize) -> Vec<u32> {
+        let mut tags = vec![0u32; rows];
+        for pos in 0..n {
+            tags[swa_slot(pos, rows)] = pos as u32;
+        }
+        tags
+    }
+
+    #[test]
+    fn ring_is_identity_below_window() {
+        // Bit-identity hard requirement: pos < 1024 keeps slot == pos and
+        // dist == pos - k exactly as the pre-ring path computed them.
+        for pos in [0usize, 1, 7, 512, 1023] {
+            let tags = written_tags(SWA_WINDOW_ROWS, pos + 1);
+            let (slots, dists) = swa_gather_map(&tags, pos, SWA_WINDOW_ROWS).unwrap();
+            assert_eq!(slots.len(), pos + 1);
+            for (k, (&s, &d)) in slots.iter().zip(dists.iter()).enumerate() {
+                assert_eq!(s as usize, k, "pos {pos} slot {k}");
+                assert_eq!(d as usize, pos - k, "pos {pos} dist {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn ring_wraps_with_true_positions() {
+        // First wrap: pos 1024 evicts key 0; window is keys 1..=1024.
+        let tags = written_tags(SWA_WINDOW_ROWS, 1025);
+        let (slots, dists) = swa_gather_map(&tags, 1024, SWA_WINDOW_ROWS).unwrap();
+        assert_eq!(slots.len(), SWA_WINDOW_ROWS);
+        assert_eq!(slots[0] as usize, 1);
+        assert_eq!(slots[SWA_WINDOW_ROWS - 1] as usize, 0);
+        assert_eq!(dists[0] as usize, 1023);
+        assert_eq!(dists[SWA_WINDOW_ROWS - 1], 0);
+        // Order preserved across the physical seam: consecutive logical rows
+        // are consecutive true positions.
+        for w in slots.windows(2) {
+            let (a, b) = (w[0] as usize, w[1] as usize);
+            assert_eq!(tags[b] - tags[a], 1);
+        }
+        // Deep wrap: pos 2500 holds keys 1477..=2500.
+        let tags = written_tags(SWA_WINDOW_ROWS, 2501);
+        let (slots, dists) = swa_gather_map(&tags, 2500, SWA_WINDOW_ROWS).unwrap();
+        assert_eq!(slots.len(), SWA_WINDOW_ROWS);
+        assert_eq!(tags[slots[0] as usize], 1477);
+        assert_eq!(tags[*slots.last().unwrap() as usize], 2500);
+        assert_eq!(dists[0] as usize, 1023);
+        assert_eq!(dists[dists.len() - 1], 0);
+    }
+
+    #[test]
+    fn ring_window_len_caps_at_rows() {
+        assert_eq!(swa_window_len(0, SWA_WINDOW_ROWS), 1);
+        assert_eq!(swa_window_len(1023, SWA_WINDOW_ROWS), 1024);
+        assert_eq!(swa_window_len(1024, SWA_WINDOW_ROWS), 1024);
+        assert_eq!(swa_window_len(5000, SWA_WINDOW_ROWS), 1024);
+        // Small rings (e.g. max_seq=64 test loads) wrap at their own size.
+        assert_eq!(swa_window_len(63, 64), 64);
+        assert_eq!(swa_window_len(64, 64), 64);
+        assert_eq!(swa_slot(64, 64), 0);
+        assert_eq!(swa_slot(65, 64), 1);
+    }
+
+    #[test]
+    fn ring_tag_mismatch_fails_closed() {
+        // Stale tag (skipped write) is an error, never a silent wrong gather.
+        let mut tags = written_tags(SWA_WINDOW_ROWS, 1025);
+        tags[swa_slot(500, SWA_WINDOW_ROWS)] = 0;
+        assert!(swa_gather_map(&tags, 1024, SWA_WINDOW_ROWS).is_err());
+        // Shape mismatches fail closed too.
+        assert!(swa_gather_map(&tags[..100], 50, SWA_WINDOW_ROWS).is_err());
+        assert!(swa_gather_map(&tags, 50, 0).is_err());
+    }
 }
