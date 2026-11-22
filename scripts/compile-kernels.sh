@@ -8,7 +8,7 @@
 # Compile only admitted runtime modules from rdna-compute's exact Rust source
 # registry. Basename enumeration of kernels/src/*.hip cannot reproduce the
 # runtime's preambles, stripped headers, substituted samplers or module keys.
-# Usage: ./scripts/compile-kernels.sh [gfx1201 gfx1100 gfx1151 gfx906 gfx942]
+# Usage: ./scripts/compile-kernels.sh [gfx1201 gfx1100 gfx1151 gfx906 gfx942 gfx1030]
 #        ./scripts/compile-kernels.sh --print-registry [arch ...]
 #        ./scripts/compile-kernels.sh --print-rocm-resolution
 set -euo pipefail
@@ -23,7 +23,7 @@ fi
 if [ $# -gt 0 ] && [ "$1" != "--print-rocm-resolution" ]; then
     ARCHS=("$@")
 else
-    ARCHS=(gfx1201 gfx1100 gfx1151 gfx906 gfx942)
+    ARCHS=(gfx1201 gfx1100 gfx1151 gfx906 gfx942 gfx1030)
 fi
 
 ROCM_RESOLUTION="$(

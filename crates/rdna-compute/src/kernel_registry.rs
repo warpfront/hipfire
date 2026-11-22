@@ -75,7 +75,7 @@ mod kernels {
 }
 
 pub const SUPPORTED_ARCHES: &[&str] = &[
-    "gfx1201", "gfx1100", "gfx1151", "gfx906", "gfx942", "gfx1150",
+    "gfx1201", "gfx1100", "gfx1151", "gfx906", "gfx942", "gfx1150", "gfx1030",
 ];
 
 #[derive(Debug, Clone)]
@@ -415,6 +415,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         "gfx1100" => add!(
             "gemv_hfq4g256_rdna3",
             kernels::GEMV_HFQ4G256_GFX1100_SRC,
+            ["gemv_hfq4g256"]
+        ),
+        // RDNA2 default (`gemv_hfq4g256_for_arch`, HIPFIRE_RDNA2_VARIANT unset = v1).
+        "gfx1030" => add!(
+            "gemv_hfq4g256_rdna2v1",
+            kernels::GEMV_HFQ4G256_GFX1030_V1_SRC,
             ["gemv_hfq4g256"]
         ),
         _ => add!(
@@ -4447,6 +4453,139 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ]
         );
     }
+    // gfx1030 (RDNA2) Qwen3.5 dense MQ4 AR closure: modules the beta JIT route compiled on
+    // the RX 6950 XT beyond the inventory above. Sources are the exact expressions the
+    // launchers pass (the mmq_x16 bodies inlined as `launch_hfq4_mmq_tile*` does).
+    if arch == "gfx1030" {
+        add!(
+            "convert_f32_to_f16",
+            kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC,
+            ["convert_f32_to_f16", "gemm_hfq4g256_residual_fp16"]
+        );
+        add!(
+            "deinterleave_q_rmsnorm_f32_batched",
+            kernels::DEINTERLEAVE_Q_RMSNORM_BATCHED_SRC,
+            ["deinterleave_q_rmsnorm_f32_batched"]
+        );
+        add!(
+            "fused_qk_l2_norm_scale_interleave_f32_batched",
+            kernels::FUSED_QK_L2_NORM_SCALE_INTERLEAVE_F32_BATCHED_SRC,
+            ["fused_qk_l2_norm_scale_interleave_f32_batched"]
+        );
+        add!(
+            "fused_rmsnorm_mq_rotate_awq",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC,
+            ["fused_rmsnorm_mq_rotate_awq"]
+        );
+        add!(
+            "gemm_gate_up_hfq4g256_dot2",
+            kernels::GEMM_GATE_UP_HFQ4G256_DOT2_SRC,
+            ["gemm_gate_up_hfq4g256_dot2"]
+        );
+        entries.push(entry(
+            arch,
+            "gemm_gate_up_hfq4g256_mmq_x16",
+            &["gemm_gate_up_hfq4g256_mmq_x16"],
+            kernels::GEMM_GATE_UP_HFQ4G256_MMQ_X16_SRC
+                .replace(
+                    "#include \"gemm_gate_up_hfq4g256_mmq_body.cuh\"",
+                    kernels::GEMM_GATE_UP_HFQ4G256_MMQ_BODY_CUH,
+                )
+                .into(),
+            extra_flags,
+        ));
+        add!(
+            "gemm_hfq4g256_residual_mmq",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
+            [
+                "gemm_hfq4g256_residual_mmq",
+                "gemm_hfq4g256_residual_mmq_full_add",
+                "quantize_q8_1_mmq_ds4",
+                "gemm_hfq4g256_residual_mmq_full_set",
+            ]
+        );
+        entries.push(entry(
+            arch,
+            "gemm_hfq4g256_residual_mmq_x16",
+            &["gemm_hfq4g256_residual_mmq_x16"],
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_X16_SRC
+                .replace(
+                    "#include \"gemm_hfq4g256_residual_mmq_body.cuh\"",
+                    kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_BODY_CUH,
+                )
+                .into(),
+            extra_flags,
+        ));
+        entries.push(entry(
+            arch,
+            "gemm_qkv_hfq4g256_mmq_x16",
+            &["gemm_qkv_hfq4g256_mmq_x16"],
+            kernels::GEMM_QKV_HFQ4G256_MMQ_X16_SRC
+                .replace(
+                    "#include \"gemm_qkv_hfq4g256_mmq_body.cuh\"",
+                    kernels::GEMM_QKV_HFQ4G256_MMQ_BODY_CUH,
+                )
+                .into(),
+            extra_flags,
+        ));
+        // The RDNA2 auto routes' wide tiles (`gemm_*_hfq4g256_mmq_rdna2_auto`), walked on the 4B/9B AR routes.
+        entries.push(entry(
+            arch,
+            "gemm_gate_up_hfq4g256_mmq_x32",
+            &["gemm_gate_up_hfq4g256_mmq_x32"],
+            kernels::GEMM_GATE_UP_HFQ4G256_MMQ_X32_SRC
+                .replace(
+                    "#include \"gemm_gate_up_hfq4g256_mmq_body.cuh\"",
+                    kernels::GEMM_GATE_UP_HFQ4G256_MMQ_BODY_CUH,
+                )
+                .into(),
+            extra_flags,
+        ));
+        entries.push(entry(
+            arch,
+            "gemm_hfq4g256_residual_mmq_x32_y64",
+            &["gemm_hfq4g256_residual_mmq_x32_y64"],
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_X32_Y64_SRC
+                .replace(
+                    "#include \"gemm_hfq4g256_residual_mmq_body.cuh\"",
+                    kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_BODY_CUH,
+                )
+                .into(),
+            extra_flags,
+        ));
+        entries.push(entry(
+            arch,
+            "gemm_qkv_hfq4g256_mmq_x32",
+            &["gemm_qkv_hfq4g256_mmq_x32"],
+            kernels::GEMM_QKV_HFQ4G256_MMQ_X32_SRC
+                .replace(
+                    "#include \"gemm_qkv_hfq4g256_mmq_body.cuh\"",
+                    kernels::GEMM_QKV_HFQ4G256_MMQ_BODY_CUH,
+                )
+                .into(),
+            extra_flags,
+        ));
+        add!(
+            "gemv_hfq4g256_residual",
+            kernels::GEMV_HFQ4G256_RESIDUAL_SRC,
+            ["gemv_hfq4g256_residual"]
+        );
+        add!(
+            "mq_rotate_x",
+            kernels::GEMV_MQ4G256_SRC,
+            ["gemv_mq4g256", "mq_rotate_x"]
+        );
+        add!(
+            "rope_partial_halfsplit",
+            kernels::ROPE_PARTIAL_HALFSPLIT_SRC,
+            ["rope_partial_halfsplit_f32"]
+        );
+        add!(
+            "rope_partial_halfsplit_batched",
+            kernels::ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC,
+            ["rope_partial_halfsplit_batched_f32"]
+        );
+    }
     // Default-on `HIPFIRE_QWEN4_HC_ROW_FOLD` on gfx1201: the MoE-tail and mixer-tail row
     // folds, in the same module (the `__GFX12__` entries are compiled for gfx12 only).
     if arch == "gfx1201" {
@@ -5796,7 +5935,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     // `_masked` / windowed callers, attention.rs `launch_asym_flash_batched`);
     // gfx1100 carries it above. Source goes through `ensure_fwht_kv_kernel`'s
     // strip-and-prepend, i.e. `assemble_asym`.
-    if matches!(arch, "gfx1151" | "gfx1201") {
+    if matches!(arch, "gfx1151" | "gfx1201" | "gfx1030") {
         add!(
             "attention_flash_q8_0_tile_batched",
             assemble_asym(kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC),
@@ -8900,6 +9039,8 @@ const WALKED_ROUTE_PLAN_FILES: &[&str] = &[
     include_str!("route_plans/qwen3.8-flash-next.gfx1100.tsv"),
     include_str!("route_plans/qwen3.8-flash-next-base.mq4-xts.gfx1100.tsv"),
     include_str!("route_plans/qwen3.8-flash-next-base.mq3-xts.gfx1100.tsv"),
+    include_str!("route_plans/qwen3.5-4b.mq4.gfx1030.tsv"),
+    include_str!("route_plans/qwen3.5-9b.mq4.gfx1030.tsv"),
 ];
 
 /// One parsed `route_plans/*.tsv`.

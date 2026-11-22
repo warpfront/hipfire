@@ -43,7 +43,7 @@
 # Usage: scripts/build-binary-archive.sh --tag TAG [--commit REV] [--out DIR]
 #            [--target-dir DIR] [--packs DIR] [arch ...]
 #   --commit defaults to the local tag TAG; archs default to gfx1151 gfx1201
-#   gfx1100. The CLI and daemon are built once and shared by every arch.
+#   gfx1100 gfx1030. The CLI and daemon are built once and shared by every arch.
 #   --packs DIR takes an arch's kernels from DIR/hipfire-kernels-TAG-ARCH.tar.gz
 #   (scripts/build-kernel-pack.sh output, SHA-256 checked) instead of compiling
 #   them again; an arch with no pack there is compiled.
@@ -92,7 +92,7 @@ TOOLCHAIN="$(tr -d '[:space:]' < "$TOOLCHAIN_FILE")"
     || { echo "ERROR: $TOOLCHAIN_FILE must hold one Rust version (x.y.z), got '$TOOLCHAIN'" >&2; exit 2; }
 command -v rustup >/dev/null 2>&1 \
     || { echo "ERROR: rustup is required (the release toolchain $TOOLCHAIN is selected with cargo +$TOOLCHAIN)" >&2; exit 2; }
-[ "${#ARCHS[@]}" -gt 0 ] || ARCHS=(gfx1151 gfx1201 gfx1100)
+[ "${#ARCHS[@]}" -gt 0 ] || ARCHS=(gfx1151 gfx1201 gfx1100 gfx1030)
 [ -n "$TAG" ] || { echo "ERROR: --tag is required" >&2; exit 2; }
 if ! git check-ref-format "refs/tags/$TAG" >/dev/null 2>&1 || [[ "$TAG" == -* ]]; then
     echo "ERROR: invalid tag name '$TAG'" >&2

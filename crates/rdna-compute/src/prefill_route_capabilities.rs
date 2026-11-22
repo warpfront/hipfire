@@ -384,7 +384,9 @@ mod tests {
         let gfx1201 = arch == "gfx1201";
         let rdna = matches!(arch, "gfx1151" | "gfx1100");
         match route {
-            PrefillRoute::GdnQkIndexed => gfx1201 || rdna || matches!(arch, "gfx942" | "gfx906"),
+            PrefillRoute::GdnQkIndexed => {
+                gfx1201 || rdna || matches!(arch, "gfx942" | "gfx906" | "gfx1030")
+            }
             PrefillRoute::GdnMoePreFused => gfx1201,
             PrefillRoute::GdnMoeChunkScan => gfx1201,
             PrefillRoute::MoeRouterFusedPrefill => gfx1201 || rdna,
@@ -584,7 +586,8 @@ mod tests {
         assert!(!qualified("gfx1100", qk));
         assert!(raw_inventory("gfx942", qk));
         assert!(!qualified("gfx942", qk));
-        assert!(!raw_inventory("gfx1030", qk));
+        assert!(raw_inventory("gfx1030", qk));
+        assert!(!qualified("gfx1030", qk));
         let chunk = PrefillRoute::GdnMoeChunkScan;
         assert!(!raw_inventory("gfx1100", chunk));
         assert!(!qualified("gfx1100", chunk));

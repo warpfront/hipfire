@@ -24,7 +24,7 @@
 #            [--target-dir DIR] [--jobs N] [--rocm-min X.Y] [--rocm-max-exclusive X.Y]
 #            [arch ...]
 #   --commit defaults to the local tag TAG; archs default to every admitted
-#   registry arch (gfx1201 gfx1100 gfx1151 gfx906 gfx942).
+#   registry arch (gfx1201 gfx1100 gfx1151 gfx906 gfx942 gfx1030).
 #   --jobs limits concurrent architectures (default 1). The host-scaled total
 #   compiler budget is split across them, not multiplied; HIPFIRE_PACK_JOBS
 #   overrides that total (still bounded by cores and available RAM).
@@ -71,7 +71,7 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
-[ "${#ARCHS[@]}" -gt 0 ] || ARCHS=(gfx1201 gfx1100 gfx1151 gfx906 gfx942)
+[ "${#ARCHS[@]}" -gt 0 ] || ARCHS=(gfx1201 gfx1100 gfx1151 gfx906 gfx942 gfx1030)
 [ -n "$TAG" ] || { echo "ERROR: --tag is required" >&2; exit 2; }
 if ! git check-ref-format "refs/tags/$TAG" >/dev/null 2>&1 || [[ "$TAG" == -* ]]; then
     echo "ERROR: invalid tag name '$TAG'" >&2

@@ -246,6 +246,10 @@ def main():
     ap.add_argument("--sealed", action="store_true",
                     help="validate a checked-in plan: keep route plans on, so any kernel the sealed "
                          "route did not plan fails its request")
+    ap.add_argument("--slice", metavar="START:END",
+                    help="walk only requests START..END-1 of the plan (Python slice; ids keep the full plan's "
+                         "index), so a long walk splits across fabric jobs; route_plan_build.py unions the "
+                         "chunks given as repeated --walk / --sealed-replay. A chunk may not start on a session resume")
     a = ap.parse_args()
 
     run = pathlib.Path(a.run)
@@ -255,6 +259,13 @@ def main():
     plan = (bounded_plan(pathlib.Path(a.prompt_dir)) if a.profile == "xtx-fn-bounded"
             else product_plan(pathlib.Path(a.prompt_dir)) if a.profile == "xtx-fn-product"
             else walk_plan(a.route, pathlib.Path(a.prompt_dir), a.max_seq))
+    first = 0
+    if a.slice:
+        start, end = (int(x) if x else None for x in a.slice.split(":"))
+        first = range(len(plan))[slice(start, end)].start
+        plan = plan[start:end]
+        if not plan or "chain_user" in plan[0]:
+            raise SystemExit(f"--slice {a.slice}: empty, or starts on a session resume")
     env = os.environ.copy()
     env.update(HOME=str(run / "home"), HIPFIRE_HOME=str(run / "home" / ".hipfire"),
                HIPFIRE_LOCK_DIR=str(run / "lockdir"), HIPFIRE_KERNEL_CACHE=str(run / "kcache"),
@@ -281,7 +292,7 @@ def main():
     (run / "command.json").write_text(json.dumps({
         "daemon": str(daemon), "daemon_sha256": hashlib.sha256(daemon.read_bytes()).hexdigest(),
         "route": a.route, "env": {k: v for k, v in env.items() if k.startswith(("HIP", "ROCR")) or k == "HOME"},
-        "load": load, "requests": len(plan)}, indent=1))
+        "load": load, "requests": len(plan), "slice": a.slice}, indent=1))
     (run / "plan.json").write_text(json.dumps(plan, indent=1))
 
     err = (run / "stderr.log").open("w")
@@ -368,7 +379,7 @@ def main():
     print(json.dumps({"load": obj.get("type"), "s": round(dt, 2)}), flush=True)
     if obj.get("type") == "loaded":
         history = []
-        for i, msg in enumerate(plan):
+        for i, msg in enumerate(plan, first):
             fit = msg.get("_fit")
             msg = {k: v for k, v in msg.items() if not k.startswith("_")}
             if fit is not None:
