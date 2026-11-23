@@ -176,7 +176,7 @@ done envelope.
   "k": "1,2,4",
   "workloads": ["stateless", "multiturn"],
   "runs": 3,
-  "arms": [["legacy", "noslots"], ["engine", "noslots"], ["legacy", "batch"]],
+  "arms": [["legacy", "noslots"], ["engine", "batch"], ["legacy", "batch"]],
   "ref": ["legacy", "noslots"],
   "target": ["legacy", "batch"],
   "tol_pct": 2.0,
@@ -223,9 +223,9 @@ rows; legacy fn-lanes are not row-exact by default):
   and p99 at most the target's + `tol_pct`
 
 An arm whose bench exits non-zero or yields no cells fails the run. A
-`noslots` engine arm holds requests client-side, so it cannot overlap them;
-an engine that schedules N requests needs a backend that keeps k requests in
-flight.
+`noslots` engine arm holds requests client-side, so it cannot overlap them.
+On Qwen4 the engine's N-request scheduler serves the `batch` backend
+(`serve.vmm_batch`, HIPF-505): the engine arm is `["engine", "batch"]`.
 
 ## Coverage gaps
 

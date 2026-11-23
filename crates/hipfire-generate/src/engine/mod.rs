@@ -8,11 +8,14 @@
 //! [`RequestRun`] is one request's state machine. It never touches a GPU:
 //! [`RequestRun::next_work`] names the next forward and the `apply_*` calls
 //! fold each forward's result back in (sample with the request's own RNG,
-//! count, stop, finish). [`drive`] runs it as a batch of one over two seams:
+//! count, stop, finish). [`step`] runs one forward of it over two seams:
 //! [`Forwards`] (the model on its mesh, [`mesh::MeshForwards`] over any
-//! `MeshFamily`) and [`Emit`] (the wire protocol, [`chatml::ChatMlEmit`]).
-//! [`run::run`] owns admission, the budget, metrics, the terminal and the one
-//! attested rollback for every error and abort exit.
+//! `MeshFamily`) and [`Emit`] (the wire protocol, [`chatml::ChatMlStream`]).
+//! [`drive`] steps one request to its end; [`run::run`] owns its admission,
+//! the budget, metrics, the terminal and the one attested rollback for every
+//! error and abort exit. [`sched::Scheduler`] steps N requests at once
+//! (mixed prompt and decode epochs); [`serve::drive`] serves it to the
+//! daemon's continuous batch.
 //!
 //! Intended differences from the legacy loops: the RNG is per request (not
 //! the process-global sampler state), an EOS token is not counted in
@@ -21,6 +24,8 @@
 pub mod chatml;
 pub mod mesh;
 pub mod run;
+pub mod sched;
+pub mod serve;
 
 use hipfire_runtime::sampler::{apply_logit_policy_cpu, SamplerConfig};
 use std::collections::VecDeque;
@@ -131,6 +136,11 @@ pub struct RequestRun {
     finish: Option<Finish>,
     sampler: SamplerConfig,
     rng: u32,
+    /// Prompt rows resident when this prefill (re)started: progress counts
+    /// from here.
+    prompt_base: usize,
+    /// A contained prompt fault already reran the prompt (once at most).
+    reran: bool,
 }
 
 impl RequestRun {
@@ -154,6 +164,8 @@ impl RequestRun {
             sampler,
             // xorshift32 has a fixed point at 0.
             rng: seed.max(1),
+            prompt_base: reused,
+            reran: false,
         }
     }
 
@@ -174,10 +186,20 @@ impl RequestRun {
     /// Whether the next token comes from the device argmax: plain greedy, no
     /// penalty or blocked token, and no forced token queued.
     pub fn wants_top1(&self) -> bool {
-        self.forced.is_empty()
-            && self.sampler.temperature <= 0.0
+        self.forced.is_empty() && self.greedy()
+    }
+
+    /// Whether every token this request picks is the row's argmax (forced
+    /// template tokens aside): no temperature, penalty or blocked token.
+    pub fn greedy(&self) -> bool {
+        self.sampler.temperature <= 0.0
             && self.sampler.blocked_tokens.is_empty()
             && hipfire_runtime::sampler::PenaltyTable::flags_for(&self.sampler) == 0
+    }
+
+    /// Decode rows this request may still run.
+    pub fn remaining(&self) -> usize {
+        self.budget - self.generated
     }
 
     /// A prefill tile ended at `end`; the final one hands its logits row,
@@ -236,15 +258,17 @@ impl RequestRun {
         self.generated
     }
 
-    /// The prompt reruns from `start` (a contained prompt fault): only while
-    /// still prefilling.
+    /// The prompt reruns from `start` (a contained prompt fault): once, and
+    /// only while still prefilling.
     pub fn restart_prefill(&mut self, start: usize) -> Result<(), String> {
-        if self.pending.is_some() || start >= self.prompt_len {
+        if self.reran || self.pending.is_some() || start >= self.prompt_len {
             return Err(format!(
-                "prompt rerun from {start} after prefill finished or past the prompt"
+                "prompt rerun from {start} after a rerun, after prefill finished or past the prompt"
             ));
         }
         self.position = start;
+        self.prompt_base = start;
+        self.reran = true;
         Ok(())
     }
 
@@ -339,67 +363,99 @@ pub enum Exit {
     Failed(String),
 }
 
-/// The batch-of-one loop: `next_work -> forwards -> apply` until done,
-/// polling abort before every forward (each prompt epoch included) and
-/// reporting `prefill_progress` after every prompt epoch. A contained prompt
-/// fault reruns the prompt once from the model's re-planned start.
+/// The batch-of-one loop: [`step`] until done, polling abort before every
+/// forward (each prompt epoch included).
 pub fn drive(
     run: &mut RequestRun,
     forwards: &mut impl Forwards,
     emit: &mut (impl Emit + ?Sized),
 ) -> Exit {
-    let mut reused = run.position;
-    let mut rerun = false;
     loop {
-        let work = run.next_work();
-        if let Work::Done(finish) = work {
+        if let Work::Done(finish) = run.next_work() {
             return Exit::Finished(finish);
         }
         if emit.aborted() {
             return Exit::Aborted;
         }
-        let step = match work {
-            Work::Prefill { rows } => {
-                let _phase = hipfire_runtime::prefill_progress::prompt_phase();
-                match forwards.prefill(rows) {
-                    Ok((end, logits)) => {
-                        if logits.is_some() {
-                            emit.commit_prompt();
-                        }
-                        let applied = run.apply_prefill(end, logits, emit.history());
-                        hipfire_runtime::prefill_progress::report(
-                            end - reused,
-                            run.prompt_len - reused,
-                        );
-                        applied
-                    }
-                    Err(error) if !rerun => match forwards.prefill_rerun() {
-                        Ok(Some(start)) => {
-                            eprintln!("[engine] prompt reruns from {start}: {error}");
-                            rerun = true;
-                            reused = start;
-                            run.restart_prefill(start)
-                        }
-                        Ok(None) => Err(error),
-                        Err(recover) => Err(format!("{error}; rerun failed: {recover}")),
-                    },
-                    Err(error) => Err(error),
-                }
-            }
-            Work::Decode { token } => {
-                forwards
-                    .decode(token, run.wants_top1())
-                    .and_then(|(ran, next)| {
-                        let (verdict, close) = emit.emit(ran)?;
-                        run.apply_decode(next, verdict, &close, emit.history());
-                        Ok(())
-                    })
-            }
-            Work::Done(_) => unreachable!(),
-        };
-        if let Err(error) = step {
+        if let Err(error) = step(run, &mut Both(forwards, emit)) {
             return Exit::Failed(error);
         }
+    }
+}
+
+/// One forward of a request and its apply: the next prompt epoch (reporting
+/// `prefill_progress`; a contained fault reruns the prompt once from the
+/// model's re-planned start) or one decode, whose token is emitted. `Err`:
+/// the request failed.
+pub fn step(run: &mut RequestRun, io: &mut (impl Forwards + Emit + ?Sized)) -> Result<(), String> {
+    match run.next_work() {
+        Work::Prefill { rows } => {
+            let _phase = hipfire_runtime::prefill_progress::prompt_phase();
+            match io.prefill(rows) {
+                Ok((end, logits)) => {
+                    if logits.is_some() {
+                        io.commit_prompt();
+                    }
+                    run.apply_prefill(end, logits, io.history())?;
+                    hipfire_runtime::prefill_progress::report(
+                        end - run.prompt_base,
+                        run.prompt_len - run.prompt_base,
+                    );
+                    Ok(())
+                }
+                Err(error) if !run.reran => match io.prefill_rerun() {
+                    Ok(Some(start)) => {
+                        eprintln!("[engine] prompt reruns from {start}: {error}");
+                        run.restart_prefill(start)
+                    }
+                    Ok(None) => Err(error),
+                    Err(recover) => Err(format!("{error}; rerun failed: {recover}")),
+                },
+                Err(error) => Err(error),
+            }
+        }
+        Work::Decode { token } => {
+            let (ran, next) = io.decode(token, run.wants_top1())?;
+            let (verdict, close) = io.emit(ran)?;
+            run.apply_decode(next, verdict, &close, io.history());
+            Ok(())
+        }
+        Work::Done(_) => Ok(()),
+    }
+}
+
+/// A request's [`Forwards`] and [`Emit`] as one [`step`] seam.
+struct Both<'a, F, E: ?Sized>(&'a mut F, &'a mut E);
+
+impl<F: Forwards, E: ?Sized> Forwards for Both<'_, F, E> {
+    fn prefill(&mut self, rows: Range<usize>) -> Result<(usize, Option<Vec<f32>>), String> {
+        self.0.prefill(rows)
+    }
+
+    fn decode(&mut self, token: Option<u32>, top1: bool) -> Result<(u32, Next), String> {
+        self.0.decode(token, top1)
+    }
+
+    fn prefill_rerun(&mut self) -> Result<Option<usize>, String> {
+        self.0.prefill_rerun()
+    }
+}
+
+impl<F, E: Emit + ?Sized> Emit for Both<'_, F, E> {
+    fn commit_prompt(&mut self) {
+        self.1.commit_prompt();
+    }
+
+    fn emit(&mut self, token: u32) -> Result<(Verdict, Vec<u32>), String> {
+        self.1.emit(token)
+    }
+
+    fn history(&self) -> &[u32] {
+        self.1.history()
+    }
+
+    fn aborted(&self) -> bool {
+        self.1.aborted()
     }
 }
 

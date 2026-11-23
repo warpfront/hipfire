@@ -276,7 +276,7 @@ Process-wide scalar policy is typed as well:
 | `hardware.uniform_vram_tolerance_gb` | `null` | Free-VRAM spread override; unset uses the compiled default. |
 | `generation.loop_guard_threshold` | `0` | Repeated 4-gram count that forces EOS; zero disables. |
 | `generation.loop_guard_window` | `256` | Token window inspected by the loop guard. |
-| `generation.engine_loop` | `"legacy"` | `legacy` or `engine` (G12 PoC, experimental). `engine` runs allowlisted routes on the shared engine loop over the mesh executor; today only Qwen4 AR on a Single load. Read once per process; every `done` reports `loop`. |
+| `generation.engine_loop` | `"legacy"` | `legacy` or `engine` (G12 PoC, experimental). `engine` runs allowlisted routes on the shared engine loop over the mesh executor; today only Qwen4 AR on a Single load, and with `serve.vmm_batch` its continuous batch (the engine's N-request scheduler replaces the fn-lanes driver). Read once per process; every `done` reports `loop`. |
 | `kernel.flash_partials_batch` | `null` | `null` or int 0–65536; prefill flash-attention scratch multiplier. |
 | `kernel.lm_head_f16` | `"auto"` | `auto`, `native`, `f16`, `f32`, `fp32`, `legacy`, plus numeric compatibility aliases `1`/`0`. |
 | `diagnostic.prompt_heat_limit` | `64` | Maximum token-heat rows. |

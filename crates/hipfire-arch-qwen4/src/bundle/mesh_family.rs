@@ -12,9 +12,12 @@ use crate::gpu_forward::Qwen4MeshHead;
 use crate::mesh_bindings::{Qwen4MeshBindings, Qwen4RankBand};
 use crate::program::qwen4_step_graph_with_output;
 use hipfire_dispatch::pipeline::step_graph::StepGraph;
-use hipfire_runtime::mesh_family::{EpochInput, MeshFamily};
+use hipfire_runtime::mesh_family::{EpochInput, MeshFamily, MeshLanes};
 use hipfire_runtime::multi_gpu::executor::{MeshStepBindings, Result};
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::slot_batch::{
+    BatchStepPlan, RequestEpoch, RequestRows, RequestStepKind, RowRange,
+};
 use hipfire_runtime::weight_manifest::{StateEntry, WeightEntry};
 
 fn text(error: impl std::fmt::Display) -> String {
@@ -182,5 +185,184 @@ impl MeshFamily for Qwen4Bundle {
             }));
             run(&mut bindings)
         })
+    }
+
+    /// The staged AR lanes of a Single load (MTP lanes verify drafts: not
+    /// this epoch).
+    fn mesh_lanes(&mut self) -> Option<&mut dyn MeshLanes> {
+        let ar = self.lanes()?.spec().is_none();
+        (ar && self.lane_topology() == "single").then_some(self as &mut dyn MeshLanes)
+    }
+}
+
+/// The lane of an engine request: its tag, admitted once.
+fn lane_epoch(tag: u64) -> RequestEpoch {
+    RequestEpoch {
+        request_tag: tag,
+        owner_generation: 1,
+    }
+}
+
+/// Qwen4's multi-request decode epoch: the fn-lanes executor's mixed-row step
+/// with AR rows only. A request enters through promotion (the resident state
+/// swaps into the lane), the path byte-identical to the singleton's decode.
+impl MeshLanes for Qwen4Bundle {
+    fn lane_capacity(&self) -> usize {
+        self.lanes().map_or(0, |store| store.max_lanes())
+    }
+
+    fn lane_rows(&self) -> usize {
+        self.lanes().map_or(0, |store| store.row_budget())
+    }
+
+    fn free_lanes(&self) -> usize {
+        self.lanes()
+            .map_or(0, |store| store.max_lanes() - store.epochs().len())
+    }
+
+    fn park(
+        &mut self,
+        gpus: &mut Gpus,
+        tag: u64,
+        prompt: &[u32],
+        ran: &[u32],
+        seed: u32,
+        remaining: usize,
+    ) -> Result<()> {
+        let gpu = device(gpus)?;
+        let epoch = lane_epoch(tag);
+        // The lane's committed picks end with its pending seed.
+        let mut generated = ran.to_vec();
+        generated.push(seed);
+        let position = prompt.len() + ran.len();
+        if self.state.position != position {
+            return Err(format!(
+                "park: the resident state sits at {}, not after its {position} tokens",
+                self.state.position
+            ));
+        }
+        self.prepare_promotion(gpu, epoch, prompt.to_vec(), generated, seed, position, None)
+            .map_err(text)?;
+        // The prompt's boundary snapshots stay published: the reset that
+        // follows the swap drops the resident turn.
+        self.session_publish_captures();
+        if let Err(error) = self.commit_promotion(gpu, &epoch) {
+            let _ = self.release_lane(&epoch);
+            return Err(format!("lane promotion: {error}"));
+        }
+        if remaining > 0 {
+            self.lane_executor()
+                .map_err(text)?
+                .map_ahead_decode(gpu, &epoch, remaining);
+        }
+        Ok(())
+    }
+
+    /// The reverse of the promotion's swap: the lane's request states move
+    /// into the resident slot, and the session keeps them as its live state.
+    fn unpark(&mut self, gpus: &mut Gpus, tag: u64, tokens: &[u32]) -> Result<()> {
+        let gpu = device(gpus)?;
+        let epoch = lane_epoch(tag);
+        if self.session.is_none() {
+            return Err("no session cache: a lane record cannot continue live".into());
+        }
+        let position = self
+            .lanes()
+            .and_then(|store| store.lane(&epoch))
+            .map(|lane| lane.state.position);
+        if position != Some(tokens.len()) {
+            return Err(format!(
+                "lane record {tag} sits at {position:?}, not at its {} tokens",
+                tokens.len()
+            ));
+        }
+        // As the promotion: the resident request moves sealed.
+        self.seal_gdn_streams(gpu).map_err(text)?;
+        self.with_lanes(|store, bundle| {
+            let lane = store
+                .lane_mut(&epoch)
+                .ok_or_else(|| format!("lane record {tag} disappeared"))?;
+            bundle.state.clamp_f16_valid();
+            lane.state.clamp_f16_valid();
+            bundle.state.swap_requests(&mut lane.state);
+            store.release(&epoch)
+        })
+        .map_err(text)?;
+        // The kept state continues: request-local PLE work of an earlier
+        // request must not publish into it (`session_begin`'s live rule).
+        self.invalidate_ple_epoch().map_err(text)?;
+        if let Some(session) = self.session.as_mut() {
+            session.adopt_live(tokens, SessionRoute::Ar);
+        }
+        Ok(())
+    }
+
+    fn step_lanes(&mut self, gpus: &mut Gpus, rows: &[(u64, u32)]) -> Result<Vec<u32>> {
+        let gpu = device(gpus)?;
+        let store = self.lanes().ok_or("Qwen4 lanes are not staged")?;
+        // The executor takes a plan's requests in stable slot order.
+        let mut slotted = Vec::with_capacity(rows.len());
+        for &(tag, token) in rows {
+            let epoch = lane_epoch(tag);
+            let slot = store
+                .slot_of(&epoch)
+                .ok_or_else(|| format!("engine lane {tag} is not admitted"))?;
+            slotted.push((slot, epoch, token));
+        }
+        slotted.sort_unstable_by_key(|&(slot, ..)| slot);
+        let mut plan = BatchStepPlan::default();
+        plan.batch.m_per_slot = vec![0; store.max_lanes()];
+        let mut forced = Vec::new();
+        for (begin, &(slot, epoch, token)) in slotted.iter().enumerate() {
+            let lane = store
+                .lane(&epoch)
+                .ok_or_else(|| format!("engine lane {} disappeared", epoch.request_tag))?;
+            // A token other than the lane's last pick (a forced template
+            // token) becomes its pending seed first.
+            if store.root_seed(&epoch).or(lane.host.pending_seed) != Some(token) {
+                forced.push((epoch, token));
+            }
+            let position = i32::try_from(lane.state.position).map_err(text)?;
+            plan.batch.tokens.push(token);
+            plan.batch.positions.push(position);
+            plan.batch.row_slot.push(i32::try_from(slot).map_err(text)?);
+            plan.batch.m_per_slot[slot] = 1;
+            plan.requests.push(RequestRows {
+                epoch,
+                rows: RowRange { begin, len: 1 },
+                kind: RequestStepKind::Ar,
+            });
+        }
+        plan.decode_rows = rows.len();
+        for (epoch, token) in forced {
+            self.force_lane_seed(&epoch, token).map_err(text)?;
+        }
+        let mut executor = self.lane_executor().map_err(text)?;
+        let advances = executor
+            .provision_step(gpu, &plan)
+            .and_then(|()| executor.forward_step(gpu, &plan))
+            .and_then(|out| executor.commit_step(gpu, &plan, out));
+        let advances = match advances {
+            Ok(advances) => advances,
+            Err(error) => {
+                executor.abort_step(&plan);
+                return Err(error);
+            }
+        };
+        rows.iter()
+            .map(|&(tag, _)| {
+                advances
+                    .iter()
+                    .find(|advance| advance.epoch == lane_epoch(tag))
+                    .and_then(|advance| advance.committed_ids.last().copied())
+                    .ok_or_else(|| format!("lane {tag} committed no pick"))
+            })
+            .collect()
+    }
+
+    fn free_lane(&mut self, tag: u64) {
+        if let Err(error) = self.release_lane(&lane_epoch(tag)) {
+            eprintln!("[engine] lane {tag} release: {error}");
+        }
     }
 }

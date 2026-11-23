@@ -43,9 +43,14 @@ impl Forwards for MeshForwards<'_> {
     }
 
     fn decode(&mut self, token: Option<u32>, top1: bool) -> Result<(u32, Next), String> {
-        let (ran, out) =
-            self.runner
-                .decode_epoch(self.request, &mut *self.family, self.gpus, token, top1)?;
+        let (ran, out) = self.runner.decode_epoch(
+            self.request,
+            &mut *self.family,
+            self.gpus,
+            token,
+            top1,
+            true,
+        )?;
         let next = match out {
             DecodeOut::Top1(id) => Next::Top1(id),
             DecodeOut::Logits(row) => Next::Logits(row),

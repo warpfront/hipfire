@@ -2941,16 +2941,30 @@ pub(crate) fn qwen4_lone_lane_for_request(
 }
 
 /// [`qwen4_lone_lane_for_request`] for the loaded model and message
-/// (requires a staged lane store).
+/// (requires a staged lane store); every request the engine's scheduler
+/// serves ([`engine_serves_lanes`]).
 fn qwen4_lone_request_takes_lane_for(msg: &serde_json::Value, m: &LoadedModel) -> bool {
-    m.qwen4().is_some_and(|b| {
-        b.lanes().is_some()
-            && qwen4_lone_lane_for_request(
-                b.lane_topology(),
-                m.speculator.is_some(),
-                request_sets_min_tokens(msg),
-            )
-    })
+    engine_serves_lanes(m)
+        || m.qwen4().is_some_and(|b| {
+            b.lanes().is_some()
+                && qwen4_lone_lane_for_request(
+                    b.lane_topology(),
+                    m.speculator.is_some(),
+                    request_sets_min_tokens(msg),
+                )
+        })
+}
+
+/// The engine's N-request scheduler serves this load's staged lanes (G12):
+/// the engine loop runs Qwen4 AR and the load staged single-card AR lanes
+/// with no drafter. A lone request enters it too: it decodes on the resident
+/// state, as the singleton does, until a peer arrives.
+pub(crate) fn engine_serves_lanes(m: &LoadedModel) -> bool {
+    crate::engine::runs_on_engine(GenerationRoute::Qwen4Ar)
+        && m.speculator.is_none()
+        && m.qwen4().is_some_and(|b| {
+            b.lane_topology() == "single" && b.lanes().is_some_and(|store| store.spec().is_none())
+        })
 }
 
 /// Qwen4 lane admission: greedy requests, or sampled ones when the store is
@@ -3280,6 +3294,9 @@ pub fn drive_staged_continuous_batch(
 ) -> Result<(), BatchDriveError> {
     if m.qwen4().is_some() {
         return match vmm_batch {
+            Some(params) if engine_serves_lanes(m) => {
+                crate::engine::serve::drive(sched, gpu, m, params, stdout, inbox)
+            }
             Some(params) => {
                 crate::fn_batch::drive_qwen4_lane_batch(sched, gpu, m, params, stdout, inbox, None)
             }
