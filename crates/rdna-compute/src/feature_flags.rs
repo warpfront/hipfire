@@ -732,17 +732,18 @@ pub struct FeatureFlags {
     /// Fuse Gemma 4 Q8 prefill projections on exact gfx1100. This remains an
     /// opt-in while the E-series path is validated across QKV-sharing shapes.
     pub gemma4_q8_fused_prefill: bool,
-    /// Batch Gemma 4 main and PLE embedding lookup on validated gfx1100 and
-    /// gfx1201 paths. The `auto` policy remains independently disableable.
+    /// Batch Gemma 4 main and PLE embedding lookup on validated gfx1100,
+    /// gfx1151 and gfx1201 paths. The `auto` policy stays independently
+    /// disableable.
     pub gemma4_batched_embedding_prefill: bool,
     /// Batch the E-series per-layer-input model projection on exact gfx1100
     /// instead of re-streaming the same matrix through one GEMV per row.
     pub gemma4_ple_batched_prefill: bool,
     /// Exact-arithmetic batched E-series PLE branch projections on validated
-    /// gfx1100/gfx1201 paths. Remains independently disableable.
+    /// gfx1100/gfx1151/gfx1201 paths. Remains independently disableable.
     pub gemma4_ple_branch_batched_prefill: bool,
     /// Fuse the E-series PLE GELU and strided per-layer multiply on validated
-    /// gfx1100 and gfx1201 paths.
+    /// gfx1100, gfx1151 and gfx1201 paths.
     pub gemma4_ple_activation_fused_prefill: bool,
     pub rope_interleaved_legacy: bool,
     pub wo_wmma_variant: Option<String>,
