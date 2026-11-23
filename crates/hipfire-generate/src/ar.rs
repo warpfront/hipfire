@@ -4107,10 +4107,10 @@ pub fn generate(
                     // cache value. Qwen turns are content-only, so nothing is dropped. The
                     // echoed `reasoning_content` selects the exact producer turn when several
                     // turns share this content/tool fingerprint (e.g. think-only turns); with no
-                    // echo only a unique identity hits.
-                    let hit = cache_ref
-                        .get_for_reasoning(&fp, msg.reasoning_content.as_deref())
-                        .and_then(|turn| turn.content.as_ref().map(|c| c.token_ids.clone()));
+                    // echo only a unique identity hits, and an empty message never does.
+                    let hit =
+                        crate::common::lookup_echoed_asst_turn(cache_ref, fp, &normalized, msg)
+                            .and_then(|turn| turn.content.as_ref().map(|c| c.token_ids.clone()));
                     if trace_cache {
                         eprintln!(
                             "[qwen-cache lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} tool_calls={} hit={}",

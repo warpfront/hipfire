@@ -2815,8 +2815,7 @@ pub fn plan_prompt_cache(
             let normalized =
                 hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
             let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-            asst_turn_cache
-                .get_for_reasoning(&fp, msg.reasoning_content.as_deref())
+            crate::common::lookup_echoed_asst_turn(asst_turn_cache, fp, &normalized, msg)
                 .and_then(|t| t.content.as_ref().map(|c| c.token_ids.clone()))
         },
     );
@@ -2925,8 +2924,9 @@ pub fn plan_from_rendered(
 /// Qwen jinja cache-lookup turn synthesis: fingerprint the message's normalized
 /// content (+ tool identity), select the cached turn by the echoed
 /// `reasoning_content` (exact when nonempty; with none, only a unique turn for
-/// the fingerprint hits — think-only turns share an empty-content fingerprint),
-/// and forward the stored producer reasoning so rich
+/// the fingerprint hits, and a message with no content, tools or reasoning
+/// never does: see [`crate::common::lookup_echoed_asst_turn`]), and forward the
+/// stored producer reasoning so rich
 /// `reasoning_content` history satisfies the splice text check. Primer rule: a
 /// whole-envelope turn (reasoning present) replays verbatim — the template
 /// re-emits every marker around its slots, so prepending would duplicate the
@@ -2944,26 +2944,24 @@ pub fn qwen_jinja_lookup_turn(
 ) -> Option<hipfire_runtime::prompt_frame::CachedAssistantTurn> {
     let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
     let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-    cache
-        .get_for_reasoning(&fp, msg.reasoning_content.as_deref())
-        .and_then(|turn| {
-            turn.content.as_ref().map(|c| {
-                let mut v = if turn.reasoning.is_some() {
-                    Vec::new()
-                } else {
-                    primer.to_vec()
-                };
-                v.extend_from_slice(&c.token_ids);
-                hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                    reasoning: turn.reasoning.clone(),
-                    tools: Vec::new(),
-                    content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                        token_ids: v,
-                        text: msg.content.clone(),
-                    }),
-                }
-            })
+    crate::common::lookup_echoed_asst_turn(cache, fp, &normalized, msg).and_then(|turn| {
+        turn.content.as_ref().map(|c| {
+            let mut v = if turn.reasoning.is_some() {
+                Vec::new()
+            } else {
+                primer.to_vec()
+            };
+            v.extend_from_slice(&c.token_ids);
+            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                reasoning: turn.reasoning.clone(),
+                tools: Vec::new(),
+                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                    token_ids: v,
+                    text: msg.content.clone(),
+                }),
+            }
         })
+    })
 }
 
 /// Reorder containers without changing any request value or array position.
@@ -9925,6 +9923,60 @@ mod qwen_lookup_primer_tests {
         assert!(full.reasoning.is_none());
         assert!(qwen_jinja_lookup_turn(&mut cache, &assistant_msg("missing"), &[90]).is_none());
     }
+
+    /// #1198: an assistant message with empty content, no tool calls and no
+    /// `reasoning_content` carries nothing that names the turn it echoes, so it
+    /// never renders as the cached span of the one stored reasoning-only turn
+    /// (which shares its fingerprint). The stored turn still hits through its
+    /// echoed reasoning, and a content-identified turn keeps the unique-entry
+    /// fallback.
+    #[test]
+    fn empty_message_never_replays_another_reasoning_only_turn() {
+        let mut cache = AsstTurnCache::new_from_env();
+        insert(
+            &mut cache,
+            "",
+            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                reasoning: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                    token_ids: Vec::new(),
+                    text: "The user is asking about entry 4.\n".to_string(),
+                }),
+                tools: Vec::new(),
+                content: Some(body(&[4, 5, 6])),
+            },
+        );
+        insert(
+            &mut cache,
+            "answer C",
+            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                reasoning: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                    token_ids: Vec::new(),
+                    text: "plan C\n".to_string(),
+                }),
+                tools: Vec::new(),
+                content: Some(body(&[7, 8, 9])),
+            },
+        );
+        for content in ["", " \n", "<think>\nstill thinking\n</think>\n\n"] {
+            assert!(
+                qwen_jinja_lookup_turn(&mut cache, &assistant_msg(content), &[90]).is_none(),
+                "empty message {content:?} must render from its text"
+            );
+            let mut empty_reasoning = assistant_msg(content);
+            empty_reasoning.reasoning_content = Some(String::new());
+            assert!(qwen_jinja_lookup_turn(&mut cache, &empty_reasoning, &[90]).is_none());
+        }
+        let mut echoed = assistant_msg("");
+        echoed.reasoning_content = Some("The user is asking about entry 4.\n".to_string());
+        let hit =
+            qwen_jinja_lookup_turn(&mut cache, &echoed, &[90]).expect("echoed reasoning hits");
+        assert_eq!(hit.content.expect("content").token_ids, vec![4, 5, 6]);
+        echoed.reasoning_content = Some("another turn's reasoning\n".to_string());
+        assert!(qwen_jinja_lookup_turn(&mut cache, &echoed, &[90]).is_none());
+        let hit = qwen_jinja_lookup_turn(&mut cache, &assistant_msg("answer C"), &[90])
+            .expect("content-identified turn keeps the unique fallback");
+        assert_eq!(hit.content.expect("content").token_ids, vec![7, 8, 9]);
+    }
 }
 
 /// Multi-turn history contract shared by the Qwen spec (MTP) and AR routes:
@@ -10806,17 +10858,22 @@ mod qwen_history_chain_tests {
                 }
             } else {
                 // No echoed reasoning: a turn hits only when it is the sole
-                // cached turn with its content; an ambiguous one is a plain
-                // miss. Never another turn's tokens.
+                // cached turn with its content and that content is not empty
+                // (#1198: an empty message names no turn); anything else is a
+                // plain miss. Never another turn's tokens.
                 for k in 0..turn {
                     let sharing = contents[..turn]
                         .iter()
                         .filter(|c| **c == contents[k])
                         .count();
+                    let anonymous =
+                        crate::common::normalize_asst_turn_for_fingerprint(&contents[k])
+                            .trim()
+                            .is_empty();
                     assert_eq!(
                         contains(&prompt, &bodies[k]),
-                        sharing == 1,
-                        "{route:?} turn {turn}: earlier turn {k} (shares its content with {sharing} turn(s))"
+                        sharing == 1 && !anonymous,
+                        "{route:?} turn {turn}: earlier turn {k} (shares its content with {sharing} turn(s), empty {anonymous})"
                     );
                 }
             }

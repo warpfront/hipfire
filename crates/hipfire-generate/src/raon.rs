@@ -647,9 +647,8 @@ fn asst_cache_probe(
         let stripped = crate::common::strip_think_for_fingerprint(&msg.content);
         let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
         let fp = hipfire_engine::turn_cache::asst_turn_fingerprint(&normalized, &msg.tool_calls);
-        if let Some(turn) = m
-            .asst_turn_cache
-            .get_for_reasoning(&fp, msg.reasoning_content.as_deref())
+        if let Some(turn) =
+            crate::common::lookup_echoed_asst_turn(&mut m.asst_turn_cache, fp, &normalized, msg)
         {
             hits += 1;
             if turn

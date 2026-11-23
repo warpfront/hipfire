@@ -129,6 +129,28 @@ pub fn normalize_asst_turn_for_fingerprint(s: &str) -> String {
     hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned()
 }
 
+/// The cached turn an echoed assistant message replays: the entry for its
+/// content/tool fingerprint `fp`, selected by its echoed `reasoning_content`
+/// ([`AsstTurnCache::get_for_reasoning`]). `normalized` is the message content
+/// as fingerprinted. A message with no visible content, no tool calls and no
+/// echoed reasoning never hits: every reasoning-only turn shares that
+/// fingerprint, and the turn the client echoes (one stopped inside its
+/// reasoning is never stored) need not be the one cached, so the unique-entry
+/// fallback would splice another turn's reasoning in its place. Such a
+/// message renders from its text.
+pub fn lookup_echoed_asst_turn<'c>(
+    cache: &'c mut AsstTurnCache,
+    fp: u64,
+    normalized: &str,
+    msg: &hipfire_runtime::prompt_frame::Message,
+) -> Option<&'c hipfire_runtime::prompt_frame::CachedAssistantTurn> {
+    let reasoning = msg.reasoning_content.as_deref().filter(|r| !r.is_empty());
+    if reasoning.is_none() && msg.tool_calls.is_empty() && normalized.trim().is_empty() {
+        return None;
+    }
+    cache.get_for_reasoning(&fp, reasoning)
+}
+
 /// Error message of a client cancel whose fail-closed rollback was not attested.
 pub const UNATTESTED_CANCEL_MESSAGE: &str =
     "client cancelled; fail-closed rollback could not be attested";
