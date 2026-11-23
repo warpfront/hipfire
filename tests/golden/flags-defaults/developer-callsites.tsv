@@ -497,7 +497,6 @@ developer_callsite	*	HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE#developer_var=-
 developer_callsite	*	HIPFIRE_QWEN4_G942_ROWS16_GRID_IMAGE#developer_var=-
 developer_callsite	*	HIPFIRE_QWEN4_GDN_PREFILL#developer_var=unwrap_or_default
 developer_callsite	*	HIPFIRE_QWEN4_LANES_ON_D2#developer_bool=false
-developer_callsite	*	HIPFIRE_QWEN4_LANE_COMMIT_FILL#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_LANE_COPY_LANES#developer_var=ok.and_then.unwrap_or(COPY_WIDE_LANES)
 developer_callsite	*	HIPFIRE_QWEN4_LANE_COST_TRACE#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN4_LANE_LAB_ROUTES#developer_var=as_deref.map

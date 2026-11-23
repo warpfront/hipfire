@@ -8313,6 +8313,8 @@ pub fn route_entries_sealed(
     default_flags.deepseek4_attn_topk_direct = input.flags.deepseek4_attn_topk_direct;
     default_flags.deepseek4_wo_q8_wmma = input.flags.deepseek4_wo_q8_wmma;
     default_flags.no_device_compiler = input.flags.no_device_compiler;
+    // Qwen4 lane commit fill (HIPF-500): a Qwen4 lane prepare choice, no kernel of a closed route.
+    default_flags.qwen4_lane_commit_fill = input.flags.qwen4_lane_commit_fill;
     if format!("{:?}", input.flags) != format!("{default_flags:?}") {
         return refuse(format!("non-default feature flags on {}", input.arch));
     }

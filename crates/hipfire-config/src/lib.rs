@@ -3517,6 +3517,14 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_FA_QRESIDENT_PM",
         "PeaceMaker twin of the fp8 Q-resident FA2 prefill: auto (default) is on exact gfx1201 only (the arch with the embedded artifact); true / false force it."
     ),
+    process_auto_bool_field!(
+        "kernel.qwen4_lane_commit_fill",
+        "qwen4_lane_commit_fill",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_LANE_COMMIT_FILL",
+        "Qwen4 lane commit fill (one batched decode-fill Append per lane for a window's kept drafts): auto (default) is on exact gfx1201 only; true / false force it."
+    ),
     process_bool_field!(
         "attention.qwen4_qsa_wmma_gather",
         "qwen4_qsa_wmma_gather",
@@ -5519,6 +5527,14 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "the DeepSeek V4 indexer WMMA switch was removed (HIPF-488)",
         replacement: "none; the indexer takes its WMMA route wherever ArchCaps::has_wmma holds",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_lane_commit_fill",
+        legacy_key: "developer.qwen4_lane_commit_fill",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-500); HIPFIRE_QWEN4_LANE_COMMIT_FILL is unchanged",
+        replacement: "kernel.qwen4_lane_commit_fill",
     },
     RetiredConfigKey {
         key: "developer.qwen4_qsa_wmma_gather",
@@ -10210,6 +10226,7 @@ fn promoted_flag_env_value(legacy_key: &str, raw: &str) -> Option<ConfigValue> {
         "ep_peer_allreduce"
         | "ep_peer_allreduce_decode"
         | "qwen4_mtp_draft_rounds"
+        | "qwen4_lane_commit_fill"
         | "qwen4_expert_drop_zero"
         | "tp_peer_alternating"
         | "tp_peer_push"
@@ -11436,6 +11453,7 @@ mod tests {
                 "ep_peer_allreduce",
                 "ep_peer_allreduce_decode",
                 "qwen4_mtp_draft_rounds",
+                "qwen4_lane_commit_fill",
                 "qwen4_expert_drop_zero",
                 "tp_peer_alternating",
                 "tp_peer_push",
@@ -11492,8 +11510,8 @@ mod tests {
         // (HIPF-438) + 4 tier-B arch-crate / runtime (HIPF-437) + 2 kernel-side (HIPF-489)
         // + 2 memory-side (HIPF-489 case 6) + 4 Qwen4 gfx1100 package keys
         // (HIPF-489 case 6 part B) + 22 Qwen4 tier-C S5b (HIPF-487)
-        // + 22 tier-C kernel-side (HIPF-488).
-        assert_eq!(promoted.len(), 95);
+        // + 22 tier-C kernel-side (HIPF-488) + 1 (HIPF-500).
+        assert_eq!(promoted.len(), 96);
         for f in promoted {
             let dev = developer_key_for_env(f.env_compat.unwrap()).unwrap();
             let err = ConfigLayer::default().set_cli(&dev, "1").unwrap_err();

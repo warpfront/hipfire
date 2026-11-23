@@ -1,0 +1,3 @@
+### Config: typed keys for kept developer flags
+
+- **Config: `HIPFIRE_QWEN4_LANE_COMMIT_FILL` has a typed key and is read through `FeatureFlags` (HIPF-500, HIPF-396 tier C S5b; unset behaviour and every env spelling's effect unchanged).** New key `kernel.qwen4_lane_commit_fill` (`auto`/`true`/`false`, `auto` = on exact gfx1201 only); the env keeps its exact `1` / `0` grammar, anything else is `auto`. The lane prepare reads `gpu.flags.qwen4_lane_commit_fill_enabled()` instead of the environment. The former `[developer] qwen4_lane_commit_fill` spelling is a retired key that names the replacement. The closed gfx1201 route plan ignores the field (it selects no kernel of that route).

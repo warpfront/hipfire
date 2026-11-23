@@ -162,6 +162,10 @@ pub struct FeatureFlags {
     /// of the rank (or at a settle before work that would carry it under another label), and is
     /// reported as `prepare (deferred)`. Same kernels in the same stream order, bytes identical.
     pub qwen4_lane_prepare_async: bool,
+    /// Lane commit fill (`HIPFIRE_QWEN4_LANE_COMMIT_FILL`, default on for exact gfx1201, `0` is
+    /// the kill switch): a lane step's prepare rebuilds a window's kept drafts with one batched
+    /// decode-fill Append per lane instead of one `mtp_append_token` per row, bytes identical.
+    pub qwen4_lane_commit_fill: bool,
     /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`),
     /// default on for exact gfx1201, `0` is the kill switch: the foreign experts'
     /// grouped down rows are marked `-1` in the combine order instead of being
@@ -1238,6 +1242,7 @@ impl FeatureFlags {
             qwen4_draft_topk8_rows: parse_bool("HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS").unwrap_or(is_gfx1201),
             qwen4_lane_prepare_async: parse_bool("HIPFIRE_QWEN4_LANE_PREPARE_ASYNC")
                 .unwrap_or(is_gfx1201),
+            qwen4_lane_commit_fill: exact_tri("HIPFIRE_QWEN4_LANE_COMMIT_FILL").unwrap_or(is_gfx1201),
             qwen4_ep_pmask_implicit_zero: parse_bool("HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO")
                 .unwrap_or(is_gfx1201),
             qwen4_ep_pmask_implicit_zero_poison: parse_bool(
@@ -1926,6 +1931,12 @@ impl FeatureFlags {
         self.qwen4_lane_prepare_async && self.arch == "gfx1201"
     }
 
+    /// Lane commit fill (`HIPFIRE_QWEN4_LANE_COMMIT_FILL`): exact gfx1201 only, default on,
+    /// `0` is the kill switch.
+    pub fn qwen4_lane_commit_fill_enabled(&self) -> bool {
+        self.qwen4_lane_commit_fill && self.arch == "gfx1201"
+    }
+
     /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`):
     /// exact gfx1201 only.
     pub fn qwen4_ep_pmask_implicit_zero_enabled(&self) -> bool {
@@ -2297,6 +2308,7 @@ impl FeatureFlags {
             qwen4_draft_glue_fold: false,
             qwen4_draft_topk8_rows: false,
             qwen4_lane_prepare_async: false,
+            qwen4_lane_commit_fill: false,
             qwen4_ep_pmask_implicit_zero: false,
             qwen4_ep_pmask_implicit_zero_poison: false,
             qwen4_hc_row_fold: false,
@@ -5290,6 +5302,7 @@ mod tests {
                 f.qwen4_ep_pmask_implicit_zero,
                 f.qwen4_draft_glue_fold,
                 f.qwen4_draft_topk8_rows,
+                f.qwen4_lane_commit_fill,
             ]
             .iter()
             .map(bool::to_string)
@@ -5337,6 +5350,7 @@ mod tests {
             "kernel.qwen4_ep_pmask_implicit_zero",
             "kernel.qwen4_draft_glue_fold",
             "kernel.qwen4_draft_topk8_rows",
+            "kernel.qwen4_lane_commit_fill",
         ];
         for (i, key) in keys.into_iter().enumerate() {
             let flipped = defaults[i] != "true";

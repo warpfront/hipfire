@@ -1384,8 +1384,7 @@ pub(crate) fn prepare_lane_window(
 /// `0`, exact gfx1201 only. The batched Append is the per-row kernels' bytes
 /// (`append_rows`' `DecodeFill` route, as the singleton takeover fill).
 pub(crate) fn lane_commit_fill_enabled(gpu: &Gpu) -> bool {
-    gpu.arch_caps.is_gfx1201()
-        && hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_COMMIT_FILL", true)
+    gpu.flags.qwen4_lane_commit_fill_enabled()
 }
 
 /// [`prepare_lane_window`] for any verify window of a lane (native, copy,
