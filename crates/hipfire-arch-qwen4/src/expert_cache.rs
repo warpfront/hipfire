@@ -1,7 +1,8 @@
 //! Decode-only exact LRU of immutable Flash-Next expert payloads, on the shared runtime core.
 //!
 //! A token uses the tables acquired at its start. Misses execute from immutable mapped host
-//! backing; asynchronous copies serve later tokens. Dirty short prefill reads independent
+//! backing; asynchronous copies serve later tokens. A dirty short prompt tile of two or more
+//! rows reads the published tables under its own token; a one-row tile reads the independent
 //! immutable core/host tables. Long prefill restores the original donor bytes before using the
 //! frozen resident view.
 //!
@@ -26,12 +27,15 @@
 //!   `withdrawn()` are written into the per-layer device tables through the dispatch
 //!   [`MutableExpertResidency`] capability (the table writes and the launch authority stay
 //!   dispatch's);
-//! * the donor protocol (§5.2, see [`ExpertCache::prepare_prefill`]): a dirty prompt shorter than
-//!   the staged threshold reads the immutable core/host tables and leaves fills, mappings,
-//!   tickets and recency alone; a prompt that needs the Resident donors back refuses while a
-//!   token or window is open, drains every fill, rewrites each pool hull from the pinned mirror,
-//!   records the re-seed behind those copies and publishes it over the canonical mapping, all
-//!   before its first kernel. Prefill never observes routes, so it promotes no expert;
+//! * the donor protocol (§5.2, see [`ExpertCache::prepare_prefill`]): a dirty prompt tile
+//!   shorter than the staged threshold leaves fills, mappings, tickets and recency alone. With
+//!   two or more rows it reads the published decode tables under a token that observes no
+//!   route ([`ExpertCache::begin_published_prefill`], cancelled once its readers retired); a
+//!   one-row tile (the decode seal) reads the immutable core/host tables. A prompt that needs
+//!   the Resident donors back refuses while a token or window is open, drains every fill,
+//!   rewrites each pool hull from the pinned mirror, records the re-seed behind those copies and
+//!   publishes it over the canonical mapping, all before its first kernel. Prefill never
+//!   observes routes, so it promotes no expert;
 //! * teardown ([`ExpertCache::shutdown`], `Drop`): wait every fill, drop the pools once the
 //!   device is idle; an unretired token or an unprovable retirement retains every owner.
 //!
@@ -138,6 +142,10 @@ pub(crate) struct ExpertCacheStats {
     /// view. Admission does not prove GPU execution or measure GPU time.
     pub mapped_prefill_calls: u64,
     pub mapped_prefill_rows: u64,
+    /// Calls and rows of dirty short prompt tiles that read the published tables
+    /// under a route-free token ([`ExpertCache::begin_published_prefill`]).
+    pub published_prefill_calls: u64,
+    pub published_prefill_rows: u64,
     pub prefill_restores: u64,
     pub restore_bytes: u64,
     pub peak_inflight: usize,
@@ -190,6 +198,19 @@ fn note_mapped_prefill(stats: &mut ExpertCacheStats, rows: usize) -> Result<()> 
     stats.mapped_prefill_calls = stats.mapped_prefill_calls.saturating_add(1);
     stats.mapped_prefill_rows = stats
         .mapped_prefill_rows
+        .saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
+    Ok(())
+}
+
+/// Count a prompt tile admitted to the published tables. Counters only: the tile holds a token
+/// that is cancelled, never finished, so it records no use and plans no fill.
+fn note_published_prefill(stats: &mut ExpertCacheStats, rows: usize) -> Result<()> {
+    if rows < 2 {
+        return Err("expert cache published prefill requires at least two rows".into());
+    }
+    stats.published_prefill_calls = stats.published_prefill_calls.saturating_add(1);
+    stats.published_prefill_rows = stats
+        .published_prefill_rows
         .saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
     Ok(())
 }
@@ -1284,6 +1305,25 @@ impl ExpertCache {
         note_mapped_prefill(&mut self.stats, rows)
     }
 
+    /// Open the token of a dirty short prompt tile of `rows >= 2` rows that reads the PUBLISHED
+    /// decode tables (the experts the cache holds now, the rest from host). The tile is a reader
+    /// like a window: the token's lease keeps every publication and victim reclaim out until it
+    /// retires, and pending fills only write withdrawn slots, which no published entry names.
+    /// Retire it with [`Self::cancel_after_gpu_wait`] once its readers are proven retired: the
+    /// tile observes no route, so it records no use, changes no recency and plans no fill.
+    pub(crate) fn begin_published_prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        rows: usize,
+    ) -> Result<ExpertCacheToken> {
+        if rows < 2 {
+            return Err("expert cache published prefill requires at least two rows".into());
+        }
+        let token = self.begin_token(gpu, WindowConsumerPhase::Prefill)?;
+        note_published_prefill(&mut self.stats, rows)?;
+        Ok(token)
+    }
+
     fn emit_stats(&self) {
         if tracing::enabled!(tracing::Level::DEBUG) {
             tracing::debug!(stats = ?self.stats(), "qwen4 exact expert cache");
@@ -1768,9 +1808,10 @@ impl ExpertCache {
     /// re-seeded tickets outrank every earlier one ([`ticket_generation`]). All of it completes
     /// before this returns, i.e. before the prefill's first kernel. Nothing reads a donor slot
     /// while it is rewritten: the caller holds `&mut` over the cache, no token or retained queue
-    /// is outstanding, and a mapped prefill tile still in flight reads the immutable core/host
-    /// tables, never a donor slot. A failure after the first byte moved poisons the cache (the
-    /// donors may be half restored).
+    /// is outstanding (a published prompt tile retires its token before it returns), and a
+    /// mapped prefill tile still in flight reads the immutable core/host tables, never a donor
+    /// slot. A failure after the first byte moved poisons the cache (the donors may be half
+    /// restored).
     ///
     /// Prefill never observes routes: it records no use, so a scan-heavy prompt promotes no
     /// expert, and the restore resets recency to the seed's (every donor stamped alike).
@@ -2723,6 +2764,26 @@ mod tests {
             ExpertCacheStats {
                 mapped_prefill_calls: 2,
                 mapped_prefill_rows: 512,
+                ..ExpertCacheStats::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_published_prefill_counts_its_rows_and_touches_nothing_else() {
+        let mut stats = ExpertCacheStats::default();
+        // One row is the decode seal: it keeps the immutable core/host view.
+        assert!(note_published_prefill(&mut stats, 0).is_err());
+        assert!(note_published_prefill(&mut stats, 1).is_err());
+        assert_eq!(stats, ExpertCacheStats::default());
+        note_published_prefill(&mut stats, 2).unwrap();
+        note_published_prefill(&mut stats, 2045).unwrap();
+        // No window, use, fill or mapped-view row is counted.
+        assert_eq!(
+            stats,
+            ExpertCacheStats {
+                published_prefill_calls: 2,
+                published_prefill_rows: 2047,
                 ..ExpertCacheStats::default()
             }
         );

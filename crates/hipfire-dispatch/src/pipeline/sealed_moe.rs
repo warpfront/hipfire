@@ -4113,13 +4113,15 @@ fn validate_decode(
 }
 
 /// Admission of a grouped-prefill-protocol call over a mutable-residency expert set: an
-/// exact-cache verify or repair window (PLAN A2; `docs/expert-cache/ROUTE-INVENTORY.md` §7).
+/// exact-cache verify or repair window, or a short dirty prompt tile that reads the published
+/// residency (PLAN A2; `docs/expert-cache/ROUTE-INVENTORY.md` §7).
 ///
 /// Every kernel the admitted route can launch reads the routed pointer tables through the
-/// table address in its kernarg at execute time. Everything that reads table contents at
-/// plan or bind time, or leaves the device, is refused here, before sealing:
-/// * exact gfx1201 and a 2..=[`WIDE_VERIFY_MAX_ROWS`] row window (one row is the indexed
-///   decode seal; a prompt reads the canonical prefill scope, never this binding);
+/// table address in its kernarg at execute time, at any row count. Everything that reads
+/// table contents at plan or bind time, or leaves the device, is refused here, before sealing:
+/// * exact gfx1201 and at least 2 rows (one row is the indexed decode seal). No upper bound:
+///   the rows only pick among the qualified arms; the tile that would read a stage is
+///   refused by the stage-table rule below;
 /// * the sealed QT44/QT53 grouped route only: no generic, FP8 or expert-slab lowering and
 ///   no expert-IU4 or MQ2-Lloyd arm (GU-14/DOWN-13, GU-16/DOWN-15 are not reachable);
 /// * no stage tables (TAB-3/TAB-5 are filled from host entries at plan time);
@@ -4129,20 +4131,17 @@ fn validate_decode(
 /// Kernel selection then reads only the binding's plan-derived host bit (the tier
 /// identity's `any_host`), never the current placement, and the call's launch authority
 /// is its live reader lease at the current image epoch ([`validate_live_binding`]).
-///
-/// [`WIDE_VERIFY_MAX_ROWS`]: rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS
 fn validate_mutable_prefill(
     ctx: &DispatchCtx,
     params: &MoePrefillParams<'_>,
 ) -> Result<(), DispatchError> {
     use crate::families::moe::MoeRouteCapability::{Qt44Qt53Grouped, Qt44Qt53GroupedSymmetric};
-    const MAX_ROWS: usize = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
     if ctx.arch.arch() != "gfx1201" {
         return Err(invalid("mutable residency prefill requires exact gfx1201"));
     }
-    if !(2..=MAX_ROWS).contains(&params.batch_size) {
+    if params.batch_size < 2 {
         return Err(invalid(format!(
-            "mutable residency prefill serves 2..={MAX_ROWS}-row verify windows, got {} rows",
+            "mutable residency prefill serves windows and prompt tiles of at least 2 rows, got {} rows",
             params.batch_size
         )));
     }
@@ -6437,7 +6436,7 @@ mod tests {
     }
 
     #[test]
-    fn mutable_residency_admits_only_qualified_decode_and_verify_windows() {
+    fn mutable_residency_admits_only_qualified_decode_windows_and_prompt_tiles() {
         let table = mutable_table();
         let fixture = live_fixture(&table, 0x5100_0000);
         let routed = MutableRouted {
@@ -6486,9 +6485,9 @@ mod tests {
             let error = validate_decode(&ctx, &bound, &params).unwrap_err();
             assert!(format!("{error:?}").contains(expected), "{error:?}");
         }
-        // The grouped-prefill protocol (an n-row verify/repair window) is admitted only for a
-        // 2..=64-row sealed QT44/QT53 replicated window on gfx1201, and then only under a live
-        // reader lease naming the published image.
+        // The grouped-prefill protocol (an n-row verify/repair window or a short dirty prompt
+        // tile) is admitted only for a sealed QT44/QT53 replicated call of at least 2 rows on
+        // gfx1201, and then only under a live reader lease naming the published image.
         use crate::families::moe::{
             MoeRouteCapability, MoeRouteFormats, MoeRouteGeometry, MoeRoutePolicy,
         };
@@ -6529,17 +6528,16 @@ mod tests {
             params
         };
         let gfx1201 = DispatchCtx::for_test("gfx1201");
-        for rows in [2, 5, 9, 64] {
+        for rows in [2, 5, 9, 64, 65, 2047] {
             validate_mutable_prefill(&gfx1201, &window(rows)).unwrap();
         }
         let mut plain = window(4);
         plain.route_policy = Some(policy(MoeRouteCapability::Qt44Qt53Grouped));
         validate_mutable_prefill(&gfx1201, &plain).unwrap();
         type Mutate = fn(&mut MoePrefillParams<'_>);
-        let refusals: [(&str, usize, Mutate, &str); 8] = [
+        let refusals: [(&str, usize, Mutate, &str); 7] = [
             ("gfx1100", 4, |_| {}, "exact gfx1201"),
-            ("gfx1201", 1, |_| {}, "2..=64-row verify windows"),
-            ("gfx1201", 65, |_| {}, "2..=64-row verify windows"),
+            ("gfx1201", 1, |_| {}, "at least 2 rows"),
             (
                 "gfx1201",
                 4,

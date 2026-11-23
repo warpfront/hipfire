@@ -724,13 +724,21 @@ fn run(a: &Args) -> R<Report> {
             )?;
             let after_short = census(&bundle, &gpu, a.cache)?;
             if a.cache {
+                // A dirty tile of two or more rows reads the published tables; a one-row tile
+                // reads the immutable core/host view. Neither restores the donors.
+                let (view, other) = if case.short_rows >= 2 {
+                    ("published_prefill", "mapped_prefill")
+                } else {
+                    ("mapped_prefill", "published_prefill")
+                };
                 require(
-                    delta(&before_short, &after_short, "mapped_prefill_calls")? > 0
-                        && delta(&before_short, &after_short, "mapped_prefill_rows")?
+                    delta(&before_short, &after_short, &format!("{view}_calls"))? > 0
+                        && delta(&before_short, &after_short, &format!("{view}_rows"))?
                             == case.short_rows as u64
+                        && delta(&before_short, &after_short, &format!("{other}_calls"))? == 0
                         && delta(&before_short, &after_short, "prefill_restores")? == 0
                         && delta(&before_short, &after_short, "restore_bytes")? == 0,
-                    "short prefill did not use mapped view without bulk restoration",
+                    "short prefill did not use its dirty-prompt view without bulk restoration",
                 )?;
             }
             decode(

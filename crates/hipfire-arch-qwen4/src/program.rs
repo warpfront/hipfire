@@ -999,9 +999,10 @@ pub fn seal_moe_for_layer<'a>(
         )));
     }
     // An exact-cache (mutable residency) layer seals the same way: one row is the indexed
-    // decode, an n-row verify/repair window the grouped prefill protocol, which dispatch
-    // admits under mutable residency only for a 2..=64-row sealed QT44/QT53 window (no
-    // stage tables, CPU or EP) whose published image is leased at the current epoch.
+    // decode, an n-row verify/repair window or a short dirty prompt tile the grouped prefill
+    // protocol, which dispatch admits under mutable residency only for a sealed QT44/QT53 call
+    // of at least 2 rows (no stage tables, CPU or EP) whose published image is leased at the
+    // current epoch.
     if route_rows == 1 && !moe.route_policy.capability.is_fp8_grouped() {
         let params = build_moe_decode(dims, moe, scratch.hc_mixed, scratch, cpu_deferred)?;
         seal_decode(bound, ctx, params)

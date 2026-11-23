@@ -9518,7 +9518,7 @@ fn load_qwen4_rank_unscoped(
         );
         if let Some(tail) = &cache_tail {
             eprintln!(
-                "  qwen4 exact expert cache: {} core experts in VRAM, {} evictable slots ({} MiB), immutable host mirror +{} MiB; dirty short prefill uses immutable core/host tables, longer prefill restores the donor tail",
+                "  qwen4 exact expert cache: {} core experts in VRAM, {} evictable slots ({} MiB), immutable host mirror +{} MiB; dirty short prefill reads the published tables (one-row tiles the immutable core/host tables), longer prefill restores the donor tail",
                 device_experts.saturating_sub(tail.donors.len()), tail.donors.len(),
                 tail.donor_bytes / MIB, tail.donor_bytes / MIB,
             );

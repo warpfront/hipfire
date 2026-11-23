@@ -10766,24 +10766,42 @@ fn tile_moe_of<'a, T>(
     }
 }
 
-/// A dirty short prompt can read immutable core/host weights while the cache
-/// keeps its donor slots. A clean prompt or a staged-width tile retains the
-/// original Resident prefill route, including a long prompt's short clean tail.
-fn expert_cache_prefill_uses_host(dirty: bool, rows: usize, stage_min_rows: usize) -> bool {
-    dirty && rows > 0 && rows < stage_min_rows
+/// The tables an exact-cache prompt tile reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CachePromptView {
+    /// The original Resident prefill route: a clean prompt, or a staged-width tile (restored
+    /// first), including a long prompt's short clean tail.
+    Resident,
+    /// A dirty short tile of two or more rows: the published decode tables under a route-free
+    /// token, so the experts the cache holds now are read from VRAM.
+    Published,
+    /// A dirty one-row tile (dispatch admits a grouped-prefill call over mutable residency
+    /// from two rows): the immutable core/host tables.
+    Host,
+}
+
+fn expert_cache_prompt_view(dirty: bool, rows: usize, stage_min_rows: usize) -> CachePromptView {
+    if !dirty || rows == 0 || rows >= stage_min_rows {
+        CachePromptView::Resident
+    } else if rows == 1 {
+        CachePromptView::Host
+    } else {
+        CachePromptView::Published
+    }
 }
 
 /// The cache's immutable prompt tables are distinct from its mutable decode
-/// tables. Keep this selection shared by tile descriptors and program building.
+/// tables, which a window and a published prompt tile both read (`mutable_active`).
+/// Keep this selection shared by tile descriptors and program building.
 fn cache_tile_moe_of<'a, T>(
-    decode_active: bool,
+    mutable_active: bool,
     host_prefill_active: bool,
     resident: &'a [T],
     decode: &'a [T],
     host_prefill: &'a [T],
 ) -> &'a [T] {
-    debug_assert!(!(decode_active && host_prefill_active));
-    if decode_active {
+    debug_assert!(!(mutable_active && host_prefill_active));
+    if mutable_active {
         decode
     } else if host_prefill_active {
         host_prefill
@@ -11335,6 +11353,9 @@ pub struct Qwen4GpuForward {
     cache_routes: Option<ExpertCacheRoutes>,
     cache_active: bool,
     cache_host_prefill_active: bool,
+    /// A published prompt tile is running: it reads `moe_cache` (the mutable tables) under a
+    /// route-free token, with no route collection.
+    cache_prompt_active: bool,
     cache_replay_quiescent: Cell<bool>,
     cpu_deferred_experts: bool,
     /// Trunk layers armed for the D2 tier split (a distinct numerical mode:
@@ -13844,6 +13865,7 @@ impl Qwen4GpuForward {
             cache_routes: None,
             cache_active: false,
             cache_host_prefill_active: false,
+            cache_prompt_active: false,
             cache_replay_quiescent: Cell::new(true),
             borrow_class_rows,
             borrow_runtimes_active: false,
@@ -15031,7 +15053,7 @@ impl Qwen4GpuForward {
         self.cache_routes = Some(routes);
         self.expert_cache = Some(cache);
         eprintln!("  qwen4 exact expert cache: decode and native-MTP verify windows, tail cap={:?} bytes (None = default {}% of the ranked device owner), max-inflight={}, routed ids unchanged", policy.tail_bytes_cap, crate::expert_cache_config::DEFAULT_DONOR_PERCENT, policy.max_inflight);
-        eprintln!("  qwen4 exact expert cache: dirty prompt tiles below {} rows read immutable core/host tables", self.cache_prefill_stage_min_rows(gpu));
+        eprintln!("  qwen4 exact expert cache: dirty prompt tiles of 2..{} rows read the published tables (one-row tiles the immutable core/host tables)", self.cache_prefill_stage_min_rows(gpu));
         Ok(())
     }
 
@@ -15078,7 +15100,7 @@ impl Qwen4GpuForward {
 
     pub(crate) fn tile_moe(&self) -> &[Option<Qwen4MoeLayerRuntime>] {
         cache_tile_moe_of(
-            self.cache_active,
+            self.cache_active || self.cache_prompt_active,
             self.cache_host_prefill_active,
             tile_moe_of(
                 self.borrow_runtimes_active,
@@ -16983,7 +17005,7 @@ impl Qwen4GpuForward {
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
         if self.prefill_scope {
-            let host_prefill = expert_cache_prefill_uses_host(
+            let view = expert_cache_prompt_view(
                 self.expert_cache
                     .as_ref()
                     .expect("cache present")
@@ -16991,6 +17013,19 @@ impl Qwen4GpuForward {
                 tokens.len(),
                 self.cache_prefill_stage_min_rows(gpu),
             );
+            if view == CachePromptView::Published {
+                return self.forward_cache_published_prompt(
+                    bundle,
+                    gpu,
+                    tokens,
+                    argmax_of,
+                    logits,
+                    top1,
+                    wide_hidden_capture,
+                    output_policy,
+                );
+            }
+            let host_prefill = view == CachePromptView::Host;
             let cache = self.expert_cache.as_mut().expect("cache present");
             if host_prefill {
                 // Only immutable core/host payloads and static tables are
@@ -17024,8 +17059,8 @@ impl Qwen4GpuForward {
             return result;
         }
         // A decode token or a native-MTP verify / repair window: one cache window of `rows`
-        // rows, sized at construction for the widest verify. Dispatch seals n > 1 on the
-        // grouped-prefill protocol and admits it only as an eager 2..=64-row window.
+        // rows, sized at construction for the widest verify (64). Dispatch seals n > 1 on the
+        // grouped-prefill protocol and runs it eager only.
         let rows = tokens.len();
         if rows == 0 || rows > qwen4_spec_logit_rows(self.scratch.max_chunk) {
             return Err(invalid(format!(
@@ -17149,6 +17184,82 @@ impl Qwen4GpuForward {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// A dirty short prompt tile of two or more rows on the published decode tables
+    /// ([`CachePromptView::Published`]): the experts the cache holds now are read from VRAM, the
+    /// rest from host, exactly the bytes every other view reads. The token's lease holds the
+    /// current image for the whole tile (no publication or victim reclaim can land), nothing
+    /// observes a route, and the token is cancelled once a HIP wait proved every reader retired:
+    /// a multi-row tile never runs a retained body, so the HIP wait covers it.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_cache_published_prompt(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        argmax_of: Option<&GpuTensor>,
+        logits: Option<&GpuTensor>,
+        top1: Option<&GpuTensor>,
+        wide_hidden_capture: Option<&GpuTensor>,
+        output_policy: Qwen4OutputPolicy,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let token = self
+            .expert_cache
+            .as_mut()
+            .expect("cache present")
+            .begin_published_prefill(gpu, tokens.len())
+            .map_err(invalid)?;
+        self.cache_replay_quiescent.set(true);
+        let result = (|| {
+            for runtime in self.moe_cache.iter_mut().flatten() {
+                runtime.refresh_cache_entries()?;
+            }
+            self.cache_prompt_active = true;
+            self.forward_chunk_tile(
+                bundle,
+                gpu,
+                tokens,
+                argmax_of,
+                logits,
+                top1,
+                wide_hidden_capture,
+                output_policy,
+            )
+        })();
+        self.cache_prompt_active = false;
+        let context = |error: &Qwen4GpuForwardError| format!("published prompt tile: {error}; ");
+        if !self.cache_replay_quiescent.get() {
+            let reason = format!(
+                "{}exact-cache retained queue has unknown quiescence",
+                result.as_ref().err().map(context).unwrap_or_default()
+            );
+            gpu.quarantine_retained_replay_owners(reason.clone());
+            return Err(invalid(reason));
+        }
+        if let Err(wait) = gpu.hip.device_synchronize() {
+            let reason = format!(
+                "{}exact-cache published prompt HIP wait failed: {wait}",
+                result.as_ref().err().map(context).unwrap_or_default()
+            );
+            gpu.quarantine_retained_replay_owners(reason.clone());
+            return Err(invalid(reason));
+        }
+        // SAFETY: no retained queue submitted (quiescence proven above) and the HIP wait
+        // retired every reader of the tile.
+        unsafe {
+            self.expert_cache
+                .as_mut()
+                .expect("cache present")
+                .cancel_after_gpu_wait(gpu, token)
+                .map_err(|retire| {
+                    invalid(format!(
+                        "{}published prompt token retirement failed: {retire}",
+                        result.as_ref().err().map(context).unwrap_or_default()
+                    ))
+                })?;
+        }
+        result
     }
 
     /// Bank and runtime selection, the only place decode-share state changes.
@@ -17916,9 +18027,9 @@ impl Qwen4GpuForward {
         let expert_stage = match self
             .expert_stage
             .as_ref()
-            // Cache decode has independent mutable tables and donor slots;
-            // the existing stage remains available only to canonical prefill.
-            .filter(|_| !self.cache_active)
+            // Cache windows and published prompt tiles read independent mutable tables and
+            // donor slots; the existing stage remains available only to canonical prefill.
+            .filter(|_| !self.cache_active && !self.cache_prompt_active)
             // This stage was built for Resident placement. Its host mask and
             // sparse tables cannot stage the extra host-backed donor entries
             // of the immutable core/host prompt view.
@@ -17972,7 +18083,7 @@ impl Qwen4GpuForward {
         // runtime fields only (`Self::tile_moe` would borrow all of `self`
         // across the program build and its closures).
         let tile_moe = cache_tile_moe_of(
-            self.cache_active,
+            self.cache_active || self.cache_prompt_active,
             self.cache_host_prefill_active,
             tile_moe_of(
                 self.borrow_runtimes_active,
@@ -22115,25 +22226,43 @@ mod tests {
     }
 
     #[test]
-    fn expert_cache_prefill_preserves_resident_on_pristine_and_staged_tiles() {
-        use super::{expert_cache_prefill_uses_host as host, resolve_expert_stage_min_rows};
+    fn expert_cache_prompt_view_keeps_resident_on_pristine_and_staged_tiles() {
+        use super::{
+            expert_cache_prompt_view as view, resolve_expert_stage_min_rows, CachePromptView,
+        };
         let floor = resolve_expert_stage_min_rows("gfx1201", 4096, false, None).0;
         assert_eq!(floor, 2048);
-        // Covers singleton prompt tails, the few-row boundary, the compact
-        // fallback/IU4 boundary, and the first staged-width tile.
-        for rows in [1, 8, 9, 511, 512, 2047] {
-            assert!(host(true, rows, floor), "dirty prompt of {rows} rows");
-            assert!(!host(false, rows, floor), "pristine prompt of {rows} rows");
+        // A dirty singleton prompt tail keeps the immutable core/host view; every wider dirty
+        // tile below the stage (the few-row boundary, the compact fallback/IU4 boundary, the
+        // last unstaged width) reads the published tables.
+        assert_eq!(view(true, 1, floor), CachePromptView::Host);
+        for rows in [2, 8, 9, 511, 512, 2047] {
+            assert_eq!(
+                view(true, rows, floor),
+                CachePromptView::Published,
+                "dirty {rows}"
+            );
+        }
+        for rows in [1, 2, 8, 9, 511, 512, 2047] {
+            assert_eq!(
+                view(false, rows, floor),
+                CachePromptView::Resident,
+                "pristine {rows}"
+            );
         }
         for rows in [0, 2048, 4096] {
-            assert!(!host(true, rows, floor), "resident tile of {rows} rows");
+            assert_eq!(
+                view(true, rows, floor),
+                CachePromptView::Resident,
+                "staged {rows}"
+            );
         }
         // After a long prompt restored the tail, its short remainder keeps
-        // Resident weights rather than needlessly moving those reads to host.
-        assert!(!host(false, 1007, floor));
+        // Resident weights rather than needlessly moving those reads elsewhere.
+        assert_eq!(view(false, 1007, floor), CachePromptView::Resident);
         let explicit_floor = resolve_expert_stage_min_rows("gfx1201", 4096, false, Some("2")).0;
-        assert!(host(true, 1, explicit_floor));
-        assert!(!host(true, 2, explicit_floor));
+        assert_eq!(view(true, 1, explicit_floor), CachePromptView::Host);
+        assert_eq!(view(true, 2, explicit_floor), CachePromptView::Resident);
     }
 
     #[test]
