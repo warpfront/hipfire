@@ -1081,16 +1081,6 @@ pub fn batch_lfm_exceeds_capacity(
     prompt_len.saturating_add(max_tokens) > lane_capacity
 }
 
-/// Shared LFM admission decision: `true` when the request is valid and fits
-/// within `lane_capacity` (including `max_tokens`). Invalid (empty or over-cap)
-/// must emit validation/context error with no `gen_start`/GPU work.
-pub fn batch_lfm_admission_ok(prompt_len: usize, max_tokens: usize, lane_capacity: usize) -> bool {
-    if prompt_len == 0 {
-        return false;
-    }
-    !batch_lfm_exceeds_capacity(prompt_len, max_tokens, lane_capacity)
-}
-
 /// Length-cap terminal when max_tokens or lane capacity is hit without a
 /// competing stop cause (EOS / filter / loop guard).
 pub fn batch_hit_length_cap(
