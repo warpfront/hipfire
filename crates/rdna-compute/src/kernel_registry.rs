@@ -2453,6 +2453,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "bf16_roundtrip_f32",
                 "bf16_scaled_add_batched_f32",
                 "bf16_scaled_add_f32",
+                "copy_regions_bf16_f32",
                 "copy_regions_u32",
                 "gated_delta_conv_bf16_f32",
                 "gated_delta_conv_bf16_f32_batched_k4",
@@ -3338,6 +3339,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "bf16_roundtrip_f32",
                 "bf16_scaled_add_batched_f32",
                 "bf16_scaled_add_f32",
+                "copy_regions_bf16_f32",
                 "copy_regions_u32",
                 "gated_delta_conv_bf16_f32",
                 "gated_delta_conv_bf16_f32_batched_k4",
@@ -3602,6 +3604,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "bf16_roundtrip_f32",
                 "bf16_scaled_add_batched_f32",
                 "bf16_scaled_add_f32",
+                "copy_regions_bf16_f32",
                 "copy_regions_u32",
                 "gated_delta_conv_bf16_f32",
                 "gated_delta_conv_bf16_f32_batched_k4",
@@ -3719,6 +3722,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "bf16_roundtrip_f32",
                 "bf16_scaled_add_batched_f32",
                 "bf16_scaled_add_f32",
+                "copy_regions_bf16_f32",
                 "copy_regions_u32",
                 "gated_delta_conv_bf16_f32",
                 "gated_delta_conv_bf16_f32_batched_k4",
@@ -6476,6 +6480,7 @@ const QSA_LANES_TU_SYMBOLS: &[&str] = &[
     "bf16_roundtrip_f32",
     "bf16_scaled_add_batched_f32",
     "bf16_scaled_add_f32",
+    "copy_regions_bf16_f32",
     "copy_regions_u32",
     "gated_delta_conv_bf16_f32",
     "gated_delta_conv_bf16_f32_batched_k4",
@@ -12998,8 +13003,9 @@ mod tests {
 
     /// Preserve the measured sealed gfx1100 object's historical export/index
     /// gap; the later gfx1201-only x8 addition does not alter gfx11 exports. The
-    /// current source adds two gfx11 exports the sealed object predates: the
-    /// rope table and the q8 hg4 low-LDS twin (`..._hg4_lite`).
+    /// current source adds three gfx11 exports the sealed object predates: the
+    /// rope table, the q8 hg4 low-LDS twin (`..._hg4_lite`) and the BF16-rounding
+    /// region copy (`copy_regions_bf16_f32`).
     #[test]
     fn source_export_evaluator_reproduces_the_sealed_gfx1100_object_and_index_gap() {
         use std::collections::BTreeSet;
@@ -13020,6 +13026,7 @@ mod tests {
             .iter()
             .cloned()
             .chain([
+                "copy_regions_bf16_f32".to_owned(),
                 "indexed_attention_attention_q8_batched_hg4_lite".to_owned(),
                 "indexed_attention_rope_table_f32".to_owned(),
             ])

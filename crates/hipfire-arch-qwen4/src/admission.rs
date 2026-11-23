@@ -2137,14 +2137,19 @@ mod tests {
             let ar = budget(&config, &manifest.weights, &placement, &free).unwrap();
             let on = budget_mtp(&config, &manifest.weights, &placement, &free, Some(mtp)).unwrap();
             let capture = |band: &std::ops::Range<usize>| {
-                let gdn_layers = band
-                    .clone()
-                    .filter(|&layer| {
-                        config.layer_types[layer] == crate::config::LayerType::LinearAttention
-                    })
-                    .count();
-                crate::state::Qwen4State::row_capture_bytes_scoped(&config, gdn, 4, gdn_layers)
-                    .unwrap() as u64
+                let count = |kind| {
+                    band.clone()
+                        .filter(|&layer| config.layer_types[layer] == kind)
+                        .count()
+                };
+                crate::state::Qwen4State::row_capture_bytes_scoped(
+                    &config,
+                    gdn,
+                    4,
+                    count(crate::config::LayerType::LinearAttention),
+                    count(crate::config::LayerType::FullAttention),
+                )
+                .unwrap() as u64
             };
             for (stage, (ar, on)) in ar.iter().zip(&on).enumerate() {
                 // The whole MTP term, and nothing else, is the difference.

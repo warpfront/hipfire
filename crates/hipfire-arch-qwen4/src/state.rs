@@ -39,7 +39,7 @@ use rdna_compute::tensor_ops::gdn_wy_stream::{
     gdn_wy_stream_seal, GdnWyCarry, GdnWyEdge, GdnWySeal, WY_TILE_ROWS,
 };
 use rdna_compute::tensor_ops::{
-    copy_regions, gated_delta_rollback_layers, gated_delta_rollback_layers_ef,
+    copy_regions, copy_regions_bf16, gated_delta_rollback_layers, gated_delta_rollback_layers_ef,
     gdn_q8ef_residual_zero, qsa_f16_arena_rows, CopyRegion, GatedDeltaRollbackEf,
     GatedDeltaRollbackEfLayer, GatedDeltaRollbackLayers, GdnStateFormat, QsaF16ArenaRef,
     QsaF16ValidLen, QsaKvFormat, QsaStateLayout,
@@ -2424,6 +2424,12 @@ pub struct Qwen4State {
     /// are views of ([`capture_ring_pool_slots`]); `None`: every layer's ring
     /// in `row_capture` is its own allocation.
     row_capture_pool: Option<GpuTensor>,
+    /// Per QSA layer, the per-row selections of an armed verify (`rows` x
+    /// the layer's `selected_capacity` i32, row `r` at `r * capacity`): the
+    /// verify's selection batch, so a rollback restores the persistent
+    /// selection of its last kept row (the selection sequential decode leaves
+    /// there). Allocated with the GDN capture by [`Self::ensure_row_capture`].
+    qsa_selection_capture: Vec<GpuTensor>,
     /// Rows a verify may capture (0 = none allocated); the ring holds `2 * rows`
     /// logical slots on `rows + 1` physical ones ([`capture_ring_slots`]).
     row_capture_rows: usize,
@@ -2868,6 +2874,7 @@ impl Qwen4State {
             row_capture: Vec::new(),
             row_capture_output: None,
             row_capture_pool: None,
+            qsa_selection_capture: Vec::new(),
             row_capture_rows: 0,
             gdn_live: 0,
             gdn_format: format.gdn,
@@ -4568,34 +4575,47 @@ impl Qwen4State {
             free(output);
             free(table);
         }
+        for selection in self.qsa_selection_capture {
+            free(selection);
+        }
         first.map_or(Ok(()), |error| Err(StateError::Hip(error)))
     }
 
     /// Device bytes [`Self::ensure_row_capture`] allocates for `rows`-row
     /// blocks with `gdn`-format recurrent states: per GDN layer a two-half
     /// recurrent-state ring in that format's storage, the F32 input rows and
-    /// recurrence inputs, then one F32 output block and the pointer table.
-    /// The single-slot recurrent state each ring replaces is freed into the
-    /// GPU pool, which keeps it (it stays charged as fixed state).
+    /// recurrence inputs, one F32 output block and the pointer table, then per
+    /// QSA layer the per-row selection capture. The single-slot recurrent
+    /// state each ring replaces is freed into the GPU pool, which keeps it (it
+    /// stays charged as fixed state).
     pub(crate) fn row_capture_bytes(
         config: &Qwen4Config,
         gdn: GdnStateFormat,
         rows: usize,
     ) -> Option<usize> {
-        Self::row_capture_bytes_scoped(config, gdn, rows, config.n_linear_layers())
+        Self::row_capture_bytes_scoped(
+            config,
+            gdn,
+            rows,
+            config.n_linear_layers(),
+            config.n_full_layers(),
+        )
     }
 
-    /// [`Self::row_capture_bytes`] for a band owning `gdn_layers` GDN layers.
+    /// [`Self::row_capture_bytes`] for a band owning `gdn_layers` GDN layers
+    /// and `qsa_layers` QSA layers.
     pub(crate) fn row_capture_bytes_scoped(
         config: &Qwen4Config,
         gdn: GdnStateFormat,
         rows: usize,
         gdn_layers: usize,
+        qsa_layers: usize,
     ) -> Option<usize> {
         if rows > hipfire_config::QWEN4_VERIFY_MAX_ROWS {
             return None;
         }
-        let sizes = Self::row_capture_allocation_sizes_scoped(config, gdn, rows, gdn_layers)?;
+        let sizes =
+            Self::row_capture_allocation_sizes_scoped(config, gdn, rows, gdn_layers, qsa_layers)?;
         let total = sizes
             .iter()
             .try_fold(0u64, |total, &bytes| total.checked_add(bytes))?;
@@ -4605,22 +4625,34 @@ impl Qwen4State {
     /// [`Self::row_capture_bytes`] per allocation of
     /// [`Self::ensure_row_capture`], in its allocation order: the shared pool
     /// first, then per GDN layer the F32 input rows and the F32 recurrence
-    /// inputs; then the one F32 output block and the pointer table.
-    /// Empty below two rows or for a band with no GDN layer (nothing is
-    /// allocated); `None` on overflow.
+    /// inputs; then the one F32 output block and the pointer table; then per
+    /// QSA layer the per-row selection capture. A band with no GDN layer
+    /// allocates only the selection captures. Empty below two rows; `None`
+    /// on overflow.
     pub(crate) fn row_capture_allocation_sizes_scoped(
         config: &Qwen4Config,
         gdn: GdnStateFormat,
         rows: usize,
         gdn_layers: usize,
+        qsa_layers: usize,
     ) -> Option<Vec<u64>> {
         if rows > hipfire_config::QWEN4_VERIFY_MAX_ROWS {
             return None;
         }
-        if rows < 2 || gdn_layers == 0 {
-            // A band with no GDN layer allocates nothing: `ensure_row_capture`
-            // returns before the output block and pointer table.
+        if rows < 2 {
             return Some(Vec::new());
+        }
+        let selection = rows
+            .checked_mul(config.qsa_selected_capacity())?
+            .checked_mul(std::mem::size_of::<i32>())?;
+        let selections = qsa_layers.checked_mul(selection)?;
+        if gdn_layers == 0 {
+            // A band with no GDN layer allocates no ring: `ensure_row_capture`
+            // returns before the pool, output block and pointer table.
+            return std::iter::repeat_n(selection, qsa_layers)
+                .filter(|&bytes| bytes > 0)
+                .map(|bytes| u64::try_from(bytes).ok())
+                .collect();
         }
         let value_heads = config.linear_num_value_heads;
         let f32_bytes = std::mem::size_of::<f32>();
@@ -4660,13 +4692,15 @@ impl Qwen4State {
             .checked_mul(layer)?
             .checked_add(output)?
             .checked_add(table)?
-            .checked_add(pool)?;
-        let mut sizes = Vec::with_capacity(2 * gdn_layers + 3);
+            .checked_add(pool)?
+            .checked_add(selections)?;
+        let mut sizes = Vec::with_capacity(2 * gdn_layers + 3 + qsa_layers);
         sizes.push(pool);
         for _ in 0..gdn_layers {
             sizes.extend([inputs, recurrence]);
         }
         sizes.extend([output, table]);
+        sizes.extend(std::iter::repeat_n(selection, qsa_layers));
         sizes
             .into_iter()
             .filter(|&bytes| bytes > 0)
@@ -4707,10 +4741,25 @@ impl Qwen4State {
         if self.gdn.is_empty() {
             // A band without GDN layers has no recurrence to capture; the
             // rows and live slot still track the other owners so a rollback
-            // agrees with them.
+            // agrees with them, and its QSA layers keep their selections.
+            let mut selections = Vec::with_capacity(self.qsa.len());
+            if let Err(error) = self.alloc_qsa_selection_capture(gpu, rows, &mut selections) {
+                for tensor in selections.into_iter().rev() {
+                    let _ = gpu.free_tensor(tensor);
+                }
+                return Err(error);
+            }
+            if !selections.is_empty() {
+                // Captured graphs may bake the selection pointers replaced below.
+                gpu.invalidate_for_scratch_growth();
+            }
             self.snapshot_arena.invalidate();
+            let previous = std::mem::replace(&mut self.qsa_selection_capture, selections);
             self.row_capture_rows = rows;
             self.gdn_live = 0;
+            for tensor in previous {
+                gpu.free_tensor(tensor).map_err(StateError::Hip)?;
+            }
             #[cfg(feature = "lab")]
             self.lab
                 .ring(crate::lab_window::LabRingEvent::Realloc { ring_rows: rows });
@@ -4782,6 +4831,7 @@ impl Qwen4State {
         let mut inputs_all: Vec<GpuTensor> = Vec::with_capacity(self.gdn.len());
         let mut recurrence_all: Vec<GpuTensor> = Vec::with_capacity(self.gdn.len());
         let mut tail: Vec<GpuTensor> = Vec::with_capacity(2);
+        let mut selections: Vec<GpuTensor> = Vec::with_capacity(self.qsa.len());
         let staged = (|| -> Result<(), StateError> {
             if pooled {
                 pool = Some(
@@ -4833,6 +4883,7 @@ impl Qwen4State {
                 gpu.zeros(&[table_bytes], DType::Raw)
                     .map_err(StateError::Hip)?,
             );
+            self.alloc_qsa_selection_capture(gpu, rows, &mut selections)?;
             gpu.upload_stream_ordered(&tail.last().expect("pointer table").buf, &pointers)
                 .map_err(StateError::Hip)?;
             Ok(())
@@ -4845,6 +4896,7 @@ impl Qwen4State {
                 .chain(inputs_all)
                 .chain(recurrence_all)
                 .chain(tail)
+                .chain(selections)
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
@@ -4870,6 +4922,7 @@ impl Qwen4State {
         let previous_output = self.row_capture_output.replace((output, table));
         let previous_pool = std::mem::replace(&mut self.row_capture_pool, pool);
         let previous = std::mem::replace(&mut self.row_capture, next);
+        let previous_selections = std::mem::replace(&mut self.qsa_selection_capture, selections);
         let ringed = !previous.is_empty();
         let mut old_states = Vec::new();
         for (index, layer) in self.gdn.iter_mut().enumerate() {
@@ -4903,6 +4956,7 @@ impl Qwen4State {
                 .into_iter()
                 .flat_map(|(output, table)| [output, table]),
         );
+        stale.extend(previous_selections);
         for tensor in stale {
             gpu.free_tensor(tensor).map_err(StateError::Hip)?;
         }
@@ -4910,6 +4964,36 @@ impl Qwen4State {
         self.lab
             .ring(crate::lab_window::LabRingEvent::Realloc { ring_rows: rows });
         Ok(())
+    }
+
+    /// Stage one zeroed per-row selection capture per QSA layer
+    /// ([`Self::qsa_selection_capture`]) for verifies of up to `rows` rows
+    /// into `out`; nothing is published. The caller frees `out` on error.
+    fn alloc_qsa_selection_capture(
+        &self,
+        gpu: &mut Gpu,
+        rows: usize,
+        out: &mut Vec<GpuTensor>,
+    ) -> Result<(), StateError> {
+        for layer in &self.qsa {
+            let bytes = rows
+                .checked_mul(layer.selected_capacity)
+                .and_then(|n| n.checked_mul(std::mem::size_of::<i32>()))
+                .ok_or(StateError::DimensionOverflow)?;
+            out.push(gpu.zeros(&[bytes], DType::Raw).map_err(StateError::Hip)?);
+        }
+        Ok(())
+    }
+
+    /// QSA slot `slot`'s per-row selection capture for an armed `rows`-row
+    /// verify (the rows [`Self::gdn_row_capture`] captures; `None` otherwise):
+    /// the verify writes its selection batch there, row `r` at
+    /// `r * selected_capacity`, so a rollback can restore a kept row's.
+    pub(crate) fn qsa_selection_capture(&self, slot: usize, rows: usize) -> Option<&GpuTensor> {
+        if !self.row_capture_armed || rows < 2 || rows > self.row_capture_rows {
+            return None;
+        }
+        self.qsa_selection_capture.get(slot)
     }
 
     /// Rows an armed verify captures (0 = this GPU's GDN route cannot).
@@ -5050,9 +5134,11 @@ impl Qwen4State {
     /// it). The GDN recurrent state re-runs the kept rows' recurrence from
     /// the pre-verify state (bitwise the verify's own prefix) into the free
     /// half of the ring; convolution history comes from the verify's input
-    /// rows, the PLE convolution history from `ple_normed` (the verify's PLE
-    /// convolution input rows), QSA marks and PLE token history from the
-    /// ticket plus `keep`.  Append arenas (QSA K/V, raw and pooled index keys)
+    /// rows (BF16-rounded, as the convolution stores them), the PLE
+    /// convolution history from `ple_normed` (the verify's PLE convolution
+    /// input rows), the persistent QSA selection from the verify's per-row
+    /// selection capture, QSA marks and PLE token history from the ticket
+    /// plus `keep`.  Append arenas (QSA K/V, raw and pooled index keys)
     /// need no rollback: rows past the kept end are invisible until
     /// overwritten, and a pooled block is re-pooled by the row that completes
     /// it.
@@ -5218,17 +5304,25 @@ impl Qwen4State {
         // Convolution history slot `position % conv_history`: the kept verify
         // rows' inputs where they reach, the snapshot's history elsewhere.
         let rows_from = (start + keep).saturating_sub(conv_history).max(start);
+        // The convolution kernels keep each input row BF16-rounded in their
+        // history; the capture holds the raw F32 rows, so the kept rows are
+        // copied through that rounding (the snapshot's slots already are).
+        let mut rounded = Vec::with_capacity(self.gdn.len() * conv_history);
         for (index, layer) in self.gdn.iter().enumerate() {
             let (_, inputs, _) = &self.row_capture[index];
             let channel_bytes = layer.conv.byte_size() / conv_history;
             for slot in 0..conv_history {
                 let kept =
                     (rows_from..start + keep).find(|position| position % conv_history == slot);
-                let (src, src_offset) = match kept {
-                    Some(position) => (&inputs.buf, (position - start) * channel_bytes),
-                    None => (&arena.conv[index].buf, slot * channel_bytes),
+                let (list, src, src_offset) = match kept {
+                    Some(position) => (
+                        &mut rounded,
+                        &inputs.buf,
+                        (position - start) * channel_bytes,
+                    ),
+                    None => (&mut copies, &arena.conv[index].buf, slot * channel_bytes),
                 };
-                copies.push(CopyRegion {
+                list.push(CopyRegion {
                     dst: &layer.conv.buf,
                     dst_offset: slot * channel_bytes,
                     src,
@@ -5237,12 +5331,21 @@ impl Qwen4State {
                 });
             }
         }
+        // The persistent selection is the last kept row's, from the verify's
+        // per-row selection capture.
         for (index, layer) in self.qsa.iter().enumerate() {
-            copies.push(whole(
-                &arena.qsa_selected[index],
-                &layer.selected_indices,
-                layer.selected_indices.byte_size(),
-            ));
+            let selection = self
+                .qsa_selection_capture
+                .get(index)
+                .ok_or(StateError::SnapshotTicket)?;
+            let row_bytes = layer.selected_capacity * std::mem::size_of::<i32>();
+            copies.push(CopyRegion {
+                dst: &layer.selected_indices.buf,
+                dst_offset: 0,
+                src: &selection.buf,
+                src_offset: (keep - 1) * row_bytes,
+                bytes: row_bytes,
+            });
         }
         if let Some((live, saved)) = ple_rollback {
             for row in 0..ple_history_rows {
@@ -5262,6 +5365,7 @@ impl Qwen4State {
             }
         }
         copy_regions(gpu, &copies).map_err(StateError::Hip)?;
+        copy_regions_bf16(gpu, &rounded).map_err(StateError::Hip)?;
         for (index, layer) in self.qsa.iter_mut().enumerate() {
             let mark = arena.qsa_marks[index];
             let position = mark.position + keep;
@@ -6365,11 +6469,13 @@ mod tests {
 
     /// The verify capture ring's per-allocation inventory against the owner's
     /// geometry and the byte query: three allocations per GDN layer, the F32
-    /// output block and the pointer table; whole-model and band layer counts.
+    /// output block and the pointer table, then one selection capture per QSA
+    /// layer; whole-model and band layer counts.
     #[test]
     fn row_capture_allocation_sizes_sum_to_the_byte_query() {
         let config = crate::config::compact_test_config();
         let layers = config.n_linear_layers();
+        let qsa_layers = config.n_full_layers();
         let value_heads = config.linear_num_value_heads;
         for gdn in [
             GdnStateFormat::F32,
@@ -6392,9 +6498,10 @@ mod tests {
                 32,
                 hipfire_config::QWEN4_VERIFY_MAX_ROWS,
             ] {
-                let sizes =
-                    Qwen4State::row_capture_allocation_sizes_scoped(&config, gdn, rows, layers)
-                        .unwrap();
+                let sizes = Qwen4State::row_capture_allocation_sizes_scoped(
+                    &config, gdn, rows, layers, qsa_layers,
+                )
+                .unwrap();
                 assert_eq!(
                     Some(sizes.iter().sum::<u64>()),
                     Qwen4State::row_capture_bytes(&config, gdn, rows).map(|bytes| bytes as u64),
@@ -6413,8 +6520,9 @@ mod tests {
                     (rows * qkv * 4) as u64,
                     (rows * (qkv + 2 * value_heads) * 4) as u64,
                 );
-                // One shared pool, then (inputs, recurrence) per layer.
-                assert_eq!(sizes.len(), 2 * layers + 3);
+                // One shared pool, then (inputs, recurrence) per layer, the
+                // output and table, then a selection capture per QSA layer.
+                assert_eq!(sizes.len(), 2 * layers + 3 + qsa_layers);
                 assert_eq!(
                     sizes[0],
                     capture_ring_pool_slots(rows, layers).unwrap() as u64 * slot_bytes
@@ -6423,20 +6531,24 @@ mod tests {
                     assert_eq!(layer, [inputs, recurrence], "{gdn:?} {rows}");
                 }
                 assert_eq!(
-                    sizes[1 + 2 * layers..],
+                    sizes[1 + 2 * layers..3 + 2 * layers],
                     [
                         (rows * value_heads * GDN_HEAD_DIM * 4) as u64,
                         (layers * 16) as u64
                     ]
                 );
+                let selection = (rows * config.qsa_selected_capacity() * 4) as u64;
+                assert!(sizes[3 + 2 * layers..].iter().all(|&s| s == selection));
             }
-            for band in [0usize, 7] {
+            for (band, qsa_band) in [(0usize, 0usize), (0, 3), (7, 0), (7, 2)] {
                 assert_eq!(
-                    Qwen4State::row_capture_allocation_sizes_scoped(&config, gdn, 4, band)
-                        .map(|sizes| sizes.iter().sum::<u64>()),
-                    Qwen4State::row_capture_bytes_scoped(&config, gdn, 4, band)
+                    Qwen4State::row_capture_allocation_sizes_scoped(
+                        &config, gdn, 4, band, qsa_band
+                    )
+                    .map(|sizes| sizes.iter().sum::<u64>()),
+                    Qwen4State::row_capture_bytes_scoped(&config, gdn, 4, band, qsa_band)
                         .map(|bytes| bytes as u64),
-                    "{gdn:?} band {band}"
+                    "{gdn:?} band {band} {qsa_band}"
                 );
             }
             assert_eq!(
@@ -6444,7 +6556,8 @@ mod tests {
                     &config,
                     gdn,
                     usize::MAX / 2,
-                    layers
+                    layers,
+                    qsa_layers,
                 ),
                 None
             );
@@ -6798,13 +6911,13 @@ mod tests {
             .collect();
         let per_request = 2 * (9 * 2560 * 4 * 4 + 4 * 2560 * 4);
         assert_eq!(pp2[0] - pp2[1], per_request);
-        // The ring census of the whole model equals the all-GDN scoped one.
+        // The ring census of the whole model equals the all-layer scoped one.
         assert_eq!(
-            Qwen4State::row_capture_bytes_scoped(&config, GdnStateFormat::Q8, 4, 36),
+            Qwen4State::row_capture_bytes_scoped(&config, GdnStateFormat::Q8, 4, 36, 12),
             Qwen4State::row_capture_bytes(&config, GdnStateFormat::Q8, 4)
         );
         assert!(
-            Qwen4State::row_capture_bytes_scoped(&config, GdnStateFormat::Q8, 4, 18)
+            Qwen4State::row_capture_bytes_scoped(&config, GdnStateFormat::Q8, 4, 18, 6)
                 < Qwen4State::row_capture_bytes(&config, GdnStateFormat::Q8, 4)
         );
     }
@@ -7042,6 +7155,7 @@ mod tests {
             row_capture: Vec::new(),
             row_capture_output: None,
             row_capture_pool: None,
+            qsa_selection_capture: Vec::new(),
             row_capture_rows: 0,
             gdn_live: 0,
             gdn_format: GdnStateFormat::F32,
@@ -7931,19 +8045,22 @@ mod tests {
     #[test]
     fn row_capture_bytes_charge_the_gdn_storage_dtype() {
         let config = crate::config::compact_test_config();
-        // 36 GDN layers x (F32 inputs 4R x 10240 and recurrence 4R x 10336) + the shared ring pool
-        // (2 * 35 + R + 1 = 75 slots) + 4R x 6144 F32 output + 36 x 16 table.
+        // The GDN ring alone (no QSA selection capture): 36 GDN layers x (F32 inputs 4R x 10240
+        // and recurrence 4R x 10336) + the shared ring pool (2 * 35 + R + 1 = 75 slots) + 4R x
+        // 6144 F32 output + 36 x 16 table.
+        let ring = |gdn, rows| Qwen4State::row_capture_bytes_scoped(&config, gdn, rows, 36, 0);
         assert_eq!(capture_ring_slots(4), Some(5));
         assert_eq!(capture_ring_pool_slots(4, 36), Some(75));
         let (f32_bytes, q8_bytes) = (247_880_256, 72_776_256);
-        assert_eq!(
-            Qwen4State::row_capture_bytes(&config, GdnStateFormat::F32, 4),
-            Some(f32_bytes)
-        );
+        assert_eq!(ring(GdnStateFormat::F32, 4), Some(f32_bytes));
         // Q8 slots are 48 x 128 x 132 bytes, not 3 MiB of F32.
+        assert_eq!(ring(GdnStateFormat::Q8, 4), Some(q8_bytes));
+        assert_eq!(ring(GdnStateFormat::Q8, 1), Some(0));
+        // The whole model adds each of its 12 QSA layers' 4-row selection capture.
+        let selections = 12 * 4 * config.qsa_selected_capacity() * 4;
         assert_eq!(
             Qwen4State::row_capture_bytes(&config, GdnStateFormat::Q8, 4),
-            Some(q8_bytes)
+            Some(q8_bytes + selections)
         );
         assert_eq!(
             Qwen4State::row_capture_bytes(&config, GdnStateFormat::Q8, 1),
@@ -7962,30 +8079,18 @@ mod tests {
             .into_ar_only()
             .expect("ar-only");
         let locals = [0, 1].map(|rank| global.trunk_shard_local(rank, 2).expect("local config"));
-        // The global figures of `row_capture_bytes_charge_the_gdn_storage_dtype`.
-        assert_eq!(
-            Qwen4State::row_capture_bytes(&global, GdnStateFormat::F32, 4),
-            Some(247_880_256)
-        );
-        assert_eq!(
-            Qwen4State::row_capture_bytes(&global, GdnStateFormat::Q8, 4),
-            Some(72_776_256)
-        );
+        // The global figures of `row_capture_bytes_charge_the_gdn_storage_dtype` (GDN ring only;
+        // the QSA selection capture does not depend on the GDN heads).
+        let ring =
+            |config, gdn, rows| Qwen4State::row_capture_bytes_scoped(config, gdn, rows, 36, 0);
+        assert_eq!(ring(&global, GdnStateFormat::F32, 4), Some(247_880_256));
+        assert_eq!(ring(&global, GdnStateFormat::Q8, 4), Some(72_776_256));
         for local in &locals {
             // 36 x (F32 inputs 4R x 5120 and recurrence 4R x 5168) + the shared 75-slot ring pool
             // + 4R x 3072 F32 output + 36 x 16 table; Q8 slots are 24 x 128 x 132 bytes.
-            assert_eq!(
-                Qwen4State::row_capture_bytes(local, GdnStateFormat::F32, 4),
-                Some(123_940_416)
-            );
-            assert_eq!(
-                Qwen4State::row_capture_bytes(local, GdnStateFormat::Q8, 4),
-                Some(36_388_416)
-            );
-            assert_eq!(
-                Qwen4State::row_capture_bytes(local, GdnStateFormat::Q8, 1),
-                Some(0)
-            );
+            assert_eq!(ring(local, GdnStateFormat::F32, 4), Some(123_940_416));
+            assert_eq!(ring(local, GdnStateFormat::Q8, 4), Some(36_388_416));
+            assert_eq!(ring(local, GdnStateFormat::Q8, 1), Some(0));
         }
         let (heads, key_heads) = (
             locals[0].linear_num_value_heads,
@@ -8050,7 +8155,7 @@ mod tests {
                         ring + layers * inputs + discard + 16 * layers
                     };
                     assert_eq!(
-                        Qwen4State::row_capture_bytes_scoped(&config, format, n, layers),
+                        Qwen4State::row_capture_bytes_scoped(&config, format, n, layers, 0),
                         Some(expected),
                         "{format:?} rows={n} layers={layers}",
                     );
@@ -8070,7 +8175,7 @@ mod tests {
                 }
                 let layers = if field == 4 { usize::MAX } else { 1 };
                 assert_eq!(
-                    Qwen4State::row_capture_bytes_scoped(&huge, format, rows, layers),
+                    Qwen4State::row_capture_bytes_scoped(&huge, format, rows, layers, 0),
                     None,
                     "{format:?} overflowing field {field}",
                 );
@@ -8300,6 +8405,8 @@ mod tests {
             )
             .expect("singleton recurrence");
         };
+        // The convolution kernels keep each input row BF16-rounded in their
+        // history, so sequential decode leaves the rounded projection there.
         let advance_history = |gpu: &mut Gpu, state: &mut Qwen4State, row: usize| {
             gpu.hip
                 .memcpy_htod(
@@ -8309,7 +8416,7 @@ mod tests {
                         .buf,
                     &projection[row * qkv..][..qkv]
                         .iter()
-                        .flat_map(|x| x.to_ne_bytes())
+                        .flat_map(|&x| half::bf16::from_f32(x).to_f32().to_ne_bytes())
                         .collect::<Vec<_>>(),
                 )
                 .expect("conv input");
@@ -8524,6 +8631,159 @@ mod tests {
         for tensor in [proj, gates, betas, initial, output, ple] {
             gpu.free_tensor(tensor).expect("free fixture");
         }
+    }
+
+    /// #1199: a captured-row rollback leaves the state sequential decode
+    /// would: every convolution history slot a kept row reaches holds that
+    /// row's input BF16-rounded (what the convolution kernels store), the
+    /// others the snapshot's, and each QSA layer's persistent selection is
+    /// the verify's row `keep - 1` selection, not the pre-verify one.
+    #[test]
+    fn row_capture_rollback_rounds_conv_history_and_keeps_last_row_selection() {
+        let Some(mut gpu) = try_gpu() else { return };
+        let mut config = crate::config::synthetic_test_config(
+            crate::config::Qwen4FfnConfig::Dense {
+                intermediate_size: 16,
+            },
+            16,
+            2,
+            false,
+            false,
+        );
+        config.linear_num_key_heads = 1;
+        config.linear_num_value_heads = 2;
+        config.linear_key_head_dim = GDN_HEAD_DIM;
+        config.linear_value_head_dim = GDN_HEAD_DIM;
+        assert_eq!((config.n_linear_layers(), config.n_full_layers()), (1, 1));
+        let rows = 4;
+        let start = 37;
+        let history = config.linear_conv_kernel_dim - 1;
+        let value_heads = config.linear_num_value_heads;
+        let qk = config.linear_num_key_heads * GDN_HEAD_DIM;
+        let qkv = 2 * qk + value_heads * GDN_HEAD_DIM;
+        // Not BF16-representable: a raw copy differs from the rounded one.
+        let inputs: Vec<f32> = (0..rows * qkv)
+            .map(|i| 0.25 + ((i * 37 % 1009) as f32 - 504.0) * 1.37e-4)
+            .collect();
+        assert!(inputs
+            .iter()
+            .any(|&x| half::bf16::from_f32(x).to_f32() != x));
+        let ple = gpu.zeros(&[1], DType::F32).expect("unused PLE input");
+        let tokens: Vec<u32> = (0..rows as u32).map(|i| 10 + i).collect();
+        let mut state =
+            Qwen4State::new(&mut gpu, &config, 256, Qwen4StateFormat::F32).expect("state");
+        state
+            .ensure_row_capture(&mut gpu, rows, history)
+            .expect("ring");
+        let capacity = state.qsa[0].selected_capacity;
+        let selection =
+            |row: usize| -> Vec<i32> { (0..capacity).map(|i| (100 * row + i) as i32).collect() };
+        let to_bytes =
+            |words: &[i32]| -> Vec<u8> { words.iter().flat_map(|x| x.to_ne_bytes()).collect() };
+        for keep in 1..rows {
+            gpu.hip
+                .memset(&state.gdn[0].conv.buf, 0x32, state.gdn[0].conv.byte_size())
+                .expect("seed conv");
+            // The pre-verify selection: a pattern no captured row holds.
+            gpu.hip
+                .memcpy_htod(
+                    &state.qsa[0].selected_indices.buf,
+                    &to_bytes(&vec![-7; capacity]),
+                )
+                .expect("seed selection");
+            state.position = start;
+            let seeded_conv = gpu
+                .download_raw_bytes(&state.gdn[0].conv)
+                .expect("seeded conv");
+            state.row_capture_armed = true;
+            let ticket = state.snapshot(&mut gpu).expect("armed snapshot");
+            let captured = state.gdn_row_capture(0, rows).expect("armed capture");
+            let recurrence: Vec<u8> = inputs
+                .iter()
+                .copied()
+                .chain(std::iter::repeat_n(-0.6, rows * value_heads))
+                .chain(std::iter::repeat_n(0.4, rows * value_heads))
+                .flat_map(|x| x.to_ne_bytes())
+                .collect();
+            gpu.hip
+                .memcpy_htod(&captured.recurrence.buf, &recurrence)
+                .expect("recurrence inputs");
+            gpu.hip
+                .memcpy_htod(
+                    &captured.inputs.buf,
+                    &inputs
+                        .iter()
+                        .flat_map(|x| x.to_ne_bytes())
+                        .collect::<Vec<_>>(),
+                )
+                .expect("conv inputs");
+            let captured_selection = state
+                .qsa_selection_capture(0, rows)
+                .expect("armed selection capture");
+            gpu.hip
+                .memcpy_htod(
+                    &captured_selection.buf,
+                    &to_bytes(&(0..rows).flat_map(selection).collect::<Vec<_>>()),
+                )
+                .expect("captured selections");
+            state.commit_row_capture(rows);
+            // The verify's last row selection is what an unrepaired state keeps.
+            gpu.hip
+                .memcpy_htod(
+                    &state.qsa[0].selected_indices.buf,
+                    &to_bytes(&selection(rows - 1)),
+                )
+                .expect("verify selection");
+            state.position = start + rows;
+            state.row_capture_armed = false;
+            state
+                .rollback_rows_retain(
+                    &mut gpu,
+                    ticket,
+                    keep,
+                    rows,
+                    &tokens,
+                    &ple,
+                    0,
+                    history,
+                    config.indexer_compress_ratio,
+                    config.indexer_budget,
+                )
+                .expect("rollback");
+            state.commit(ticket, &mut gpu).expect("commit prefix");
+            let conv = gpu.download_f32(&state.gdn[0].conv).expect("conv");
+            for slot in 0..history {
+                let got = &conv[slot * qkv..][..qkv];
+                let kept = (start..start + keep)
+                    .rev()
+                    .find(|position| position % history == slot);
+                match kept {
+                    Some(position) => {
+                        let row = &inputs[(position - start) * qkv..][..qkv];
+                        let rounded: Vec<f32> = row
+                            .iter()
+                            .map(|&x| half::bf16::from_f32(x).to_f32())
+                            .collect();
+                        assert_eq!(got, &rounded[..], "keep {keep} slot {slot}");
+                    }
+                    None => assert_eq!(
+                        got.iter().flat_map(|x| x.to_ne_bytes()).collect::<Vec<_>>(),
+                        seeded_conv[slot * qkv * 4..][..qkv * 4],
+                        "keep {keep} slot {slot}"
+                    ),
+                }
+            }
+            let stored = gpu
+                .download_raw_bytes(&state.qsa[0].selected_indices)
+                .expect("selection");
+            assert_eq!(
+                stored[..capacity * 4],
+                to_bytes(&selection(keep - 1))[..],
+                "keep {keep}"
+            );
+        }
+        state.free_gpu(&mut gpu).expect("free");
+        gpu.free_tensor(ple).expect("free fixture");
     }
 
     #[test]

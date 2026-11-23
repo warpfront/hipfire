@@ -3149,6 +3149,7 @@ impl Qwen4Bundle {
             self.state_format.gdn,
             rows,
             self.state.gdn.len(),
+            self.state.qsa.len(),
         )
     }
 
@@ -3443,6 +3444,7 @@ impl Qwen4Bundle {
             self.state_format.gdn,
             rows,
             self.state.gdn.len(),
+            self.state.qsa.len(),
         )
     }
 

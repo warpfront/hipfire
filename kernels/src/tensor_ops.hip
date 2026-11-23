@@ -5114,6 +5114,20 @@ extern "C" __global__ void copy_regions_u32(CopyRegions regions, int count) {
          i += gridDim.x * blockDim.x)
         dst[i] = src[i];
 }
+// copy_regions_u32 over F32 words, each stored as its BF16 rounding widened
+// back to F32 (`bf16_round`, exactly what the GDN convolution kernels store in
+// their history): a verify rollback rebuilds a convolution history from the
+// captured F32 input rows with it (copy_regions_bf16 in tensor_ops.rs).
+extern "C" __global__ void copy_regions_bf16_f32(CopyRegions regions, int count) {
+    const int region = (int)blockIdx.y;
+    if (region >= count) return;
+    float* dst = reinterpret_cast<float*>(regions.dst[region]);
+    const float* src = reinterpret_cast<const float*>(regions.src[region]);
+    const unsigned int words = regions.words[region];
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < words;
+         i += gridDim.x * blockDim.x)
+        dst[i] = bf16_to_f32(bf16_round(src[i]));
+}
 #undef COPY_REGIONS_MAX
 
 // Reuse the previous MTP QSA sparse row after step zero. The selected buffer

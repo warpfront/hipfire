@@ -1390,19 +1390,14 @@ pub fn native_mtp_census_scope(
         ));
     }
     let overflow = |what: &str| format!("native MTP census {what} overflows");
-    let gdn_layers = scope
-        .band
-        .clone()
-        .filter(|&layer| {
-            config.layer_types.get(layer) == Some(&crate::config::LayerType::LinearAttention)
-        })
-        .count();
+    let (gdn_layers, qsa_layers) = crate::state::scope_layer_counts(config, scope);
     let row_capture = match mtp.row_capture {
         Some((gdn, ring_rows)) => crate::state::Qwen4State::row_capture_bytes_scoped(
             config,
             gdn,
             ring_rows.max(crate::mtp_spec::native_mtp_window_rows(mtp.max_k)),
             gdn_layers,
+            qsa_layers,
         )
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or_else(|| overflow("row capture"))?,
@@ -9503,19 +9498,15 @@ mod tests {
                 let census =
                     native_mtp_census_scope(&config, weights, &context, 256, &inputs, scope)
                         .unwrap();
-                let gdn_layers = scope
-                    .band
-                    .clone()
-                    .filter(|&layer| {
-                        config.layer_types[layer] == crate::config::LayerType::LinearAttention
-                    })
-                    .count();
-                // Every band: the capture of its own GDN layers, four rows.
+                let (gdn_layers, qsa_layers) = crate::state::scope_layer_counts(&config, scope);
+                // Every band: the capture of its own GDN and QSA layers, four rows.
                 assert!(gdn_layers > 0);
                 assert_eq!(
                     census.row_capture,
-                    crate::state::Qwen4State::row_capture_bytes_scoped(&config, gdn, 4, gdn_layers)
-                        .unwrap() as u64,
+                    crate::state::Qwen4State::row_capture_bytes_scoped(
+                        &config, gdn, 4, gdn_layers, qsa_layers
+                    )
+                    .unwrap() as u64,
                     "{counts:?} {:?}",
                     scope.band
                 );
@@ -11172,13 +11163,15 @@ mod tests {
             shared_i8_charge_at(true, 4096, &weights, 48, Some(256)),
             Ok(100_270_080)
         );
-        // The capture ring (Q8, 8 rows) at the local head count: exactly half of the global one.
+        // The GDN capture ring (Q8, 8 rows, no QSA selection capture) at the local head count:
+        // exactly half of the global one.
         let ring = |config: &Qwen4Config| -> u64 {
             crate::state::Qwen4State::row_capture_allocation_sizes_scoped(
                 config,
                 crate::GdnStateFormat::Q8,
                 8,
                 config.n_linear_layers(),
+                0,
             )
             .unwrap()
             .iter()

@@ -10365,10 +10365,11 @@ impl<'a> LayerPhaseEnv<'a> {
                 }));
             }
             LayerType::FullAttention => {
-                let state = bundle
+                let qsa_slot = bundle
                     .state
-                    .qsa_by_layer(layer_index)
+                    .qsa_local(layer_index)
                     .ok_or_else(|| invalid("QSA state slot missing"))?;
+                let state = &bundle.state.qsa[qsa_slot];
                 let weights = match &description.attention {
                     Qwen4AttentionWeights::Full(weights) => weights,
                     _ => return Err(invalid("QSA descriptor kind mismatch")),
@@ -10417,7 +10418,12 @@ impl<'a> LayerPhaseEnv<'a> {
                     k_scratch: &scratch.qsa_k,
                     v_scratch: &scratch.qsa_v,
                     qsa_output: &scratch.qsa_output,
-                    selected_scratch: &scratch.qsa_selected,
+                    // An armed verify keeps every row's selection for its
+                    // rollback (the GDN capture's rows).
+                    selected_scratch: bundle
+                        .state
+                        .qsa_selection_capture(qsa_slot, n)
+                        .unwrap_or(&scratch.qsa_selected),
                     attention_output: &scratch.attention_output,
                     bf16_scratch: &scratch.gdn_bf16,
                     rows: n,

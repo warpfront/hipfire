@@ -9948,8 +9948,56 @@ fn qsa_copy_region_extent_post(
 }
 
 pub(crate) fn launch_copy_regions(gpu: &mut Gpu, table: &[(u64, u64, u32)]) -> HipResult<()> {
-    const NAME: &str = "copy_regions_u32";
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, NAME)?;
+    launch_copy_regions_kernel(gpu, "copy_regions_u32", table)
+}
+
+/// [`copy_regions`] storing every F32 word as its BF16 rounding widened back
+/// to F32 (`copy_regions_bf16_f32`): the value the GDN convolution kernels
+/// keep in their history for an F32 input row. Every region must be 4-byte
+/// aligned F32 words; regions of one call run concurrently.
+pub fn copy_regions_bf16(gpu: &mut Gpu, regions: &[CopyRegion<'_>]) -> HipResult<()> {
+    let mut table = [(0u64, 0u64, 0u32); COPY_REGIONS_MAX];
+    let mut count = 0;
+    for region in regions {
+        if region.dst_offset + region.bytes > region.dst.size()
+            || region.src_offset + region.bytes > region.src.size()
+        {
+            return Err(HipError::new(
+                0,
+                "copy_regions_bf16: region exceeds its buffer",
+            ));
+        }
+        let dst = region.dst.as_ptr() as u64 + region.dst_offset as u64;
+        let src = region.src.as_ptr() as u64 + region.src_offset as u64;
+        let words = region.bytes / 4;
+        if !(dst | src | region.bytes as u64).is_multiple_of(4) || words > u32::MAX as usize {
+            return Err(HipError::new(
+                0,
+                "copy_regions_bf16: region is not aligned F32 words",
+            ));
+        }
+        if words == 0 {
+            continue;
+        }
+        table[count] = (dst, src, words as u32);
+        count += 1;
+        if count == COPY_REGIONS_MAX {
+            launch_copy_regions_kernel(gpu, "copy_regions_bf16_f32", &table[..count])?;
+            count = 0;
+        }
+    }
+    if count > 0 {
+        launch_copy_regions_kernel(gpu, "copy_regions_bf16_f32", &table[..count])?;
+    }
+    Ok(())
+}
+
+fn launch_copy_regions_kernel(
+    gpu: &mut Gpu,
+    name: &'static str,
+    table: &[(u64, u64, u32)],
+) -> HipResult<()> {
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, name)?;
     let mut args = KernargBlob::new();
     for index in 0..COPY_REGIONS_MAX {
         args.push_u64(table.get(index).map_or(0, |entry| entry.0));
@@ -9964,7 +10012,7 @@ pub(crate) fn launch_copy_regions(gpu: &mut Gpu, table: &[(u64, u64, u32)]) -> H
     args.pad_to(16);
     let max_words = table.iter().map(|entry| entry.2).max().unwrap_or(0);
     gpu.launch_blob_recorded(
-        NAME,
+        name,
         [max_words.div_ceil(256).clamp(1, 64), table.len() as u32, 1],
         [256, 1, 1],
         0,

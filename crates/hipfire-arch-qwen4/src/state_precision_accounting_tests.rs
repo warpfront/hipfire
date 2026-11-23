@@ -424,7 +424,7 @@ fn gdn_precision_owner_accounting_pp_and_lane_counts() {
         let mut gdn_total = 0;
         for scope in pp_scopes(counts) {
             // PP bands charge their own GDN layers, nothing divided.
-            let (gdn_layers, _) = scope_layer_counts(&config, &scope);
+            let (gdn_layers, qsa_layers) = scope_layer_counts(&config, &scope);
             gdn_total += gdn_layers;
             let band = Qwen4State::device_bytes_scoped(&config, f32, &context, &scope).unwrap()
                 - Qwen4State::device_bytes_scoped(&config, q8, &context, &scope).unwrap();
@@ -436,7 +436,8 @@ fn gdn_precision_owner_accounting_pp_and_lane_counts() {
             );
             for r in RINGS {
                 let ring = |gdn| {
-                    Qwen4State::row_capture_bytes_scoped(&config, gdn, r, gdn_layers).unwrap()
+                    Qwen4State::row_capture_bytes_scoped(&config, gdn, r, gdn_layers, qsa_layers)
+                        .unwrap()
                 };
                 assert_eq!(
                     ring(GdnStateFormat::F32) - ring(GdnStateFormat::Q8),
@@ -563,7 +564,7 @@ fn gdn_precision_owner_accounting_checked_overflow() {
         for rows in [usize::MAX, usize::MAX / 2, 1usize << 62] {
             assert_eq!(Qwen4State::row_capture_bytes(&config, gdn, rows), None);
             assert_eq!(
-                Qwen4State::row_capture_bytes_scoped(&config, gdn, rows, 36),
+                Qwen4State::row_capture_bytes_scoped(&config, gdn, rows, 36, 12),
                 None
             );
             assert_eq!(

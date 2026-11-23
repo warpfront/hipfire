@@ -11045,7 +11045,7 @@ pub fn native_mtp_capture(
 }
 /// Public byte bridge for the loader's resource snapshot: the device bytes of
 /// the ACTUAL capture ring this config/GDN owns at `rows` rows over
-/// `owned_gdn_layers` GDN layers, via the one
+/// `owned_gdn_layers` GDN layers (plus every QSA layer's selection capture), via the one
 /// [`crate::state::Qwen4State::row_capture_bytes_scoped`] formula (never a
 /// parallel memory planner). Full single-device layer count, as the settled
 /// state uses; PP/EP bands stay absent upstream. `None` on arithmetic
@@ -11059,8 +11059,14 @@ pub fn qwen4_capture_bytes(
     if owned_gdn_layers == 0 || owned_gdn_layers != config.n_linear_layers() {
         return None;
     }
-    crate::state::Qwen4State::row_capture_bytes_scoped(config, gdn, rows, owned_gdn_layers)
-        .and_then(|bytes| u64::try_from(bytes).ok())
+    crate::state::Qwen4State::row_capture_bytes_scoped(
+        config,
+        gdn,
+        rows,
+        owned_gdn_layers,
+        config.n_full_layers(),
+    )
+    .and_then(|bytes| u64::try_from(bytes).ok())
 }
 
 /// Whether a native MTP request on this GPU allocates the prompt-fill Append
@@ -11278,6 +11284,7 @@ pub(crate) fn native_mtp_request_allocation_sizes_ring(
                 gdn,
                 ring_rows.max(rows),
                 ring_config.n_linear_layers(),
+                ring_config.n_full_layers(),
             )?,
         );
     }
@@ -11360,6 +11367,7 @@ mod tests {
                                 gdn,
                                 rows.max(native_mtp_window_rows(drafts)),
                                 config.n_linear_layers(),
+                                config.n_full_layers(),
                             )
                             .unwrap()
                             .len()

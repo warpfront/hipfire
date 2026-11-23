@@ -3620,8 +3620,8 @@ mod tests {
             if arch == "gfx1100" {
                 // Keep the sealed inventory unchanged. The later HC x8
                 // export is gfx1201-only and does not alter gfx11 exports; the
-                // q8 hg4 low-LDS twin is a later gfx11 export the sealed object
-                // predates.
+                // q8 hg4 low-LDS twin, the rope table and the BF16-rounding
+                // region copy are later gfx11 exports the sealed object predates.
                 assert_eq!(
                     old.iter()
                         .copied()
@@ -3630,6 +3630,7 @@ mod tests {
                         .iter()
                         .copied()
                         .chain([
+                            "copy_regions_bf16_f32",
                             "indexed_attention_attention_q8_batched_hg4_lite",
                             "indexed_attention_rope_table_f32",
                         ])

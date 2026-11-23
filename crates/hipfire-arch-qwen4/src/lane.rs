@@ -5040,9 +5040,10 @@ mod band_accounting_tests {
         // The non-output band holds its lanes' capture rings and no head,
         // logits or wide hidden: exactly the AR store plus the rings and the
         // snapshot mirror of each MTP lane state (the AR lanes have none).
-        let (gdn_layers, _) = scope_layer_counts(&config, &scopes[0]);
+        let (gdn_layers, qsa_layers) = scope_layer_counts(&config, &scopes[0]);
         let ring =
-            Qwen4State::row_capture_bytes_scoped(&config, format.gdn, 4, gdn_layers).unwrap();
+            Qwen4State::row_capture_bytes_scoped(&config, format.gdn, 4, gdn_layers, qsa_layers)
+                .unwrap();
         let state = |scope: &Qwen4BandScope, spec| {
             Qwen4State::device_bytes_with_mirror(
                 &config,

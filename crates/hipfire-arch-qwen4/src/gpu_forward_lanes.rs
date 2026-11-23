@@ -4342,7 +4342,15 @@ fn forward_lanes_scoped(
                                 k_scratch: &v.qsa_k,
                                 v_scratch: &v.qsa_v,
                                 qsa_output: &v.qsa_output,
-                                selected_scratch: &scratch.qsa_selected,
+                                // An armed verify's stateful phases keep every
+                                // row's selection for its rollback (the GDN
+                                // capture's rows).
+                                selected_scratch: state
+                                    .qsa_selection_capture(slot, r)
+                                    .filter(|_| {
+                                        matches!(phase, MixerPhase::Whole | MixerPhase::Core)
+                                    })
+                                    .unwrap_or(&scratch.qsa_selected),
                                 attention_output: &v.attention_output,
                                 bf16_scratch: &scratch.gdn_bf16,
                                 rows: r,

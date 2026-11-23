@@ -476,9 +476,15 @@ fn gdn_capture_sizes(
     inputs: &CensusInputs<'_>,
     rows: usize,
 ) -> Result<Vec<u64>, String> {
-    let (gdn_layers, _) = scope_layer_counts(config, inputs.scope);
-    Qwen4State::row_capture_allocation_sizes_scoped(config, inputs.format.gdn, rows, gdn_layers)
-        .ok_or_else(|| overflow("GDN capture ring"))
+    let (gdn_layers, qsa_layers) = scope_layer_counts(config, inputs.scope);
+    Qwen4State::row_capture_allocation_sizes_scoped(
+        config,
+        inputs.format.gdn,
+        rows,
+        gdn_layers,
+        qsa_layers,
+    )
+    .ok_or_else(|| overflow("GDN capture ring"))
 }
 
 fn step_buffer_lines(
@@ -885,7 +891,7 @@ mod tests {
                                 let census = lane_spec_census(&budget, &inputs).unwrap();
                                 let head = rank == head_rank;
                                 assert_eq!(census.head_owner, head);
-                                let (gdn_layers, _) = scope_layer_counts(&config, scope);
+                                let (gdn_layers, qsa_layers) = scope_layer_counts(&config, scope);
                                 let n = lanes as u64;
                                 let mut expected = 0u64;
                                 // Target state per lane, ring per lane.
@@ -906,6 +912,7 @@ mod tests {
                                     gdn,
                                     budget.capture_rows_per_lane,
                                     gdn_layers,
+                                    qsa_layers,
                                 )
                                 .unwrap();
                                 assert_eq!(
@@ -914,7 +921,8 @@ mod tests {
                                         &config,
                                         gdn,
                                         budget.capture_rows_per_lane,
-                                        gdn_layers
+                                        gdn_layers,
+                                        qsa_layers
                                     )
                                     .unwrap() as u64
                                 );
@@ -1172,12 +1180,13 @@ mod tests {
                                 + rows * std::mem::size_of::<i32>();
                             if let Some(k) = spec_k {
                                 let wide = config.hc_count * config.hidden_size;
-                                let (gdn_layers, _) = scope_layer_counts(&config, &scope);
+                                let (gdn_layers, qsa_layers) = scope_layer_counts(&config, &scope);
                                 let ring = Qwen4State::row_capture_bytes_scoped(
                                     &config,
                                     format.gdn,
                                     k + 1,
                                     gdn_layers,
+                                    qsa_layers,
                                 )
                                 .unwrap();
                                 per_lane += MtpGpuState::device_bytes(&config, &context).unwrap()
@@ -1463,9 +1472,14 @@ mod tests {
         for rows in [2usize, 4, 8] {
             assert_eq!(capture_ring_slots(rows), Some(rows + 1));
             let slots = current_capture_ring_total_slots(rows, gdn_layers).unwrap();
-            let bytes =
-                Qwen4State::row_capture_bytes_scoped(&config, GdnStateFormat::Q8, rows, gdn_layers)
-                    .unwrap();
+            let bytes = Qwen4State::row_capture_bytes_scoped(
+                &config,
+                GdnStateFormat::Q8,
+                rows,
+                gdn_layers,
+                0,
+            )
+            .unwrap();
             let per_row_mib = bytes as f64 / rows as f64 / (1u64 << 20) as f64;
             let expected = 2.85 + slots as f64 / gdn_layers as f64 / rows as f64 * set_mib;
             assert!(
@@ -1493,7 +1507,7 @@ mod tests {
             + vh * config.linear_value_head_dim;
         for gdn in FORMATS {
             let sizes =
-                Qwen4State::row_capture_allocation_sizes_scoped(&config, gdn, rows, gdn_layers)
+                Qwen4State::row_capture_allocation_sizes_scoped(&config, gdn, rows, gdn_layers, 0)
                     .unwrap();
             let slot = gdn.storage().state_bytes(vh, 128, 128) as u64;
             let inputs = (rows * qkv * 4) as u64;
@@ -1578,7 +1592,11 @@ mod tests {
             .find(|l| l.component == CensusComponent::CaptureRing)
             .unwrap();
         let ring = sum(&Qwen4State::row_capture_allocation_sizes_scoped(
-            &config, gdn, rows, gdn_layers,
+            &config,
+            gdn,
+            rows,
+            gdn_layers,
+            config.n_full_layers(),
         )
         .unwrap());
         let expected = census.total().unwrap() - ring_line.bytes().unwrap() + lanes as u64 * ring;
@@ -1620,9 +1638,14 @@ mod tests {
             .unwrap() as u64;
             let head: Vec<u64> = MtpGpuState::allocation_sizes(&config, &ctx).unwrap();
             let wide = (config.hc_count * config.hidden_size * 4) as u64;
-            let ring =
-                Qwen4State::row_capture_allocation_sizes_scoped(&config, gdn, rows, gdn_layers)
-                    .unwrap();
+            let ring = Qwen4State::row_capture_allocation_sizes_scoped(
+                &config,
+                gdn,
+                rows,
+                gdn_layers,
+                config.n_full_layers(),
+            )
+            .unwrap();
             println!("## max_seq {max_seq} chunk {chunk} (K{k} -> {rows}-row ring), per MTP lane over an AR lane");
             println!(
                 "AR lane target state                 {:>14} B {:>9} MiB (not MTP)",

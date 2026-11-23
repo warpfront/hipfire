@@ -205,6 +205,11 @@ pub(super) fn build_program<'a>(
                     .qsa
                     .get(qsa_slot)
                     .ok_or_else(|| invalid("QSA state slot missing"))?;
+                // An armed verify keeps every row's selection for its rollback.
+                let selected_scratch = bundle
+                    .state
+                    .qsa_selection_capture(qsa_slot, n)
+                    .unwrap_or(&scratch.qsa_selected);
                 qsa_slot += 1;
                 let weights = match &description.attention {
                     Qwen4AttentionWeights::Full(weights) => weights,
@@ -254,7 +259,7 @@ pub(super) fn build_program<'a>(
                     k_scratch: &scratch.qsa_k,
                     v_scratch: &scratch.qsa_v,
                     qsa_output: &scratch.qsa_output,
-                    selected_scratch: &scratch.qsa_selected,
+                    selected_scratch,
                     attention_output: &scratch.attention_output,
                     bf16_scratch: &scratch.gdn_bf16,
                     rows: n,
