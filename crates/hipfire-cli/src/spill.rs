@@ -111,8 +111,13 @@ pub(crate) struct SpillMonitor {
 
 impl SpillMonitor {
     /// Attach to `device` and take the baseline. `None` when the counters
-    /// are not readable: the monitor is silently off.
+    /// are not readable, or on a unified-memory APU: there the "VRAM" carve-out
+    /// and GTT are the same system DRAM (a 512 MiB carve-out is only a
+    /// placeholder), so GTT growth is not a spill to slower memory (#1204).
     pub(crate) fn attach(device: &PowerDevice) -> Option<Self> {
+        if hipfire_config::is_unified_memory_arch(&device.arch) {
+            return None;
+        }
         let baseline = read_sample(&device.dir)?;
         Some(Self {
             dir: device.dir.clone(),
@@ -273,6 +278,34 @@ mod tests {
         std::fs::remove_file(dir.join("mem_info_gtt_used")).unwrap();
         assert_eq!(monitor.check(), None);
         assert_eq!(monitor.report_json(), Value::Null);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #1204: a Strix Halo with a 512 MiB UMA carve-out keeps the whole model in
+    /// GTT, so GTT grows past the threshold while the tiny carve-out reads full.
+    /// That is not a spill on a unified-memory APU; the same counters on a
+    /// discrete card still arm the monitor.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unified_memory_apus_never_attach() {
+        let dir = std::env::temp_dir().join(format!("hipfire-spill-apu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, mib) in [
+            ("mem_info_gtt_used", 17_203),
+            ("mem_info_vram_used", 467),
+            ("mem_info_vram_total", 512),
+        ] {
+            std::fs::write(dir.join(name), format!("{}\n", mib * MIB)).unwrap();
+        }
+        let device = |arch: &str| PowerDevice {
+            card: None,
+            pci: "0000:c0:00.0".to_owned(),
+            arch: arch.to_owned(),
+            selected_by: "test".to_owned(),
+            dir: dir.clone(),
+        };
+        assert!(SpillMonitor::attach(&device("gfx1151")).is_none());
+        assert!(SpillMonitor::attach(&device("gfx1201")).is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
