@@ -359,21 +359,8 @@ pub fn is_batch_request_eligible(
             {
                 return false;
             }
-        } else if let Some(bundle) = m.state.as_ref().and_then(|s| {
-            (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
-        }) {
-            if route != GenerationRoute::LfmAr {
-                return false;
-            }
-            if bundle.lfm2_decode_batch.is_none() {
-                return false;
-            }
-            if !bundle.config.is_dense() {
-                return false;
-            }
-            if lfm2moe::batch_weight_formats_supported(&bundle.weights).is_err() {
-                return false;
-            }
+        } else if m.lfm2moe().is_some() {
+            // LFM2 has no batch path (`continuous_batch_route(11)` is None).
             return false;
         } else if let Some(bundle) = m.muse_glimmer() {
             if route != GenerationRoute::GlimmerAr || bundle.lanes.is_none() {
@@ -5446,11 +5433,7 @@ pub fn is_qwen_ep_batch_request_eligible(
     if !caps.supports_ep_batch {
         return false;
     }
-    if m.qwen35().is_some_and(|b| b.qwen35_decode_batch.is_some())
-        || m.lfm2moe()
-            .and_then(|b| b.lfm2_decode_batch.as_ref())
-            .is_some()
-    {
+    if m.qwen35().is_some_and(|b| b.qwen35_decode_batch.is_some()) {
         return false;
     }
     // Staged `batch` above is the admission: staging already passed the full

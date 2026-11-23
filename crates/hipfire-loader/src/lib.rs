@@ -428,7 +428,6 @@ pub fn registry_carriers() -> impl Iterator<Item = &'static dyn Carrier> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContinuousBatchRoute {
     Qwen35,
-    Lfm2Moe,
     /// Flash-Next (qwen4, arch 16) exact AR lanes. Staged only through the
     /// VMM branch (`serve.vmm_batch`); there is no fixed-lane qwen4 body.
     Qwen4,
@@ -439,8 +438,7 @@ pub enum ContinuousBatchRoute {
 /// Exact arch_id -> continuous-batch route. qwen35 5|6, glimmer 14 and qwen4
 /// 16 admit: LFM2 (11) has no servable batch path (see the lfm2moe carrier
 /// caps), so the route refuses it and no batch state is ever allocated. No
-/// carrier probing — pure id match. `ContinuousBatchRoute::Lfm2Moe` stays for
-/// the staging body, which is now unreachable.
+/// carrier probing — pure id match.
 pub fn continuous_batch_route(arch_id: u32) -> Option<ContinuousBatchRoute> {
     match arch_id {
         5 | 6 => Some(ContinuousBatchRoute::Qwen35),

@@ -17,10 +17,8 @@ use crate::batch::{
     BatchTerminalCleanup,
 };
 use hipfire_arch_deepseek4::sampling::{sample_token, Xorshift};
-use hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState;
-use hipfire_arch_lfm2moe::Lfm2MoeBundle;
 use hipfire_engine::emit::*;
-use hipfire_engine::prompt::{batch_render_prompt_tokens, qwen_jinja_reasoning};
+use hipfire_engine::prompt::qwen_jinja_reasoning;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
 use hipfire_engine::wire_seed;
@@ -124,54 +122,10 @@ fn render_lane_prompt(
     msg: &serde_json::Value,
 ) -> Result<(Vec<u32>, bool), String> {
     let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer missing")?;
-    let prompt = batch_single_user_content(msg).unwrap_or_else(|| {
-        msg.get("prompt")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Hello")
-            .to_string()
-    });
-    let system = msg.get("system").and_then(|v| v.as_str());
-    let max_think = msg
-        .get("max_think_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    let messages = match msg.get("messages") {
-        Some(v) => Some(
-            serde_json::from_value::<Vec<hipfire_runtime::prompt_frame::Message>>(v.clone())
-                .map_err(|e| format!("invalid messages field: {e}"))?,
-        ),
-        None => None,
-    };
-    if let Some(b) = m.muse_glimmer() {
-        let ids = render_glimmer_lane_prompt(
-            tokenizer,
-            m.chat_template.as_ref(),
-            b.config.bos_token,
-            msg,
-        )?;
-        return Ok((ids, false));
-    }
-    let assistant_prefix = match msg
-        .get("assistant_prefix")
-        .and_then(|v| v.as_str())
-        .unwrap_or("plain")
-    {
-        "open_think" => hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
-        "closed_think" => hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
-        _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-    };
-    batch_render_prompt_tokens(
-        &prompt,
-        system,
-        assistant_prefix,
-        tokenizer,
-        m.chat_template.as_ref(),
-        max_think,
-        messages.as_deref(),
-        max_think != 1,
-        None,
-    )
-    .map_err(|e| e.to_string())
+    let b = m.muse_glimmer().ok_or("batch model is not a lane family")?;
+    let ids =
+        render_glimmer_lane_prompt(tokenizer, m.chat_template.as_ref(), b.config.bos_token, msg)?;
+    Ok((ids, false))
 }
 
 /// Glimmer lane prompt ids. The singleton dispatch normalizes `prompt` and
@@ -293,13 +247,9 @@ pub(crate) fn emit_lane_assignment_capacity_error(
 /// The generation route of a model served by this driver; `None` for every
 /// other family.
 pub fn lane_family_route(m: &LoadedModel) -> Option<GenerationRoute> {
-    if m.muse_glimmer().is_some() {
-        Some(GenerationRoute::GlimmerAr)
-    } else if m.lfm2moe().is_some() {
-        Some(GenerationRoute::LfmAr)
-    } else {
-        None
-    }
+    m.muse_glimmer()
+        .is_some()
+        .then_some(GenerationRoute::GlimmerAr)
 }
 
 /// Daemon: drive the staged fixed-lane batch of a lane family (Glimmer,
@@ -1425,252 +1375,8 @@ fn lane_family(m: &mut LoadedModel) -> Result<Box<dyn LaneFamily + '_>, String> 
             lanes: (0..n).map(|_| GlimmerLane::new(0)).collect(),
         }));
     }
-    let b = any
-        .downcast_mut::<Lfm2MoeBundle>()
-        .ok_or("batch model is not a lane family")?;
-    let Lfm2MoeBundle {
-        config,
-        weights,
-        eos_tok,
-        lfm2_decode_batch,
-        ..
-    } = b;
-    let state = lfm2_decode_batch
-        .as_mut()
-        .ok_or("batch state not allocated")?;
-    let n = state.max_batch;
-    Ok(Box::new(LfmLanes {
-        state,
-        config,
-        weights,
-        tokenizer,
-        eos: *eos_tok,
-        // Stop set shared with crate::dense::generate_lfm2moe.
-        stop_toks: hipfire_arch_lfm2moe::carrier::stop_tokens(tokenizer, *eos_tok),
-        tool_open: tokenizer.special_token_id("\x3C\x7Ctool_call_start\x7C\x3E"),
-        tool_close: tokenizer.special_token_id("\x3C\x7Ctool_call_end\x7C\x3E"),
-        spans: (0..n).map(|_| LfmToolSpan::default()).collect(),
-    }))
+    Err("batch model is not a lane family".into())
 }
-
-/// LFM tool-call span suppression (mirrors dense::generate_lfm2moe): the
-/// span — markers + body — is held back from the stream and parsed into
-/// `calls` at the lane's finish.
-#[derive(Default)]
-struct LfmToolSpan {
-    open: bool,
-    span: Vec<u32>,
-    body: Vec<u32>,
-    calls: Vec<ToolCall>,
-}
-
-struct LfmLanes<'a> {
-    state: &'a mut Lfm2DecodeBatchState,
-    config: &'a hipfire_arch_lfm2moe::config::Lfm2MoeConfig,
-    weights: &'a hipfire_arch_lfm2moe::Lfm2MoeWeights,
-    tokenizer: &'a Tokenizer,
-    eos: u32,
-    stop_toks: Vec<u32>,
-    tool_open: Option<u32>,
-    tool_close: Option<u32>,
-    spans: Vec<LfmToolSpan>,
-}
-
-impl LaneFamily for LfmLanes<'_> {
-    fn route(&self) -> GenerationRoute {
-        GenerationRoute::LfmAr
-    }
-    fn idle_token(&self) -> u32 {
-        self.eos
-    }
-    fn repeat_capacity(&self) -> usize {
-        self.state.sample_repeat_capacity
-    }
-    fn reset(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
-        self.state.reset(gpu).map_err(|e| e.to_string())
-    }
-    fn reset_lane(&mut self, gpu: &mut rdna_compute::Gpu, lane: usize) -> Result<(), String> {
-        self.state
-            .reset_lane(gpu, self.config, lane)
-            .map_err(|e| e.to_string())
-    }
-    fn open_lane(&mut self, lane: usize, _req: &BatchPendingRequest) {
-        self.spans[lane] = LfmToolSpan::default();
-    }
-    fn prefill_lane(
-        &mut self,
-        gpu: &mut rdna_compute::Gpu,
-        lane: usize,
-        prompt: &[u32],
-        abort: &dyn Fn() -> bool,
-    ) -> Result<bool, String> {
-        if abort() {
-            return Ok(false);
-        }
-        self.state
-            .prefill_lane(gpu, self.weights, self.config, lane, prompt)
-            .map_err(|e| e.to_string())?;
-        Ok(!abort())
-    }
-    fn batched_prefill(&self) -> bool {
-        true
-    }
-    fn per_lane_sampling(&self) -> bool {
-        // `sample_product` takes one config per batch: lanes share a cohort.
-        false
-    }
-    fn prefill_lanes(
-        &mut self,
-        gpu: &mut rdna_compute::Gpu,
-        prompts: &[&[u32]],
-    ) -> Result<(), String> {
-        self.state
-            .prefill_lanes_batched(gpu, self.weights, self.config, prompts)
-            .map_err(|e| e.to_string())
-    }
-    fn sample_first(
-        &mut self,
-        gpu: &mut rdna_compute::Gpu,
-        lane: usize,
-        s: &BatchSampling,
-        rng: u32,
-    ) -> Result<(u32, u32), String> {
-        self.state
-            .sample_lane_product(
-                gpu,
-                self.config,
-                lane,
-                &[],
-                s.temp,
-                s.top_p,
-                s.top_k,
-                s.min_p,
-                rng,
-                s.repeat_penalty,
-                s.presence_penalty,
-                s.frequency_penalty,
-            )
-            .map_err(|e| e.to_string())
-    }
-    fn decode(
-        &mut self,
-        gpu: &mut rdna_compute::Gpu,
-        tokens: &[u32],
-        positions: &[usize],
-        _running: &[usize],
-    ) -> Result<(), String> {
-        hipfire_arch_lfm2moe::forward_batch::forward_decode_batch_lfm(
-            gpu,
-            self.weights,
-            self.config,
-            tokens,
-            positions,
-            self.state,
-        )
-        .map_err(|e| e.to_string())
-    }
-    fn sample(
-        &mut self,
-        gpu: &mut rdna_compute::Gpu,
-        draws: &[LaneDraw],
-    ) -> Result<Vec<(u32, u32)>, String> {
-        let (n, cap) = (self.state.max_batch, self.state.sample_repeat_capacity);
-        let mut repeat_tokens = vec![0u32; n * cap];
-        let mut repeat_lengths = vec![0u32; n];
-        let mut rng_states = vec![0u32; n];
-        for d in draws {
-            repeat_tokens[d.lane * cap..][..d.history.len()].copy_from_slice(&d.history);
-            repeat_lengths[d.lane] = d.history.len() as u32;
-            rng_states[d.lane] = d.rng;
-        }
-        // ponytail: one sampling config for the whole batch (the first
-        // draw's), as before the shared driver; per-lane configs need a
-        // per-lane sampler.
-        let s = &draws[0].sampling;
-        let sampled = self
-            .state
-            .sample_product(
-                gpu,
-                self.config,
-                n,
-                &repeat_tokens,
-                &repeat_lengths,
-                &rng_states,
-                s.temp,
-                s.top_p,
-                s.top_k,
-                s.min_p,
-                s.repeat_penalty,
-                s.presence_penalty,
-                s.frequency_penalty,
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(draws.iter().map(|d| sampled[d.lane]).collect())
-    }
-    fn emit(
-        &mut self,
-        lane: usize,
-        state: &mut QwenBatchLane,
-        token: u32,
-        stdout: &mut std::io::Stdout,
-        id: &str,
-    ) -> LaneEmit {
-        if self.stop_toks.contains(&token) {
-            return LaneEmit::Stop;
-        }
-        let span = &mut self.spans[lane];
-        let mut span_diverted = false;
-        if self.tool_open == Some(token) && !span.open {
-            span.open = true;
-            span.span.clear();
-            span.span.push(token);
-            span.body.clear();
-            span_diverted = true;
-        } else if span.open {
-            span.span.push(token);
-            if self.tool_close == Some(token) {
-                span.open = false;
-                let body_text = self.tokenizer.decode(&span.body);
-                span.calls
-                    .extend(hipfire_runtime::emit_text::parse_lfm_tool_call_body(
-                        &body_text,
-                    ));
-            } else {
-                span.body.push(token);
-            }
-            span_diverted = true;
-        }
-        let mut future_streamed = state.streamed_tokens.clone();
-        future_streamed.push(token);
-        let all_bytes = self.tokenizer.decode_bytes(&future_streamed);
-        let valid_len = match std::str::from_utf8(&all_bytes) {
-            Ok(_) => all_bytes.len(),
-            Err(e) => e.valid_up_to(),
-        };
-        let prev_fed = state.bytes_fed_to_filter.min(valid_len);
-        let frag = std::str::from_utf8(&all_bytes[prev_fed..valid_len]).unwrap_or("");
-        // String guard: leaked EOS-class strings not registered as specials.
-        if matches!(frag.trim(), "<|endoftext|>" | "</s>" | "<|im_end|>") {
-            return LaneEmit::Stop;
-        }
-        state.bytes_fed_to_filter = valid_len;
-        if !frag.is_empty() && !span_diverted {
-            emit_visible_token(stdout, id, frag);
-            LaneEmit::Visible
-        } else {
-            LaneEmit::Hidden
-        }
-    }
-    fn finish(&mut self, lane: usize, stdout: &mut std::io::Stdout, id: &str) -> Vec<ToolCall> {
-        let span = std::mem::take(&mut self.spans[lane]);
-        // Unclosed span at the terminal: re-emit the buffered raw text.
-        if span.open {
-            emit_visible_token(stdout, id, &self.tokenizer.decode(&span.span));
-        }
-        span.calls
-    }
-}
-
 /// Per-lane Harmony routing, as the singleton `generate_muse_glimmer` AR loop.
 struct GlimmerLane {
     text: TokenTextStream,
