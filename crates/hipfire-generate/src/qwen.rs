@@ -4145,8 +4145,7 @@ pub fn generate_dflash(
                     *store_cache,
                 );
                 if !effects.emit_done {
-                    let ep =
-                        production_cancel_epilogue(m, gpu, spec_cancel_keeps_committed_prefix(m));
+                    let ep = spec_terminal_cancel_epilogue(m, gpu);
                     emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
                     return true;
                 }
@@ -4296,7 +4295,7 @@ pub fn generate_dflash(
         let intended_store = cache_action.store && !cached_seq.is_empty();
         let effects = decision.commit_effects(intended_release, intended_store);
         if !effects.emit_done {
-            let ep = production_cancel_epilogue(m, gpu, spec_cancel_keeps_committed_prefix(m));
+            let ep = spec_terminal_cancel_epilogue(m, gpu);
             emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
             return true;
         }
@@ -5651,6 +5650,16 @@ pub fn generate_spec(
     let first_token = match classify_spec_prefill(prefill_outcome) {
         Ok(first_token) => first_token,
         Err(terminal) => {
+            // A client cancel mid-prefill keeps the Qwen4 snapshots captured at
+            // the prompt boundaries already prefilled (a failure drops them).
+            if matches!(terminal, SpecPrefillTerminal::Cancelled) && pp.is_none() {
+                if let Some(bundle) = slot
+                    .as_any_mut()
+                    .downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+                {
+                    bundle.session_publish_captures();
+                }
+            }
             // Fail-closed: reset+sync first; the terminal follows attestation.
             let ep = spec_rollback_live(
                 &mut m.seq_pos,
@@ -12192,10 +12201,13 @@ fn spec_rollback_live(
 /// is emitted to the client but not yet fed, so the target KV / DeltaNet state
 /// is exactly `prompt_tokens` + the fed part of `emitted` (`position` tokens).
 /// [`production_cancel_epilogue_live`] keeps that prefix as the conversation
-/// when the cursors attest it; the validated configuration is a resident
+/// when the cursors attest it; the validated configurations are a resident
 /// single-GPU Qwen3.5-class target (`ModelSlot`, no KV compaction) on
-/// the MTP or DFlash speculator. A pipeline-parallel mesh, every other target
-/// and every unattestable cursor keep the full reset ([`spec_rollback_live`]).
+/// the MTP or DFlash speculator, and a single-device Qwen4 target with a
+/// session cache on a session-resuming speculator, whose kept prefix is then
+/// committed like a finished turn ([`qwen4_settle_cancelled_session`]). A
+/// pipeline-parallel mesh, every other target and every unattestable cursor
+/// keep the full reset ([`spec_rollback_live`]).
 #[allow(clippy::too_many_arguments)]
 fn spec_cancel_epilogue_live(
     seq_pos: &mut usize,
@@ -12225,12 +12237,18 @@ fn spec_cancel_epilogue_live(
             spec,
         );
     }
-    let eligible = matches!(spec.name(), "mtp" | "dflash")
+    let qwen4_session = spec.session_route().is_some()
         && slot
             .as_any_mut()
-            .downcast_mut::<speculative::ModelSlot>()
-            .is_some_and(|ms| ms.kv_cache.compact_offset == 0);
-    production_cancel_epilogue_live(
+            .downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+            .is_some_and(|bundle| bundle.cancel_keeps_session());
+    let eligible = qwen4_session
+        || (matches!(spec.name(), "mtp" | "dflash")
+            && slot
+                .as_any_mut()
+                .downcast_mut::<speculative::ModelSlot>()
+                .is_some_and(|ms| ms.kv_cache.compact_offset == 0));
+    let epilogue = production_cancel_epilogue_live(
         seq_pos,
         conversation_tokens,
         prefill_checkpoints,
@@ -12244,23 +12262,88 @@ fn spec_cancel_epilogue_live(
             fed: position,
             stream: spec_cancel_committed_stream(prompt_tokens, emitted, position, pending_seed),
         },
-    )
+    );
+    if qwen4_session {
+        if let Some(bundle) = slot
+            .as_any_mut()
+            .downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+        {
+            qwen4_settle_cancelled_session(bundle, &epilogue, conversation_tokens);
+        }
+    }
+    epilogue
+}
+
+/// The session side of a client cancel on a Qwen4 target, after its epilogue.
+/// A cancel is not a failure: when the epilogue kept the committed prefix
+/// (`conversation` non-empty, device drained), commit it like a finished turn
+/// (publish the turn's captures and residents, keep the live state when the
+/// owners sit at its end), so the next request continues it or restores the
+/// turn's start instead of an older snapshot. After a full reset only the pool
+/// snapshots captured at prompt boundaries are published.
+fn qwen4_settle_cancelled_session(
+    bundle: &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
+    epilogue: &RollbackEpilogue,
+    conversation: &[u32],
+) {
+    if epilogue.rolled_back && !conversation.is_empty() {
+        hipfire_runtime::arch_model::ArchModel::session_commit_live(bundle, conversation);
+    } else {
+        bundle.session_publish_captures();
+    }
+}
+
+/// [`spec_cancel_keeps_committed_prefix`]'s Qwen4 arm: a single-device Qwen4
+/// target with a session cache on a session-resuming speculator.
+fn qwen4_cancel_keeps_session(m: &LoadedModel) -> bool {
+    m.pp <= 1
+        && m.speculator
+            .as_ref()
+            .is_some_and(|s| s.session_route().is_some())
+        && m.qwen4().is_some_and(|b| b.cancel_keeps_session())
+}
+
+/// Cancel epilogue at the spec route's terminal commit handshake (the turn
+/// finished, the client left before `done`): [`production_cancel_epilogue`]
+/// under [`spec_cancel_keeps_committed_prefix`], then the Qwen4 session side
+/// ([`qwen4_settle_cancelled_session`]).
+fn spec_terminal_cancel_epilogue(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    let qwen4_session = qwen4_cancel_keeps_session(m);
+    let epilogue = production_cancel_epilogue(m, gpu, spec_cancel_keeps_committed_prefix(m));
+    if qwen4_session {
+        let LoadedModel {
+            state,
+            conversation_tokens,
+            ..
+        } = m;
+        if let Some(bundle) = state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+        }) {
+            qwen4_settle_cancelled_session(bundle, &epilogue, conversation_tokens);
+        }
+    }
+    epilogue
 }
 
 /// Whether a client cancel at the terminal commit handshake of the spec route
 /// (the turn finished, the client left before `done`) may keep the conversation
-/// the turn already baked: the same validated configuration as
+/// the turn already baked: the same validated configurations as
 /// [`spec_cancel_epilogue_live`] (resident single-GPU Qwen3.5-class bundle on
-/// the MTP or DFlash speculator, no KV compaction). Nothing was
-/// reverted, so the host record and device cursor agree by construction;
-/// [`production_cancel_epilogue`] still checks that they do.
+/// the MTP or DFlash speculator, no KV compaction; single-device Qwen4 with a
+/// session cache). Nothing was reverted, so the host record and device cursor
+/// agree by construction; [`production_cancel_epilogue`] still checks that
+/// they do.
 fn spec_cancel_keeps_committed_prefix(m: &LoadedModel) -> bool {
-    m.pp <= 1
-        && m.kv_adaptive.is_none()
-        && m.speculator
-            .as_ref()
-            .is_some_and(|s| matches!(s.name(), "mtp" | "dflash"))
-        && m.qwen35().is_some_and(|b| b.kv_cache.compact_offset == 0)
+    qwen4_cancel_keeps_session(m)
+        || (m.pp <= 1
+            && m.kv_adaptive.is_none()
+            && m.speculator
+                .as_ref()
+                .is_some_and(|s| matches!(s.name(), "mtp" | "dflash"))
+            && m.qwen35().is_some_and(|b| b.kv_cache.compact_offset == 0))
 }
 
 /// Run the stopping-window repair and feed the terminal pending seed the last

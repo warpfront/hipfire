@@ -2242,11 +2242,19 @@ impl SessionCache {
     /// Start a prefill that continues the live state in place: the caller
     /// keeps every owner as it is (no reset, no restore) and prefills only the
     /// suffix. Does the bookkeeping head of [`Self::begin`] (frees displaced
-    /// buffers, drops uncommitted snapshots). The resident snapshot stays: a
-    /// continuation only appends rows above it.
+    /// buffers, drops uncommitted snapshots).
+    ///
+    /// The live state at `reused` (the committed end of the conversation's
+    /// previous turn) becomes this turn's pending resident snapshot, published
+    /// at [`Self::commit`]: a request that diverges inside this turn's suffix
+    /// (the same request sent again, an edited last message, the request after
+    /// a cancel) restores it instead of an older snapshot. It copies the fixed
+    /// parts only, at the position the prefill starts from, so the prefill's
+    /// chunk schedule is unchanged. A capture the state or the memory guard
+    /// refuses is skipped (the previous resident stays).
     ///
     /// With `capture == false` it arms no boundary, so
-    /// [`Self::next_boundary`] is `None` and nothing is captured this turn.
+    /// [`Self::next_boundary`] is `None` and nothing else is captured this turn.
     ///
     /// A live-continued turn's state descends from decode, never from a cold
     /// canonical prefill, so it is marked session-exact (`live_cold_exact`
@@ -2275,22 +2283,56 @@ impl SessionCache {
         {
             free_store(gpu, self.tail.take().unwrap().buf);
         }
-        if !capture {
-            return;
-        }
         let Some(scope) = state.snapshot_scope(route) else {
             return;
         };
+        let domain = self.domain.scoped(&scope);
+        if let Err(error) = self.capture_live_start(gpu, state, &domain, route, prompt, reused) {
+            eprintln!("  session cache: skipped {reused}-token live resident snapshot ({error})");
+        }
+        if !capture {
+            return;
+        }
         let (boundaries, lineage) = Self::turn_boundaries(state, prompt, reused, true);
         self.turn = Some(Turn {
             boundaries,
             lineage,
             cold_exact: self.live_cold_exact,
             start: reused,
-            domain: self.domain.scoped(&scope),
+            domain,
             route,
             end: prompt.len(),
         });
+    }
+
+    /// [`Self::begin_live`]'s resident capture of the live state at `reused`.
+    fn capture_live_start(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        domain: &CacheDomain,
+        route: SessionRoute,
+        prompt: &[u32],
+        reused: usize,
+    ) -> Result<(), String> {
+        if reused == 0 || reused > prompt.len() {
+            return Ok(());
+        }
+        let key = (
+            domain.clone(),
+            reused as u64,
+            prefix_fingerprint(&prompt[..reused]),
+        );
+        if self
+            .resident
+            .as_ref()
+            .is_some_and(|resident| resident.key == key)
+        {
+            return Ok(());
+        }
+        let growth = state.growth_reserve_bytes(gpu, prompt.len());
+        let SnapshotParts { meta, layout } = state.snapshot_parts(route, reused)?;
+        self.capture_resident(false, gpu, key, &meta, &layout, growth, false)
     }
 
     fn turn_boundaries(
@@ -3013,8 +3055,35 @@ impl SessionCache {
 
     /// Publish this turn's snapshots, parents before children. Uncommitted
     /// snapshots are dropped by the next [`Self::begin`], so a failed turn
-    /// never publishes state.
+    /// never publishes state (a client cancel publishes its prompt captures
+    /// through [`Self::publish_captures`]).
     pub fn commit(&mut self) {
+        self.publish_captures();
+        if let Some(resident) = self.resident_pending.take() {
+            if let Some(displaced) = self.resident.replace(resident) {
+                self.release_bufs.push(displaced.buf);
+            }
+        }
+        if let Some(tail) = self.tail_pending.take() {
+            if let Some(displaced) = self.tail.replace(tail) {
+                self.release_bufs.push(displaced.buf);
+            }
+        } else if self.tail.as_ref().is_some_and(|tail| {
+            self.turn
+                .as_ref()
+                .is_some_and(|turn| turn.start < tail.key.1 as usize)
+        }) {
+            self.release_bufs.push(self.tail.take().unwrap().buf);
+        }
+        self.turn = None;
+    }
+
+    /// Publish this turn's pool snapshots (parents before children) and
+    /// nothing else: each holds its own copy of the state at a prompt
+    /// boundary the prefill completed, so a client cancel after it (during
+    /// the rest of the prefill or during decode) does not invalidate it. The
+    /// pending residents back live rows and are left to the caller.
+    pub fn publish_captures(&mut self) {
         let mut refused = HashSet::new();
         for (key, snapshot) in std::mem::take(&mut self.pending) {
             if snapshot
@@ -3049,23 +3118,6 @@ impl SessionCache {
                 self.retire(snapshot);
             }
         }
-        if let Some(resident) = self.resident_pending.take() {
-            if let Some(displaced) = self.resident.replace(resident) {
-                self.release_bufs.push(displaced.buf);
-            }
-        }
-        if let Some(tail) = self.tail_pending.take() {
-            if let Some(displaced) = self.tail.replace(tail) {
-                self.release_bufs.push(displaced.buf);
-            }
-        } else if self.tail.as_ref().is_some_and(|tail| {
-            self.turn
-                .as_ref()
-                .is_some_and(|turn| turn.start < tail.key.1 as usize)
-        }) {
-            self.release_bufs.push(self.tail.take().unwrap().buf);
-        }
-        self.turn = None;
     }
 
     /// Bytes of every published device snapshot.
@@ -4043,6 +4095,13 @@ impl SessionDriver {
             .get(..position)
             .ok_or("session boundary exceeds the prompt in flight")?;
         self.cache.at_boundary(gpu, state, prefix)
+    }
+
+    /// Publish the pool snapshots the request in flight captured, after a
+    /// client cancel ([`SessionCache::publish_captures`]). The live state, the
+    /// turn and the pending residents are left to the reset that follows.
+    pub fn publish_captures(&mut self) {
+        self.cache.publish_captures();
     }
 
     /// Publish this turn's snapshots and drop the live state.
@@ -5042,6 +5101,88 @@ mod tests {
         cache.commit();
         assert_eq!(cache.pool.total_bytes(), 0);
         assert_eq!(cache.plan(&toy, &a, SessionRoute::Ar), 0);
+        gpu.free_tensor(toy.fixed).unwrap();
+        gpu.free_tensor(toy.rows).unwrap();
+    }
+
+    /// #1198: a live continuation keeps its start (the committed end of the
+    /// previous turn) as its resident, so the same request sent again, which
+    /// cannot continue live, restores there instead of the previous turn's
+    /// last stride snapshot.
+    #[test]
+    fn live_begin_keeps_its_start_for_a_retry() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: session cache tests require a GPU");
+            return;
+        };
+        let gpu = &mut gpu;
+        let mut toy = Toy {
+            fixed: gpu.alloc_tensor(&[FIXED_BYTES], DType::Raw).unwrap(),
+            rows: gpu
+                .alloc_tensor(&[ROW_CAPACITY * ROW_BYTES], DType::Raw)
+                .unwrap(),
+            position: 0,
+            tail_snapshot: false,
+        };
+        let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
+        let mut cache = SessionCache::new(domain(), 8 * one);
+        let a = prompt(1, 2 * STRIDE + 5);
+        assert_eq!(turn(&mut cache, gpu, &mut toy, &a, true), 0);
+        let mut b = a.clone();
+        b.extend(prompt(2, 20));
+        // Before the live turn, the retry's best point is the stride snapshot.
+        assert_eq!(cache.plan(&toy, &b, SessionRoute::Ar), 2 * STRIDE);
+        cache.begin_live(gpu, &mut toy, &b, SessionRoute::Ar, a.len(), false);
+        assert_eq!(cache.next_boundary(), None);
+        assert_eq!(
+            cache.resident_pending.as_ref().map(|r| r.key.1),
+            Some(a.len() as u64)
+        );
+        toy.advance(gpu, &b);
+        cache.commit();
+        // Nothing entered the pool; the retry restores the live start.
+        assert_eq!(cache.pool.len(), 2);
+        assert_restores(&mut cache, gpu, &mut toy, &b, a.len());
+        cache.clear(gpu);
+        gpu.free_tensor(toy.fixed).unwrap();
+        gpu.free_tensor(toy.rows).unwrap();
+    }
+
+    /// #1198: a cancelled turn publishes the pool snapshots its prefill
+    /// captured (each is its own copy), while its residents, which back live
+    /// rows, go with the reset that follows.
+    #[test]
+    fn cancel_publishes_prompt_captures_not_residents() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: session cache tests require a GPU");
+            return;
+        };
+        let gpu = &mut gpu;
+        let mut toy = Toy {
+            fixed: gpu.alloc_tensor(&[FIXED_BYTES], DType::Raw).unwrap(),
+            rows: gpu
+                .alloc_tensor(&[ROW_CAPACITY * ROW_BYTES], DType::Raw)
+                .unwrap(),
+            position: 0,
+            tail_snapshot: false,
+        };
+        let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
+        let mut cache = SessionCache::new(domain(), 8 * one);
+        let a = prompt(1, 2 * STRIDE + 5);
+        turn(&mut cache, gpu, &mut toy, &a, false);
+        assert_eq!(cache.pending.len(), 2);
+        assert!(cache.resident_pending.is_some());
+        cache.publish_captures();
+        assert!(cache.pending.is_empty());
+        assert_eq!(cache.pool.len(), 2);
+        // The reset outside the cache drops the residents.
+        cache.live_state_reset();
+        toy.reset(gpu).unwrap();
+        assert!(cache.resident.is_none() && cache.resident_pending.is_none());
+        let mut retry = a.clone();
+        retry.push(7);
+        assert_restores(&mut cache, gpu, &mut toy, &retry, 2 * STRIDE);
+        cache.clear(gpu);
         gpu.free_tensor(toy.fixed).unwrap();
         gpu.free_tensor(toy.rows).unwrap();
     }

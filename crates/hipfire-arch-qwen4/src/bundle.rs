@@ -5113,6 +5113,32 @@ impl Qwen4Bundle {
             .map_err(BundleError::Forward)
     }
 
+    /// Publish the pool snapshots the request in flight captured at prompt
+    /// boundaries ([`SessionDriver::publish_captures`]): the client cancelled
+    /// it, which does not invalidate them, so the next request can restore
+    /// them before the reset drops the live state. Single-device only; a
+    /// pipeline or expert-parallel load keeps dropping them.
+    pub fn session_publish_captures(&mut self) {
+        if self.pp.is_some() || self.ep.is_some() {
+            return;
+        }
+        if self.refuse_expert_cache_state_op(None, "session_publish_captures") {
+            return;
+        }
+        if let Some(session) = self.session.as_mut() {
+            session.publish_captures();
+        }
+    }
+
+    /// Whether a client cancel at a committed decode boundary may keep this
+    /// conversation: a single-device bundle with a session cache, which then
+    /// commits the committed prefix like a finished turn
+    /// ([`hipfire_runtime::arch_model::ArchModel::session_commit_live`]
+    /// validates the owners' position before keeping anything live).
+    pub fn cancel_keeps_session(&self) -> bool {
+        self.pp.is_none() && self.ep.is_none() && self.session.is_some()
+    }
+
     /// The host-only schedule settings of this bundle (the root's are the
     /// authoritative copy every PP band adopts).
     pub(crate) fn pp_session_policy(&self) -> PpSessionPolicy {
