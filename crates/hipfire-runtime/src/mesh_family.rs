@@ -136,7 +136,8 @@ pub struct MeshRunner {
     /// ticket covers: nothing counts as drained until a successful reset.
     unsettled: bool,
     /// A failed device synchronization quarantined the mesh. Persistent for
-    /// the load: every later request is refused, whoever owns the devices.
+    /// this runner (the load): every later engine request is refused. Routes
+    /// that do not run on the engine are not gated by it.
     quarantined: Option<String>,
 }
 
@@ -256,6 +257,10 @@ impl MeshRunner {
     pub fn settle(&mut self, gpus: &mut Gpus) -> Result<()> {
         if self.unsettled {
             return Err("an epoch failed mid-submission; the device is not drained".into());
+        }
+        // A quarantined device was never proven idle: the outputs stay leaked.
+        if let Some(reason) = &self.quarantined {
+            return Err(format!("engine mesh quarantined until restart: {reason}"));
         }
         if self.outstanding.is_empty() {
             return Ok(());
