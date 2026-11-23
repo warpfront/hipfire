@@ -2458,12 +2458,12 @@ impl Gpus {
         self.mesh_execution.output_owner
     }
 
-    /// Whether the mesh is provisioned and neither poisoned nor quarantined.
     /// Whether a failed device synchronization quarantined the mesh.
     pub fn mesh_quarantined(&self) -> bool {
         self.mesh_execution.quarantined
     }
 
+    /// Whether the mesh is provisioned and neither poisoned nor quarantined.
     pub fn mesh_healthy(&self) -> bool {
         let state = &self.mesh_execution;
         state.mesh_epoch.is_some() && !state.poisoned && !state.quarantined
