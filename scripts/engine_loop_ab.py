@@ -226,6 +226,9 @@ def done_view(done):
 DIFF, INTENDED, SPEC_STAT, UNEXERCISED = "diff", "intended", "spec-stat", "unexercised"
 # Prompt-side done fields, compared on sampled requests too.
 PROMPT_SIDE = ("cached_tokens", "prefill_tokens")
+# Scenario -> index of its first follow-up that should reuse a prefix the legacy
+# loop drops (another conversation in between, an abort before it).
+MORE_REUSE = {"interleaved": 2, "abort_prefill": 1, "abort_decode": 1}
 
 
 def compare(sc, a, b, spec_noise=False):
@@ -255,10 +258,17 @@ def compare(sc, a, b, spec_noise=False):
         # coverage, judged on the legacy arm
         if sc == "eos_budget" and i == 0 and dx.get("finish_reason") != "stop":
             note(UNEXERCISED, "the probe hit its budget before EOS")
-        if sc in ("multi_turn", "interleaved") and i >= (1 if sc == "multi_turn" else 2) and not dx.get("cached_tokens"):
+        if sc == "multi_turn" and i > 0 and not dx.get("cached_tokens"):
             note(UNEXERCISED, f"[{i}] turn reused no prefix (cached_tokens {dx.get('cached_tokens')!r})")
-        if sc == "abort_decode" and i == 1 and not dx.get("cached_tokens"):
-            note(UNEXERCISED, "the follow-up after the abort reused no prefix")
+        # reuse the legacy loop may lack (one live session record): judged on the
+        # engine arm; more reuse than legacy over the same prompt is intended
+        if sc in MORE_REUSE and i >= MORE_REUSE[sc]:
+            cx, cy = dx.get("cached_tokens") or 0, dy.get("cached_tokens") or 0
+            if not cy:
+                note(UNEXERCISED, f"[{i}] the engine reused no prefix")
+            if cy > cx and cx + (dx.get("prefill_tokens") or 0) == cy + (dy.get("prefill_tokens") or 0):
+                note(INTENDED, f"[{i}] engine reused {cy} cached tokens, legacy {cx}")
+                dx, dy = ({k: v for k, v in d.items() if k not in PROMPT_SIDE} for d in (dx, dy))
         if sc == "abort_prefill" and i == 0 and x["events"]:
             note(UNEXERCISED, f"abort landed after {len(x['events'])} decode events, not in prefill")
         if sc == "abort_decode" and i == 0:
@@ -359,16 +369,24 @@ def judge(res, route, tvd_max, perf=None):
         g_spec = (len(taus["engine"]) == len(taus["legacy"])
                   and statistics.mean(taus["engine"]) >= 0.99 * statistics.mean(taus["legacy"]))
     loop_ok, loops = loop_checks(res, route.get("expect_engine", False))
-    # no state leak: within each arm the cold prompt rerun last gives the cold tokens and ids
-    isolation = {arm: [(r["events"], r.get("ids", [])) for r in (res[arm]["cold"][0], res[arm]["isolation"][0])]
-                 for arm in ARMS if "isolation" in res[arm]}
-    isolation = {arm: a == b for arm, (a, b) in isolation.items()}
+    isolation = {arm: isolation_check(res[arm]) for arm in ARMS if "isolation" in res[arm]}
     g_perf = perf["median"]["g_perf"] if perf else None
     ok = (all(s["status"] != DIFF for s in scenarios.values()) and sampled["ok"] and g_spec is not False
-          and loop_ok and all(isolation.values()) and g_perf is not False
+          and loop_ok and False not in isolation.values() and g_perf is not False
           and res["legacy"]["daemon_rc"] == res["engine"]["daemon_rc"] == 0)
     return {"ok": ok, "scenarios": scenarios, "sampled": sampled, "tau": taus, "g_spec": g_spec,
             "loop_ok": loop_ok, "loop": loops, "isolation": isolation, "g_perf": g_perf}
+
+
+def isolation_check(rows):
+    """No state leak: the cold prompt rerun last gives the cold tokens and ids. Judged
+    when the rerun prefilled cold or restored the whole prompt; a partial prefix reuse
+    is not token-exact with a cold prefill, so it is `unexercised`."""
+    c, i = rows["cold"][0], rows["isolation"][0]
+    prompt = (c["done"].get("cached_tokens") or 0) + (c["done"].get("prefill_tokens") or 0)
+    if 0 < (i["done"].get("cached_tokens") or 0) < prompt:
+        return UNEXERCISED
+    return (c["events"], c.get("ids", [])) == (i["events"], i.get("ids", []))
 
 
 def self_test():
@@ -420,10 +438,12 @@ def self_test():
     assert st("abort_prefill", [r("", "error", message="m"), r("x")], [r("", "error", message="m"), r("x")]) != "diff"
     assert st("abort_decode", ab, [ab[0], r("", "error", message="m")]) == "diff"
     assert st("abort_decode", [ab[0], r("", "error", message="m")], [ab[0], r("", "error", message="m")]) == "diff"
+    assert st("abort_prefill", [r("", finish_reason="aborted"), fx],
+              [r("", finish_reason="aborted"), fx]) == "equal"
     assert st("abort_prefill", [r("", finish_reason="aborted"), r("x")],
-              [r("", finish_reason="aborted"), r("x")]) == "equal"
-    assert st("abort_prefill", [r("ab", finish_reason="aborted"), r("x")],
-              [r("ab", finish_reason="aborted"), r("x")]) == "unexercised"
+              [r("", finish_reason="aborted"), r("x")]) == "unexercised"
+    assert st("abort_prefill", [r("ab", finish_reason="aborted"), fx],
+              [r("ab", finish_reason="aborted"), fx]) == "unexercised"
     mt = [r("a", cached_tokens=0), r("b", cached_tokens=0)]
     assert st("multi_turn", mt, mt) == "unexercised"
     assert st("multi_turn", mt, [mt[0], r("b", cached_tokens=0, tokens=-1)]) == "diff"
@@ -443,6 +463,12 @@ def self_test():
     assert st("interleaved", il, il) == "unexercised"
     assert st("interleaved", il[:3], il[:3]) == "equal"
     assert st("interleaved", il[:3], il[:2] + [r("c", cached_tokens=4)]) == "diff"
+    # the engine's N live records reuse what one legacy record dropped: intended, if the prompt is the same
+    lx = il[:2] + [r("c", cached_tokens=0, prefill_tokens=10)]
+    assert st("interleaved", lx, il[:2] + [r("c", cached_tokens=6, prefill_tokens=4)]) == "intended"
+    assert st("interleaved", lx, il[:2] + [r("c", cached_tokens=6, prefill_tokens=5)]) == "diff"
+    assert st("abort_decode", [ab[0], r("x", cached_tokens=0, prefill_tokens=9)],
+              [ab[0], r("x", cached_tokens=8, prefill_tokens=1)]) == "intended"
 
     # gates
     def arm(loop=None, tau=1.0, sweep=("abc", "bcd", "cde", "def"), repro=("p", "p"), rc=0, iso="ab"):
@@ -479,6 +505,12 @@ def self_test():
     assert not perf_ok({"prefill_tok_s_delta_pct": 0.0, "decode_tok_s_delta_pct": 2.1})
     assert not perf_ok({"prefill_tok_s_delta_pct": None, "decode_tok_s_delta_pct": 0.0})
     assert not ok(arm(iso="ax"), leg=arm(iso="ax"))  # state leaked into a later request
+    part = arm(iso="ax")
+    part["cold"][0]["done"]["prefill_tokens"] = 5
+    part["isolation"][0]["done"]["cached_tokens"] = 1  # partial reuse: not judged
+    assert isolation_check(part) == UNEXERCISED and ok(part, leg=part)
+    part["isolation"][0]["done"]["cached_tokens"] = 5  # the whole prompt restored: judged
+    assert isolation_check(part) is False
     conc_self_test()
     print("self-test ok")
 
@@ -511,7 +543,7 @@ def conc_self_test():
         done = {k: v for k, v in (("cached_tokens", cached), ("tau", tau), ("loop", loop)) if v is not None}
         return result(typ, [["t", c] for c in text], [[ord(c), i] for i, c in enumerate(text)], None, done)
 
-    def conc_arm(loop, backend, tok_s=30.0, ttft=1000.0, k4=None, cached=5, tau=None, rc=0, stamp=None):
+    def conc_arm(loop, backend, tok_s=30.0, ttft=1000.0, k4=None, cached=5, tau=None, rc=0, stamp=None, mt4=None):
         reqs, stamp = {}, stamp or loop
         for wl in ("stateless", "multiturn"):
             for k in (1, 4):
@@ -520,6 +552,8 @@ def conc_self_test():
                     reqs[f"{wl}/{k}/1/0/1"] = req("cd", cached=cached, tau=tau, loop=stamp)
         if k4:
             reqs["stateless/4/1/0/0"] = k4
+        if mt4:
+            reqs["multiturn/4/1/0/1"] = mt4
         cells = {f"{wl}/{k}": {"out_tok_s": tok_s, "ttft_p50_ms": ttft, "ttft_p99_ms": ttft}
                  for wl in ("stateless", "multiturn") for k in (1, 4)}
         return {"loop": loop, "backend": backend, "rc": rc, "cells": cells, "reqs": reqs}
@@ -555,6 +589,15 @@ def conc_self_test():
     assert not cj(eng=conc_arm("engine", "noslots", tok_s=61.0, ttft=950.0))["ok"]  # TTFT above target
     assert not cj(eng=good, batch=conc_arm("legacy", "batch", rc=1))["ok"]  # an arm that did not run
     assert cj(eng=good)["engine"]["engine-noslots"]["target"] == {"stateless/4": True, "multiturn/4": True}
+    # legacy drops the follow-up's prefix at k=4 and prefills it cold (other tokens); an
+    # engine that keeps it is compared with the legacy request that reused as much (k=1)
+    cold4 = conc_arm("legacy", "noslots", mt4=req("zz", cached=0, loop="legacy"))
+    kept = cj(leg=cold4, c={})
+    assert kept["ok"] and not kept["unexercised"] and kept["reference_c1_ne_cn"]["legacy-noslots"] == 1, kept
+    lost = cj(eng=conc_arm("engine", "noslots", mt4=req("zz", cached=0)), leg=cold4, c={})
+    assert lost["fails"] == ["engine-noslots: C1 != CN 1"], lost["fails"]
+    odd = cj(eng=conc_arm("engine", "noslots", mt4=req("cd", cached=3)), leg=cold4, c={})
+    assert odd["ok"] and odd["engine"]["engine-noslots"]["ref_reuse_unmatched"] == ["multiturn/4/1/0/1"]
 
 
 def host_state(own_pid=None):
@@ -747,10 +790,19 @@ def judge_conc(arms, c, expect_engine):
         if a["rc"] != 0 or not a["cells"] or not a["reqs"]:
             fails.append(f"{tag}: bench rc {a['rc']}, {len(a['cells'])} cells, {len(a['reqs'])} requests")
     same = lambda x, y: x is not None and y is not None and (x["events"], x["ids"]) == (y["events"], y["ids"])
+    cached = lambda x: (x or {"done": {}})["done"].get("cached_tokens") or 0
+    at = lambda key, k: "/".join([key.split("/")[0], str(k), *key.split("/")[2:]])
+    c1_ne_cn = lambda reqs: sorted(k for k, x in reqs.items()
+                                   if k.split("/")[1] != "1" and not same(x, reqs.get(at(k, 1))))
+    # every arm's C1 != CN count; legacy rows are reference only (a legacy multi-turn
+    # follow-up that loses its prefix at k>1 prefills cold, which is not token-exact
+    # with the reused prefix, HIPF-472)
+    reference = {tag: len(c1_ne_cn(a["reqs"])) for tag, a in arms.items() if a["loop"] != "engine"}
     for tag, a in arms.items():
         if a["loop"] != "engine":
             continue
         reqs, rr = a["reqs"], (ref or {}).get("reqs", {})
+        ks = sorted({x.split("/")[1] for x in rr}, key=int)
         r = report[tag] = {}
         r["errors"] = sorted(k for k, x in reqs.items() if x["type"] != "done")
         loops = [x["done"].get("loop") for x in reqs.values() if x["type"] == "done"]
@@ -758,11 +810,17 @@ def judge_conc(arms, c, expect_engine):
         loop_bad = (any(v not in (None, "legacy", "engine") for v in loops)
                     or (None in loops and any(v is not None for v in loops))
                     or (expect_engine and any(v != "engine" for v in loops)))
-        r["c1_ne_cn"] = sorted(k for k, x in reqs.items() if k.split("/")[1] != "1" and not same(
-            x, reqs.get("/".join([k.split("/")[0], "1", *k.split("/")[2:]]))))
-        r["ne_ref"] = sorted(k for k, x in reqs.items() if not same(x, rr.get(k)))
+        r["c1_ne_cn"] = c1_ne_cn(reqs)
+        # G-tok: against the ref request with the same prefix reuse (same k first),
+        # since a reused prefix and a cold prefill are not token-exact
+        refs = {k: next((y for y in (rr.get(at(k, kk)) for kk in [k.split("/")[1], *ks])
+                         if y is not None and cached(y) == cached(x)), None) for k, x in reqs.items()}
+        r["ne_ref"] = sorted(k for k, x in reqs.items() if k not in rr or (refs[k] and not same(x, refs[k])))
+        r["ref_reuse_unmatched"] = sorted(k for k in reqs if k in rr and refs[k] is None)
+        if r["ref_reuse_unmatched"]:
+            unexercised.append(f"{tag}: {len(r['ref_reuse_unmatched'])} requests reused a prefix length no ref "
+                               f"request did (tokens not compared)")
         follow = [k for k in reqs if k.startswith("multiturn/") and not k.endswith("/0")]
-        cached = lambda x: (x or {"done": {}})["done"].get("cached_tokens") or 0
         r["cache_below_ref"] = sorted(k for k in follow if cached(reqs[k]) < cached(rr.get(k)))
         r["cache_hits"] = [sum(cached(reqs[k]) > 0 for k in follow), sum(cached(rr.get(k)) > 0 for k in follow),
                            len(follow)]
@@ -789,7 +847,7 @@ def judge_conc(arms, c, expect_engine):
             if bad:
                 fails.append(f"{tag}: {name}" + (f" {len(bad)}" if isinstance(bad, list) else ""))
     return {"ok": not fails, "fails": fails, "unexercised": unexercised, "engine": report,
-            "cells": {tag: a["cells"] for tag, a in arms.items()}}
+            "reference_c1_ne_cn": reference, "cells": {tag: a["cells"] for tag, a in arms.items()}}
 
 
 def sha256_cached(path, out):
@@ -838,6 +896,11 @@ def main():
     model = os.path.expanduser(route["model"])
     route["model"] = model
 
+    # identify the harness when it starts: a run takes hours and the file may change under it
+    me = Path(__file__).resolve()
+    git = lambda *a: subprocess.run(["git", "-C", str(me.parent), *a], capture_output=True, text=True).stdout.strip()
+    harness = {"sha256": hashlib.sha256(me.read_bytes()).hexdigest(), "git_head": git("rev-parse", "HEAD"),
+               "dirty": bool(git("status", "--porcelain", "--", str(me)))}
     res, t0, j, perf, conc, unex, summary = {}, time.time(), {"ok": True}, None, None, [], []
     if not args.conc_only:
         for arm in ARMS:
@@ -847,6 +910,7 @@ def main():
         j = judge(res, route, args.tvd_max, perf)
         # a pass with unexercised scenarios must not be citable as covering them
         unex = [k for k, v in j["scenarios"].items() if v["status"] == UNEXERCISED]
+        unex += [f"isolation ({arm})" for arm, v in j["isolation"].items() if v == UNEXERCISED]
         sampled = j["sampled"]
         summary.append(", ".join(f"{k}={v['status']}" for k, v in j["scenarios"].items()))
         summary.append(f"sampled tvd={sampled['tvd_first8']} repro={sampled['legacy_reproducible']}/"
@@ -868,16 +932,13 @@ def main():
     verdict = ("pass-partial" if unex else "pass") if ok else "fail"
     summary = ", ".join(summary)
 
-    me = Path(__file__).resolve()
-    git = lambda *a: subprocess.run(["git", "-C", str(me.parent), *a], capture_output=True, text=True).stdout.strip()
     receipt = {
         "route": route, "verdict": verdict, "unexercised": unex, **{k: v for k, v in j.items() if k != "ok"},
         "daemon": {"path": os.path.realpath(args.daemon),
                    "md5": hashlib.md5(Path(args.daemon).read_bytes()).hexdigest()},
         "fixture_sha256": sha256_cached(model, out),
         # identifies the harness bytes even when run from a copy outside the repo
-        "harness": {"sha256": hashlib.sha256(me.read_bytes()).hexdigest(), "git_head": git("rev-parse", "HEAD"),
-                    "dirty": bool(git("status", "--porcelain", "--", str(me)))},
+        "harness": harness,
         "host": host_state(), "wall_s": round(time.time() - t0, 1), "arms": res,
     }
     if perf:

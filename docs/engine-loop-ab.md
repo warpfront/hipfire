@@ -93,11 +93,14 @@ fields are compared except timing keys (`*_ms`, `*_s`, `*tok_s`, `*timings`,
 
 **Scenario status** is `equal`, `intended` (only whitelisted diffs),
 `unexercised` or `diff`. Only `diff` fails a scenario. `unexercised` means the
-scenario did not test what its name says, judged on the legacy arm: the
-`eos_budget` probe hit its budget before EOS, a `multi_turn` turn after the
-first or an `interleaved` turn 2 reused no prefix (`cached_tokens` 0), the
-`abort_prefill` abort landed after decode tokens, the `abort_decode` abort
-landed past half the budget, or its follow-up reused no prefix.
+scenario did not test what its name says: the `eos_budget` probe hit its
+budget before EOS, a `multi_turn` turn after the first reused no prefix
+(`cached_tokens` 0), the `abort_prefill` abort landed after decode tokens, or
+the `abort_decode` abort landed past half the budget (all judged on the legacy
+arm); or, judged on the engine arm, an `interleaved` turn 2 or an abort
+follow-up reused no prefix. The legacy loop keeps one live session record and
+drops it on an abort (Qwen4 AR on halo: `interleaved` turn 2 and both abort
+follow-ups reuse 0, HIPF-472), so these measure the engine's N records.
 The receipt verdict is then `pass-partial` (exit 0) and the EVIDENCE disposition names the unexercised scenarios; a gate that relies on that scenario
 needs another route or fixture. Baseline: on Gemma 4 26B-A4B, `multi_turn`,
 `abort_prefill` and `abort_decode` are all `unexercised` (HIPF-475).
@@ -125,6 +128,11 @@ These are reported as `intended` and do not fail the run:
 3. **Stop on the last budget token** is `finish_reason: "stop"` on the engine,
    following the `qwen_dflash_hit_length_cap` semantics. Legacy `length` vs
    engine `stop` is allowed in `eos_budget`.
+4. **More prefix reuse where legacy drops its record.** In `interleaved`
+   turn 2 and the abort follow-ups, engine `cached_tokens` above legacy's is
+   allowed when `cached_tokens + prefill_tokens` (the prompt) is equal and the
+   tokens are equal (M1 gate: N live records, a reusable session after an
+   abort). Less reuse than legacy is a diff.
 
 Every other difference is a diff.
 
@@ -138,7 +146,10 @@ A run passes when all of these hold:
   the value is `legacy` or the arm's own. With `expect_engine`, every
   engine-arm done envelope is `engine`. A pre-engine binary emits no `loop`
   and passes.
-- **Isolation:** within each arm, `isolation` gives `cold`'s tokens and ids.
+- **Isolation:** within each arm, `isolation` gives `cold`'s tokens and ids
+  when it prefilled cold or restored the whole prompt. A partial prefix reuse
+  is not token-exact with a cold prefill (see Concurrency), so it is
+  `unexercised`.
 - **G-spec:** for a route whose legacy arm reports `tau`, the engine reports
   `tau` on the same requests and its mean over every greedy request is at
   least legacy tau − 1 %. On Qwen4 MTP the legacy-vs-legacy spread already
@@ -194,8 +205,16 @@ rows; legacy fn-lanes are not row-exact by default):
 
 - every request ends in `done`; `loop` stamps as in the Loop gate
 - **C1 == CN:** each request at k>1 has the tokens and ids of the same
-  request (round, conversation, turn) at k=1
-- **G-tok:** tokens and ids equal the `ref` arm's
+  request (round, conversation, turn) at k=1. Legacy rows report their count
+  as `reference_c1_ne_cn`: the legacy loop keeps one session record, so at k>1
+  a multi-turn follow-up prefills cold, and a cold prefill is not token-exact
+  with a reused prefix (Qwen4 AR mq4-xts, halo: 75 of 96 follow-ups at k=2/4
+  differ from k=1, every stateless request and first turn is equal, HIPF-472).
+  An engine that keeps each conversation's prefix passes it.
+- **G-tok:** tokens and ids equal the `ref` arm's request with the same
+  `cached_tokens`, at the same k first, else at another k. A request whose
+  reuse no `ref` request matched is listed (`ref_reuse_unmatched`) and marks
+  the run `pass-partial`.
 - **cache:** every multi-turn follow-up reuses at least the `ref` arm's
   `cached_tokens`; no follow-up with a prefix hit on the engine marks the run
   `pass-partial`
