@@ -89,7 +89,6 @@ pub fn load_lfm2moe_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Lfm2Mo
                 weights,
                 state,
                 eos_tok,
-                lfm2_decode_batch: None,
                 vision_config: None,
                 vision_weights: None,
             })
@@ -114,7 +113,6 @@ pub fn load_lfm2moe_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Lfm2Mo
                 weights,
                 state,
                 eos_tok,
-                lfm2_decode_batch: None,
                 // Safetensors Dir loads stay text-only — the qwen35 carrier
                 // makes the same choice; VL artifacts are HFQ-only here.
                 vision_config: None,

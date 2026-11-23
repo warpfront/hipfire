@@ -82,12 +82,6 @@ pub struct Lfm2MoeBundle {
     pub weights: Lfm2MoeWeights,
     pub state: Lfm2MoeState,
     pub eos_tok: u32,
-    /// Continuous-decode batch state (arch 11 dense, single-GPU). `Some` only
-    /// when continuous batch has been staged via `batch_staging::stage_continuous_batch`;
-    /// `None` is the common AR path. Lives in the bundle (not `LoadedModel`)
-    /// so `LoadedModel` can become arch-free. Previously
-    /// `LoadedModel.lfm2_decode_batch`.
-    pub lfm2_decode_batch: Option<crate::batch::Lfm2DecodeBatchState>,
     /// Optional SigLIP2-NaFlex tower + multi-modal projector, present only
     /// for `lfm2_vl` artifacts quantized with `--include-vision`. Text-only
     /// checkpoints keep `None` on both fields; images fail closed at the

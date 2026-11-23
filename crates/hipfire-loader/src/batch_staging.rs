@@ -10,7 +10,7 @@
 //!
 //! It belongs here rather than in the daemon because `LoadedModel` already
 //! owns the typed fields these write (`qwen35_decode_batch`,
-//! `lfm2_decode_batch`, `EpArch::Qwen35 { batch, .. }`) — only the
+//! `EpArch::Qwen35 { batch, .. }`) — only the
 //! *construction* had leaked upward.
 //!
 //! `ContinuousBatchScheduler` lives in `hipfire-engine`, which is *above* this
@@ -212,75 +212,6 @@ pub fn stage_continuous_batch(
                 // staged through the VMM branch above; there is no
                 // fixed-lane qwen4 batch state.
                 eprintln!("[daemon] qwen4 lanes need serve.vmm_batch — fallback to sequential");
-            }
-            Some(crate::ContinuousBatchRoute::Lfm2Moe) => {
-                if m.lfm2moe().is_none() {
-                    eprintln!("[daemon] continuous batch requested but model state not Lfm2Moe — fallback to sequential");
-                } else if !m.lfm2moe().unwrap().config.is_dense() {
-                    eprintln!(
-                                        "[daemon] continuous batch requested but LFM MoE not supported (dense only) — fallback to sequential"
-                                    );
-                } else if let Err(reason) = hipfire_arch_lfm2moe::batch_weight_formats_supported(
-                    &m.lfm2moe().unwrap().weights,
-                ) {
-                    eprintln!(
-                                        "[daemon] continuous batch requested but weight formats unsupported: {} — fallback to sequential",
-                                        reason
-                                    );
-                } else {
-                    let repeat_cap = 2048usize.max(1);
-                    let max_attention_lane = {
-                        let b = m.lfm2moe().unwrap();
-                        gpu.attention_q8_0_kv_independent_max_lane_capacity(b.config.head_dim)
-                    };
-                    let batch_lane_capacity = m.max_seq.min(max_attention_lane);
-                    if batch_lane_capacity == 0 {
-                        eprintln!(
-                                            "[daemon] continuous batch unavailable: independent attention admits no lanes — fallback to sequential"
-                                        );
-                    } else {
-                        if batch_lane_capacity < m.max_seq {
-                            eprintln!(
-                                                "[daemon] continuous batch lane capacity clamped: requested={} supported={}",
-                                                m.max_seq,
-                                                batch_lane_capacity
-                                            );
-                        }
-                        // Clone config for the call so the immutable borrow ends before the mutable one.
-                        let cfg = m.lfm2moe().unwrap().config.clone();
-                        match hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState::new(
-                            gpu,
-                            &cfg,
-                            requested,
-                            batch_lane_capacity,
-                            repeat_cap,
-                        ) {
-                            Ok(batch_state) => {
-                                if let Some(b) = m.lfm2moe_mut() {
-                                    b.lfm2_decode_batch = Some(batch_state);
-                                    out.slots = requested;
-                                    out.lane_capacity = batch_lane_capacity;
-                                    out.capable = true;
-                                    eprintln!(
-                                                        "[daemon] continuous batch staged: slots={} lane_cap={} repeat_cap={}",
-                                                        requested,
-                                                        batch_lane_capacity,
-                                                        repeat_cap
-                                                    );
-                                } else {
-                                    // Should be unreachable (we checked is_some above), but free to avoid leak.
-                                    batch_state.free_gpu(gpu);
-                                    eprintln!("[daemon] continuous batch requested but model state not Lfm2Moe — fallback to sequential");
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                                    "[daemon] continuous batch allocation failed: {e} — fallback to sequential"
-                                                );
-                            }
-                        }
-                    }
-                }
             }
             Some(crate::ContinuousBatchRoute::MuseGlimmer) => match m.muse_glimmer_mut() {
                 // The lanes share the singleton's verify scratch, so a DFlash

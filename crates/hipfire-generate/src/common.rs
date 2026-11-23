@@ -1740,13 +1740,6 @@ pub fn fail_closed_reset_target_and_spec(
                 }
             }
         }
-        if let Some(b) = m.lfm2moe_mut() {
-            if let Some(bs) = b.lfm2_decode_batch.as_mut() {
-                if let Err(e) = bs.reset(gpu) {
-                    push_reset_err(&mut first_err, "lfm2_decode_batch.reset", e);
-                }
-            }
-        }
     }
     // Always free host checkpoint rings. When a Speculator is present its own
     // ring is freed by `reset` below; these are AR/vestigial rings on `m`.

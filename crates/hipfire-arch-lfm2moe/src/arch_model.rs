@@ -39,7 +39,6 @@ impl ArchModel for Lfm2MoeBundle {
             weights,
             state,
             eos_tok: _,
-            lfm2_decode_batch,
             vision_config: _,
             vision_weights,
         } = *self;
@@ -47,9 +46,6 @@ impl ArchModel for Lfm2MoeBundle {
         // pool drain reuses VRAM (pointer-keyed leak class; see docs/testing.md §2B).
         if let Some(vw) = vision_weights {
             vw.free_gpu(gpu);
-        }
-        if let Some(batch) = lfm2_decode_batch {
-            batch.free_gpu(gpu);
         }
         state.free_gpu(gpu);
         weights.free_gpu(gpu);
