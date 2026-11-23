@@ -115,7 +115,7 @@ static ROTATION: LazyLock<RotationFamily> = LazyLock::new(RotationFamily::new);
 /// Arches whose batched sandwich prefill admits the exact fused and wide
 /// routes below. Elsewhere batched rows take the per-row fallbacks.
 fn batched_fusion_arch(arch: &str) -> bool {
-    matches!(arch, "gfx1100" | "gfx1201")
+    matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
 }
 
 /// True while a calibration collector is armed. Routes that never

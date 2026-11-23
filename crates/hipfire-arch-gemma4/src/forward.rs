@@ -1190,7 +1190,7 @@ fn embed_lookup_row(
 
 #[inline]
 fn supports_gemma4_batched_prefill_arch(arch: &str) -> bool {
-    matches!(arch, "gfx1100" | "gfx1201")
+    matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
 }
 
 #[cfg(test)]
@@ -1208,7 +1208,7 @@ mod tests {
     fn batched_prefill_arch_scope_is_explicit() {
         assert!(supports_gemma4_batched_prefill_arch("gfx1100"));
         assert!(supports_gemma4_batched_prefill_arch("gfx1201"));
-        assert!(!supports_gemma4_batched_prefill_arch("gfx1151"));
+        assert!(supports_gemma4_batched_prefill_arch("gfx1151"));
         assert!(!supports_gemma4_batched_prefill_arch("gfx1200"));
     }
 }

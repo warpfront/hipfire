@@ -1552,17 +1552,17 @@ impl FeatureFlags {
             gemma4_batched_embedding_prefill: parse_bool(
                 "HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL",
             )
-            .unwrap_or(matches!(arch, "gfx1100" | "gfx1201")),
+            .unwrap_or(matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")),
             gemma4_ple_batched_prefill: parse_bool("HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL")
                 .unwrap_or(false),
             gemma4_ple_branch_batched_prefill: parse_bool(
                 "HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL",
             )
-            .unwrap_or(matches!(arch, "gfx1100" | "gfx1201")),
+            .unwrap_or(matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")),
             gemma4_ple_activation_fused_prefill: parse_bool(
                 "HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL",
             )
-            .unwrap_or(matches!(arch, "gfx1100" | "gfx1201")),
+            .unwrap_or(matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")),
             rope_interleaved_legacy: value("HIPFIRE_ROPE_INTERLEAVED_LEGACY").ok().as_deref()
                 == Some("1"),
             wo_wmma_variant: value("HIPFIRE_WO_WMMA_VARIANT").ok(),
@@ -4839,7 +4839,14 @@ mod tests {
         assert!(!gfx1201.gemma4_q8_fused_prefill);
         assert!(!gfx1201.gemma4_ple_batched_prefill);
 
-        for arch in ["gfx1101", "gfx1102", "gfx1151", "gfx1200"] {
+        let gfx1151 = FeatureFlags::from_process_config("gfx1151", &process);
+        assert!(gfx1151.gemma4_batched_embedding_prefill);
+        assert!(gfx1151.gemma4_ple_branch_batched_prefill);
+        assert!(gfx1151.gemma4_ple_activation_fused_prefill);
+        assert!(!gfx1151.gemma4_q8_fused_prefill);
+        assert!(!gfx1151.gemma4_ple_batched_prefill);
+
+        for arch in ["gfx1101", "gfx1102", "gfx1200"] {
             let flags = FeatureFlags::from_process_config(arch, &process);
             assert!(!flags.gemma4_batched_embedding_prefill, "arch={arch}");
             assert!(!flags.gemma4_ple_branch_batched_prefill, "arch={arch}");
@@ -4867,7 +4874,7 @@ mod tests {
         }])
         .unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
-        for arch in ["gfx1100", "gfx1201"] {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             let flags = FeatureFlags::from_process_config(arch, &process);
             assert!(!flags.gemma4_batched_embedding_prefill, "arch={arch}");
             assert!(!flags.gemma4_ple_branch_batched_prefill, "arch={arch}");

@@ -254,7 +254,7 @@ Architecture-gated default-on kernel routes (exact arch only; other arches keep 
 | Key | Default on | Opt out | Notes |
 |---|---|---|---|
 | `kernel.gfx1100_fa2_split_verify` | exact gfx1100 | `false` / `HIPFIRE_GFX1100_FA2_SPLIT_VERIFY=0`; parent `kernel.verify_attn=false` / `HIPFIRE_VERIFY_ATTN=0` | Uses FA2 split-KV S8 only inside the existing dense Qwen H24/KV4/HD256, Q8/Q8 VMM-KV, sequential B4..32 long-context verifier envelope; admission, capture and Redline guards are unchanged. Its split partial/merge reduction order is not byte-identical to the incumbent route; promotion is backed by logit KLD, a hard30 task tie and canonical-XTS DFlash A/B evidence. |
-| `kernel.gemma4_ple_branch_batched_prefill` | `auto`: exact gfx1100 and gfx1201 | `false` / `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=0` | Exact-arithmetic batched PLE branch projections; gfx1101, gfx1102, gfx1151, gfx1200 stay off. Separate from `kernel.gemma4_ple_batched_prefill` (default off). |
+| `kernel.gemma4_ple_branch_batched_prefill` | `auto`: exact gfx1100, gfx1151 and gfx1201 | `false` / `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=0` | Exact-arithmetic batched PLE branch projections; gfx1101, gfx1102, gfx1200 stay off. Separate from `kernel.gemma4_ple_batched_prefill` (default off). |
 | `kernel.gfx11_q8_fa2_wide` | `auto`: exact gfx1100 and gfx1151 (not gfx1100-only) | `false` / `HIPFIRE_GFX11_Q8_FA2_WIDE=0` | Whole-chunk Q8/Q8 FA2 prefill; requires `kernel.gfx11_fa2_prefill`. gfx1151 enabled deliberately in commit `ae9c5cf9d12a5a63ae60630637d22d00a4fc964e` via the twin CU-mode dispatch (same arithmetic, byte-identical). |
 | `kernel.pm_decode` | `auto`: exact gfx1201 | `false` / `HIPFIRE_PM_DECODE=0` | Loads the embedded, oracle-accepted PeaceMaker twins of the five W1 decode projection modules (`fused_qkvza_hfq4g256_mq4v2`, `fused_qkv_hfq4g256_mq4v2`, `fused_gate_up_hfq4g256_mq4v2`, `gemv_hfq4g256_multirow_default_mq4v2`, `gemv_hfq4g256_residual_mq4v2`) instead of compiling them with hipcc. Each image is pinned by bundle and ELF SHA-256 and refused on mismatch. Byte-identical outputs; the hipcc modules stay in the kernel pack for the opt-out; other arches never load the twins. |
 
@@ -1892,8 +1892,8 @@ ranges are the schema's; every key also appears in the generated
 | `kernel.calib_force_bf16` | `false` | bool; keep native-BF16 calibration teachers in BF16 (calibration only). |
 | `kernel.gemma4_q8_fused_prefill` | `false` | bool; fuse eligible Gemma 4 Q8 prefill projections on gfx1100. |
 | `kernel.gemma4_ple_batched_prefill` | `false` | bool; batch the Gemma 4 E-series PLE model projection on gfx1100. |
-| `kernel.gemma4_batched_embedding_prefill` | `"auto"` | `auto` \| bool; `auto` enables validated gfx1100/gfx1201. |
-| `kernel.gemma4_ple_activation_fused_prefill` | `"auto"` | `auto` \| bool; `auto` enables validated gfx1100/gfx1201. |
+| `kernel.gemma4_batched_embedding_prefill` | `"auto"` | `auto` \| bool; `auto` enables validated gfx1100/gfx1151/gfx1201. |
+| `kernel.gemma4_ple_activation_fused_prefill` | `"auto"` | `auto` \| bool; `auto` enables validated gfx1100/gfx1151/gfx1201. |
 | `memory.unsafe_wsl_vmm_kv` | `false` | bool. UNSAFE until certified: allow the VMM KV backend under WSL/ROCDXG, where WDDM VA growth may alias earlier KV pages. Off: automatic KV selects legacy and an explicit `kv_backend = "vmm"` is refused. |
 | `replay.unsafe_wsl_redline` | `false` | bool. UNSAFE until certified: allow Redline PM4/retained replay under WSL/ROCDXG. Off: the retained default falls back to the HIP graph and an explicit `replay.backend = "redline"`/`"shadow"` is refused. |
 
