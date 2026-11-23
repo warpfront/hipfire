@@ -912,7 +912,15 @@ When `messages` contains no `system` or `developer` role, the serve layer insert
 turn that runs out of `max_tokens` while still reasoning ends with `length`:
 the partial `reasoning_content` is returned and `content` is empty. A turn
 the model ends (end-of-turn token) while still reasoning ends the same way
-with `stop`. Neither turn releases a tool call or is cached.
+with `stop`. Neither turn releases a tool call. On the Qwen3.5-family routes
+(Qwen3.6/3.8 27B and 35B-A3B: `qwen_ar`, `qwen_dflash` incl. MTP) and on
+Flash-Next (`qwen4_ar`, `qwen4_spec`) both are kept for prefix reuse like any
+other turn, unless the body holds a tool call: the conversation state stays
+(Flash-Next keeps its session live) and the generated body is stored, so the
+next request continues in place when it sends the turn back with its
+`reasoning_content`. Sent back with empty `content` and no
+`reasoning_content`, the turn carries nothing that identifies it: it renders
+from its text, and reuse resumes from the last snapshot before it.
 
 Streaming error contract: a failure that happens BEFORE the first byte is a
 plain HTTP error status (no SSE body). A failure after the stream has started
