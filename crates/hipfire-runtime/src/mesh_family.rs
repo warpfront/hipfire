@@ -145,10 +145,11 @@ pub trait MeshLanes {
     /// session adopts it); the lane is freed. The resident state must hold
     /// no request.
     fn unpark(&mut self, gpus: &mut Gpus, tag: u64, tokens: &[u32]) -> Result<()>;
-    /// One epoch: every `(tag, token)` lane runs `token`; returns each
-    /// lane's argmax of that row, in order. On `Err` the step's lanes are
-    /// poisoned (free them).
-    fn step_lanes(&mut self, gpus: &mut Gpus, rows: &[(u64, u32)]) -> Result<Vec<u32>>;
+    /// One epoch: every `(tag, token, logits)` lane runs `token`; returns, in
+    /// order, each lane's argmax of that row ([`DecodeOut::Top1`]) or, with
+    /// `logits`, the row itself ([`DecodeOut::Logits`], for the request's
+    /// own sampler). On `Err` the step's lanes are poisoned (free them).
+    fn step_lanes(&mut self, gpus: &mut Gpus, rows: &[(u64, u32, bool)]) -> Result<Vec<DecodeOut>>;
     /// Free `tag`'s lane (host only; the next park reuses its state).
     fn free_lane(&mut self, tag: u64);
 }

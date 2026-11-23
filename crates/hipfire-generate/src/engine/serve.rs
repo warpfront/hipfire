@@ -13,8 +13,9 @@
 //!
 //! A request that finished on the resident state keeps it until the client
 //! commits its terminal: the commit then keeps its conversation live in the
-//! session cache, as the singleton does. A request that finished in a lane
-//! freed the lane at once (no live record).
+//! session cache, as the singleton does, and moves it into a lane record. A
+//! request that finished in a lane keeps that lane as its conversation's
+//! record once committed ([`LaneRecord`]); a cancel frees it.
 
 use super::chatml::{ChatMl, ChatMlStream, Host};
 use super::sched::{Batch, Ended, Place, Scheduler};
@@ -955,22 +956,42 @@ impl Batch for Ctx<'_> {
             remaining,
         )?;
         if let Some(request) = live.request.take() {
-            self.runner.end(request, self.gpus)?;
+            if let Err(error) = self.runner.end(request, self.gpus) {
+                // The request is in its lane now: settle rolls back the
+                // resident state only, so the lane is freed here.
+                if let Some(lanes) = self
+                    .state
+                    .mesh_family()
+                    .and_then(|family| family.mesh_lanes())
+                {
+                    lanes.free_lane(live.tag);
+                }
+                return Err(error);
+            }
         }
         Ok(())
     }
 
-    fn step_lanes(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
-        let tagged: Vec<(u64, u32)> = rows
+    fn step_lanes(&mut self, rows: &[(usize, u32, bool)]) -> Result<Vec<Next>, String> {
+        let tagged: Vec<(u64, u32, bool)> = rows
             .iter()
-            .map(|&(idx, token)| (self.live(idx).tag, token))
+            .map(|&(idx, token, logits)| (self.live(idx).tag, token, logits))
             .collect();
         let gpus = &mut *self.gpus;
-        self.state
+        let outs = self
+            .state
             .mesh_family()
             .and_then(|family| family.mesh_lanes())
             .ok_or("the load staged no engine lanes")?
-            .step_lanes(gpus, &tagged)
+            .step_lanes(gpus, &tagged)?;
+        Ok(outs
+            .into_iter()
+            .map(|out| match out {
+                DecodeOut::Top1(id) => Next::Top1(id),
+                DecodeOut::Logits(row) => Next::Logits(row),
+                DecodeOut::Device => unreachable!("lane rows come back to the host"),
+            })
+            .collect())
     }
 
     fn commit_prompt(&mut self, idx: usize) {

@@ -12,7 +12,7 @@ use crate::gpu_forward::Qwen4MeshHead;
 use crate::mesh_bindings::{Qwen4MeshBindings, Qwen4RankBand};
 use crate::program::qwen4_step_graph_with_output;
 use hipfire_dispatch::pipeline::step_graph::StepGraph;
-use hipfire_runtime::mesh_family::{EpochInput, MeshFamily, MeshLanes};
+use hipfire_runtime::mesh_family::{DecodeOut, EpochInput, MeshFamily, MeshLanes};
 use hipfire_runtime::multi_gpu::executor::{MeshStepBindings, Result};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::slot_batch::{
@@ -297,12 +297,12 @@ impl MeshLanes for Qwen4Bundle {
         Ok(())
     }
 
-    fn step_lanes(&mut self, gpus: &mut Gpus, rows: &[(u64, u32)]) -> Result<Vec<u32>> {
+    fn step_lanes(&mut self, gpus: &mut Gpus, rows: &[(u64, u32, bool)]) -> Result<Vec<DecodeOut>> {
         let gpu = device(gpus)?;
         let store = self.lanes().ok_or("Qwen4 lanes are not staged")?;
         // The executor takes a plan's requests in stable slot order.
         let mut slotted = Vec::with_capacity(rows.len());
-        for &(tag, token) in rows {
+        for &(tag, token, _) in rows {
             let epoch = lane_epoch(tag);
             let slot = store
                 .slot_of(&epoch)
@@ -318,7 +318,8 @@ impl MeshLanes for Qwen4Bundle {
                 .lane(&epoch)
                 .ok_or_else(|| format!("engine lane {} disappeared", epoch.request_tag))?;
             // A token other than the lane's last pick (a forced template
-            // token) becomes its pending seed first.
+            // token, or the request's own sampled draw) becomes its pending
+            // seed first.
             if store.root_seed(&epoch).or(lane.host.pending_seed) != Some(token) {
                 forced.push((epoch, token));
             }
@@ -337,25 +338,74 @@ impl MeshLanes for Qwen4Bundle {
         for (epoch, token) in forced {
             self.force_lane_seed(&epoch, token).map_err(text)?;
         }
-        let mut executor = self.lane_executor().map_err(text)?;
-        let advances = executor
-            .provision_step(gpu, &plan)
-            .and_then(|()| executor.forward_step(gpu, &plan))
-            .and_then(|out| executor.commit_step(gpu, &plan, out));
-        let advances = match advances {
-            Ok(advances) => advances,
-            Err(error) => {
+        let stepped = {
+            let mut executor = self.lane_executor().map_err(text)?;
+            let out = executor
+                .provision_step(gpu, &plan)
+                .and_then(|()| executor.forward_step(gpu, &plan));
+            if out.is_err() {
                 executor.abort_step(&plan);
-                return Err(error);
             }
+            out?
+        };
+        // A sampling request's row is read before the commit (the step's
+        // logits are valid until the next forward): decode row `r` of the
+        // plan is logits row `r`.
+        let vocab = self.config.vocab_size;
+        let mut rows_out = Vec::with_capacity(rows.len());
+        for &(tag, _, logits) in rows {
+            if !logits {
+                rows_out.push(None);
+                continue;
+            }
+            let row = plan
+                .requests
+                .iter()
+                .position(|request| request.epoch == lane_epoch(tag))
+                .ok_or_else(|| format!("lane {tag} is not in its step"))?;
+            let read = self
+                .lanes()
+                .and_then(|store| store.logits())
+                .ok_or_else(|| "the lane store has no step logits".to_string())
+                .and_then(|all| {
+                    let view = all.sub_offset(row * vocab, vocab);
+                    let mut bytes = vec![0u8; vocab * 4];
+                    gpu.dtoh_stream_ordered(&mut bytes, &view.buf)
+                        .map_err(text)?;
+                    gpu.take_device_wait_error().map_err(text)?;
+                    Ok(bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect::<Vec<f32>>())
+                });
+            match read {
+                Ok(row) => rows_out.push(Some(row)),
+                Err(error) => {
+                    if let Ok(mut executor) = self.lane_executor() {
+                        executor.abort_step(&plan);
+                    }
+                    return Err(format!("lane {tag} logits: {error}"));
+                }
+            }
+        }
+        let advances = {
+            let mut executor = self.lane_executor().map_err(text)?;
+            let advances = executor.commit_step(gpu, &plan, stepped);
+            if advances.is_err() {
+                executor.abort_step(&plan);
+            }
+            advances?
         };
         rows.iter()
-            .map(|&(tag, _)| {
-                advances
+            .zip(rows_out)
+            .map(|(&(tag, _, _), row)| match row {
+                Some(row) => Ok(DecodeOut::Logits(row)),
+                None => advances
                     .iter()
                     .find(|advance| advance.epoch == lane_epoch(tag))
                     .and_then(|advance| advance.committed_ids.last().copied())
-                    .ok_or_else(|| format!("lane {tag} committed no pick"))
+                    .map(DecodeOut::Top1)
+                    .ok_or_else(|| format!("lane {tag} committed no pick")),
             })
             .collect()
     }

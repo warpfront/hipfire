@@ -27,8 +27,9 @@
 //!   epoch that runs their first tokens. The requests that moved this tick
 //!   stream their first lane token together right before that epoch, not
 //!   after it ran them; one that this token ends never runs it.
-//! - A request that is not greedy (host sampler) never parks: it decodes on
-//!   the resident state until it finishes, while lanes keep decoding.
+//! - A request that samples (temperature, penalties) parks like a greedy one:
+//!   its lane row comes back as logits and it draws with its own RNG, so its
+//!   tokens are the singleton's for the same seed.
 //! - An abort or failure ends only its own request; [`Ended`] names where its
 //!   state was, so the caller releases exactly that.
 
@@ -73,8 +74,9 @@ pub trait Batch {
     ) -> Result<(u32, Next), String>;
     /// Move the resident `idx` into a lane; its next row runs `seed`.
     fn park(&mut self, idx: usize, seed: u32, remaining: usize) -> Result<(), String>;
-    /// One lane epoch: each `(idx, token)` runs `token`; each row's argmax.
-    fn step_lanes(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String>;
+    /// One lane epoch: each `(idx, token, logits)` runs `token`; each row's
+    /// argmax ([`Next::Top1`]) or, with `logits`, the row ([`Next::Logits`]).
+    fn step_lanes(&mut self, rows: &[(usize, u32, bool)]) -> Result<Vec<Next>, String>;
     /// [`Emit::commit_prompt`] of `idx`.
     fn commit_prompt(&mut self, idx: usize);
     /// [`Emit::emit`] of `idx`.
@@ -196,7 +198,8 @@ impl Scheduler {
         // A request that left the resident state for a lane hands it to the
         // next in line within the tick: queued prompts that each finish in
         // one epoch all reach this tick's lane epoch (their first tokens
-        // share it), a longer prompt takes one epoch per tick.
+        // share it), a longer prompt takes one epoch per tick. Aborts are
+        // polled again before every epoch inside the tick, as `drive` does.
         while self.start(b, &mut ended) && self.resident_epoch(b, &mut ended) {}
         self.lane_epoch(b, &mut ended);
         ended
@@ -212,8 +215,14 @@ impl Scheduler {
         if self.held {
             return false;
         }
-        let Some(&idx) = self.queue.front() else {
-            return false;
+        let idx = loop {
+            let Some(&idx) = self.queue.front() else {
+                return false;
+            };
+            if !b.aborted(idx) {
+                break idx;
+            }
+            ended.push(self.end(idx, Exit::Aborted));
         };
         let lanes = self.lanes().count();
         let capacity = b.lane_capacity();
@@ -236,16 +245,21 @@ impl Scheduler {
         }
     }
 
-    /// The resident request's next epoch; a greedy one that decodes while
+    /// The resident request's next epoch; a request that decodes while
     /// others are live moves into a lane (after one drained decode when its
-    /// next token is still on the device). Whether it moved.
+    /// next token is still on the device). Whether the resident state is
+    /// free for the next request (it moved or was aborted).
     fn resident_epoch(&mut self, b: &mut impl Batch, ended: &mut Vec<Ended>) -> bool {
         let Some(idx) = self.resident else {
             return false;
         };
+        if b.aborted(idx) {
+            ended.push(self.end(idx, Exit::Aborted));
+            return true;
+        }
         let lanes = self.lanes().count();
         let others = lanes > 0 || !self.queue.is_empty();
-        let parks = others && self.run_mut(idx).greedy() && lanes < b.lane_capacity();
+        let parks = others && lanes < b.lane_capacity();
         let run = self.run_mut(idx);
         // A parking request whose next token is host-known moves without an
         // epoch; every other resident request runs one.
@@ -291,6 +305,10 @@ impl Scheduler {
             .filter(|&idx| self.reqs[idx].as_ref().is_some_and(|req| req.fresh))
             .collect();
         for idx in fresh {
+            if b.aborted(idx) {
+                ended.push(self.end(idx, Exit::Aborted));
+                continue;
+            }
             let req = self.reqs[idx].as_mut().expect("a lane request is live");
             req.fresh = false;
             let run = req.run.as_mut().expect("a lane request has its run");
@@ -329,8 +347,9 @@ impl Scheduler {
         let mut rows = Vec::with_capacity(take);
         for j in 0..take {
             let idx = lanes[(self.cursor + j) % lanes.len()];
-            match self.run_mut(idx).next_work() {
-                Work::Decode { token: Some(token) } => rows.push((idx, token)),
+            let run = self.run_mut(idx);
+            match run.next_work() {
+                Work::Decode { token: Some(token) } => rows.push((idx, token, !run.greedy())),
                 work => {
                     let error = format!("a lane request has no host token to run: {work:?}");
                     ended.push(self.end(idx, Exit::Failed(error)));
@@ -347,20 +366,18 @@ impl Scheduler {
                 let error = failed.err().unwrap_or_else(|| {
                     format!("a lane epoch of {} rows returned another count", rows.len())
                 });
-                for &(idx, _) in &rows {
+                for &(idx, ..) in &rows {
                     ended.push(self.end(idx, Exit::Failed(error.clone())));
                 }
                 return;
             }
         };
-        for (&(idx, token), pick) in rows.iter().zip(picks) {
+        for (&(idx, token, _), pick) in rows.iter().zip(picks) {
             let ahead = self.reqs[idx].as_mut().and_then(|req| req.ahead.take());
             let emitted = ahead.map_or_else(|| b.emit(idx, token), Ok);
             let run = self.run_mut(idx);
             match emitted {
-                Ok((verdict, close)) => {
-                    run.apply_decode(Next::Top1(pick), verdict, &close, b.history(idx))
-                }
+                Ok((verdict, close)) => run.apply_decode(pick, verdict, &close, b.history(idx)),
                 Err(error) => {
                     ended.push(self.end(idx, Exit::Failed(error)));
                     continue;
@@ -455,7 +472,20 @@ mod tests {
         emitted: HashMap<usize, Vec<u32>>,
         aborted: HashMap<usize, bool>,
         in_lane: HashMap<usize, bool>,
+        /// Requests that sample (temperature 0.8) instead of argmax.
+        sampled: Vec<usize>,
+        /// `(a, b)`: the client aborts `b` while `a` prefills (mid-tick).
+        abort_during_prefill: Option<(usize, usize)>,
         calls: Vec<Call>,
+    }
+
+    /// A logits row over the state's history for a sampled request: several
+    /// near values, so the draw depends on the request's own RNG.
+    fn row_of(state: &[u32]) -> Vec<f32> {
+        let h = u64::from(pick(state)) + 1;
+        (0..VOCAB as u64)
+            .map(|i| ((h * (i + 3)) % 11) as f32 / 4.0)
+            .collect()
     }
 
     fn greedy() -> SamplerConfig {
@@ -490,7 +520,21 @@ mod tests {
         fn begin(&mut self, idx: usize) -> Result<RequestRun, String> {
             self.state.insert(idx, Vec::new());
             let len = self.prompts[&idx].len();
-            Ok(RequestRun::new(len, 0, self.budget, greedy(), 1))
+            let sampler = if self.sampled.contains(&idx) {
+                SamplerConfig {
+                    temperature: 0.8,
+                    ..greedy()
+                }
+            } else {
+                greedy()
+            };
+            Ok(RequestRun::new(
+                len,
+                0,
+                self.budget,
+                sampler,
+                7 + idx as u32,
+            ))
         }
 
         fn prefill(
@@ -503,10 +547,18 @@ mod tests {
                 "prompts run on the resident state"
             );
             self.calls.push(Call::Prefill(idx));
+            if let Some((_, other)) = self.abort_during_prefill.filter(|&(a, _)| a == idx) {
+                self.aborted.insert(other, true);
+            }
             let end = (rows.start + CHUNK).min(rows.end);
             let state = self.state.get_mut(&idx).unwrap();
             state.extend_from_slice(&self.prompts[&idx][rows.start..end]);
-            Ok((end, (end == rows.end).then(|| one_hot(pick(state)))))
+            let row = if self.sampled.contains(&idx) {
+                row_of(state)
+            } else {
+                one_hot(pick(state))
+            };
+            Ok((end, (end == rows.end).then_some(row)))
         }
 
         fn prefill_rerun(&mut self, _idx: usize) -> Result<Option<usize>, String> {
@@ -520,7 +572,7 @@ mod tests {
             top1: bool,
             keep: bool,
         ) -> Result<(u32, Next), String> {
-            assert!(top1, "the fake requests are greedy");
+            assert_eq!(top1, !self.sampled.contains(&idx));
             self.calls.push(Call::Decode { idx, keep });
             let ran = match token {
                 Some(token) => token,
@@ -528,6 +580,9 @@ mod tests {
             };
             let state = self.state.get_mut(&idx).unwrap();
             state.push(ran);
+            if !top1 {
+                return Ok((ran, Next::Logits(row_of(state))));
+            }
             let next = pick(state);
             if keep {
                 self.device.insert(idx, next);
@@ -547,16 +602,21 @@ mod tests {
             Ok(())
         }
 
-        fn step_lanes(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
+        fn step_lanes(&mut self, rows: &[(usize, u32, bool)]) -> Result<Vec<Next>, String> {
             self.calls
                 .push(Call::Lanes(rows.iter().map(|r| r.0).collect()));
             Ok(rows
                 .iter()
-                .map(|&(idx, token)| {
+                .map(|&(idx, token, logits)| {
                     assert!(self.in_lane.contains_key(&idx));
+                    assert_eq!(logits, self.sampled.contains(&idx));
                     let state = self.state.get_mut(&idx).unwrap();
                     state.push(token);
-                    pick(state)
+                    if logits {
+                        Next::Logits(row_of(state))
+                    } else {
+                        Next::Top1(pick(state))
+                    }
                 })
                 .collect())
         }
@@ -593,6 +653,8 @@ mod tests {
             eos: 0,
             capacity,
             rows,
+            // Request 1 samples in every scenario.
+            sampled: vec![1],
             ..Fake::default()
         }
     }
@@ -660,6 +722,12 @@ mod tests {
                 assert_eq!(
                     &b.emitted[&idx], tokens,
                     "request {idx} at capacity {capacity}, rows {rows}"
+                );
+            }
+            if capacity > 1 {
+                assert!(
+                    b.calls.contains(&Call::Park(1)),
+                    "the sampled request decodes in a lane too"
                 );
             }
             if capacity > 1 && rows > 1 {
@@ -833,6 +901,29 @@ mod tests {
             assert_eq!(b.emitted[&idx], reference[idx], "request {idx}");
         }
         assert!(!b.emitted.contains_key(&3));
+    }
+
+    #[test]
+    fn an_abort_latched_mid_tick_stops_the_request_before_its_next_epoch() {
+        let prompts = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
+        let mut b = fake(&prompts, 4, 4);
+        b.eos = u32::MAX;
+        // 1 is aborted while 0 prefills; 2 is aborted while 1 would prefill.
+        b.abort_during_prefill = Some((0, 1));
+        let mut s = Scheduler::default();
+        for idx in 0..3 {
+            s.admit(idx);
+        }
+        let ended = s.tick(&mut b);
+        assert!(!b.calls.contains(&Call::Prefill(1)), "{:?}", b.calls);
+        assert!(!b.emitted.contains_key(&1));
+        let one = ended
+            .iter()
+            .find(|e| e.idx == 1)
+            .expect("1 ended this tick");
+        assert_eq!((&one.exit, one.place), (&Exit::Aborted, Place::Queued));
+        // The resident state went on to the next request in the same tick.
+        assert!(b.calls.contains(&Call::Prefill(2)), "{:?}", b.calls);
     }
 
     #[test]
