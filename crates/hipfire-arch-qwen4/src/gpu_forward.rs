@@ -16518,6 +16518,9 @@ impl Qwen4GpuForward {
             Some("expert parallelism")
         } else if self.expert_stage.is_some() {
             Some("expert staging")
+        } else if self.expert_cache.is_some() {
+            // Its decode refuses a mesh segment; decline before any request starts.
+            Some("the exact expert cache")
         } else if self.npu_trunk_loaded() && !(self.scope.input && self.scope.output) {
             Some("the NPU trunk on a partial band")
         } else if self.qsa_tap.is_some() {

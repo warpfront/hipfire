@@ -104,6 +104,60 @@ pub trait MeshFamily {
         input: EpochInput<'_>,
         run: &mut dyn FnMut(&mut dyn MeshStepBindings) -> Result<()>,
     ) -> Result<()>;
+
+    /// The family's multi-request decode epoch, when this load staged one:
+    /// decoding requests leave the resident state for lanes of their own, so
+    /// the resident state takes the next prompt while they decode.
+    fn mesh_lanes(&mut self) -> Option<&mut dyn MeshLanes> {
+        None
+    }
+}
+
+/// One decode epoch over N requests, each in its own state slot (a lane) at
+/// its own position. Prompts never run here: they run on the resident state
+/// at the singleton's prompt cadence (hybrid state is chunking-sensitive), and
+/// a request moves into a lane once it decodes ([`Self::park`]). A lane row
+/// is byte-identical to the singleton's decode row of the same state, so a
+/// finished request's lane is also its conversation's live state
+/// ([`LaneRecord`], [`Self::unpark`]).
+pub trait MeshLanes {
+    /// Requests the lanes hold at once.
+    fn lane_capacity(&self) -> usize;
+    /// Lanes no request or record holds.
+    fn free_lanes(&self) -> usize;
+    /// Lanes one [`Self::step_lanes`] runs at most.
+    fn lane_rows(&self) -> usize;
+    /// Move the resident request into a free lane as `tag`: it ran `prompt`
+    /// and then `ran` (its decoded tokens), its next row runs `seed`, and up
+    /// to `remaining` decode rows follow. The resident state is reset. A
+    /// finished conversation parks with `remaining` 0: its seed never runs.
+    fn park(
+        &mut self,
+        gpus: &mut Gpus,
+        tag: u64,
+        prompt: &[u32],
+        ran: &[u32],
+        seed: u32,
+        remaining: usize,
+    ) -> Result<()>;
+    /// Move `tag`'s lane, holding exactly `tokens` of a committed
+    /// conversation, back into the resident state as its live state (the
+    /// session adopts it); the lane is freed. The resident state must hold
+    /// no request.
+    fn unpark(&mut self, gpus: &mut Gpus, tag: u64, tokens: &[u32]) -> Result<()>;
+    /// One epoch: every `(tag, token)` lane runs `token`; returns each
+    /// lane's argmax of that row, in order. On `Err` the step's lanes are
+    /// poisoned (free them).
+    fn step_lanes(&mut self, gpus: &mut Gpus, rows: &[(u64, u32)]) -> Result<Vec<u32>>;
+    /// Free `tag`'s lane (host only; the next park reuses its state).
+    fn free_lane(&mut self, tag: u64);
+}
+
+/// A committed conversation whose state stays in lane `tag`, holding exactly
+/// `tokens`: its next turn continues it live ([`MeshLanes::unpark`]).
+pub struct LaneRecord {
+    pub tag: u64,
+    pub tokens: Vec<u32>,
 }
 
 /// What a decode epoch leaves for choosing the next token.
@@ -132,6 +186,15 @@ pub struct MeshRunner {
     next_op: u64,
     /// Submitted, not yet drained epochs of the request in flight, oldest first.
     outstanding: Vec<MeshTicket>,
+    /// An epoch submission failed after it may have enqueued work that no
+    /// ticket covers: nothing counts as drained until a successful reset.
+    unsettled: bool,
+    /// A failed device synchronization quarantined the mesh. Persistent for
+    /// this runner (the load): every later engine request is refused. Routes
+    /// that do not run on the engine are not gated by it.
+    quarantined: Option<String>,
+    /// Committed conversations kept in the family's lanes, oldest first.
+    pub records: Vec<LaneRecord>,
 }
 
 /// One request's output buffers on the mesh's output owner.
@@ -154,11 +217,26 @@ impl MeshRunner {
             request_id: 0,
             next_op: 1,
             outstanding: Vec::new(),
+            unsettled: false,
+            quarantined: None,
+            records: Vec::new(),
         })
     }
 
     pub fn mesh(&self) -> &DeviceMesh {
         &self.mesh
+    }
+
+    /// Why this load's mesh refuses all work (a failed synchronization).
+    pub fn quarantined(&self) -> Option<&str> {
+        self.quarantined.as_deref()
+    }
+
+    /// Record a quarantine `gpus` reports, so it outlives this request's lend.
+    fn note_quarantine(&mut self, gpus: &Gpus, error: &str) {
+        if gpus.mesh_quarantined() && self.quarantined.is_none() {
+            self.quarantined = Some(error.to_string());
+        }
     }
 
     /// Start a request on `gpus`: provision a one-owner mesh (a multi-owner
@@ -167,6 +245,9 @@ impl MeshRunner {
     pub fn begin(&mut self, family: &dyn MeshFamily, gpus: &mut Gpus) -> Result<MeshRequest> {
         if gpus.mesh.epoch() != self.mesh.epoch() {
             return Err("the request's devices carry a different mesh than the runner".into());
+        }
+        if let Some(reason) = &self.quarantined {
+            return Err(format!("engine mesh quarantined until restart: {reason}"));
         }
         family.admit(gpus)?;
         if gpus.mesh_output_owner().is_none() {
@@ -212,22 +293,40 @@ impl MeshRunner {
     /// returns the drain verdict. A failed drain leaks them: work in flight
     /// may still write them.
     pub fn end(&mut self, request: MeshRequest, gpus: &mut Gpus) -> Result<()> {
+        // ponytail: the two output tensors leak per failed request; reclaim
+        // them after the rollback's attested reset if failures become common.
         if let Err(error) = self.settle(gpus) {
             std::mem::forget(request);
             return Err(error);
         }
-        let gpu = &mut gpus.devices[request.owner];
+        let Some(gpu) = gpus.devices.get_mut(request.owner) else {
+            std::mem::forget(request);
+            return Err("the mesh's devices are gone".into());
+        };
         let _ = gpu.free_tensor(request.logits);
         let _ = gpu.free_tensor(request.top1);
         Ok(())
     }
 
     /// Drain every outstanding epoch with one synchronization of each device.
+    /// An empty ticket list is no proof of an idle device after a failed
+    /// submission (`unsettled`): that refuses until the reset drains it.
     pub fn settle(&mut self, gpus: &mut Gpus) -> Result<()> {
+        if self.unsettled {
+            return Err("an epoch failed mid-submission; the device is not drained".into());
+        }
+        // A quarantined device was never proven idle: the outputs stay leaked.
+        if let Some(reason) = &self.quarantined {
+            return Err(format!("engine mesh quarantined until restart: {reason}"));
+        }
         if self.outstanding.is_empty() {
             return Ok(());
         }
-        gpus.drain_mesh_epochs(std::mem::take(&mut self.outstanding))
+        let result = gpus.drain_mesh_epochs(std::mem::take(&mut self.outstanding));
+        if let Err(error) = &result {
+            self.note_quarantine(gpus, error);
+        }
+        result
     }
 
     /// Run the next prompt epoch; returns its end and, at the prompt end,
@@ -269,10 +368,11 @@ impl MeshRunner {
     }
 
     /// One decode epoch of `token`, or with `None` of the device argmax of
-    /// the previous row; returns the token it ran. With `top1` on a family
-    /// with device-token decode nothing drains: the next epoch reads this
-    /// row's argmax on the device ([`DecodeOut::Device`]). Otherwise the
-    /// epoch drains and the row's argmax (`top1`) or the row comes back.
+    /// the previous row (a device-token family only); returns the token it
+    /// ran. With `top1` and `keep` on a device-token family nothing drains:
+    /// the next epoch reads this row's argmax on the device
+    /// ([`DecodeOut::Device`]). Otherwise the epoch drains and the row's
+    /// argmax (`top1`) or the row comes back.
     pub fn decode_epoch(
         &mut self,
         request: &MeshRequest,
@@ -280,39 +380,38 @@ impl MeshRunner {
         gpus: &mut Gpus,
         token: Option<u32>,
         top1: bool,
+        keep: bool,
     ) -> Result<(u32, DecodeOut)> {
-        if top1 && family.device_token_decode() {
-            let head = EpochHead {
-                logits: &request.logits,
-                top1: None,
-            };
-            let device = token.is_none().then_some(&request.logits);
-            let placeholder = [token.unwrap_or(0)];
-            self.epoch(
-                family,
-                gpus,
-                &placeholder,
-                MeshRoute::Decode,
-                Some(head),
-                device,
-            )?;
-            let ran = match token {
-                Some(token) => token,
-                None => family.decoded_token()?,
-            };
-            return Ok((ran, DecodeOut::Device));
+        let device = token.is_none().then_some(&request.logits);
+        if device.is_some() && !family.device_token_decode() {
+            return Err("a host-token decode epoch needs its token".into());
         }
-        let token = token.ok_or("a host-token decode epoch needs its token")?;
+        let placeholder = [token.unwrap_or(0)];
+        let keep = top1 && keep && family.device_token_decode();
         let head = EpochHead {
             logits: &request.logits,
-            top1: top1.then_some(&request.top1),
+            top1: (top1 && !keep).then_some(&request.top1),
         };
-        self.epoch(family, gpus, &[token], MeshRoute::Decode, Some(head), None)?;
+        self.epoch(
+            family,
+            gpus,
+            &placeholder,
+            MeshRoute::Decode,
+            Some(head),
+            device,
+        )?;
+        let ran = match token {
+            Some(token) => token,
+            None => family.decoded_token()?,
+        };
+        if keep {
+            return Ok((ran, DecodeOut::Device));
+        }
         self.settle(gpus)?;
         if !top1 {
             return self
                 .read_logits(request, gpus)
-                .map(|row| (token, DecodeOut::Logits(row)));
+                .map(|row| (ran, DecodeOut::Logits(row)));
         }
         let bytes = gpus.devices[request.owner]
             .download_raw_bytes(&request.top1)
@@ -321,14 +420,18 @@ impl MeshRunner {
             .get(..4)
             .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .ok_or("top-1 readback is short")?;
-        Ok((token, DecodeOut::Top1(id)))
+        Ok((ran, DecodeOut::Top1(id)))
     }
 
     /// Bring a poisoned mesh back after a contained fault: drain every device
     /// and, for a one-owner mesh, provision it again.
     pub fn recover(&mut self, family: &dyn MeshFamily, gpus: &mut Gpus) -> Result<()> {
         self.outstanding.clear();
-        gpus.drain_mesh_edges()?;
+        if let Err(error) = gpus.drain_mesh_edges() {
+            self.note_quarantine(gpus, &error);
+            return Err(error);
+        }
+        self.unsettled = false;
         if gpus.devices.len() != 1 {
             return Err("a multi-owner mesh is recovered by its loader".into());
         }
@@ -354,6 +457,10 @@ impl MeshRunner {
             edge_epochs: edge_epochs(gpus)?,
         };
         let result = family.with_bindings(input, &mut |bindings| gpus.reset_mesh(bindings, &epoch));
+        match &result {
+            Ok(()) => self.unsettled = false,
+            Err(error) => self.note_quarantine(gpus, error),
+        }
         for gpu in gpus.devices.iter_mut() {
             gpu.invalidate_graph_state();
             gpu.replay.invalidate_replay_observation_window();
@@ -415,11 +522,15 @@ impl MeshRunner {
             device_token,
             edge_epochs: edge_epochs(gpus)?,
         };
+        // A submission may enqueue work and then fail before its ticket exists.
+        self.unsettled = true;
         let outstanding = &mut self.outstanding;
         family.with_bindings(input, &mut |bindings| {
             outstanding.push(gpus.submit_mesh_epoch(plan, &epoch, bindings)?);
             Ok(())
-        })
+        })?;
+        self.unsettled = false;
+        Ok(())
     }
 
     fn read_logits(&mut self, request: &MeshRequest, gpus: &mut Gpus) -> Result<Vec<f32>> {

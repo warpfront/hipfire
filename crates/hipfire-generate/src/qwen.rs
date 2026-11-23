@@ -11851,7 +11851,7 @@ pub fn generate_qwen4_ar(
             stop,
             min_tokens,
             max_think_tokens,
-            eos: vec![eos_token],
+            eos: &[eos_token],
         };
         let request = crate::engine::run::Request {
             sampler: hipfire_runtime::sampler::SamplerConfig {

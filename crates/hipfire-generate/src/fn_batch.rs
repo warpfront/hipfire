@@ -717,7 +717,7 @@ fn cancel_lane(
     Ok(())
 }
 
-fn render_request(
+pub(crate) fn render_request(
     model: &mut LoadedModel,
     request: &BatchPendingRequest,
 ) -> Result<(Vec<u32>, bool), (String, &'static str)> {

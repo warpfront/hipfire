@@ -4306,6 +4306,19 @@ impl SessionDriver {
         self.cache.live_state_reset();
     }
 
+    /// The owners now hold exactly `tokens` of a conversation committed
+    /// elsewhere (a state slot swapped in, byte-exact): keep it as the live
+    /// state, as [`Self::commit_live`] would have, so its next turn plans and
+    /// begins a live continuation. Everything describing the previous live
+    /// state is forgotten first ([`Self::forget_live`]).
+    pub fn adopt_live(&mut self, tokens: &[u32], route: SessionRoute) {
+        self.forget_live();
+        self.live = Some(LiveRecord {
+            tokens: tokens.to_vec(),
+            route,
+        });
+    }
+
     /// Drop every snapshot, pending ones included, and the live state.
     pub fn clear(&mut self, gpu: &mut Gpu) {
         self.live = None;

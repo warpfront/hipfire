@@ -74,37 +74,45 @@ pub fn run(
             job.serve(m, runner, &mut gpus)
         });
         m.pp_gpus = Some(gpus);
-        return outcome;
+        return outcome.unwrap_or_else(Outcome::Declined);
     }
+    on_one_owner(m, gpu, n_layers, |m, runner, gpus| {
+        job.serve(m, runner, gpus)
+    })
+    .unwrap_or_else(Outcome::Declined)
+}
+
+/// Run `body` on the daemon's device lent as the load's one-owner mesh, with
+/// the load's runner on it. `Err`: no mesh or runner (nothing ran).
+pub(super) fn on_one_owner<R>(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    n_layers: usize,
+    body: impl FnOnce(&mut LoadedModel, &mut MeshRunner, &mut Gpus) -> R,
+) -> Result<R, String> {
     let mesh = match m.engine.as_ref().map(MeshRunner::mesh) {
         Some(mesh) if mesh.n_devices() == 1 => mesh.clone(),
-        _ => match DeviceMesh::single() {
-            Ok(mesh) => mesh,
-            Err(error) => return Outcome::Declined(format!("one-owner mesh: {error}")),
-        },
+        _ => DeviceMesh::single().map_err(|error| format!("one-owner mesh: {error}"))?,
     };
     Gpus::lend_single(gpu, &mesh, n_layers, |gpus| {
-        with_runner(m, &mesh, |m, runner| job.serve(m, runner, gpus))
+        with_runner(m, &mesh, |m, runner| body(m, runner, gpus))
     })
 }
 
 /// The load's runner on `mesh` (a new one when the mesh changed), lent out of
 /// the model for `body`.
-fn with_runner(
+fn with_runner<R>(
     m: &mut LoadedModel,
     mesh: &DeviceMesh,
-    body: impl FnOnce(&mut LoadedModel, &mut MeshRunner) -> Outcome,
-) -> Outcome {
+    body: impl FnOnce(&mut LoadedModel, &mut MeshRunner) -> R,
+) -> Result<R, String> {
     let mut runner = match m.engine.take() {
         Some(runner) if runner.mesh().epoch() == mesh.epoch() => runner,
-        _ => match MeshRunner::new(mesh.clone()) {
-            Ok(runner) => runner,
-            Err(error) => return Outcome::Declined(error),
-        },
+        _ => MeshRunner::new(mesh.clone())?,
     };
     let outcome = body(m, &mut runner);
     m.engine = Some(runner);
-    outcome
+    Ok(outcome)
 }
 
 struct Job<'a> {
@@ -134,8 +142,19 @@ impl Job<'_> {
             conversation_tokens,
             asst_turn_cache,
             spec_deferred_seed,
+            speculator,
             ..
         } = m;
+        // The engine's rollback attests the target only; a load with a drafter
+        // keeps its legacy loop, whose rollback resets both.
+        if speculator.is_some() {
+            return Outcome::Declined("a speculator is attached".into());
+        }
+        if let Some(reason) = runner.quarantined() {
+            let message = format!("engine mesh quarantined until restart: {reason}");
+            emit_active_attempt_error(stdout, Some(id), &message, "gpu", false, false);
+            return Outcome::Served;
+        }
         let (Some(state), Some(tokenizer)) = (state.as_deref_mut(), tokenizer.as_ref()) else {
             return Outcome::Declined("the model has no state or tokenizer".into());
         };

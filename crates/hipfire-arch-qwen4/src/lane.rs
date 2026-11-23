@@ -3274,6 +3274,11 @@ impl Qwen4LaneStore {
         self.table.get(epoch)
     }
 
+    /// The slot `epoch`'s live lane occupies.
+    pub fn slot_of(&self, epoch: &RequestEpoch) -> Option<usize> {
+        self.table.slot_of(epoch)
+    }
+
     pub(crate) fn lane_mut(&mut self, epoch: &RequestEpoch) -> Option<&mut Qwen4LaneState> {
         self.table.get_mut(epoch)
     }
