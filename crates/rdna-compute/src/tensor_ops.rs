@@ -14786,7 +14786,15 @@ mod tests {
                         .download_f32(&mixed)
                         .expect("download")
                         .iter()
-                        .map(|v| v.to_bits())
+                        // NaN sign/payload is whichever operand the compiler orders first
+                        // in NaN*NaN, not a kernel property: compare NaN as one class.
+                        .map(|v| {
+                            if v.is_nan() {
+                                f32::NAN.to_bits()
+                            } else {
+                                v.to_bits()
+                            }
+                        })
                         .collect();
                     gpu.free_tensor(mixed).expect("free");
                     outs.push(bits);
