@@ -37,6 +37,7 @@ pub(crate) fn mq3v25_route(
         && flags.mq3v25_a4_enabled(symmetric)
         && match flags.arch.as_str() {
             "gfx1100" => m % 128 == 0 && batch_size >= 128,
+            "gfx1151" => m % 256 == 0 && batch_size >= 256,
             "gfx1201" => batch_size >= MQ3V25_A4_GFX1201_MIN_ROWS,
             _ => false,
         }

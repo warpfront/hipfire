@@ -5498,6 +5498,10 @@ pub const GEMM_MQ3V25_RESIDUAL_MMQ_IU4_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq3v25_residual_mmq_iu4.gfx12.hip")
 );
+/// gfx1151 symmetric qt49 (MQ3V25) A4 full-tile V2B consumer
+/// (`gemm_mq3v25_residual_iu4_v2b`; [N/256, M/256, 1], [32,16,1], LDS 65536).
+pub const GEMM_MQ3V25_RESIDUAL_IU4_V2B_GFX11_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq3v25_residual_iu4_v2b.gfx11.hip");
 /// gfx1100 symmetric qt49 (MQ3V25) A4 full-tile V2C consumer
 /// (`gemm_mq3v25_residual_iu4_v2c`; [N/128, M/128, 1], [32,8,1], LDS 32768).
 pub const GEMM_MQ3V25_RESIDUAL_IU4_V2C_GFX11_SRC: &str =

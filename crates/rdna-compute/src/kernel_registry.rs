@@ -2271,6 +2271,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_mq4g256v2_residual_iu4_v2b_set_zba_gfx11"
             ]
         );
+        // Full 256x256 tiles only (LDS 65536 = one CTA per WGP); tails stay on F16.
+        add!(
+            "gemm_mq3v25_iu4_v2b_gfx1151",
+            kernels::GEMM_MQ3V25_RESIDUAL_IU4_V2B_GFX11_SRC,
+            ["gemm_mq3v25_residual_iu4_v2b"]
+        );
         add!(
             "gemm_mq4g256v2_residual_mmq_iu4",
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC,

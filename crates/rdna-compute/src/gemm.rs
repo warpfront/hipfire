@@ -21786,7 +21786,7 @@ impl Gpu {
     }
 
     /// Symmetric qt49 W3A4 consumer over the token-order K128 `block_i4_128`
-    /// sidecar. gfx1201 handles partial tiles; gfx1100 V2C needs full tiles.
+    /// sidecar. gfx1201 handles partial tiles; gfx1100 V2C and gfx1151 V2B need full tiles.
     fn gemm_mq3v25_prequant_iu4(
         &mut self,
         a: &GpuTensor,
@@ -21800,7 +21800,7 @@ impl Gpu {
         if !self.flags.mq3v25_a4_enabled(self.mq3v2_symmetric) || k % 256 != 0 || m == 0 || n == 0 {
             return Err(hip_bridge::HipError::new(
                 1,
-                "MQ3V25 A4 requires validated symmetric qt49 on gfx1100/gfx1201, positive M/N and K divisible by 256",
+                "MQ3V25 A4 requires validated symmetric qt49 on gfx1100/gfx1151/gfx1201, positive M/N and K divisible by 256",
             ));
         }
         if self.scratch.int4_mmq_slab_at(xq) {
@@ -21818,6 +21818,14 @@ impl Gpu {
                 [32, 8, 1],
                 32768,
             ),
+            "gfx1151" if m % 256 == 0 && n % 256 == 0 => (
+                "gemm_mq3v25_iu4_v2b_gfx1151",
+                "gemm_mq3v25_residual_iu4_v2b",
+                kernels::GEMM_MQ3V25_RESIDUAL_IU4_V2B_GFX11_SRC,
+                [(n / 256) as u32, (m / 256) as u32, 1],
+                [32, 16, 1],
+                65536,
+            ),
             "gfx1201" => (
                 "gemm_mq3v25_residual_mmq_iu4_gfx1201",
                 "gemm_mq3v25_residual_mmq_iu4",
@@ -21829,7 +21837,7 @@ impl Gpu {
             _ => {
                 return Err(hip_bridge::HipError::new(
                     1,
-                    "MQ3V25 A4 gfx1100 kernel requires full M/N tiles",
+                    "MQ3V25 A4 gfx1100/gfx1151 kernel requires full M/N tiles",
                 ))
             }
         };
@@ -21871,16 +21879,17 @@ impl Gpu {
         result
     }
 
-    /// gfx1100 consumers only accept complete token tiles. Keep the aligned
+    /// gfx1100/gfx1151 consumers only accept complete token tiles. Keep the aligned
     /// prefix on IU4 and leave a short suffix for the incumbent fp16 GEMM.
     fn mq3v25_iu4_full_n(&self, n: usize) -> usize {
         match self.arch.as_str() {
             "gfx1100" => n / 128 * 128,
+            "gfx1151" => n / 256 * 256,
             _ => n,
         }
     }
 
-    /// gfx1100 full-tile consumers cannot read a short beta/alpha row block.
+    /// gfx1100/gfx1151 full-tile consumers cannot read a short beta/alpha row block.
     /// Keep those small projections on the incumbent SET while their full-
     /// tile QKV/Z siblings reuse the single IU4 pack.
     fn gemm_mq3v25_iu4_set_or_legacy(
@@ -21895,6 +21904,7 @@ impl Gpu {
     ) -> HipResult<()> {
         let tile = match self.arch.as_str() {
             "gfx1100" => 128,
+            "gfx1151" => 256,
             _ => 1,
         };
         if m % tile != 0 || n % tile != 0 {

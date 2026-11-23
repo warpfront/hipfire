@@ -2945,7 +2945,7 @@ fn moe_dtypes_mq6() -> MoeDtypes<'static> {
 fn mq3v25_route_requires_marker_flag_multirow_and_exact_arch() {
     use crate::families::gemm::mq3v25_route;
     for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
-        let consumer = matches!(arch, "gfx1100" | "gfx1201");
+        let consumer = matches!(arch, "gfx1100" | "gfx1151" | "gfx1201");
         let mut flags = rdna_compute::FeatureFlags::for_test(arch);
         flags.iu4_prefill = Some(true);
         for a4 in [None, Some(true)] {
@@ -2962,6 +2962,13 @@ fn mq3v25_route_requires_marker_flag_multirow_and_exact_arch() {
                 assert!(mq3v25_route(&flags, true, 128, 4096));
                 assert!(mq3v25_route(&flags, true, 129, 4096));
                 assert!(mq3v25_route(&flags, true, 4097, 4096));
+                assert!(mq3v25_route(&flags, true, 8193, 4096));
+                assert!(!mq3v25_route(&flags, true, 8192, 4100));
+                assert!(!mq3v25_route(&flags, true, 64, 4096));
+            }
+            if arch == "gfx1151" {
+                assert!(!mq3v25_route(&flags, true, 255, 4096));
+                assert!(mq3v25_route(&flags, true, 256, 4096));
                 assert!(mq3v25_route(&flags, true, 8193, 4096));
                 assert!(!mq3v25_route(&flags, true, 8192, 4100));
                 assert!(!mq3v25_route(&flags, true, 64, 4096));
