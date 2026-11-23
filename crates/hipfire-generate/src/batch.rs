@@ -20,7 +20,6 @@
 use crate::ar::*;
 use crate::common::*;
 use hipfire_arch_deepseek4 as deepseek4;
-use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_engine::emit::*;
 use hipfire_engine::prompt::{batch_render_prompt_tokens, qwen_jinja_reasoning};

@@ -706,7 +706,7 @@ fn dense_reset_phase_error_visible_and_unattested() {
         // reset-phase failure no rollback can attest away.
         let sync = fail_closed_device_sync(&mut gpu);
         let ep = fail_closed_epilogue_after_sync(
-            Err("lfm2_decode_batch.reset: injected reset failure".to_string()),
+            Err("qwen35_decode_batch.reset: injected reset failure".to_string()),
             sync,
         );
         assert!(!ep.rolled_back, "reset failure must not attest");
@@ -729,7 +729,7 @@ fn dense_reset_phase_error_visible_and_unattested() {
     assert_eq!(events[1]["rolled_back"], false);
     let message = events[1]["message"].as_str().expect("error message");
     assert!(
-        message.contains("lfm2_decode_batch.reset: injected reset failure"),
+        message.contains("qwen35_decode_batch.reset: injected reset failure"),
         "reset context must stay visible: {message}"
     );
     assert!(

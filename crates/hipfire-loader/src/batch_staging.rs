@@ -4,7 +4,7 @@
 
 //! Continuous-batch staging, moved out of the daemon load handler.
 //!
-//! This block constructs `Qwen35DecodeBatchState`, `Lfm2DecodeBatchState` and
+//! This block constructs `Qwen35DecodeBatchState` and
 //! the EP `Qwen35DecodeBatchEpState`, and it was the single largest remaining
 //! reason the daemon named architecture types at all (17 of 87 uses).
 //!
@@ -126,7 +126,7 @@ pub fn stage_continuous_batch(
         );
     }
     // ── Continuous batch staging (must be before `loaded` ack) ──
-    // Stage Qwen35DecodeBatchState / hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState (single-GPU) or
+    // Stage Qwen35DecodeBatchState (single-GPU) or
     // Qwen35DecodeBatchEpState (EP TP=4 pure gfx1201) + host scheduler.
     // `continuous_batch_capable` reflects the newly staged state, not the previous.
     // EP is batch-only: TP must be 4 and exactly 4×gfx1201, else fail closed.
