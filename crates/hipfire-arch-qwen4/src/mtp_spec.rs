@@ -513,10 +513,10 @@ pub fn window_to_spec_step(window: MtpWindow) -> Result<SpecStep, String> {
 pub struct Qwen4SpecScratch {
     block_size: usize,
     target_snapshot: Option<TargetTicket>,
-    /// The pre-window ticket of the last committed window (start, end)
-    /// kept for [`SpecTarget::repair_committed_prefix`]; the next snapshot,
-    /// reset or restore supersedes it.
-    retained: Option<(Qwen4StateSnapshot, usize, usize)>,
+    /// The pre-window ticket of the last committed window (start, end, the
+    /// verified block's rows) kept for [`SpecTarget::repair_committed_prefix`];
+    /// the next snapshot, reset or restore supersedes it.
+    retained: Option<(Qwen4StateSnapshot, usize, usize, usize)>,
     #[cfg(feature = "reference-parity")]
     fault_after_snapshot: Option<usize>,
     #[cfg(feature = "reference-parity")]
@@ -924,8 +924,15 @@ impl Qwen4Bundle {
             Qwen4Ops::Single(gpu) => {
                 let ple_normed = ple_normed
                     .ok_or_else(|| "Qwen4 local row rollback has no PLE rows".to_string())?;
-                self.rollback_verify_rows_retain_with(gpu, ticket.local()?, keep, block, ple_normed)
-                    .map_err(|error| error.to_string())
+                self.rollback_verify_rows_retain_with(
+                    gpu,
+                    ticket.local()?,
+                    keep,
+                    block.len(),
+                    block,
+                    ple_normed,
+                )
+                .map_err(|error| error.to_string())
             }
             Qwen4Ops::Mesh(gpus) => self
                 .pp_window_repair_keep(gpus, &ticket.mesh()?, keep, block)
@@ -1879,7 +1886,7 @@ impl SpecTarget for Qwen4Bundle {
             self.validate_commit(snapshot)
                 .map_err(|error| error.to_string())?;
             self.retain_target_validated(snapshot);
-            scratch.retained = Some((snapshot, position, committed_end));
+            scratch.retained = Some((snapshot, position, committed_end, block.len()));
             return Ok(());
         }
         // A verify that left per-row rollback points (row capture armed for
@@ -1897,7 +1904,7 @@ impl SpecTarget for Qwen4Bundle {
             self.validate_commit(snapshot)
                 .map_err(|error| error.to_string())?;
             self.retain_target_validated(snapshot);
-            scratch.retained = Some((snapshot, position, committed_end));
+            scratch.retained = Some((snapshot, position, committed_end, block.len()));
         } else {
             self.restore(gpu, snapshot)
                 .map_err(|error| error.to_string())?;
@@ -1926,7 +1933,7 @@ impl SpecTarget for Qwen4Bundle {
         position: usize,
         replay: &[u32],
     ) -> Result<bool, String> {
-        let Some((ticket, start, end)) = scratch
+        let Some((ticket, start, end, rows)) = scratch
             .as_any_mut()
             .downcast_mut::<Qwen4SpecScratch>()
             .ok_or("Qwen4 repair_committed_prefix: scratch is not Qwen4SpecScratch")?
@@ -1947,14 +1954,39 @@ impl SpecTarget for Qwen4Bundle {
             }
             return Ok(false);
         }
-        let replayed = self
-            .restore_retain(gpu, ticket)
-            .map_err(|error| format!("Qwen4 terminal repair restore: {error}"))
-            .and_then(|()| {
-                // The drafter keeps the window's feature rows: no capture.
-                self.spec_forward_rows(gpu, replay, self.dflash.is_none())
-                    .map_err(|error| format!("Qwen4 terminal repair replay: {error}"))
-            });
+        // A verify that left per-row rollback points (row capture armed for
+        // its block, as `commit_prefix` decides) keeps the replayed rows by
+        // re-running their captured recurrence row by row, which is AR's
+        // arithmetic: one unarmed replay block requantizes a Q8 GDN state
+        // once per launch, so its bytes would depend on the grouping.
+        let replayed = if rows >= 2 && self.state.row_capture_rows() >= rows {
+            if start + replay.len() == end {
+                // The committed window already ends at the stop.
+                Ok(())
+            } else {
+                self.lane_ple_normed_rows(0, rows)
+                    .and_then(|ple_normed| {
+                        self.rollback_verify_rows_retain_with(
+                            gpu,
+                            ticket,
+                            replay.len(),
+                            rows,
+                            replay,
+                            &ple_normed,
+                        )
+                    })
+                    .map_err(|error| format!("Qwen4 terminal repair rollback: {error}"))
+            }
+        } else {
+            self.restore_retain(gpu, ticket)
+                .map_err(|error| format!("Qwen4 terminal repair restore: {error}"))
+                .and_then(|()| {
+                    // The drafter keeps the window's feature rows: no capture.
+                    self.spec_forward_rows(gpu, replay, self.dflash.is_none())
+                        .map(|_| ())
+                        .map_err(|error| format!("Qwen4 terminal repair replay: {error}"))
+                })
+        };
         if self.validate_commit(ticket).is_ok() {
             self.commit_validated(ticket);
         }

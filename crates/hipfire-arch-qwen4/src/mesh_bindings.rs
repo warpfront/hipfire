@@ -672,7 +672,7 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
             .ple_normed_for_rollback()
             .map_err(|error| format!("Qwen4 band {owner} row repair: {error}"))?;
         rank.bundle
-            .rollback_verify_rows_retain_with(gpu, local, keep, tokens, ple_normed)
+            .rollback_verify_rows_retain_with(gpu, local, keep, tokens.len(), tokens, ple_normed)
             .map_err(|error| format!("Qwen4 band {owner} row repair: {error}"))
     }
     fn capture_session_rank(

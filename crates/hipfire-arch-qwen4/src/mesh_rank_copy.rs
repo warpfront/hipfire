@@ -1051,7 +1051,14 @@ fn prepare_target_only(
             .lane_ple_normed_rows(p.row_begin, rows)
             .map_err(|e| format!("target-only window: PLE rows: {e}"))?;
         lane_call(bundle.with_lane(state, None, |b| {
-            b.rollback_verify_rows_retain_with(gpu, snapshot, consumed, &p.verify.rows, &ple_normed)
+            b.rollback_verify_rows_retain_with(
+                gpu,
+                snapshot,
+                consumed,
+                p.verify.rows.len(),
+                &p.verify.rows,
+                &ple_normed,
+            )
         }))
         .map_err(|e| format!("target-only window: ring rollback: {e}"))?;
     }

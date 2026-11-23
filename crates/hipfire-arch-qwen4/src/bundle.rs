@@ -3511,16 +3511,25 @@ impl Qwen4Bundle {
                 .map_err(|error| BundleError::Forward(error.to_string()))?;
             tensor.sub_offset(0, tensor.numel())
         };
-        self.rollback_verify_rows_retain_with(gpu, snapshot, keep, tokens, &ple_normed)
+        self.rollback_verify_rows_retain_with(
+            gpu,
+            snapshot,
+            keep,
+            tokens.len(),
+            tokens,
+            &ple_normed,
+        )
     }
 
     /// [`Self::rollback_verify_rows_retain`] with the verify's PLE
-    /// convolution input rows (`ple_normed`, from the block's row 0) given.
+    /// convolution input rows (`ple_normed`, from the block's row 0) given,
+    /// for a `rows`-row verify of which `tokens` holds at least the kept rows.
     pub(crate) fn rollback_verify_rows_retain_with(
         &mut self,
         gpu: &mut Gpu,
         snapshot: Qwen4StateSnapshot,
         keep: usize,
+        rows: usize,
         tokens: &[u32],
         ple_normed: &GpuTensor,
     ) -> Result<(), BundleError> {
@@ -3531,7 +3540,7 @@ impl Qwen4Bundle {
                 gpu,
                 snapshot,
                 keep,
-                tokens.len(),
+                rows,
                 tokens,
                 ple_normed,
                 self.config.ple_conv_history_rows(),
