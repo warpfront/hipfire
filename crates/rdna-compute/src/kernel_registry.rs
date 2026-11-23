@@ -8143,9 +8143,11 @@ pub fn route_entries_sealed(
     }
     // `pm_decode` is a closed route axis (accepted twins replace their HIP
     // entries below). Memory/host policy and MoE-router fields select no kernel
-    // of a closed route (HIPF-489), and the DeepSeek V4 levers select no kernel
-    // of the Qwen closed routes (HIPF-488), so they are exempt; every other flag
-    // must be the builtin default.
+    // of a closed route (HIPF-489), the DeepSeek V4 levers select no kernel
+    // of the Qwen closed routes (HIPF-488), and `no_device_compiler` only
+    // forbids compiling (a compiler-free archive serves the same closed route
+    // from its pack), so they are exempt; every other flag must be the builtin
+    // default.
     let mut default_flags = default_feature_flags(input.arch)?;
     default_flags.pm_decode = input.flags.pm_decode;
     default_flags.page_eviction = input.flags.page_eviction;
@@ -8159,6 +8161,7 @@ pub fn route_entries_sealed(
     default_flags.deepseek4_graph = input.flags.deepseek4_graph;
     default_flags.deepseek4_attn_topk_direct = input.flags.deepseek4_attn_topk_direct;
     default_flags.deepseek4_wo_q8_wmma = input.flags.deepseek4_wo_q8_wmma;
+    default_flags.no_device_compiler = input.flags.no_device_compiler;
     if format!("{:?}", input.flags) != format!("{default_flags:?}") {
         return refuse(format!("non-default feature flags on {}", input.arch));
     }
@@ -14976,6 +14979,58 @@ extern "C" __global__ void NAMED(int* p) {}
     }
 
     #[test]
+    fn no_device_compiler_keeps_the_closed_route_sealed() {
+        let owned = qwen36_27b_native_mtp_fixture();
+        let tensors: Vec<_> = owned
+            .iter()
+            .map(|(name, dtype, shape)| KernelTensorMeta {
+                name,
+                dtype: *dtype,
+                shape,
+            })
+            .collect();
+        let sealed = |flags: &crate::feature_flags::FeatureFlags| {
+            route_entries_sealed(&RouteKernelInput {
+                arch: "gfx1201",
+                model_arch: 5,
+                tensors: &tensors,
+                n_heads: 24,
+                n_kv_heads: 4,
+                head_dim: 256,
+                max_seq: 16448,
+                prefill_chunk_rows: 512,
+                kv_k: "fp8",
+                kv_v: "fp8",
+                state_quant: "q8",
+                spec: KernelSpecRoute::NativeMtp,
+                host_mapped_experts: false,
+                retained_decode: false,
+                hipcc_extra_flags: "",
+                flags,
+                route_axes: &[],
+                hc8_sidecar: false,
+            })
+        };
+        // A compiler-free archive (HIPFIRE_NO_DEVICE_COMPILER=1) serves the closed route.
+        let mut flags = default_feature_flags("gfx1201").unwrap();
+        flags.no_device_compiler = true;
+        let (plan, seal) = sealed(&flags).expect("closed route with no device compiler");
+        assert_eq!(seal, RouteSeal::Sealed);
+        assert!(!plan.entries.is_empty());
+        // A flag that does select kernels still refuses the closed route.
+        flags.mq4v2_gate_up_tight_grid = Some(!flags.mq4v2_gate_up_tight_grid.unwrap_or(true));
+        match sealed(&flags) {
+            Err(RegistryError::UnsupportedRoute(why)) => {
+                assert!(why.contains("non-default feature flags"), "{why}")
+            }
+            other => panic!(
+                "kernel-selecting flag must refuse: {:?}",
+                other.map(|p| p.1)
+            ),
+        }
+    }
+
+    #[test]
     fn native_mtp_plans_pm_fill_before_ready() {
         let owned = qwen36_27b_native_mtp_fixture();
         let tensors: Vec<_> = owned
@@ -15002,6 +15057,8 @@ extern "C" __global__ void NAMED(int* p) {}
                 flags.deepseek4_graph = Some(false);
                 flags.deepseek4_attn_topk_direct = Some(true);
                 flags.deepseek4_wo_q8_wmma = Some(false);
+                // A compiler-free archive serves the same closed route from its pack.
+                flags.no_device_compiler = true;
             }
             let mut input = RouteKernelInput {
                 arch: "gfx1201",
