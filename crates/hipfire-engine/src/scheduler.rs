@@ -775,7 +775,7 @@ pub fn request_seed_for(key: &AttemptKey, client_seed: Option<u64>) -> u32 {
 }
 
 /// Eligibility for continuous batching. Conservative: only single-GPU
-/// exact HIP Qwen 5/6, Flash-Next (qwen4, 16) exact AR lanes and dense LFM 11
+/// exact HIP Qwen 5/6, Flash-Next (qwen4, 16) exact AR lanes and Glimmer 14
 /// stateless text without excluded features.
 ///
 /// This is the architecture-capability and request-shape gate only: it reads
@@ -1010,102 +1010,6 @@ pub fn resolve_batch_sampling(
         presence_penalty,
         frequency_penalty,
         repeat_window,
-    }
-}
-
-pub fn lfm_fast_path_candidate_len(sched: &ContinuousBatchScheduler) -> usize {
-    if sched.active_count() != 0 || sched.awaiting_count() != 0 {
-        return 0;
-    }
-    if sched.inbox.len() < 2 {
-        return 0;
-    }
-    // Peek front without mutating.
-    let front_key = match sched.inbox.front() {
-        Some(k) => k.clone(),
-        None => return 0,
-    };
-    let front_req = match sched.pending.get(&front_key) {
-        Some(r) => r,
-        None => return 0,
-    };
-    // Front must be ordinary: non-thinking, max_tokens>0, within capacity, not aborted.
-    if front_req.started_in_think {
-        return 0;
-    }
-    if front_req.max_tokens == 0 {
-        return 0;
-    }
-    if front_req.prompt_tokens.is_empty()
-        || front_req.prompt_tokens.len() >= sched.lane_capacity
-        || !crate::terminal::batch_lfm_admission_ok(
-            front_req.prompt_tokens.len(),
-            front_req.max_tokens,
-            sched.lane_capacity,
-        )
-    {
-        return 0;
-    }
-    if !crate::terminal::batch_is_current(&front_key.id, front_key.attempt_id, front_req.admission)
-        || crate::terminal::batch_check_abort(
-            &front_key.id,
-            front_key.attempt_id,
-            front_req.admission,
-        )
-    {
-        return 0;
-    }
-    let first_len = front_req.prompt_tokens.len();
-    let first_cohort = match sched.pending_sampling.get(&front_key) {
-        Some(s) => s.key(),
-        None => return 0,
-    };
-    let mut count = 1usize;
-    for key in sched.inbox.iter().skip(1) {
-        if count >= sched.max_batch {
-            break;
-        }
-        let req = match sched.pending.get(key) {
-            Some(r) => r,
-            None => break,
-        };
-        if req.started_in_think {
-            break;
-        }
-        if req.max_tokens == 0 {
-            break;
-        }
-        if req.prompt_tokens.len() != first_len {
-            break;
-        }
-        if req.prompt_tokens.is_empty()
-            || req.prompt_tokens.len() >= sched.lane_capacity
-            || !crate::terminal::batch_lfm_admission_ok(
-                req.prompt_tokens.len(),
-                req.max_tokens,
-                sched.lane_capacity,
-            )
-        {
-            break;
-        }
-        if !crate::terminal::batch_is_current(&key.id, key.attempt_id, req.admission)
-            || crate::terminal::batch_check_abort(&key.id, key.attempt_id, req.admission)
-        {
-            break;
-        }
-        let cohort = match sched.pending_sampling.get(key) {
-            Some(s) => s.key(),
-            None => break,
-        };
-        if cohort != first_cohort {
-            break;
-        }
-        count += 1;
-    }
-    if count >= 2 {
-        count
-    } else {
-        0
     }
 }
 
