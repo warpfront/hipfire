@@ -14925,7 +14925,32 @@ impl Qwen4GpuForward {
             let binding = cache
                 .layer_binding(layer)
                 .ok_or_else(|| invalid(format!("layer {layer}: missing cache binding")))?;
-            Qwen4MoeLayerRuntime::from_moe_cache(gpu, weights, moe, layer, config, &binding)
+            let resident = self
+                .moe
+                .get(layer)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| invalid(format!("layer {layer}: missing Resident runtime")))?;
+            let mut decode =
+                Qwen4MoeLayerRuntime::from_moe_cache(gpu, weights, moe, layer, config, &binding)?;
+            // Every mapping of the mutable tables names the same verified bytes (a slot holds a
+            // copy of the canonical payload), so the Resident symmetric verdict holds for any
+            // published image. It only changes calls that reach the IU4 arm's row floor: the
+            // canonical-chunk prompt tiles that read the published tables, never a window.
+            match crate::expert_cache::inherit_prefill_verdict(
+                layer,
+                crate::expert_cache::PrefillVerdict {
+                    host_mapped: resident.host_mapped,
+                    symmetric: resident.symmetric,
+                },
+                decode.host_mapped,
+            ) {
+                Ok(verdict) => decode.symmetric = verdict.symmetric,
+                Err(reason) => {
+                    let _ = decode.free_gpu(gpu);
+                    return Err(invalid(reason));
+                }
+            }
+            Ok(decode)
         })
         .and_then(|()| {
             populate_moe_runtimes(&mut prefill_runtimes, &weights.layer_refs, |layer, moe| {

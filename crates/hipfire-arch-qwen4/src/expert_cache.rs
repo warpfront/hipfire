@@ -695,20 +695,21 @@ pub(crate) struct PrefillVerdict {
     pub symmetric: bool,
 }
 
-/// The verdicts of a layer's immutable core/host prompt runtime, given its Resident runtime's.
-/// The donors' mirror reproduces the Resident payloads byte for byte, so the symmetric verdict
-/// verified on the Resident headers carries over. A host-mapped bit that differs means a layer
-/// donates without holding a host expert (the plan never picks such a donor): a prompt through
+/// The verdicts of a layer's cache runtime (the immutable core/host prompt view or the mutable
+/// decode tables), given its Resident runtime's. Both name the Resident payloads byte for byte
+/// (the donors' mirror, or a slot holding a copy of the canonical payload), so the symmetric
+/// verdict verified on the Resident headers carries over. A host-mapped bit that differs means a
+/// layer donates without holding a host expert (the plan never picks such a donor): a call through
 /// it would take another route than the Resident one, so the pair is refused.
 pub(crate) fn inherit_prefill_verdict(
     layer: usize,
     resident: PrefillVerdict,
-    immutable_host_mapped: bool,
+    cache_host_mapped: bool,
 ) -> Result<PrefillVerdict> {
-    if resident.host_mapped != immutable_host_mapped {
+    if resident.host_mapped != cache_host_mapped {
         return Err(format!(
-            "expert cache layer {layer}: host_mapped is {} in the Resident view and {immutable_host_mapped} \
-             in the immutable prompt view (a layer without a host expert must not donate)",
+            "expert cache layer {layer}: host_mapped is {} in the Resident view and {cache_host_mapped} \
+             in the cache view (a layer without a host expert must not donate)",
             resident.host_mapped
         ));
     }
@@ -2915,5 +2916,47 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn the_mutable_runtime_takes_the_resident_route_on_prompt_tiles_and_windows() {
+        use crate::gpu_forward::declared_route_capability as capability;
+        use hipfire_dispatch::families::moe::MoeRouteCapability::{
+            Qt44Qt53Grouped, Qt44Qt53GroupedSymmetric,
+        };
+        let floor = rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS;
+        for resident in [
+            PrefillVerdict {
+                host_mapped: true,
+                symmetric: true,
+            },
+            PrefillVerdict {
+                host_mapped: true,
+                symmetric: false,
+            },
+            PrefillVerdict {
+                host_mapped: false,
+                symmetric: true,
+            },
+        ] {
+            let mutable = inherit_prefill_verdict(5, resident, resident.host_mapped).unwrap();
+            assert_eq!(mutable, resident);
+            // A canonical-chunk prompt tile and every window width declare the Resident route.
+            for rows in (1..=64).chain([floor, 2047, 16384]) {
+                assert_eq!(
+                    capability(false, false, mutable.symmetric, rows, floor),
+                    capability(false, false, resident.symmetric, rows, floor),
+                    "{resident:?} {rows}"
+                );
+            }
+        }
+        // Windows never reach the IU4 floor, so the verdict is inert there; a prompt tile is not.
+        for rows in 1..=64 {
+            assert_eq!(capability(false, false, true, rows, floor), Qt44Qt53Grouped);
+        }
+        assert_eq!(
+            capability(false, false, true, 16384, floor),
+            Qt44Qt53GroupedSymmetric
+        );
     }
 }
