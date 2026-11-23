@@ -239,6 +239,11 @@ pub struct DenseMtpAutoFacts<'a> {
     pub on_fits: bool,
 }
 
+/// The exact GPUs dense native MTP arms on under `auto` ([`dense_mtp_auto`]
+/// step 1). The loader's route plan reads the same list to plan the native-MTP
+/// route before the capacity verdict exists.
+pub const DENSE_MTP_AUTO_GPUS: &[&str] = &["gfx1100", "gfx1201"];
+
 /// Why [`dense_mtp_auto`] decided as it did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenseMtpAutoReason {
@@ -337,7 +342,7 @@ pub fn dense_mtp_auto(f: &DenseMtpAutoFacts<'_>) -> DenseMtpAutoDecision {
     if f.arch_id != 5 {
         return decide(false, R::NotDenseQwen35);
     }
-    if !matches!(f.gpu_arch, "gfx1100" | "gfx1201") {
+    if !DENSE_MTP_AUTO_GPUS.contains(&f.gpu_arch) {
         return decide(false, R::UnsupportedGpu);
     }
     if !f.singleton || f.pp != 1 || f.tp != 1 || f.ep != 1 {

@@ -63,7 +63,8 @@ def make_walk(root, name, route, model, stderr_lines, env=None, ok=True, max_seq
     (walk / "result.json").write_text(json.dumps({"rc": 0 if ok else 1, "ok": ok, "errors": 0, "results": []}))
     (walk / "command.json").write_text(json.dumps({
         "daemon": "d", "daemon_sha256": "ab" * 32, "route": "mtp" if route == "native_mtp" else "ar",
-        "env": env or {}, "load": {"model": str(model), "params": {"max_seq": max_seq}}, "requests": 3}))
+        "env": env or {}, "load": {"model": str(model), "params": {} if max_seq is None else {"max_seq": max_seq}},
+        "requests": 3}))
     (walk / "stderr.log").write_text("\n".join(stderr_lines) + "\n")
     return walk
 
@@ -219,6 +220,34 @@ class Qwen35Builder(unittest.TestCase):
         failed = make_walk(self.root, "g", "ar", self.model, [], env={"HIPFIRE_ROUTE_PLAN_SEAL": "1"}, ok=False)
         with self.assertRaisesRegex(SystemExit, "not ok"):
             self.build("--mtp-head", str(self.head), "--sealed-replay", f"ar={failed}")
+
+    def test_automatic_context_walks_record_the_resolved_ceiling(self):
+        # `route_plan_walk.py --auto-max-seq` omits max_seq: the default load, whose plan resolved at the
+        # loader's automatic ceiling (the axes line's max_seq).
+        axes = lambda spec: f"  route plan axes: {AXES.format(spec=spec)}"
+        ar = make_walk(self.root, "aar", "ar", self.model, [axes("Ar"), *audit("gfx1100", [("add", "add_f32")], [])],
+                       max_seq=None)
+        mtp = make_walk(self.root, "amtp", "native_mtp", self.model,
+                        [axes("NativeMtp"), *audit("gfx1100", [("add", "add_f32")], [])], max_seq=None)
+        text = self.build("--mtp-head", str(self.head), walks=[f"ar={ar}", f"native_mtp={mtp}"])
+        self.assertIn("#! max_seq 8192", text.splitlines())
+        # An explicit request still has to resolve to itself.
+        short = make_walk(self.root, "short", "ar", self.model, [axes("Ar"), *audit("gfx1100", [("add", "add_f32")], [])],
+                          max_seq=4096)
+        with self.assertRaisesRegex(SystemExit, "differs from the load request"):
+            self.build(walks=[f"ar={short}"])
+        # An automatic replay seals only when its resolved ceiling is inside the walked one.
+        replay = lambda name, axes_text: make_walk(
+            self.root, name, "ar", self.model,
+            [f"  route plan axes: {axes_text}", "  kernels: Ar route plan (1 modules), x",
+             "  kernels: Ar route preloaded and sealed"], env={"HIPFIRE_ROUTE_PLAN_SEAL": "1"}, max_seq=None)
+        ok = replay("rauto", AXES.format(spec="Ar"))
+        self.assertIn("#! sealed ar", self.build("--mtp-head", str(self.head), "--sealed-replay", f"ar={ok}",
+                                                 walks=[f"ar={ar}", f"native_mtp={mtp}"]).splitlines())
+        above = replay("rabove", AXES.format(spec="Ar").replace("max_seq=8192", "max_seq=16384"))
+        with self.assertRaisesRegex(SystemExit, "resolved max_seq 16384 above the walked 8192"):
+            self.build("--mtp-head", str(self.head), "--sealed-replay", f"ar={above}",
+                       walks=[f"ar={ar}", f"native_mtp={mtp}"])
 
 
 class FlashNextBuilder(unittest.TestCase):

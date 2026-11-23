@@ -231,7 +231,8 @@ def check_walk_facts(walk, route, facts, model_arch, arch, command):
         raise SystemExit(f"{walk}: loaded model arch {facts['model_arch']}, plan model is {model_arch}")
     if facts["arch"] != arch:
         raise SystemExit(f"{walk}: route resolved for {facts['arch']}, the audit ran on {arch}")
-    if int(facts["max_seq"]) != command["load"]["params"]["max_seq"]:
+    requested = command["load"]["params"].get("max_seq")
+    if requested is not None and int(facts["max_seq"]) != requested:
         raise SystemExit(f"{walk}: resolved max_seq {facts['max_seq']} differs from the load request")
     if facts["spec"] != SPEC_OF_ROUTE[route]:
         raise SystemExit(f"{walk}: walked as {route} but the loader resolved the {facts['spec']} route "
@@ -249,7 +250,8 @@ def check_replay(walk, route, plan_modules, plan_axes, plan_heads, plan_max_seq)
         raise SystemExit(f"{walk}: replay ran route {command['route']}, expected {WALK_ROUTE_OF[route]}")
     if env.get("HIPFIRE_ROUTE_PLAN_SEAL") != "1" or env.get("HIPFIRE_ROUTE_PLAN") == "0":
         raise SystemExit(f"{walk}: not a sealed replay (needs route_plan_walk.py --sealed)")
-    if command["load"]["params"]["max_seq"] > plan_max_seq:
+    requested = command["load"]["params"].get("max_seq")
+    if requested is not None and requested > plan_max_seq:
         raise SystemExit(f"{walk}: replay max_seq above the walked {plan_max_seq}")
     spec, modules, sealed, axes = SPEC_OF_ROUTE[route], None, False, []
     for line in (walk / "stderr.log").read_text(errors="replace").splitlines():
@@ -263,6 +265,8 @@ def check_replay(walk, route, plan_modules, plan_axes, plan_heads, plan_max_seq)
         m = AXES_LINE.match(line)
         if m:
             axes.append(parse_axes_line(m.group(1)))
+            if int(axes[-1]["max_seq"]) > plan_max_seq:
+                raise SystemExit(f"{walk}: replay resolved max_seq {axes[-1]['max_seq']} above the walked {plan_max_seq}")
     if modules is None or not sealed:
         raise SystemExit(f"{walk}: no '{spec} route plan' + 'route preloaded and sealed' lines: the checked-in plan "
                          "did not apply to the replay")
@@ -333,7 +337,10 @@ def main():
             merge(routes["ar"], hip, emb)
         else:
             native_mtp_walks += 1
-        max_seq.add(command["load"]["params"]["max_seq"])
+        # An automatic-context walk (`route_plan_walk.py --auto-max-seq`, no max_seq in the request) is the
+        # default load: its plan resolved at the loader's automatic ceiling, the model's trained context.
+        requested = command["load"]["params"].get("max_seq")
+        max_seq.add(int(facts["max_seq"]) if requested is None and facts is not None else requested)
         for name, value in policy.items():
             axes.setdefault(name, set()).add(value)
         direct_total += len(direct)

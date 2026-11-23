@@ -11,7 +11,7 @@ copies, long context), with the developer-only HIPFIRE_MODULE_LOAD_AUDIT log.
 route plan (crates/rdna-compute/src/route_plans/). Never used by product loading.
 
 usage: route_plan_walk.py --run DIR --daemon BIN --model M --route ar|mtp
-                          [--prompt-dir DIR] [--max-seq N] [--env K=V ...]
+                          [--prompt-dir DIR] [--max-seq N [--auto-max-seq]] [--env K=V ...]
                           [--profile full|xtx-fn-bounded|xtx-fn-product] [--load-param K=JSON ...]
 The environment (device selection, HIPFIRE_PLE_FORMAT, ...) is inherited; the
 run gets its own HOME/HIPFIRE_HOME, lock dir and an empty kernel cache (`--env
@@ -233,6 +233,10 @@ def main():
     ap.add_argument("--prompt-dir", default=str(pathlib.Path(__file__).resolve().parent.parent
                                                 / "benchmarks" / "prompts"))
     ap.add_argument("--max-seq", type=int, default=40960)
+    ap.add_argument("--auto-max-seq", action="store_true",
+                    help="walk the default load: omit max_seq from the load request, so the loader sizes the context "
+                         "itself (its plan resolves at the model's trained context); --max-seq then only sizes the "
+                         "walk's long prompts and bench contexts and should be the context the card admits")
     ap.add_argument("--env", action="append", default=[])
     ap.add_argument("--profile", choices=["full", "xtx-fn-bounded", "xtx-fn-product"], default="full",
                     help="full: the ~640-request walk of the gfx1201 plans; xtx-fn-bounded: the gfx1100 "
@@ -285,6 +289,8 @@ def main():
         env[k] = v
     load = {"type": "load", "model": a.model,
             "params": {"max_seq": a.max_seq, "mtp_mode": "on" if a.route == "mtp" else "off"}}
+    if a.auto_max_seq:
+        del load["params"]["max_seq"]
     for kv in a.load_param:
         k, v = kv.split("=", 1)
         load["params"][k] = json.loads(v)

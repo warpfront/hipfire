@@ -3623,6 +3623,20 @@ struct PredictedRoute {
     modules: usize,
 }
 
+/// Whether a qwen35 route plan resolves the native-MTP head: the loader's
+/// producer-capability gate. `on` admits; dense (`num_experts == 0`, as the
+/// load's own `mtp_dense_auto`) `auto` on a
+/// [`hipfire_runtime::config::DENSE_MTP_AUTO_GPUS`] GPU may arm the head on its
+/// measured capacities after weights load, so the plan is the native-MTP route
+/// (a decline serves its AR subset, sealed); any other `auto` (no declared
+/// measured AR floor: MoE, other GPUs) loads no head, so the plan is AR.
+fn route_plans_mtp_head(mode: hipfire_config::MtpMode, num_experts: usize, gpu_arch: &str) -> bool {
+    let dense_auto = mode == hipfire_config::MtpMode::Auto
+        && num_experts == 0
+        && hipfire_runtime::config::DENSE_MTP_AUTO_GPUS.contains(&gpu_arch);
+    dense_auto || hipfire_config::mtp_mode_admits(mode, hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR)
+}
+
 /// Resolve this load's kernel route plan from header metadata and the
 /// carrier's own policy resolvers. `Err` is the refusal reason: the route is
 /// outside every closed plan and keeps lazy kernel loading.
@@ -3745,13 +3759,12 @@ fn resolve_route_plan(
         StateQuant::Q4 => "q4",
     };
     // Native MTP head, in the loader's order: bundled trailer, then sidecar.
-    // A head that later fails its trunk check falls back to AR, a subset of
-    // the MTP plan. The plan applies the loader's producer-capability gate:
-    // `auto` without a declared measured AR floor (qwen35's case) loads no
-    // head, so the plan is the AR route.
-    let head = if !hipfire_config::mtp_mode_admits(
+    // A head that later fails its trunk check, or that dense `auto` declines
+    // on its measured capacities, falls back to AR, a subset of the MTP plan.
+    let head = if !route_plans_mtp_head(
         hipfire_config::MtpMode::from_tri_state(req.spec.mtp),
-        hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR,
+        config.num_experts,
+        gpu.arch.as_str(),
     ) {
         None
     } else {
@@ -7333,6 +7346,26 @@ mod kho_scratch_warning_tests {
         assert_eq!(kho_scratch_load_warning(true, None), None);
         assert_eq!(kho_scratch_load_warning(true, Some((1 << 30) - 1)), None);
         assert!(kho_scratch_load_warning(true, Some(1 << 30)).is_some());
+    }
+}
+
+#[cfg(test)]
+mod route_plan_mtp_head_tests {
+    use super::route_plans_mtp_head;
+    use hipfire_config::MtpMode::{Auto, Off, On};
+
+    /// Dense `auto` plans the native-MTP route exactly where `dense_mtp_auto`
+    /// can arm the head; MoE `auto` and other GPUs stay AR; `on`/`off` are
+    /// unconditional.
+    #[test]
+    fn dense_auto_plans_native_mtp_on_the_auto_gpus_only() {
+        assert!(route_plans_mtp_head(Auto, 0, "gfx1201"));
+        assert!(route_plans_mtp_head(Auto, 0, "gfx1100"));
+        assert!(!route_plans_mtp_head(Auto, 0, "gfx1030"));
+        assert!(!route_plans_mtp_head(Auto, 0, "gfx1151"));
+        assert!(!route_plans_mtp_head(Auto, 256, "gfx1201"));
+        assert!(route_plans_mtp_head(On, 256, "gfx1030"));
+        assert!(!route_plans_mtp_head(Off, 0, "gfx1201"));
     }
 }
 
