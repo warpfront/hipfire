@@ -1109,27 +1109,6 @@ pub fn lfm_fast_path_candidate_len(sched: &ContinuousBatchScheduler) -> usize {
     }
 }
 
-/// Small helper that reuses the existing `sample_lane_product` contract and
-/// populates the same lane fields as the sequential `while let try_assign_one` path.
-pub fn lfm_populate_lane_after_sample(
-    sched: &mut ContinuousBatchScheduler,
-    lane_idx: usize,
-    next_token: u32,
-    next_rng: u32,
-    prompt_len: usize,
-) {
-    if let BatchLane::Running(lane) = &mut sched.lanes[lane_idx] {
-        lane.prompt_len = prompt_len;
-        lane.seq_pos = prompt_len;
-        lane.next_token = Some(next_token);
-        lane.rng_state = next_rng as u64;
-        lane.conversation_tokens = Vec::new();
-        lane.streamed_tokens = Vec::new();
-        lane.bytes_fed_to_filter = 0;
-        lane.prefill_done_at = Some(Instant::now());
-    }
-}
-
 // ── Daemon inbox with barrier pushback ─────────────────────────────────
 
 /// Async inbox for DaemonMsg. The reader announces keys before queuing;

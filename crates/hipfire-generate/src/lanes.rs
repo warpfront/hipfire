@@ -6,9 +6,8 @@
 //! One driver owns admission, seeding, the decode step, terminals, cancel
 //! and retire for every fixed-lane family; a [`LaneFamily`] adapter supplies
 //! only the model work (prefill a lane, decode the running lanes, sample)
-//! and the family's token-to-wire routing. Glimmer (arch 14) and LFM2
-//! (arch 11) are the adapters; the LFM2 route stays refused at
-//! [`hipfire_loader::continuous_batch_route`].
+//! and the family's token-to-wire routing. Glimmer (arch 14) is the only
+//! adapter; LFM2 is refused at [`hipfire_loader::continuous_batch_route`].
 
 use crate::ar::*;
 use crate::batch::{
@@ -33,8 +32,6 @@ use std::time::{Duration, Instant};
 /// One running lane's next draw, after its committed token was routed.
 pub(crate) struct LaneDraw {
     pub lane: usize,
-    /// The last `min(repeat_window, repeat_capacity)` streamed tokens.
-    pub history: Vec<u32>,
     pub sampling: BatchSampling,
     pub rng: u32,
 }
@@ -55,8 +52,6 @@ pub(crate) trait LaneFamily {
     fn route(&self) -> GenerationRoute;
     /// Token fed to rows with no running lane.
     fn idle_token(&self) -> u32;
-    /// Most history tokens [`LaneFamily::sample`] reads per lane.
-    fn repeat_capacity(&self) -> usize;
     fn reset(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String>;
     fn reset_lane(&mut self, gpu: &mut rdna_compute::Gpu, lane: usize) -> Result<(), String>;
     /// Fresh per-lane routing state for `req`, before its prefill.
@@ -69,17 +64,9 @@ pub(crate) trait LaneFamily {
         prompt: &[u32],
         abort: &dyn Fn() -> bool,
     ) -> Result<bool, String>;
-    /// Whether [`LaneFamily::prefill_lanes`] exists.
-    fn batched_prefill(&self) -> bool;
     /// Whether [`LaneFamily::sample`] honours each draw's own config, so
     /// lanes of different sampling configs may share a batch.
     fn per_lane_sampling(&self) -> bool;
-    /// Equal-length prompts into lanes `0..prompts.len()` in one pass.
-    fn prefill_lanes(
-        &mut self,
-        gpu: &mut rdna_compute::Gpu,
-        prompts: &[&[u32]],
-    ) -> Result<(), String>;
     /// First token of `lane` from its prefill.
     fn sample_first(
         &mut self,
@@ -252,8 +239,8 @@ pub fn lane_family_route(m: &LoadedModel) -> Option<GenerationRoute> {
         .then_some(GenerationRoute::GlimmerAr)
 }
 
-/// Daemon: drive the staged fixed-lane batch of a lane family (Glimmer,
-/// LFM2) until it drains or a barrier message needs the sequential route.
+/// Daemon: drive the staged fixed-lane batch of a lane family (Glimmer)
+/// until it drains or a barrier message needs the sequential route.
 pub fn drive_lane_continuous_batch(
     sched: &mut ContinuousBatchScheduler,
     gpu: &mut rdna_compute::Gpu,
@@ -726,128 +713,6 @@ pub fn drive_lane_continuous_batch(
                 return Ok(());
             }
         }
-        // ---- generic initial-wave fast path (batched prefill, O(prompt_len) vs O(n*prompt_len)) ----
-        // Non-mutating candidate scan ensures a one-request wave is never removed.
-        if sched.active_count() == 0 && sched.awaiting_count() == 0 {
-            let n = lfm_fast_path_candidate_len(sched);
-            if n >= 2 && family.batched_prefill() {
-                // Assign exactly n prefix lanes; each try_assign_one pops front and binds.
-                let mut assigned_keys: Vec<AttemptKey> = Vec::with_capacity(n);
-                let mut assigned_tickets: Vec<LaneTicket> = Vec::with_capacity(n);
-                let mut prompts_for_batch: Vec<Vec<u32>> = Vec::with_capacity(n);
-                let mut reqs_for_batch: Vec<BatchPendingRequest> = Vec::with_capacity(n);
-                let mut assign_ok = true;
-                for _ in 0..n {
-                    match sched.try_assign_one() {
-                        Some((key, ticket)) => {
-                            let req = sched.pending.get(&key).cloned();
-                            prompts_for_batch
-                                .push(req.as_ref().map_or(Vec::new(), |r| r.prompt_tokens.clone()));
-                            reqs_for_batch.extend(req);
-                            assigned_keys.push(key);
-                            assigned_tickets.push(ticket);
-                        }
-                        None => {
-                            assign_ok = false;
-                            break;
-                        }
-                    }
-                }
-                if assign_ok && assigned_keys.len() == n {
-                    for (t, req) in assigned_tickets.iter().zip(&reqs_for_batch) {
-                        family.open_lane(t.lane, req);
-                    }
-                    let prompt_refs: Vec<&[u32]> =
-                        prompts_for_batch.iter().map(|v| v.as_slice()).collect();
-                    let prefill_res = family.prefill_lanes(gpu, &prompt_refs);
-                    match prefill_res {
-                        Ok(()) => {
-                            for (idx, key) in assigned_keys.iter().enumerate() {
-                                let ticket = assigned_tickets[idx];
-                                let lane_idx = ticket.lane;
-                                let admission = ticket.admission;
-                                if batch_check_abort(&key.id, key.attempt_id, admission) {
-                                    if let Err(e) = family.reset_lane(gpu, lane_idx) {
-                                        return fail_all(
-                                            sched,
-                                            gpu,
-                                            family,
-                                            stdout,
-                                            format!("reset lane {lane_idx} on batched prefill abort: {e}"),
-                                        );
-                                    }
-                                    let _scope = BatchAttemptScope::enter_for_generation(
-                                        &key.id,
-                                        key.attempt_id,
-                                        admission,
-                                    );
-                                    let ep = crate::common::RollbackEpilogue {
-                                        rolled_back: true,
-                                        context: None,
-                                    };
-                                    crate::common::emit_spec_cancel_after_rollback(
-                                        stdout, &key.id, 0, &ep,
-                                    );
-                                    let _ = sched.abort_lane(lane_idx, key, admission);
-                                    continue;
-                                }
-                                let (lane_rng, sampling) = match &sched.lanes[lane_idx] {
-                                    BatchLane::Running(l) => {
-                                        (l.rng_state as u32, l.sampling.clone())
-                                    }
-                                    _ => continue,
-                                };
-                                match family.sample_first(gpu, lane_idx, &sampling, lane_rng) {
-                                    Ok((next_token, next_rng)) => {
-                                        let prompt_len = prompts_for_batch[idx].len();
-                                        lfm_populate_lane_after_sample(
-                                            sched, lane_idx, next_token, next_rng, prompt_len,
-                                        );
-                                    }
-                                    Err(e) => {
-                                        return fail_all(
-                                            sched,
-                                            gpu,
-                                            family,
-                                            stdout,
-                                            format!(
-                                                "sample lane {lane_idx} after batched prefill: {e}"
-                                            ),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            return fail_all(
-                                sched,
-                                gpu,
-                                family,
-                                stdout,
-                                format!("batched prefill lanes 0..{n}: {e}"),
-                            );
-                        }
-                    }
-                } else {
-                    // Partial assign failure: rollback any already-assigned lanes.
-                    for (k, t) in assigned_keys.iter().zip(assigned_tickets.iter()) {
-                        if let Err(e) = family.reset_lane(gpu, t.lane) {
-                            retire_lane_after_reset_failure(
-                                sched,
-                                stdout,
-                                k,
-                                t.admission,
-                                t.lane,
-                                "partial assign rollback",
-                                &e,
-                            );
-                        } else {
-                            let _ = sched.abort_lane(t.lane, k, t.admission);
-                        }
-                    }
-                }
-            }
-        }
         while let Some((key, ticket)) = sched.try_assign_one() {
             let lane_idx = ticket.lane;
             let pending_req = match sched.pending.get(&key).cloned() {
@@ -1157,7 +1022,6 @@ pub fn drive_lane_continuous_batch(
         if let Err(e) = family.decode(gpu, &tokens[..rows], &positions[..rows], &running) {
             return fail_all(sched, gpu, family, stdout, format!("lane decode: {e}"));
         }
-        let repeat_cap = family.repeat_capacity();
         let mut draws: Vec<LaneDraw> = Vec::new();
         let mut to_await: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> = Vec::new();
         let mut to_abort_running: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
@@ -1197,11 +1061,8 @@ pub fn drive_lane_continuous_batch(
                     let hit_max = lane.streamed_tokens.len() >= max_tokens;
                     let hit_lane_cap = batch_lane_at_capacity(lane.seq_pos, lane_capacity);
                     if !batch_should_finish_decode(false, hit_max, hit_lane_cap, false, loop_hit) {
-                        let window = lane.sampling.repeat_window.min(repeat_cap);
-                        let start = lane.streamed_tokens.len().saturating_sub(window);
                         draws.push(LaneDraw {
                             lane: idx,
-                            history: lane.streamed_tokens[start..].to_vec(),
                             sampling: lane.sampling.clone(),
                             rng: lane.rng_state as u32,
                         });
@@ -1449,10 +1310,6 @@ impl LaneFamily for GlimmerLaneFamily<'_> {
     fn idle_token(&self) -> u32 {
         self.b.eos_tok
     }
-    fn repeat_capacity(&self) -> usize {
-        // The singleton Glimmer route applies no repeat penalties either.
-        0
-    }
     fn reset(&mut self, _gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
         self.b.reset_session_state();
         Ok(())
@@ -1491,18 +1348,8 @@ impl LaneFamily for GlimmerLaneFamily<'_> {
         lanes.import(gpu, &b.config, &b.state, lane, prompt.len())?;
         Ok(!abort())
     }
-    fn batched_prefill(&self) -> bool {
-        false
-    }
     fn per_lane_sampling(&self) -> bool {
         true
-    }
-    fn prefill_lanes(
-        &mut self,
-        _gpu: &mut rdna_compute::Gpu,
-        _prompts: &[&[u32]],
-    ) -> Result<(), String> {
-        Err("glimmer lanes have no batched prefill".into())
     }
     fn sample_first(
         &mut self,
