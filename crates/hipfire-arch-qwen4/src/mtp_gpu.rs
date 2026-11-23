@@ -203,6 +203,9 @@ impl MoeRowGather for LaneLocalRowGather<'_> {
 /// Metadata words of an MTP head session snapshot: the boundary-row word
 /// (the boundary position plus one, or 0) and the state mark.
 const MTP_SESSION_WORDS: usize = 7;
+/// Bytes of [`Qwen4MtpGpu::session_parts`] metadata: the head's
+/// [`MTP_SESSION_WORDS`] plus the two draft-policy words.
+pub(crate) const MTP_SESSION_META_BYTES: usize = (MTP_SESSION_WORDS + 2) * 8;
 /// Prompt rows one batched Append pass (`Qwen4MtpGpu::append_rows`) runs per
 /// launch sequence: the capacity of [`MtpAppendScratch`].
 pub(crate) const MTP_FILL_ROWS: usize = 1024;

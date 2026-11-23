@@ -831,10 +831,152 @@ fn llama_dflash_greedy_route_refuses_penalties() {
     );
 }
 
+/// The shared planner with no prompt-end descriptor: every ordinary-checkpoint
+/// invariant below runs against it unchanged.
+fn plan(
+    conversation: &[u32],
+    rendered: Vec<u32>,
+    eligible: bool,
+    ckpts: &[usize],
+    tag: &str,
+) -> hipfire_generate::qwen::PromptCachePlan {
+    hipfire_generate::qwen::plan_from_rendered(conversation, rendered, eligible, ckpts, None, tag)
+}
+
+/// The `(len, fingerprint)` descriptor a speculator advertises for a payload
+/// captured at the end of exactly `prompt`.
+fn end_of(prompt: &[u32]) -> (usize, u64) {
+    (
+        prompt.len(),
+        hipfire_runtime::checkpoint_pool::prefix_fingerprint(prompt),
+    )
+}
+
+fn assert_same_plan(
+    a: &hipfire_generate::qwen::PromptCachePlan,
+    b: &hipfire_generate::qwen::PromptCachePlan,
+    what: &str,
+) {
+    assert_eq!(a.rendered, b.rendered, "{what}: rendered");
+    assert_eq!(a.new_tokens, b.new_tokens, "{what}: new_tokens");
+    assert_eq!(a.start_pos, b.start_pos, "{what}: start_pos");
+    assert_eq!(a.cached_tokens, b.cached_tokens, "{what}: cached_tokens");
+    assert_eq!(a.cache_hit, b.cache_hit, "{what}: cache_hit");
+    assert_eq!(a.resume_from, b.resume_from, "{what}: resume_from");
+}
+
+/// Whole-prompt reuse (a cold exact retry reusing `start_pos == rendered.len()`
+/// with zero prefill rows) needs the speculator's prompt-end descriptor: the
+/// right length AND fingerprint of this very prompt, over an eligible
+/// conversation that begins with it. Without that, and for every other
+/// descriptor, the plan is the descriptor-less plan (strict `< len`).
+#[test]
+fn prompt_end_descriptor_is_the_only_whole_prompt_authorisation() {
+    use hipfire_generate::qwen::plan_from_rendered;
+    let seq = |n: usize| -> Vec<u32> { (0..n as u32).collect() };
+    for n in 1..=24usize {
+        let rendered = seq(n);
+        let right = end_of(&rendered);
+        let other_len = end_of(&seq(n + 1));
+        let forged = (right.0, right.1 ^ 1);
+        let mut lineages = vec![Vec::new(), seq(n), seq(n + 3)];
+        for keep in 0..=n {
+            lineages.push(
+                seq(keep)
+                    .into_iter()
+                    .chain([900_000, 900_001])
+                    .collect::<Vec<u32>>(),
+            );
+            lineages.push(seq(keep));
+        }
+        for lineage in &lineages {
+            for ckpts in [
+                vec![],
+                vec![n],
+                vec![(n - 1).max(1)],
+                vec![1, (n / 2).max(1), n],
+            ] {
+                for eligible in [true, false] {
+                    let ctx = format!(
+                        "n={n} lineage_len={} ckpts={ckpts:?} eligible={eligible}",
+                        lineage.len()
+                    );
+                    let base = plan(lineage, rendered.clone(), eligible, &ckpts, "q35");
+                    assert!(!base.reuses_whole_prompt(), "{ctx}: no descriptor");
+                    let got = plan_from_rendered(
+                        lineage,
+                        rendered.clone(),
+                        eligible,
+                        &ckpts,
+                        Some(right),
+                        "q35",
+                    );
+                    let holds_prompt = !lineage.is_empty() && lineage.starts_with(&rendered);
+                    if eligible && holds_prompt {
+                        assert_plan(&got, &rendered, n, None, &ctx);
+                        assert!(got.new_tokens.is_empty(), "{ctx}: rows to prefill");
+                        assert!(got.reuses_whole_prompt(), "{ctx}");
+                    } else {
+                        assert_same_plan(&got, &base, &ctx);
+                    }
+                    // A descriptor of another length, another fingerprint or a
+                    // zero length never authorises reuse.
+                    for wrong in [other_len, forged, (0, right.1)] {
+                        let got = plan_from_rendered(
+                            lineage,
+                            rendered.clone(),
+                            eligible,
+                            &ckpts,
+                            Some(wrong),
+                            "q35",
+                        );
+                        assert_same_plan(&got, &base, &format!("{ctx} descriptor {wrong:?}"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn prompt_end_exact_requires_descriptor_prompt_and_conversation() {
+    use hipfire_generate::qwen::prompt_end_exact as exact;
+    let prompt: Vec<u32> = (0..32).collect();
+    let end = end_of(&prompt);
+    let mut conversation = prompt.clone();
+    conversation.extend([7000, 7001]);
+    assert!(exact(&conversation, &prompt, Some(end)));
+    // The conversation may be exactly the prompt (no answer retained).
+    assert!(exact(&prompt, &prompt, Some(end)));
+    assert!(!exact(&conversation, &prompt, None), "no descriptor");
+    assert!(!exact(&[], &prompt, Some(end)), "empty conversation");
+    assert!(
+        !exact(&prompt[..31], &prompt, Some(end)),
+        "conversation shorter than the prompt"
+    );
+    assert!(
+        !exact(&conversation, &[], Some(end_of(&[]))),
+        "empty prompt"
+    );
+    let mut diverged = prompt.clone();
+    diverged[10] = 999;
+    assert!(
+        !exact(&conversation, &diverged, Some(end)),
+        "another prompt of the same length"
+    );
+    assert!(
+        !exact(&diverged, &prompt, Some(end)),
+        "conversation that does not hold the prompt"
+    );
+    assert!(
+        !exact(&conversation, &prompt, Some((31, end.1))),
+        "descriptor length"
+    );
+}
+
 #[test]
 fn qwen_cache_planner_is_ineligible_cold() {
-    let plan =
-        hipfire_generate::qwen::plan_from_rendered(&[10, 11], vec![10, 11, 12], false, &[], "mtp");
+    let plan = plan(&[10, 11], vec![10, 11, 12], false, &[], "mtp");
     assert!(!plan.cache_hit);
     assert_eq!(plan.start_pos, 0);
     assert_eq!(plan.cached_tokens, 0);
@@ -868,7 +1010,6 @@ fn assert_plan(
 /// (non-chunk-aligned) position `p`.
 #[test]
 fn eop_checkpoint_plans_use_the_shared_planner() {
-    use hipfire_generate::qwen::plan_from_rendered as plan;
     // Distinct divergent suffix tokens never collide with the 0..n lineage.
     let fork = |keep: usize, extra: usize| -> Vec<u32> {
         (0..keep as u32)
@@ -946,7 +1087,6 @@ fn eop_checkpoint_plans_use_the_shared_planner() {
 /// plain miss.
 #[test]
 fn empty_lineage_is_a_local_miss() {
-    use hipfire_generate::qwen::plan_from_rendered as plan;
     let rendered: Vec<u32> = (0..64).collect();
     for ckpts in [&[][..], &[16usize][..], &[16usize, 40][..]] {
         let got = plan(&[], rendered.clone(), true, ckpts, "q35");
@@ -968,7 +1108,6 @@ fn empty_lineage_is_a_local_miss() {
 /// `start_pos < rendered.len()`.
 #[test]
 fn local_candidate_never_covers_the_whole_prompt() {
-    use hipfire_generate::qwen::plan_from_rendered as plan;
     let seq = |n: usize| -> Vec<u32> { (0..n as u32).collect() };
     for n in 1..=24usize {
         let rendered = seq(n);
@@ -1014,7 +1153,6 @@ fn local_candidate_never_covers_the_whole_prompt() {
 /// extension or checkpoint resume would hit.
 #[test]
 fn cache_disabled_inputs_plan_cold_through_the_shared_planner() {
-    use hipfire_generate::qwen::plan_from_rendered as plan;
     let lineage: Vec<u32> = (0..50).collect();
     let extension: Vec<u32> = (0..70).collect();
     let divergent: Vec<u32> = (0..45).chain(1_000_000..1_000_003).collect();

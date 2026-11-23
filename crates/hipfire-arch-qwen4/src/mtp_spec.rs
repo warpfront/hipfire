@@ -367,7 +367,8 @@ pub fn require_native_greedy(temp: f32) -> Result<(), String> {
 /// A cold fill is the complete prompt from position zero. A cache hit fills
 /// exactly `prompt_tokens[start_pos..]` after the bundle restored its
 /// session snapshot at `start_pos`, so target and MTP resume at the same
-/// absolute position.
+/// absolute position. A hit at the prompt end fills nothing: it restored a
+/// prompt-end snapshot, which carries the prefill's seed.
 pub fn validate_native_mtp_prefill_request(
     prompt_tokens: &[u32],
     fill_tokens: &[u32],
@@ -388,9 +389,15 @@ pub fn validate_native_mtp_prefill_request(
         }
         return Ok(());
     }
-    if start_pos == 0 || start_pos >= prompt_tokens.len() {
+    if start_pos == 0 {
         return Err(format!(
             "Qwen4 native MTP cache hit at {start_pos} needs a non-empty suffix of a {}-token prompt",
+            prompt_tokens.len()
+        ));
+    }
+    if start_pos > prompt_tokens.len() {
+        return Err(format!(
+            "Qwen4 native MTP cache hit at {start_pos} is past the end of a {}-token prompt",
             prompt_tokens.len()
         ));
     }
@@ -9666,6 +9673,8 @@ impl Qwen4MtpDrafter {
                         .map_err(|error| error.to_string())?;
                 }
             }
+            // A seed only a prompt-end restore inside this begin brings back.
+            bundle.take_prompt_end_seed();
             bundle
                 .session_begin(ops.gpu()?, prompt_tokens, reused, SessionRoute::Mtp)
                 .map_err(|error| error.to_string())?;
@@ -9706,6 +9715,10 @@ impl Qwen4MtpDrafter {
         // first band's): the head uploads its own copy on the output device.
         let reuse_trunk_ids = mtp_reuse_prefill_ids_enabled() && !ops.is_mesh();
         let mut first_token = None;
+        // Whether the incumbent loop below ran the prompt's last chunk: its
+        // logits are then spec logits row 0 and `pending` the hidden of the
+        // last row, which the prompt-end capture keeps.
+        let mut loop_seeded = false;
         // One chunked target forward per chunk instead of one single-row forward
         // per prompt token: the shared forward already captures the whole
         // chunk's wide hidden, and the head then consumes each row in order.
@@ -9894,6 +9907,7 @@ impl Qwen4MtpDrafter {
             }
             if pick.is_some() {
                 first_token = pick;
+                loop_seeded = true;
             }
             pos = end;
             hipfire_runtime::prefill_progress::report(
@@ -9901,7 +9915,32 @@ impl Qwen4MtpDrafter {
                 prompt_tokens.len() - start_pos,
             );
         }
-        let pick = first_token.expect("non-empty MTP prefill produced no seed");
+        let pick = match first_token {
+            Some(pick) => {
+                // Before the sampled draw below reads (and may penalize) row
+                // 0: an exact retry of this prompt restores all of it.
+                if loop_seeded && !ops.is_mesh() {
+                    let bundle = Self::bundle(target)?;
+                    bundle
+                        .session_save_boundary_hidden(ops.gpu()?, pending)
+                        .map_err(|error| error.to_string())?;
+                    bundle
+                        .session_at_prompt_end(ops.gpu()?, prompt_tokens, pick)
+                        .map_err(|error| error.to_string())?;
+                }
+                pick
+            }
+            // A prompt-end restore: target, head, `pending` and the last
+            // row's logits are where this prompt's prefill left them.
+            None => Self::bundle(target)?
+                .take_prompt_end_seed()
+                .ok_or_else(|| {
+                    format!(
+                        "Qwen4 MTP prefill from {start_pos} of a {}-token prompt has no seed",
+                        prompt_tokens.len()
+                    )
+                })?,
+        };
         // The seed is the first emitted token: sampled, it is drawn from the
         // last prompt row's `p` (naive: with the AR sampler itself), exactly
         // as AR draws its first token. Its penalty history is the full prompt

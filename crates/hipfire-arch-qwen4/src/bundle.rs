@@ -18,7 +18,10 @@ use crate::gpu_forward::{
     Qwen4OutputRows, Qwen4PeerExpertSource, Qwen4PeerLayerSource, QWEN4_FORWARD_HEADROOM_BYTES,
 };
 use crate::kv_backend::Qwen4KvBackend;
-use crate::mtp_gpu::{MtpAppendScratch, MtpFillContext, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
+use crate::mtp_gpu::{
+    MtpAppendScratch, MtpFillContext, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu,
+    MTP_SESSION_META_BYTES,
+};
 use crate::ple::PleHashMetadata;
 use crate::state::decode_map_ahead_tokens;
 use crate::state::Qwen4StateFormat;
@@ -33,7 +36,7 @@ use hipfire_runtime::ple_hot_store::HotRowStore;
 use hipfire_runtime::sampler::{apply_logit_policy_cpu, PenaltyTable, SamplerConfig};
 use hipfire_runtime::session_cache::{
     stride_boundaries, SessionCache, SessionDriver, SessionPieceKey, SessionRoute, SessionState,
-    SnapshotParts, StateLayout,
+    SnapshotParts, StateLayout, StatePart,
 };
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
@@ -199,6 +202,13 @@ pub struct Qwen4Bundle {
     /// verify/advance call.
     pub(crate) spec_logits: Option<GpuTensor>,
     pub(crate) spec_top1: Option<GpuTensor>,
+    /// The greedy seed a running [`Self::session_at_prompt_end`] captures with
+    /// the prompt end; `None` outside that call.
+    prompt_end_capture: Option<u32>,
+    /// The greedy seed the last session restore brought back: `Some` only
+    /// after a prompt-end restore, which leaves nothing to prefill (taken by
+    /// the MTP prefill through [`Self::take_prompt_end_seed`]).
+    prompt_end_seed: Option<u32>,
     pub(crate) spec_hidden: Option<GpuTensor>,
     pub(crate) spec_host_top1: Vec<u8>,
     /// DFlash2 drafter's target layers and capture rows (`None`: no DFlash2
@@ -453,6 +463,49 @@ pub(crate) fn session_scope(
     scope
 }
 
+/// First metadata word of the record a prompt-end snapshot appends after the
+/// MTP head's words; the second is the greedy seed the prefill picked.
+const PROMPT_END_TAG: u64 = u64::from_le_bytes(*b"q4p-end1");
+
+/// `meta` split into the target's `target_bytes`, the MTP head's words and,
+/// for a prompt-end snapshot ([`Qwen4Bundle::session_at_prompt_end`]), its
+/// greedy seed.
+fn split_session_meta(
+    meta: &[u8],
+    target_bytes: usize,
+) -> Result<(&[u8], &[u8], Option<u32>), String> {
+    let (target, rest) = meta
+        .split_at_checked(target_bytes)
+        .ok_or("qwen4 session snapshot shape mismatch")?;
+    if rest.len() != MTP_SESSION_META_BYTES + 16 {
+        return Ok((target, rest, None));
+    }
+    let (mtp, end) = rest.split_at(MTP_SESSION_META_BYTES);
+    let words = crate::state::meta_words(end).ok_or("qwen4 prompt-end record shape")?;
+    let seed = (words[0] == PROMPT_END_TAG)
+        .then(|| u32::try_from(words[1]).ok())
+        .flatten()
+        .ok_or("qwen4 prompt-end record mismatch")?;
+    Ok((target, mtp, Some(seed)))
+}
+
+/// Spec logits row 0 (the last prompt row's logits after a prefill), the
+/// extra part of a prompt-end snapshot.
+fn prompt_end_logits_part(
+    logits: Option<&GpuTensor>,
+    vocab: usize,
+) -> Result<StatePart<'_>, String> {
+    let logits = logits.ok_or("Qwen4 spec logits are not attached")?;
+    if logits.numel() < vocab {
+        return Err("Qwen4 spec logits hold no full row".into());
+    }
+    Ok(StatePart {
+        buf: &logits.buf,
+        offset: 0,
+        bytes: vocab * std::mem::size_of::<f32>(),
+    })
+}
+
 impl SessionState for Qwen4Bundle {
     fn snapshot_scope(&self, route: SessionRoute) -> Option<String> {
         // An attached root is not a band: its aggregate scope is the mesh
@@ -533,54 +586,24 @@ impl SessionState for Qwen4Bundle {
         route: SessionRoute,
         position: usize,
     ) -> Result<SnapshotParts<'_>, String> {
-        self.check_expert_cache_readers_idle()
-            .map_err(|error| error.to_string())?;
-        if self.pp.is_some() {
-            return Err("session snapshots are not supported under qwen4 topology.pp yet".into());
+        self.session_snapshot_parts(route, position, None)
+    }
+
+    /// The MTP route's prompt end, captured inside
+    /// [`Qwen4Bundle::session_at_prompt_end`]: the session state plus the
+    /// last prompt row's logits (spec logits row 0, what the sampled first
+    /// draw reads) and the greedy seed the prefill picked. The head's
+    /// boundary hidden (the first fill row's pair) is part of the state.
+    fn prompt_end_parts(
+        &mut self,
+        route: SessionRoute,
+        position: usize,
+    ) -> Option<Result<SnapshotParts<'_>, String>> {
+        let seed = self.prompt_end_capture?;
+        if route != SessionRoute::Mtp || self.spec_logits.is_none() {
+            return None;
         }
-        self.quiesce_ple().map_err(|e| e.to_string())?;
-        let mtp = match route {
-            SessionRoute::Ar => None,
-            SessionRoute::Mtp => Some(
-                self.mtp
-                    .as_ref()
-                    .ok_or("Qwen4 MTP resources are not attached")?,
-            ),
-        };
-        let staged = self
-            .pair_session_stage
-            .as_ref()
-            .filter(|stage| stage.position == Some(position))
-            .or_else(|| {
-                self.slowlink
-                    .stages
-                    .iter()
-                    .find(|stage| stage.position == Some(position))
-            });
-        if (staged.is_none() && self.state.position != position)
-            || mtp.is_some_and(|mtp| mtp.position() != position)
-        {
-            return Err(format!("qwen4 session capture: owners not at {position}"));
-        }
-        let SnapshotParts {
-            mut meta,
-            mut layout,
-        } = match staged {
-            Some(stage) => stage
-                .snapshot_parts(&self.state)
-                .map_err(|e| e.to_string())?,
-            None => {
-                let (meta, layout) = self.state.session_parts().map_err(|e| e.to_string())?;
-                SnapshotParts { meta, layout }
-            }
-        };
-        if let Some(mtp) = mtp {
-            let (mtp_meta, mtp_layout) = mtp.session_parts().map_err(|e| e.to_string())?;
-            meta.extend(mtp_meta);
-            layout.fixed.extend(mtp_layout.fixed);
-            layout.rows.extend(mtp_layout.rows);
-        }
-        Ok(SnapshotParts { meta, layout })
+        Some(self.session_snapshot_parts(route, position, Some(seed)))
     }
 
     fn restore_parts(
@@ -594,9 +617,11 @@ impl SessionState for Qwen4Bundle {
         if self.pp.is_some() {
             return Err("session restore is not supported under qwen4 topology.pp yet".into());
         }
-        let (target_meta, mtp_meta) = meta
-            .split_at_checked(self.state.session_meta_bytes())
-            .ok_or("qwen4 session snapshot shape mismatch")?;
+        let (target_meta, mtp_meta, seed) =
+            split_session_meta(meta, self.state.session_meta_bytes())?;
+        if seed.is_some() && route != SessionRoute::Mtp {
+            return Err("qwen4 prompt-end snapshot outside the MTP route".into());
+        }
         if route == SessionRoute::Mtp {
             // Refuse an MTP snapshot of another shape or without a boundary
             // row for its position before any owner mutates.
@@ -621,6 +646,12 @@ impl SessionState for Qwen4Bundle {
                 .map_err(|e| e.to_string())?;
             layout.fixed.extend(mtp_layout.fixed);
             layout.rows.extend(mtp_layout.rows);
+            if seed.is_some() {
+                layout.fixed.push(prompt_end_logits_part(
+                    self.spec_logits.as_ref(),
+                    self.config.vocab_size,
+                )?);
+            }
         }
         Ok(layout)
     }
@@ -629,16 +660,23 @@ impl SessionState for Qwen4Bundle {
     /// same checks `restore_parts` runs first (shape, mark, and the boundary
     /// row for its own position), so the session cache plans around one an
     /// older build captured without the row: its prefix is prefilled again.
+    /// A prompt-end snapshot also needs the spec logits its row goes back to.
     /// Without attached head resources the restore itself reports that.
     fn snapshot_restorable(&self, route: SessionRoute, meta: &[u8]) -> bool {
+        let Ok((_, mtp_meta, seed)) = split_session_meta(meta, self.state.session_meta_bytes())
+        else {
+            return route != SessionRoute::Mtp;
+        };
         if route != SessionRoute::Mtp {
-            return true;
+            return seed.is_none();
+        }
+        if seed.is_some() && self.spec_logits.is_none() {
+            return false;
         }
         let Some(mtp) = self.mtp.as_ref() else {
             return true;
         };
-        meta.split_at_checked(self.state.session_meta_bytes())
-            .is_some_and(|(_, mtp_meta)| mtp.check_session_restore(mtp_meta).is_ok())
+        mtp.check_session_restore(mtp_meta).is_ok()
     }
 
     fn finish_restore(
@@ -652,12 +690,13 @@ impl SessionState for Qwen4Bundle {
         if self.pp.is_some() {
             return Err("session restore is not supported under qwen4 topology.pp yet".into());
         }
-        let (target_meta, mtp_meta) = meta
-            .split_at_checked(self.state.session_meta_bytes())
-            .ok_or("qwen4 session snapshot shape mismatch")?;
+        let (target_meta, mtp_meta, seed) =
+            split_session_meta(meta, self.state.session_meta_bytes())?;
         self.state
             .finish_session_restore(target_meta)
             .map_err(|e| e.to_string())?;
+        // Only a prompt-end restore leaves a seed for the prefill to emit.
+        self.prompt_end_seed = seed;
         match (route, self.mtp.as_mut()) {
             (SessionRoute::Mtp, Some(mtp)) => mtp.finish_session_restore(mtp_meta),
             // An AR prefill leaves the head cold, as a reset would.
@@ -1005,6 +1044,8 @@ impl Qwen4Bundle {
             mtp: None,
             spec_logits: None,
             spec_top1: None,
+            prompt_end_capture: None,
+            prompt_end_seed: None,
             spec_hidden: None,
             spec_host_top1: Vec::new(),
             dflash: None,
@@ -3957,7 +3998,7 @@ impl Qwen4Bundle {
 
     /// Host copy of row `row` of the last speculative forward's logits into
     /// the reused buffer `host`.
-    pub(crate) fn spec_row_logits(
+    pub fn spec_row_logits(
         &self,
         gpu: &Gpu,
         row: usize,
@@ -5111,6 +5152,102 @@ impl Qwen4Bundle {
         self.with_session(|session, bundle| session.at_boundary(gpu, bundle, prefix))
             .unwrap_or(Ok(()))
             .map_err(BundleError::Forward)
+    }
+
+    /// Report that every owner of the MTP route consumed exactly `prompt`
+    /// (its whole prompt) and that the prefill picked `seed` from the last
+    /// row's logits in spec logits row 0, before anything reads or changes
+    /// them: captures the prompt end ([`SessionDriver::at_prompt_end`]), so
+    /// an exact retry of `prompt` restores state, logits and seed and
+    /// prefills nothing.
+    pub(crate) fn session_at_prompt_end(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        seed: u32,
+    ) -> Result<(), BundleError> {
+        self.check_expert_cache_idle(gpu)?;
+        self.ep_refuse("session_at_prompt_end outside a replicated call")?;
+        self.prompt_end_capture = Some(seed);
+        let result = self
+            .with_session(|session, bundle| {
+                session.at_prompt_end(gpu, bundle, SessionRoute::Mtp, prompt)
+            })
+            .unwrap_or(Ok(()));
+        self.prompt_end_capture = None;
+        result.map_err(BundleError::Forward)
+    }
+
+    /// The greedy seed a prompt-end restore brought back (see
+    /// `prompt_end_seed`), once.
+    pub(crate) fn take_prompt_end_seed(&mut self) -> Option<u32> {
+        self.prompt_end_seed.take()
+    }
+
+    /// [`SessionState::snapshot_parts`]; with `prompt_end` (the MTP route's
+    /// greedy seed at the prompt end) also the last row's logits and a
+    /// record naming the seed after the head's metadata.
+    fn session_snapshot_parts(
+        &mut self,
+        route: SessionRoute,
+        position: usize,
+        prompt_end: Option<u32>,
+    ) -> Result<SnapshotParts<'_>, String> {
+        self.check_expert_cache_readers_idle()
+            .map_err(|error| error.to_string())?;
+        if self.pp.is_some() {
+            return Err("session snapshots are not supported under qwen4 topology.pp yet".into());
+        }
+        self.quiesce_ple().map_err(|e| e.to_string())?;
+        let mtp = match route {
+            SessionRoute::Ar => None,
+            SessionRoute::Mtp => Some(
+                self.mtp
+                    .as_ref()
+                    .ok_or("Qwen4 MTP resources are not attached")?,
+            ),
+        };
+        let staged = self
+            .pair_session_stage
+            .as_ref()
+            .filter(|stage| stage.position == Some(position))
+            .or_else(|| {
+                self.slowlink
+                    .stages
+                    .iter()
+                    .find(|stage| stage.position == Some(position))
+            });
+        if (staged.is_none() && self.state.position != position)
+            || mtp.is_some_and(|mtp| mtp.position() != position)
+        {
+            return Err(format!("qwen4 session capture: owners not at {position}"));
+        }
+        let SnapshotParts {
+            mut meta,
+            mut layout,
+        } = match staged {
+            Some(stage) => stage
+                .snapshot_parts(&self.state)
+                .map_err(|e| e.to_string())?,
+            None => {
+                let (meta, layout) = self.state.session_parts().map_err(|e| e.to_string())?;
+                SnapshotParts { meta, layout }
+            }
+        };
+        if let Some(mtp) = mtp {
+            let (mtp_meta, mtp_layout) = mtp.session_parts().map_err(|e| e.to_string())?;
+            meta.extend(mtp_meta);
+            layout.fixed.extend(mtp_layout.fixed);
+            layout.rows.extend(mtp_layout.rows);
+            if let Some(seed) = prompt_end {
+                meta.extend(crate::state::meta_bytes(&[PROMPT_END_TAG, u64::from(seed)]));
+                layout.fixed.push(prompt_end_logits_part(
+                    self.spec_logits.as_ref(),
+                    self.config.vocab_size,
+                )?);
+            }
+        }
+        Ok(SnapshotParts { meta, layout })
     }
 
     /// Publish the pool snapshots the request in flight captured at prompt

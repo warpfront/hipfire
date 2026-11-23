@@ -21,8 +21,10 @@ use crate::mtp_spec::{
     MtpSpecResult, MtpSpecState, PendingMtpFill, PENALTY_REPEAT_CAP,
 };
 use crate::speculative::{
-    take_dn_boundary_checkpoint, take_turn_checkpoint, DeltaNetSnapshot, ModelSlot, TurnCheckpoint,
+    checkpoint_fits_admitted_context, take_dn_boundary_checkpoint, take_turn_checkpoint,
+    DeltaNetSnapshot, ModelSlot, TurnCheckpoint,
 };
+use hipfire_runtime::checkpoint_pool::prefix_fingerprint;
 use hipfire_runtime::ngram_mod::{MtpNgramContext, NgramModConfig};
 use hipfire_runtime::spec::{
     terminal_prefix_replay, MtpDrafter, MtpRequestStats, MtpSpeculator, MtpWindow, PrefillOutcome,
@@ -87,6 +89,65 @@ struct OwedFill {
     ring_added: bool,
 }
 
+/// Seed a prompt-end payload carries besides its DeltaNet image: the final
+/// trunk logits row and the head's `prev_hidden`, copied after the owed head
+/// fill (if any) is known, plus the prompt it describes.
+struct PromptEndSeed {
+    len: usize,
+    /// [`prefix_fingerprint`] of the whole prompt `[0, len)`.
+    fingerprint: u64,
+    logits: Vec<f32>,
+    prev_hidden: Vec<f32>,
+    /// The head KV covers `[0, len)`: no owed fill remains. Only a settled
+    /// payload is advertised or restorable.
+    head_settled: bool,
+}
+
+/// One bounded, drafter-owned prompt-end payload, separate from the ordinary
+/// stride / turn checkpoint ring. `snapshot` is the sealed DeltaNet image and
+/// stays allocated across requests; `seed` is `None` while the payload is
+/// stale (cold prefill, rewritten prefix) and is refilled by the next capture.
+struct PromptEndPayload {
+    snapshot: DeltaNetSnapshot,
+    seed: Option<PromptEndSeed>,
+}
+
+fn prompt_end_trace() -> bool {
+    hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+fn f32_bytes(values: &[f32]) -> &[u8] {
+    // SAFETY: any f32 is plain bytes; length is exactly the slice's byte size.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
+    }
+}
+
+/// First token from the trunk's last-row logits: greedy strict-`>` fold, else
+/// a draw from the state's continuous RNG/config with an empty penalty history
+/// (AR's first token has none). Shared by a fresh prefill and a prompt-end
+/// restore so both produce the token from the same code.
+fn seed_first_token(logits: &[f32], state: &mut MtpSpecState) -> u32 {
+    if state.sampling.is_greedy() {
+        logits
+            .iter()
+            .enumerate()
+            .fold((0u32, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv {
+                    (i as u32, v)
+                } else {
+                    (bi, bv)
+                }
+            })
+            .0
+    } else {
+        sample_from_logits(logits, &state.sampling, &mut state.rng).0
+    }
+}
+
 /// qwen35 MTP drafter. `state` is allocated on the first `mtp_prefill` (it needs
 /// `&mut Gpu` + the concrete `ModelSlot`, neither available at load-time
 /// construction). Sampling is installed once per request via
@@ -139,6 +200,9 @@ pub struct Qwen35MtpDrafter {
     defer_prefill_tail: bool,
     /// Head fill the last deferring prefill left owed (see [`OwedFill`]).
     owed_fill: Option<OwedFill>,
+    /// Sealed prompt-end payload of the newest prefill that reached its prompt
+    /// end (see [`PromptEndPayload`]).
+    prompt_end: Option<PromptEndPayload>,
 }
 
 impl Qwen35MtpDrafter {
@@ -178,6 +242,7 @@ impl Qwen35MtpDrafter {
             prompt_route,
             defer_prefill_tail: false,
             owed_fill: None,
+            prompt_end: None,
         }
     }
     /// Borrow the live MTP spec state (`None` before the first `mtp_prefill`
@@ -467,6 +532,7 @@ impl Qwen35MtpDrafter {
     /// unload, abort, failure): the prompt-end checkpoint it guarded goes too.
     fn discard_owed_fill(&mut self, gpu: &mut Gpu) {
         if let Some(owed) = self.owed_fill.take() {
+            self.invalidate_prompt_end();
             let position = owed.fill.committed_pos();
             let ring_added = owed.ring_added;
             owed.fill.discard(gpu);
@@ -504,9 +570,197 @@ impl Qwen35MtpDrafter {
             if ring_added {
                 self.drop_owed_checkpoint(gpu, position);
             }
+            self.invalidate_prompt_end();
             return Err(format!("qwen35 MTP deferred prompt fill: {error}"));
         }
+        if let Some(seed) = self.prompt_end.as_mut().and_then(|p| p.seed.as_mut()) {
+            if seed.len == position {
+                seed.head_settled = true;
+            }
+        }
         Ok(())
+    }
+
+    /// Length of the resident (non-stale) prompt-end seed.
+    fn prompt_end_len(&self) -> Option<usize> {
+        self.prompt_end.as_ref()?.seed.as_ref().map(|seed| seed.len)
+    }
+
+    /// Mark the prompt-end payload stale; its snapshot buffers stay allocated
+    /// so the next capture reuses them.
+    fn invalidate_prompt_end(&mut self) {
+        if let Some(payload) = self.prompt_end.as_mut() {
+            payload.seed = None;
+        }
+    }
+
+    /// Release the prompt-end payload's device memory (reset / unload).
+    fn free_prompt_end(&mut self, gpu: &mut Gpu) {
+        if let Some(payload) = self.prompt_end.take() {
+            payload.snapshot.free_gpu(gpu);
+        }
+    }
+
+    /// Capture the sealed prompt end after a prefill whose fill reached the end
+    /// of `prompt_tokens`: a DeltaNet image of the live (already sealed) state,
+    /// the last-row logits and `prev_hidden`. The target KV prefix and the
+    /// head KV prefix are not copied: both are absolute-position storage that
+    /// append-only decode never rewrites below the prompt end. Skipped (the
+    /// route keeps its checkpoint behavior) when the snapshot does not fit the
+    /// admitted context, the KV is compacted, or any copy fails.
+    #[allow(clippy::too_many_arguments)]
+    fn capture_prompt_end(
+        payload: &mut Option<PromptEndPayload>,
+        gpu: &mut Gpu,
+        slot: &ModelSlot,
+        state: &MtpSpecState,
+        prompt_tokens: &[u32],
+        logits: &[f32],
+        head_settled: bool,
+    ) {
+        if let Some(existing) = payload.as_mut() {
+            existing.seed = None;
+        }
+        if prompt_tokens.is_empty() || slot.kv_cache.compact_offset != 0 {
+            return;
+        }
+        let started = std::time::Instant::now();
+        if payload.is_none() {
+            if !checkpoint_fits_admitted_context(gpu, &slot.kv_cache, &slot.dn_state) {
+                return;
+            }
+            match DeltaNetSnapshot::new_for(gpu, &slot.dn_state) {
+                Ok(snapshot) => {
+                    *payload = Some(PromptEndPayload {
+                        snapshot,
+                        seed: None,
+                    })
+                }
+                Err(e) => {
+                    eprintln!(
+                        "qwen35 MTP prompt-end capture skipped: snapshot allocation failed: {e}"
+                    );
+                    return;
+                }
+            }
+        }
+        let payload = payload.as_mut().expect("allocated above");
+        let prev_hidden = match gpu.download_f32(&state.prev_hidden) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "qwen35 MTP prompt-end capture skipped: prev_hidden download failed: {e}"
+                );
+                return;
+            }
+        };
+        if let Err(e) = payload.snapshot.save_from(&slot.dn_state, gpu) {
+            eprintln!("qwen35 MTP prompt-end capture skipped: snapshot save failed: {e}");
+            return;
+        }
+        if prompt_end_trace() {
+            eprintln!(
+                "[qwen-cache mtp prompt-end capture] len={} snapshot_bytes={} logits_bytes={} hidden_bytes={} head_settled={} capture_ms={:.2}",
+                prompt_tokens.len(),
+                payload.snapshot.bytes_len(),
+                logits.len() * 4,
+                prev_hidden.len() * 4,
+                head_settled,
+                started.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        payload.seed = Some(PromptEndSeed {
+            len: prompt_tokens.len(),
+            fingerprint: prefix_fingerprint(prompt_tokens),
+            logits: logits.to_vec(),
+            prev_hidden,
+            head_settled,
+        });
+    }
+
+    /// Whole-prompt reuse: put the sealed prompt end back and return the first
+    /// token through [`seed_first_token`], the same helper a fresh prefill
+    /// uses (never a saved token; the request's RNG is untouched until here).
+    /// The planner only plans this against an advertised descriptor, so any
+    /// mismatch is an invariant failure and fails closed.
+    fn restore_prompt_end(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        prompt_tokens: &[u32],
+        start_pos: usize,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<PrefillOutcome, String> {
+        if self.owed_fill.is_some() {
+            return Err("qwen35 MTP prompt-end restore with head fill still owed".into());
+        }
+        self.defer_prefill_tail = false;
+        self.last_window = None;
+        if abort() {
+            return Ok(PrefillOutcome::Aborted);
+        }
+        if Self::tp_target(target).is_some() {
+            return Err(
+                "qwen35 MTP prompt-end restore is not available on a dense-TP target".into(),
+            );
+        }
+        let slot = Self::slot(target)?;
+        self.ensure_state(gpu, slot)?;
+        let state = self.state.as_mut().expect("ensure_state set it");
+        let payload = self
+            .prompt_end
+            .as_ref()
+            .ok_or("qwen35 MTP prompt-end restore without a resident payload")?;
+        let seed = payload
+            .seed
+            .as_ref()
+            .filter(|seed| seed.head_settled)
+            .ok_or("qwen35 MTP prompt-end payload is stale or incomplete")?;
+        if seed.len != start_pos
+            || start_pos != prompt_tokens.len()
+            || seed.fingerprint != prefix_fingerprint(prompt_tokens)
+        {
+            return Err(format!(
+                "qwen35 MTP prompt-end payload (len {}) does not describe this prompt (len {}, start {start_pos})",
+                seed.len,
+                prompt_tokens.len()
+            ));
+        }
+        if slot.kv_cache.compact_offset != 0 {
+            return Err("qwen35 MTP prompt-end restore on a compacted KV cache".into());
+        }
+        let logits_bytes = f32_bytes(&seed.logits);
+        let hidden_bytes = f32_bytes(&seed.prev_hidden);
+        if logits_bytes.len() > slot.scratch.logits.buf.size()
+            || hidden_bytes.len() > state.prev_hidden.buf.size()
+        {
+            return Err("qwen35 MTP prompt-end seed rows do not fit this slot".into());
+        }
+        let started = std::time::Instant::now();
+        payload
+            .snapshot
+            .restore_to(&mut slot.dn_state, gpu)
+            .map_err(|e| format!("qwen35 MTP prompt-end DeltaNet restore: {e}"))?;
+        gpu.hip
+            .memcpy_htod(&slot.scratch.logits.buf, logits_bytes)
+            .map_err(|e| format!("qwen35 MTP prompt-end logits restore: {e}"))?;
+        gpu.hip
+            .memcpy_htod(&state.prev_hidden.buf, hidden_bytes)
+            .map_err(|e| format!("qwen35 MTP prompt-end prev_hidden restore: {e}"))?;
+        state.prev_hidden_pos = Some(start_pos - 1);
+        // The user-turn boundary was snapshotted by the capturing prefill and
+        // is still pinned in the ring; it is one-shot, so it never leaks into
+        // a later prefill.
+        self.turn_boundary = None;
+        let first_token = seed_first_token(&seed.logits, state);
+        if prompt_end_trace() {
+            eprintln!(
+                "[qwen-cache mtp prompt-end restore] len={start_pos} restore_ms={:.2}",
+                started.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        self.begin_ngram_request(prompt_tokens);
+        Ok(PrefillOutcome::Ready { first_token })
     }
 }
 
@@ -521,6 +775,11 @@ impl MtpDrafter for Qwen35MtpDrafter {
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
+        // Whole-prompt reuse (no rows to prefill): restore the prompt-end
+        // payload instead of running a prefill.
+        if cache_hit && fill_tokens.is_empty() {
+            return self.restore_prompt_end(gpu, target, prompt_tokens, start_pos, abort);
+        }
         // A new prefill supersedes any owed fill of a dead request (cold), or
         // continues the trunk state it belongs to (warm): settle first.
         if cache_hit {
@@ -529,6 +788,12 @@ impl MtpDrafter for Qwen35MtpDrafter {
             self.discard_owed_fill(gpu);
         }
         let defer_tail = std::mem::take(&mut self.defer_prefill_tail);
+        // Rows below the prompt-end payload's length are rewritten by anything
+        // but a pure extension, so the payload stops describing the live head
+        // and target KV prefix. Its snapshot buffers stay allocated for reuse.
+        if !cache_hit || self.prompt_end_len().is_some_and(|len| start_pos < len) {
+            self.invalidate_prompt_end();
+        }
         self.last_window = None;
         if abort() {
             return Ok(PrefillOutcome::Aborted);
@@ -641,22 +906,21 @@ impl MtpDrafter for Qwen35MtpDrafter {
         let logits = gpu
             .download_f32(&slot.scratch.logits)
             .map_err(|e| format!("download seed logits: {e}"))?;
-        let first_token = if state.sampling.is_greedy() {
-            logits
-                .iter()
-                .enumerate()
-                .fold((0u32, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
-                    if v > bv {
-                        (i as u32, v)
-                    } else {
-                        (bi, bv)
-                    }
-                })
-                .0
-        } else {
-            // First token is unpenalized: AR's first token has empty history.
-            sample_from_logits(&logits, &state.sampling, &mut state.rng).0
-        };
+        // The sealed prompt end (DeltaNet image, this row, `prev_hidden`) is
+        // captured BEFORE the first token is sampled, so a restored retry draws
+        // its first token from identical bytes through the same helper below.
+        if start_pos + fill_tokens.len() == prompt_tokens.len() {
+            Self::capture_prompt_end(
+                &mut self.prompt_end,
+                gpu,
+                &*slot,
+                &*state,
+                prompt_tokens,
+                &logits,
+                self.owed_fill.is_none(),
+            );
+        }
+        let first_token = seed_first_token(&logits, state);
 
         self.begin_ngram_request(prompt_tokens);
         Ok(PrefillOutcome::Ready { first_token })
@@ -813,6 +1077,9 @@ impl MtpDrafter for Qwen35MtpDrafter {
         abort: &dyn Fn() -> bool,
     ) -> Result<bool, String> {
         self.settle_owed_fill(gpu, target)?;
+        if self.prompt_end_len().is_some_and(|len| start_pos < len) {
+            self.invalidate_prompt_end();
+        }
         self.last_window = None;
         // Forced tokens must land in BOTH the trunk and the MTP head KV /
         // prev_hidden. Plain spec_advance only moves trunk state, leaving an
@@ -846,6 +1113,9 @@ impl MtpDrafter for Qwen35MtpDrafter {
         consumed: &[u32],
     ) -> Result<bool, String> {
         self.settle_owed_fill(gpu, target)?;
+        if self.prompt_end_len().is_some_and(|len| window_start < len) {
+            self.invalidate_prompt_end();
+        }
         let Some((saved_start, saved_seed)) = self.last_window.take() else {
             return Ok(false);
         };
@@ -899,6 +1169,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
             ctx.reset_request();
         }
         self.clear_checkpoints(gpu);
+        self.free_prompt_end(gpu);
         if let Some(state) = self.state.as_mut() {
             state
                 .reset(gpu)
@@ -912,6 +1183,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
         self.last_window = None;
         self.tp_reset_pending = self.tp.is_some();
         self.clear_checkpoints(gpu);
+        self.free_prompt_end(gpu);
         if let Some(state) = self.state.as_mut() {
             state
                 .reset(gpu)
@@ -957,6 +1229,17 @@ impl MtpDrafter for Qwen35MtpDrafter {
             .collect()
     }
 
+    // Advertised only once the owed head fill has landed: before that the head
+    // KV does not yet cover `[0, len)`, so the payload is not a complete seed.
+    fn mtp_prompt_end_checkpoint(&self) -> Option<(usize, u64)> {
+        self.prompt_end
+            .as_ref()?
+            .seed
+            .as_ref()
+            .filter(|seed| seed.head_settled)
+            .map(|seed| (seed.len, seed.fingerprint))
+    }
+
     fn mtp_rewind_to(
         &mut self,
         gpu: &mut Gpu,
@@ -1000,6 +1283,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
                 "[mtp] BUG: dense-TP drafter freed via mtp_free; per-rank verify scratch leaked"
             );
         }
+        this.free_prompt_end(gpu);
         this.clear_checkpoints(gpu);
         if let Some(state) = this.state {
             state.free_gpu(gpu);
@@ -1016,6 +1300,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
             let _ = dev.bind_thread();
             this.discard_owed_fill(dev);
             this.clear_checkpoints(dev);
+            this.free_prompt_end(dev);
             if let Some(state) = this.state {
                 state.free_gpu(dev);
             }

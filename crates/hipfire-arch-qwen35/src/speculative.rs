@@ -11601,12 +11601,12 @@ mod ring_pin_tests {
     }
 }
 
-/// Whether one more DeltaNet snapshot can be allocated without eating what the
-/// admitted context still needs: `free_now >= snapshot + KV mapping growth to
-/// the admitted tokens + the fit's reserve`, where `free_now` includes memory parked in
-/// the pool. No floor set => always true; a
-/// memory query or growth-plan error => false (do not allocate).
-fn checkpoint_fits_admitted_context(gpu: &Gpu, kv: &KvCache, dn: &DeltaNetState) -> bool {
+/// Whether `extra_bytes` more device memory can be allocated without eating what
+/// the admitted context still needs: `free_now >= extra_bytes + KV mapping
+/// growth to the admitted tokens + the fit's reserve`, where `free_now` includes
+/// memory parked in the pool. No floor set => always true; a memory query or
+/// growth-plan error => false (do not allocate).
+pub fn bytes_fit_admitted_context(gpu: &Gpu, kv: &KvCache, extra_bytes: usize) -> bool {
     let Some(floor) = gpu.kv_fit_floor else {
         return true;
     };
@@ -11620,13 +11620,20 @@ fn checkpoint_fits_admitted_context(gpu: &Gpu, kv: &KvCache, dn: &DeltaNetState)
     let Ok(growth) = kv.planned_mapped_growth_bytes(gpu, floor.admitted_tokens) else {
         return false;
     };
+    available
+        >= extra_bytes
+            .saturating_add(growth)
+            .saturating_add(floor.reserve_bytes)
+}
+
+/// Whether one more DeltaNet snapshot can be allocated without eating what the
+/// admitted context still needs ([`bytes_fit_admitted_context`] for one
+/// snapshot of `dn`).
+pub fn checkpoint_fits_admitted_context(gpu: &Gpu, kv: &KvCache, dn: &DeltaNetState) -> bool {
     let Ok(snapshot) = usize::try_from(DeltaNetSnapshot::bytes_for(dn)) else {
         return false;
     };
-    available
-        >= snapshot
-            .saturating_add(growth)
-            .saturating_add(floor.reserve_bytes)
+    bytes_fit_admitted_context(gpu, kv, snapshot)
 }
 
 /// Outer chunk ceiling of the DFlash prompt seed ([`SeedPrefill::plan`]):

@@ -188,3 +188,8 @@ required-features = ["lab"]
 name = "dflash_lookup_state_oracle"
 path = "tests/dflash_lookup_state_oracle.rs"
 required-features = ["deltanet"]
+
+[[test]]
+name = "dflash_prompt_end_state_equality"
+path = "tests/dflash_prompt_end_state_equality.rs"
+required-features = ["deltanet"]

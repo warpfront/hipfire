@@ -1123,6 +1123,17 @@ pub trait Speculator {
         Vec::new()
     }
 
+    /// `(len, prefix fingerprint)` of the whole prompt whose prompt-end payload
+    /// (sealed target state, last-row logits and the speculator's post-prefill
+    /// seed) is complete and resident, `None` otherwise. The fingerprint is
+    /// [`crate::checkpoint_pool::prefix_fingerprint`] of the whole prompt. This
+    /// is the only authorisation for a planner to reuse a whole rendered
+    /// prompt (`start_pos == prompt.len()`, zero prefill rows); an ordinary
+    /// [`Self::checkpoint_positions`] entry never is. Default `None`.
+    fn prompt_end_checkpoint(&self) -> Option<(usize, u64)> {
+        None
+    }
+
     /// The request's user-turn boundary (`prompt_frame::user_turn_resume_boundary`),
     /// `None` when its prompt is not user-terminated. Set before the prompt
     /// prefill; a speculator with a checkpoint ring snapshots there. Default: ignored.
@@ -1650,6 +1661,13 @@ pub trait MtpDrafter {
         Vec::new()
     }
 
+    /// `(len, prefix fingerprint)` of the resident, complete MTP prompt-end
+    /// payload (see [`Speculator::prompt_end_checkpoint`]); advertised only
+    /// once the owed head fill has settled. Default `None`.
+    fn mtp_prompt_end_checkpoint(&self) -> Option<(usize, u64)> {
+        None
+    }
+
     /// The request's user-turn boundary (`prompt_frame::user_turn_resume_boundary`),
     /// `None` when its prompt is not user-terminated. A drafter with a checkpoint
     /// ring snapshots its target there during the prompt prefill and keeps that
@@ -1921,6 +1939,10 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
 
     fn checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
         self.arch.mtp_checkpoint_prefix_hashes()
+    }
+
+    fn prompt_end_checkpoint(&self) -> Option<(usize, u64)> {
+        self.arch.mtp_prompt_end_checkpoint()
     }
 
     fn set_turn_boundary(&mut self, boundary: Option<usize>) {
@@ -2630,10 +2652,17 @@ mod tests {
             fn mtp_checkpoint_positions(&self) -> Vec<usize> {
                 vec![2_048, 4_096]
             }
+
+            fn mtp_prompt_end_checkpoint(&self) -> Option<(usize, u64)> {
+                Some((4_096, 0xE17D))
+            }
         }
 
         let spec = MtpSpeculator::new(CheckpointDrafter);
         assert_eq!(spec.checkpoint_positions(), vec![2_048, 4_096]);
+        // A prompt-end descriptor is the drafter's alone to advertise: the
+        // adapter forwards it, and a checkpoint position never implies one.
+        assert_eq!(spec.prompt_end_checkpoint(), Some((4_096, 0xE17D)));
     }
 
     // ── SpecEmit seam types ─────────────────────────────────────────────────

@@ -33,8 +33,11 @@
 //! has children is pinned, so eviction only ever removes leaves.
 //!
 //! Besides the pool, the cache keeps fixed-only *resident* snapshots backed by
-//! the live row streams: the deepest regular boundary and an optional lineage
-//! split before the prompt's final message end. A tail restore preserves the
+//! the live row streams: the deepest regular boundary, an optional lineage
+//! split before the prompt's final message end, and the prompt end
+//! ([`SessionCache::at_prompt_end`]: the fixed state plus the last row's
+//! logits and the speculator's seed, so an exact retry of the prompt skips
+//! its whole prefill). A tail restore preserves the
 //! earlier resident's rows. Pool captures of a turn that descends from a
 //! lineage split (or from a session-exact snapshot) stay enabled but are keyed
 //! under `session_exact_domain`, so a cold-exact lookup never aliases them;
@@ -161,6 +164,21 @@ pub trait SessionState {
         route: SessionRoute,
         position: usize,
     ) -> Result<SnapshotParts<'_>, String>;
+    /// [`Self::snapshot_parts`] at the end of the prompt just prefilled
+    /// (`position == prompt.len()`), extended by what the first decode step
+    /// reads from that prefill (the last row's logits and the speculator's
+    /// seed), for [`SessionCache::at_prompt_end`]. The metadata names the
+    /// extra parts, so [`Self::restore_parts`] and [`Self::finish_restore`]
+    /// restore them with the state and leave the first decode step exactly
+    /// where the prefill left it. `None`: `route` keeps nothing at the prompt
+    /// end (a retry then prefills the last row again).
+    fn prompt_end_parts(
+        &mut self,
+        _route: SessionRoute,
+        _position: usize,
+    ) -> Option<Result<SnapshotParts<'_>, String>> {
+        None
+    }
     /// Make the live state ready to receive the snapshot described by `meta`
     /// (map capacity, bump epochs) and return its destination layout, in
     /// capture order with the snapshot's row counts.
@@ -461,6 +479,17 @@ struct Resident {
     cold_exact: bool,
 }
 
+/// Which resident a capture fills.
+#[derive(Clone, Copy)]
+enum ResidentSlot {
+    /// The deepest regular boundary (or a live turn's start).
+    Boundary,
+    /// A lineage split.
+    Tail,
+    /// The prompt end, with what the first decode step reads.
+    End,
+}
+
 /// `domain` narrowed to snapshots whose state descends from a lineage split
 /// or a decode continuation: never the key of a cold-exact snapshot.
 fn session_exact_domain(domain: &CacheDomain) -> CacheDomain {
@@ -744,6 +773,12 @@ pub struct SessionCache {
     /// Fixed state before the prompt's last message-end token.
     tail: Option<Resident>,
     tail_pending: Option<Resident>,
+    /// Fixed state at the end of a prompt plus what the first decode step
+    /// reads from its prefill ([`SessionState::prompt_end_parts`]): an exact
+    /// retry of that prompt restores it and prefills nothing.
+    end: Option<Resident>,
+    /// This turn's prompt-end capture, published as `end` by `commit`.
+    end_pending: Option<Resident>,
     /// Track split lineage even when the memory guard skips its resident.
     live_cold_exact: bool,
     /// Displaced resident buffers; freed at the next `begin`/`clear`.
@@ -1457,6 +1492,8 @@ impl SessionCache {
             resident_pending: None,
             tail: None,
             tail_pending: None,
+            end: None,
+            end_pending: None,
             live_cold_exact: true,
             release_bufs: Vec::new(),
             disk: None,
@@ -1539,8 +1576,10 @@ impl SessionCache {
         snapshot.is_some_and(|snapshot| state.snapshot_restorable(route, &snapshot.meta))
     }
 
-    /// Longest cached prefix of `prompt` (always shorter than the prompt, so
-    /// prefill computes at least the last token); 0 on a miss. A stored
+    /// Longest cached prefix of `prompt`; 0 on a miss. It is shorter than the
+    /// prompt, so prefill computes at least the last token, unless the prompt
+    /// end resident holds this very prompt ([`Self::at_prompt_end`]): then it
+    /// is the whole prompt and nothing is prefilled. A stored
     /// snapshot the state refuses to restore is skipped like a miss, so the
     /// plan falls back to the deepest restorable boundary below it (or 0).
     pub fn plan(&self, state: &dyn SessionState, prompt: &[u32], route: SessionRoute) -> usize {
@@ -1551,6 +1590,15 @@ impl SessionCache {
             return 0;
         }
         let domain = self.domain.scoped(&scope);
+        if self.end.as_ref().is_some_and(|end| {
+            let (d, p, fp) = &end.key;
+            *d == domain
+                && *p == prompt.len() as u64
+                && *fp == prefix_fingerprint(prompt)
+                && state.snapshot_restorable(route, &end.meta)
+        }) {
+            return prompt.len();
+        }
         let resident = [self.resident.as_ref(), self.tail.as_ref()]
             .into_iter()
             .flatten()
@@ -1820,6 +1868,8 @@ impl SessionCache {
                     resident(&self.resident_pending),
                     resident(&self.tail),
                     resident(&self.tail_pending),
+                    resident(&self.end),
+                    resident(&self.end_pending),
                 ]),
         )
     }
@@ -2023,6 +2073,9 @@ impl SessionCache {
         if let Some(tail) = self.tail.take() {
             free_store(gpu, tail.buf);
         }
+        if let Some(end) = self.end.take() {
+            free_store(gpu, end.buf);
+        }
     }
 
     /// The live state was reset outside the cache: its rows no longer back
@@ -2037,6 +2090,8 @@ impl SessionCache {
             self.resident_pending.take(),
             self.tail.take(),
             self.tail_pending.take(),
+            self.end.take(),
+            self.end_pending.take(),
         ]
         .into_iter()
         .flatten()
@@ -2072,6 +2127,7 @@ impl SessionCache {
         }
         stores.extend(self.resident_pending.take().map(|resident| resident.buf));
         stores.extend(self.tail_pending.take().map(|tail| tail.buf));
+        stores.extend(self.end_pending.take().map(|end| end.buf));
         self.turn = None;
         stores
     }
@@ -2123,11 +2179,13 @@ impl SessionCache {
         }
     }
 
-    /// Move the live residents into the park (they back its rows).
+    /// Move the live residents into the park (they back its rows). The prompt
+    /// end resident is dropped: the side request rewrites the rows it needs.
     fn stash_residents(&mut self) {
         if let Some(parked) = self.parked.as_mut() {
             parked.resident = self.resident.take();
             parked.tail = self.tail.take();
+            self.release_bufs.extend(self.end.take().map(|end| end.buf));
         }
     }
 
@@ -2163,7 +2221,23 @@ impl SessionCache {
         );
         let mut cold_exact = true;
         let mut tail_hit = false;
-        let restored = if reused > 0
+        // The prompt end resident serves only the exact prompt it ended; any
+        // other start rewrites rows below its end, so it goes.
+        let end_hit = reused == prompt.len()
+            && self
+                .end
+                .as_ref()
+                .is_some_and(|r| r.key == key && state.snapshot_restorable(route, &r.meta));
+        if !end_hit {
+            if let Some(end) = self.end.take() {
+                free_store(gpu, end.buf);
+            }
+        }
+        let restored = if end_hit {
+            let end = self.end.as_ref().unwrap();
+            cold_exact = end.cold_exact;
+            restore_resident(gpu, state, route, end, &mut self.host_restores_total)
+        } else if reused > 0
             && self
                 .tail
                 .as_ref()
@@ -2283,6 +2357,13 @@ impl SessionCache {
         {
             free_store(gpu, self.tail.take().unwrap().buf);
         }
+        if self
+            .end
+            .as_ref()
+            .is_some_and(|end| reused < end.key.1 as usize)
+        {
+            free_store(gpu, self.end.take().unwrap().buf);
+        }
         let Some(scope) = state.snapshot_scope(route) else {
             return;
         };
@@ -2332,7 +2413,15 @@ impl SessionCache {
         }
         let growth = state.growth_reserve_bytes(gpu, prompt.len());
         let SnapshotParts { meta, layout } = state.snapshot_parts(route, reused)?;
-        self.capture_resident(false, gpu, key, &meta, &layout, growth, false)
+        self.capture_resident(
+            ResidentSlot::Boundary,
+            gpu,
+            key,
+            &meta,
+            &layout,
+            growth,
+            false,
+        )
     }
 
     fn turn_boundaries(
@@ -2820,7 +2909,11 @@ impl SessionCache {
         };
         let SnapshotParts { meta, layout: live } = state.snapshot_parts(route, p)?;
         self.capture_resident(
-            lineage,
+            if lineage {
+                ResidentSlot::Tail
+            } else {
+                ResidentSlot::Boundary
+            },
             gpu,
             (domain.clone(), p as u64, fp),
             &meta,
@@ -2901,6 +2994,46 @@ impl SessionCache {
         Ok(())
     }
 
+    /// Report that every owner of `route` consumed exactly `prompt`, the whole
+    /// prompt just prefilled, before anything reads or changes what its last
+    /// row left (its logits, the speculator's seed). Captures the prompt end
+    /// resident ([`SessionState::prompt_end_parts`]; nothing when the route
+    /// keeps none), published by [`Self::commit`]: an exact retry of `prompt`
+    /// restores it and prefills nothing. It copies fixed parts only, and the
+    /// capture rides the prompt's natural end, so the chunk schedule is
+    /// unchanged. A capture the memory guard refuses is skipped.
+    pub fn at_prompt_end(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        route: SessionRoute,
+        prompt: &[u32],
+    ) -> Result<(), String> {
+        let Some(scope) = state.snapshot_scope(route) else {
+            return Ok(());
+        };
+        let key = (
+            self.domain.scoped(&scope),
+            prompt.len() as u64,
+            prefix_fingerprint(prompt),
+        );
+        let cold_exact = self.live_cold_exact;
+        let growth = state.growth_reserve_bytes(gpu, prompt.len());
+        let Some(parts) = state.prompt_end_parts(route, prompt.len()) else {
+            return Ok(());
+        };
+        let SnapshotParts { meta, layout } = parts?;
+        self.capture_resident(
+            ResidentSlot::End,
+            gpu,
+            key,
+            &meta,
+            &layout,
+            growth,
+            cold_exact,
+        )
+    }
+
     /// Geometry of the delta snapshot of a live state of `fixed_bytes` and
     /// `rows` (`(row_bytes, rows)` per stream): its parent is the deepest of
     /// `ancestors` (deepest first) that is published or pending and whose
@@ -2931,23 +3064,23 @@ impl SessionCache {
         (parent.map(|(key, _)| key), plan)
     }
 
-    /// This turn's pending resident (or, for a lineage split, tail) slot.
-    fn pending_slot(&mut self, lineage: bool) -> &mut Option<Resident> {
-        if lineage {
-            &mut self.tail_pending
-        } else {
-            &mut self.resident_pending
+    /// This turn's pending resident slot of `slot`'s kind.
+    fn pending_slot(&mut self, slot: ResidentSlot) -> &mut Option<Resident> {
+        match slot {
+            ResidentSlot::Boundary => &mut self.resident_pending,
+            ResidentSlot::Tail => &mut self.tail_pending,
+            ResidentSlot::End => &mut self.end_pending,
         }
     }
 
-    /// Copy the fixed parts of `live` (at boundary `key.1`) into this turn's
-    /// resident snapshot (the tail one when `lineage`), reusing its buffer.
+    /// Copy the fixed parts of `live` (at position `key.1`) into this turn's
+    /// pending resident snapshot of `slot`'s kind, reusing its buffer.
     /// A capture refused (memory guard, or under the pressure policy neither
-    /// tier can hold it) is skipped and leaves the previous boundary's.
+    /// tier can hold it) is skipped and leaves the previous one.
     #[allow(clippy::too_many_arguments)]
     fn capture_resident(
         &mut self,
-        lineage: bool,
+        slot: ResidentSlot,
         gpu: &mut Gpu,
         key: Key,
         meta: &[u8],
@@ -2966,7 +3099,7 @@ impl SessionCache {
         let fixed_offsets: Vec<usize> = live.fixed.iter().map(|part| part.offset).collect();
         self.ensure_granule(gpu);
         let owned = self.owned();
-        let previous_size = self.pending_slot(lineage).as_ref().map(|r| r.buf.size());
+        let previous_size = self.pending_slot(slot).as_ref().map(|r| r.buf.size());
         let floor = self.device_floor();
         let physical = if self.pressure.is_some() {
             self.physical_need(total as u64)
@@ -2997,14 +3130,14 @@ impl SessionCache {
                 return Ok(());
             }
             ResidentPlan::Reuse => {
-                self.pending_slot(lineage)
+                self.pending_slot(slot)
                     .take()
                     .expect("reuse is planned over a pending buffer")
                     .buf
             }
             ResidentPlan::Allocate(tier) if self.pressure.is_none() => {
                 debug_assert_eq!(tier, Tier::Device);
-                if let Some(previous) = self.pending_slot(lineage).take() {
+                if let Some(previous) = self.pending_slot(slot).take() {
                     free_store(gpu, previous.buf);
                 }
                 gpu.bind_thread()
@@ -3021,7 +3154,7 @@ impl SessionCache {
                 }
                 match alloc_store(gpu, tier, total, self.quarantine.as_ref()) {
                     Ok(store) => {
-                        if let Some(previous) = self.pending_slot(lineage).take() {
+                        if let Some(previous) = self.pending_slot(slot).take() {
                             free_store(gpu, previous.buf);
                         }
                         store
@@ -3042,7 +3175,7 @@ impl SessionCache {
         if store.is_host() {
             self.host_captures_total = self.host_captures_total.saturating_add(1);
         }
-        *self.pending_slot(lineage) = Some(Resident {
+        *self.pending_slot(slot) = Some(Resident {
             key,
             buf: store,
             fixed_bytes: live.fixed.iter().map(|part| part.bytes).collect(),
@@ -3061,6 +3194,11 @@ impl SessionCache {
         self.publish_captures();
         if let Some(resident) = self.resident_pending.take() {
             if let Some(displaced) = self.resident.replace(resident) {
+                self.release_bufs.push(displaced.buf);
+            }
+        }
+        if let Some(end) = self.end_pending.take() {
+            if let Some(displaced) = self.end.replace(end) {
                 self.release_bufs.push(displaced.buf);
             }
         }
@@ -3138,9 +3276,17 @@ impl SessionCache {
                 self.pending
                     .iter()
                     .map(|entry| device_bytes(&entry.1))
-                    .chain([device(&self.resident_pending), device(&self.tail_pending)]),
+                    .chain([
+                        device(&self.resident_pending),
+                        device(&self.tail_pending),
+                        device(&self.end_pending),
+                    ]),
             ),
-            resident_bytes: saturating_total([device(&self.resident), device(&self.tail)]),
+            resident_bytes: saturating_total([
+                device(&self.resident),
+                device(&self.tail),
+                device(&self.end),
+            ]),
             deferred_release_bytes: saturating_total(
                 self.release
                     .iter()
@@ -3161,9 +3307,17 @@ impl SessionCache {
                 self.pending
                     .iter()
                     .map(|entry| host_bytes(&entry.1))
-                    .chain([host(&self.resident_pending), host(&self.tail_pending)]),
+                    .chain([
+                        host(&self.resident_pending),
+                        host(&self.tail_pending),
+                        host(&self.end_pending),
+                    ]),
             ),
-            host_resident_bytes: saturating_total([host(&self.resident), host(&self.tail)]),
+            host_resident_bytes: saturating_total([
+                host(&self.resident),
+                host(&self.tail),
+                host(&self.end),
+            ]),
             host_deferred_release_bytes: saturating_total(
                 self.release
                     .iter()
@@ -3230,6 +3384,8 @@ impl SessionCache {
             self.resident_pending.take(),
             self.tail.take(),
             self.tail_pending.take(),
+            self.end.take(),
+            self.end_pending.take(),
         ]
         .into_iter()
         .flatten()
@@ -4007,6 +4163,8 @@ impl SessionDriver {
             && cache.resident_pending.is_none()
             && cache.tail.is_none()
             && cache.tail_pending.is_none()
+            && cache.end.is_none()
+            && cache.end_pending.is_none()
             && cache.turn.is_none()
             && cache.disk.is_none()
             && self.live.is_none()
@@ -4077,6 +4235,17 @@ impl SessionDriver {
         prefix: &[u32],
     ) -> Result<(), String> {
         self.cache.at_boundary(gpu, state, prefix)
+    }
+
+    /// [`SessionCache::at_prompt_end`].
+    pub fn at_prompt_end(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        route: SessionRoute,
+        prompt: &[u32],
+    ) -> Result<(), String> {
+        self.cache.at_prompt_end(gpu, state, route, prompt)
     }
 
     /// [`Self::at_boundary`] at `position` of the prompt in flight, without
@@ -4683,6 +4852,13 @@ mod tests {
                 layout: self.layout(position),
             })
         }
+        fn prompt_end_parts(
+            &mut self,
+            route: SessionRoute,
+            position: usize,
+        ) -> Option<Result<SnapshotParts<'_>, String>> {
+            Some(self.snapshot_parts(route, position))
+        }
         fn restore_parts(
             &mut self,
             _gpu: &mut Gpu,
@@ -5182,6 +5358,71 @@ mod tests {
         let mut retry = a.clone();
         retry.push(7);
         assert_restores(&mut cache, gpu, &mut toy, &retry, 2 * STRIDE);
+        cache.clear(gpu);
+        gpu.free_tensor(toy.fixed).unwrap();
+        gpu.free_tensor(toy.rows).unwrap();
+    }
+
+    /// #1198: the prompt end resident lets an exact retry reuse the whole
+    /// prompt after decode moved the live state on (it restores the fixed
+    /// parts over rows below the prompt end, which decode never writes);
+    /// a cancelled turn never publishes it, and any other start drops it.
+    #[test]
+    fn prompt_end_resident_serves_only_its_exact_prompt() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: session cache tests require a GPU");
+            return;
+        };
+        let gpu = &mut gpu;
+        let mut toy = Toy {
+            fixed: gpu.alloc_tensor(&[FIXED_BYTES], DType::Raw).unwrap(),
+            rows: gpu
+                .alloc_tensor(&[ROW_CAPACITY * ROW_BYTES], DType::Raw)
+                .unwrap(),
+            position: 0,
+            tail_snapshot: false,
+        };
+        let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
+        let mut cache = SessionCache::new(domain(), 8 * one);
+        let a = prompt(1, 2 * STRIDE + 5);
+        let mut decoded = a.clone();
+        decoded.extend([7, 8, 9]);
+
+        // A cancelled turn's prompt end is dropped with its residents.
+        turn(&mut cache, gpu, &mut toy, &a, false);
+        cache
+            .at_prompt_end(gpu, &mut toy, SessionRoute::Ar, &a)
+            .unwrap();
+        assert!(cache.end_pending.is_some());
+        cache.publish_captures();
+        cache.live_state_reset();
+        assert!(cache.end.is_none() && cache.end_pending.is_none());
+        assert_eq!(cache.plan(&toy, &a, SessionRoute::Ar), 2 * STRIDE);
+        toy.reset(gpu).unwrap();
+
+        // Committed, it serves the exact prompt after decode.
+        turn(&mut cache, gpu, &mut toy, &a, false);
+        cache
+            .at_prompt_end(gpu, &mut toy, SessionRoute::Ar, &a)
+            .unwrap();
+        cache.commit();
+        toy.advance(gpu, &decoded);
+        assert_restores(&mut cache, gpu, &mut toy, &a, a.len());
+        assert_eq!(cache.next_boundary(), None);
+        // The retry restored it and keeps it; a longer prompt plans below it.
+        assert_eq!(cache.plan(&toy, &a, SessionRoute::Ar), a.len());
+        assert_eq!(cache.plan(&toy, &decoded, SessionRoute::Ar), 2 * STRIDE);
+        assert_eq!(
+            cache.plan(&toy, &a[..a.len() - 1], SessionRoute::Ar),
+            2 * STRIDE
+        );
+
+        // Another start rewrites rows below the prompt end: dropped.
+        let mut edited = a[..a.len() - 1].to_vec();
+        edited.push(42);
+        assert_restores(&mut cache, gpu, &mut toy, &edited, 2 * STRIDE);
+        assert!(cache.end.is_none());
+        assert_eq!(cache.plan(&toy, &a, SessionRoute::Ar), 2 * STRIDE);
         cache.clear(gpu);
         gpu.free_tensor(toy.fixed).unwrap();
         gpu.free_tensor(toy.rows).unwrap();

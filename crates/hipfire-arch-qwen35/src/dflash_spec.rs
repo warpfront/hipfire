@@ -13,15 +13,16 @@
 use crate::dflash_verify_pm4::{DflashVerifyPm4, DFLASH_VERIFY_PM4_BLOCK};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights, StateQuant};
 use crate::speculative::{
-    apply_host_ar_trunc, sample_categorical, scatter_hidden_block_to_interleaved,
-    scatter_hidden_prefill_to_interleaved, seed_target_hidden_dense_tp2_abortable,
-    seed_target_hidden_from_prompt_abortable, seed_target_hidden_from_prompt_abortable_parts,
-    seed_target_hidden_suffix_abortable, seed_target_hidden_suffix_abortable_parts,
-    softmax_temp_into, spec_step_dflash_dense_tp2, spec_step_dflash_with_railgun,
-    xorshift_next_unit, DeltaNetSnapshot, DenseTpTargetView, DflashLookup, DflashTargetParts,
-    GdnTape, HiddenStateRingBuffer, ModelSlot, RailgunStep, SpecStepResult, TurnCheckpoint,
-    VerifyScratch,
+    apply_host_ar_trunc, bytes_fit_admitted_context, sample_categorical,
+    scatter_hidden_block_to_interleaved, scatter_hidden_prefill_to_interleaved,
+    seed_target_hidden_dense_tp2_abortable, seed_target_hidden_from_prompt_abortable,
+    seed_target_hidden_from_prompt_abortable_parts, seed_target_hidden_suffix_abortable,
+    seed_target_hidden_suffix_abortable_parts, softmax_temp_into, spec_step_dflash_dense_tp2,
+    spec_step_dflash_with_railgun, xorshift_next_unit, DeltaNetSnapshot, DenseTpTargetView,
+    DflashLookup, DflashTargetParts, GdnTape, HiddenStateRingBuffer, ModelSlot, RailgunStep,
+    SpecStepResult, TurnCheckpoint, VerifyScratch,
 };
+use hipfire_runtime::checkpoint_pool::prefix_fingerprint;
 use hipfire_runtime::dflash::{
     draft_seed_backfill_reads_host, DflashConfig, DflashScratch, DflashWeights, DraftCtxMode,
     TargetHiddenLogMark,
@@ -34,7 +35,7 @@ use hipfire_runtime::spec::{
     SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::replay::ReplayController;
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -760,6 +761,391 @@ pub(crate) fn dflash_first_token(
         let u = xorshift_next_unit(rng);
         sample_categorical(scratch, u)
     }
+}
+
+// ─── Prompt-end payload (exact whole-prompt retry) ───────────────────────
+
+/// Identity of the prompt a prompt-end payload was captured at: its token
+/// count and [`prefix_fingerprint`], the pair
+/// [`Speculator::prompt_end_checkpoint`] advertises and the planner compares
+/// with the whole rendered prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PromptEndKey {
+    len: usize,
+    prefix_hash: u64,
+}
+
+impl PromptEndKey {
+    fn of(prompt: &[u32]) -> Self {
+        Self {
+            len: prompt.len(),
+            prefix_hash: prefix_fingerprint(prompt),
+        }
+    }
+}
+
+/// The host half of a prompt-end payload. Present only while the device
+/// halves held by [`PromptEndStore`] describe the same prompt.
+struct PromptEndLive {
+    key: PromptEndKey,
+    /// The last prompt row's logits as the cold prefill downloaded them. The
+    /// first token is drawn from them again, never saved: the request's own
+    /// sampling config and RNG decide it.
+    logits: Vec<f32>,
+    /// The draft's `target_hidden` cursors exactly as
+    /// [`dflash_prefill_finish`] left them (backfill included).
+    thlog: TargetHiddenLogMark,
+    /// Rows `[0, feature_rows)` of `target_hidden` saved in
+    /// [`PromptEndStore::features`] (the windowed ring, which decode
+    /// rewrites); `0` for the Legacy context, whose prompt rows stay resident.
+    feature_rows: usize,
+}
+
+/// Device bytes and timings of the prompt-end payload
+/// ([`DflashSpeculator::prompt_end_stats`]). The microseconds are the wall
+/// time of the last capture / restore, synchronizations included.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PromptEndStats {
+    /// Prompt length the payload covers.
+    pub len: usize,
+    /// Bytes of the retained DeltaNet snapshot.
+    pub dn_snapshot_bytes: u64,
+    /// Bytes of the saved `target_hidden` window rows (0: Legacy context).
+    pub feature_bytes: u64,
+    /// Host bytes of the saved last-row logits.
+    pub logits_bytes: u64,
+    pub capture_us: u64,
+    pub restore_us: u64,
+    pub captures: u64,
+    pub restores: u64,
+}
+
+/// Prompt-end payload of the last COLD prompt prefill: what a retry of the
+/// same rendered prompt needs to skip every prefill row and still start
+/// decode from the state a fresh prefill ends in.
+///
+/// - The sealed DeltaNet state ([`DeltaNetSnapshot`], taken after the seed's
+///   final seal, not a stride checkpoint) and the last-row logits.
+/// - The draft context the first window reads: `target_hidden` rows and the
+///   `TargetHiddenLog` cursors `dflash_prefill_finish` left, projection
+///   watermarks included (cold: zero, so the first draft re-projects exactly
+///   the rows a fresh prefill's first draft projects).
+///
+/// Target attention KV `[0, len)` is not copied: decode appends above it, and
+/// every write below `len` ([`Self::note_write`]) drops the payload.
+///
+/// The Legacy context keeps `target_hidden` as `[ctx x feature]` absolute
+/// rows, so decode (rows `>= len`) never touches the prompt's: nothing is
+/// saved. The windowed context is a ring (row `p` at slot `p % W`): decode
+/// overwrites the prompt's oldest rows, so rows `[0, min(len, W))` are saved
+/// (`4 x min(len, W) x E x D` bytes: 200 MiB for the 27B DFlash2 draft, five
+/// extracts, `D = 5120`, `W = 2048`). The raw per-layer
+/// `HiddenStateRingBuffer` is not saved: it is write-before-read staging (a
+/// verify window advances it by the whole block while only `accepted + 1`
+/// rows are scattered, so after decode it is no image of the committed rows)
+/// and no reader looks at a ring row older than the window being committed.
+///
+/// The buffers are allocated on the first capture, only from memory the
+/// admitted context does not need ([`bytes_fit_admitted_context`]), reused by
+/// later captures and freed by [`Self::release`] (reset, free, lane move). A
+/// payload that cannot be held is simply not retained: the route keeps the
+/// ordinary checkpoint behaviour.
+#[derive(Default)]
+struct PromptEndStore {
+    snap: Option<DeltaNetSnapshot>,
+    features: Option<GpuTensor>,
+    feature_cap_rows: usize,
+    /// Set only while `snap` (and `features`, when `feature_rows > 0`) hold
+    /// the state of exactly `key`.
+    live: Option<PromptEndLive>,
+    stats: PromptEndStats,
+    refusal_logged: bool,
+}
+
+impl PromptEndStore {
+    /// `(len, prefix fingerprint)` of the resident payload.
+    fn descriptor(&self) -> Option<(usize, u64)> {
+        self.live
+            .as_ref()
+            .map(|live| (live.key.len, live.key.prefix_hash))
+    }
+
+    /// Drop the payload's validity; the buffers stay for the next capture.
+    fn invalidate(&mut self) {
+        self.live = None;
+    }
+
+    /// A write to absolute rows `>= position` is about to land. Rows below
+    /// the payload's prompt end are what it describes, so a write below drops
+    /// it; appends at or above leave it intact.
+    fn note_write(&mut self, position: usize) {
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|live| position < live.key.len)
+        {
+            self.live = None;
+        }
+    }
+
+    /// Drop the payload and return its device memory.
+    fn release(&mut self, gpu: &mut Gpu) {
+        self.live = None;
+        if let Some(snap) = self.snap.take() {
+            snap.free_gpu(gpu);
+        }
+        if let Some(features) = self.features.take() {
+            let _ = gpu.free_tensor(features);
+        }
+        self.feature_cap_rows = 0;
+    }
+
+    /// Capture the payload of the cold prefill that just finished
+    /// (`first_logits` are its downloaded last-row logits). Runs after
+    /// `dflash_prefill_finish` and before the first token is drawn, so neither
+    /// the token nor the request RNG is part of it. Best effort: a payload that
+    /// cannot be held is not retained (logged once per load).
+    fn capture(
+        &mut self,
+        gpu: &mut Gpu,
+        slot: &ModelSlot,
+        df: &DflashState,
+        prompt: &[u32],
+        first_logits: &[f32],
+    ) {
+        self.live = None;
+        if let Err(why) = self.try_capture(gpu, slot, df, prompt, first_logits) {
+            self.live = None;
+            if !self.refusal_logged {
+                self.refusal_logged = true;
+                eprintln!(
+                    "[dflash] prompt-end payload not retained ({why}); an exact retry keeps the checkpoint reuse"
+                );
+            }
+        }
+    }
+
+    fn try_capture(
+        &mut self,
+        gpu: &mut Gpu,
+        slot: &ModelSlot,
+        df: &DflashState,
+        prompt: &[u32],
+        first_logits: &[f32],
+    ) -> Result<(), String> {
+        if prompt.is_empty() {
+            return Err("empty prompt".into());
+        }
+        let started = std::time::Instant::now();
+        let ds = &df.draft_scratch;
+        if ds.feature_stage_rows.is_some() {
+            return Err("draft feature rows are staged, not resident".into());
+        }
+        if first_logits.len() != slot.scratch.logits.numel() {
+            return Err(format!(
+                "logits row of {} values, target scratch holds {}",
+                first_logits.len(),
+                slot.scratch.logits.numel()
+            ));
+        }
+        let feature_row_bytes = df.draft_config.feature_width() * 4;
+        let feature_rows = match ds.ctx_mode {
+            DraftCtxMode::Windowed { w, .. } => prompt.len().min(w),
+            DraftCtxMode::Legacy => {
+                if prompt.len() > ds.max_ctx_len {
+                    return Err(format!(
+                        "prompt of {} rows exceeds the draft context {}",
+                        prompt.len(),
+                        ds.max_ctx_len
+                    ));
+                }
+                0
+            }
+        };
+        let feature_bytes = feature_rows * feature_row_bytes;
+        if ds.target_hidden.buf.size() < feature_bytes {
+            return Err("target_hidden is smaller than the window to save".into());
+        }
+        let snapshot_charge = if self.snap.is_none() {
+            usize::try_from(DeltaNetSnapshot::device_charge_for(&slot.dn_state))
+                .unwrap_or(usize::MAX)
+        } else {
+            0
+        };
+        let feature_charge = if feature_rows > self.feature_cap_rows {
+            feature_bytes
+        } else {
+            0
+        };
+        let charge = snapshot_charge.saturating_add(feature_charge);
+        if charge > 0 && !bytes_fit_admitted_context(gpu, &slot.kv_cache, charge) {
+            return Err(format!("{charge} B do not fit beside the admitted context"));
+        }
+        if self.snap.is_none() {
+            self.snap = Some(
+                DeltaNetSnapshot::new_for(gpu, &slot.dn_state)
+                    .map_err(|e| format!("DeltaNetSnapshot::new_for: {e}"))?,
+            );
+        }
+        if feature_charge > 0 {
+            if let Some(old) = self.features.take() {
+                let _ = gpu.free_tensor(old);
+            }
+            self.feature_cap_rows = 0;
+            let numel = feature_rows * (feature_row_bytes / 4);
+            self.features = Some(
+                gpu.alloc_tensor(&[numel], DType::F32)
+                    .map_err(|e| format!("feature backup alloc: {e}"))?,
+            );
+            self.feature_cap_rows = feature_rows;
+        }
+        let key = PromptEndKey::of(prompt);
+        // The prefill's scatter and backfill may still be queued on the
+        // execution stream: drain it before reading what they wrote.
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("capture sync: {e}"))?;
+        let snap = self
+            .snap
+            .as_mut()
+            .ok_or_else(|| "prompt-end snapshot missing".to_string())?;
+        snap.save_from(&slot.dn_state, gpu)
+            .map_err(|e| format!("DeltaNetSnapshot::save_from: {e}"))?;
+        snap.prefix_hash = key.prefix_hash;
+        if feature_rows > 0 {
+            let backup = self
+                .features
+                .as_ref()
+                .ok_or_else(|| "prompt-end feature backup missing".to_string())?;
+            gpu.hip
+                .memcpy_dtod_at(&backup.buf, 0, &ds.target_hidden.buf, 0, feature_bytes)
+                .map_err(|e| format!("feature backup copy: {e}"))?;
+        }
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("capture sync: {e}"))?;
+        let dn_snapshot_bytes = self.snap.as_ref().map_or(0, |s| s.bytes_len());
+        self.live = Some(PromptEndLive {
+            key,
+            logits: first_logits.to_vec(),
+            thlog: ds.thlog.mark(),
+            feature_rows,
+        });
+        self.stats.len = key.len;
+        self.stats.dn_snapshot_bytes = dn_snapshot_bytes;
+        self.stats.feature_bytes = feature_bytes as u64;
+        self.stats.logits_bytes = (first_logits.len() * 4) as u64;
+        self.stats.capture_us = started.elapsed().as_micros() as u64;
+        self.stats.captures += 1;
+        Ok(())
+    }
+
+    /// Return the target and the draft context to the end of the cold prefill
+    /// that captured the payload and give back its last-row logits (the
+    /// caller draws the first token from them). Refuses a payload that does
+    /// not describe exactly `prompt`; a failure after the first byte moved
+    /// leaves the payload dropped, and the caller's rollback resets the rest.
+    fn restore(
+        &mut self,
+        gpu: &mut Gpu,
+        slot: &mut ModelSlot,
+        df: &mut DflashState,
+        prompt: &[u32],
+    ) -> Result<Vec<f32>, String> {
+        let started = std::time::Instant::now();
+        let key = PromptEndKey::of(prompt);
+        match self.live.as_ref() {
+            Some(live) if live.key == key => {}
+            Some(live) => {
+                return Err(format!(
+                    "DFlash exact prompt-end restore: the payload covers {} tokens (fingerprint {:016x}), the prompt is {} tokens (fingerprint {:016x})",
+                    live.key.len, live.key.prefix_hash, key.len, key.prefix_hash
+                ));
+            }
+            None => {
+                return Err(
+                    "DFlash exact prompt-end restore without a resident payload".to_string()
+                );
+            }
+        }
+        let Some(live) = self.live.take() else {
+            return Err("DFlash exact prompt-end restore without a resident payload".to_string());
+        };
+        let snap = self
+            .snap
+            .as_ref()
+            .ok_or_else(|| "DFlash exact prompt-end restore: snapshot missing".to_string())?;
+        if live.logits.len() != slot.scratch.logits.numel() {
+            return Err(format!(
+                "DFlash exact prompt-end restore: payload logits {} != target scratch {}",
+                live.logits.len(),
+                slot.scratch.logits.numel()
+            ));
+        }
+        snap.restore_to(&mut slot.dn_state, gpu)
+            .map_err(|e| format!("DeltaNetSnapshot::restore_to: {e}"))?;
+        // SAFETY: `live.logits` is `len` initialized f32s viewed as bytes.
+        let logits_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(live.logits.as_ptr() as *const u8, live.logits.len() * 4)
+        };
+        gpu.hip
+            .memcpy_htod_offset(&slot.scratch.logits.buf, 0, logits_bytes)
+            .map_err(|e| format!("DFlash exact prompt-end restore: logits upload: {e}"))?;
+        if live.feature_rows > 0 {
+            let backup = self.features.as_ref().ok_or_else(|| {
+                "DFlash exact prompt-end restore: feature backup missing".to_string()
+            })?;
+            let bytes = live.feature_rows * df.draft_config.feature_width() * 4;
+            if backup.buf.size() < bytes || df.draft_scratch.target_hidden.buf.size() < bytes {
+                return Err(
+                    "DFlash exact prompt-end restore: feature window larger than its buffers"
+                        .to_string(),
+                );
+            }
+            gpu.hip
+                .memcpy_dtod_at(
+                    &df.draft_scratch.target_hidden.buf,
+                    0,
+                    &backup.buf,
+                    0,
+                    bytes,
+                )
+                .map_err(|e| format!("DFlash exact prompt-end restore: feature copy: {e}"))?;
+        }
+        // The cursors a cold prefill's finish leaves: a reset log, the prompt's
+        // contiguous rows, then the saved watermarks.
+        let thlog = &mut df.draft_scratch.thlog;
+        thlog.reset();
+        thlog.seed_prompt(key.len);
+        thlog.restore(live.thlog)?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("DFlash exact prompt-end restore: sync: {e}"))?;
+        let logits = live.logits.clone();
+        self.live = Some(live);
+        self.stats.restore_us = started.elapsed().as_micros() as u64;
+        self.stats.restores += 1;
+        Ok(logits)
+    }
+}
+
+/// The planner's exact edge as `Speculator::prefill` sees it: the whole
+/// rendered prompt is cached (`prefill_start == prompt.len()`), nothing is
+/// left to prefill, and it is neither a checkpoint resume nor a cold prefill.
+/// The planner emits it only for a prompt-end descriptor this speculator
+/// advertised; the restore itself re-checks the payload's fingerprint.
+fn is_exact_prompt_end_request(
+    prompt_tokens: &[u32],
+    prefill_tokens: &[u32],
+    prefill_start: usize,
+    cache_hit: bool,
+    resume_from: Option<usize>,
+) -> bool {
+    cache_hit
+        && resume_from.is_none()
+        && prefill_tokens.is_empty()
+        && !prompt_tokens.is_empty()
+        && prefill_start == prompt_tokens.len()
 }
 
 // ─── DflashSpeculator ───────────────────────────────────────────────────
@@ -2242,6 +2628,9 @@ pub struct DflashSpeculator {
     /// The driver-owned speculate-vs-AR floor and per-load price cache
     /// (`Speculator::floor_control`): allocated here, lives for the load.
     floor: hipfire_runtime::spec::DriverFloor,
+    /// Prompt-end payload of the last cold prompt prefill (exact whole-prompt
+    /// retry); see [`PromptEndStore`].
+    prompt_end: PromptEndStore,
 }
 
 /// Pre-window mark of the last completed window (terminal-prefix repair).
@@ -2297,6 +2686,7 @@ impl DflashSpeculator {
             lookup: None,
             railgun: None,
             floor,
+            prompt_end: PromptEndStore::default(),
         }
     }
 
@@ -2305,6 +2695,22 @@ impl DflashSpeculator {
     #[doc(hidden)]
     pub fn lane_state(&self) -> Option<&DflashState> {
         self.df.as_ref()
+    }
+
+    /// Device bytes and timings of the prompt-end payload this speculator
+    /// holds or last held (`None` before the first capture). Diagnostic and
+    /// state-oracle surface only.
+    #[doc(hidden)]
+    pub fn prompt_end_stats(&self) -> Option<PromptEndStats> {
+        self.prompt_end.snap.as_ref().map(|_| self.prompt_end.stats)
+    }
+
+    /// The request-seeded sampling RNG as it stands now (state-oracle
+    /// surface: a restored prompt end must leave it exactly where a fresh
+    /// prefill's first-token draw does).
+    #[doc(hidden)]
+    pub fn request_rng_state(&self) -> u64 {
+        self.rng_state
     }
 
     /// Borrow the retained-PM4 verify route (report / phase inspection).
@@ -2385,6 +2791,25 @@ impl Speculator for DflashSpeculator {
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
         enter_non_ar_target_work(&mut gpu.replay);
+        // Whole-prompt reuse the planner authorised from
+        // `prompt_end_checkpoint` (its exact edge): no row to prefill, the
+        // prompt-end payload is restored instead.
+        let exact = is_exact_prompt_end_request(
+            prompt_tokens,
+            prefill_tokens,
+            prefill_start,
+            cache_hit,
+            resume_from,
+        );
+        if !exact {
+            // A cold prefill replaces the target state the payload was taken
+            // from; a suffix prefill rewrites rows from `prefill_start` on.
+            if cache_hit {
+                self.prompt_end.note_write(prefill_start);
+            } else {
+                self.prompt_end.invalidate();
+            }
+        }
         self.adaptive.reset();
         if let Some(lk) = self.lookup.as_mut() {
             lk.end_request();
@@ -2406,91 +2831,127 @@ impl Speculator for DflashSpeculator {
             t.seed_prompt(prompt_tokens);
         }
 
-        // A CPU shadow exists only while the cold backfill reads it (see
-        // `dflash_prefill_host_required`). Cold prompts drop draft
-        // upload/projection tracking; cache hits preserve the prior turn's GPU
-        // projections and extend its suffix.
-        let mut host_hidden = Vec::new();
-        let capture_host =
-            dflash_prefill_host_required(df.draft_scratch.ctx_mode, prompt_tokens.len());
-        if !cache_hit {
-            df.draft_scratch.reset_upload_tracking();
-        }
-
-        // Seed the target's hidden state into the drafter ring (chunked prefill
-        // with hidden extraction). Cache hit → seed only the suffix from
-        // `prefill_start`, reusing the prior turn's KV + recurrent state; miss →
-        // seed the full prompt (the seed fn resets target state itself).
-        let (ck_interval, ck_cap) = (self.ck_interval, self.ck_cap);
-        // This request's user-turn boundary: the seed snapshots at its newest
-        // chunk end at or before it; that snapshot stays pinned through the
-        // following tool-result requests until the next user turn. One-shot per
-        // request.
-        let mut turn = TurnCheckpoint {
-            boundary: self.turn_boundary.take(),
-            pin: self.pinned_boundary,
-        };
-        let ckpt_sink = Some(&mut self.checkpoints);
-        let aborted = if cache_hit {
-            seed_target_hidden_suffix_abortable(
-                gpu,
-                slot,
-                &mut df.hidden_rb,
-                prefill_tokens,
-                prefill_start,
-                prompt_tokens.get(..prefill_start).unwrap_or(&[]),
-                abort,
-                ckpt_sink,
-                ck_interval,
-                ck_cap,
-                &mut turn,
-            )
+        let first_logits = if exact {
+            // Restore the state the cold prefill that captured the payload
+            // ended in (the first token below is drawn from the restored
+            // logits through the same `dflash_first_token` call a fresh
+            // prefill makes).
+            let logits = self.prompt_end.restore(gpu, slot, df, prompt_tokens)?;
+            // The request's one-shot turn boundary is consumed as a fresh seed
+            // consumes it. Checkpoints above the prompt end belong to the
+            // superseded answer, and a pin on one of them goes with it.
+            self.turn_boundary = None;
+            if let Some(stale) = self
+                .checkpoints
+                .iter()
+                .position(|(pos, _)| *pos > prompt_tokens.len())
+            {
+                for (_, snap) in self.checkpoints.drain(stale..) {
+                    snap.free_gpu(gpu);
+                }
+            }
+            if self
+                .pinned_boundary
+                .is_some_and(|pin| self.checkpoints.iter().all(|(pos, _)| *pos != pin))
+            {
+                self.pinned_boundary = None;
+            }
+            logits
         } else {
-            seed_target_hidden_from_prompt_abortable(
-                gpu,
-                slot,
-                &mut df.hidden_rb,
-                capture_host.then_some(&mut host_hidden),
-                prefill_tokens,
-                abort,
-                ckpt_sink,
-                ck_interval,
-                ck_cap,
-                &mut turn,
-            )
-        }
-        .map_err(|e| {
-            hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::seed");
-            e.to_string()
-        })?;
-        self.pinned_boundary = turn.pin;
-        if aborted {
-            // Caller resets conversation state + emits aborted/done; the slot
-            // guard restores the target bundle on the way out.
-            return Ok(PrefillOutcome::Aborted);
-        }
+            // A CPU shadow exists only while the cold backfill reads it (see
+            // `dflash_prefill_host_required`). Cold prompts drop draft
+            // upload/projection tracking; cache hits preserve the prior turn's GPU
+            // projections and extend its suffix.
+            let mut host_hidden = Vec::new();
+            let capture_host =
+                dflash_prefill_host_required(df.draft_scratch.ctx_mode, prompt_tokens.len());
+            if !cache_hit {
+                df.draft_scratch.reset_upload_tracking();
+            }
 
-        // Prime/extend the draft's GPU target_hidden buffer, backfill, seed the
-        // thlog and read the post-prompt logits (shared with the VMM lane
-        // prefill: `dflash_prefill_finish`).
-        //
-        // First emit = target draw at the final prompt position (seed already
-        // ran the per-token forward; scratch.logits holds the post-prompt logits).
-        // temp≈0 stays the historical host argmax fold (byte-identical greedy).
-        // temp>0 uses the same host nucleus sampler as chain DFlash verify so the
-        // post-prefill seed is not a special greedy exception on distribution-
-        // preserving requests.
-        let first_logits = dflash_prefill_finish(
-            gpu,
-            df,
-            &host_hidden,
-            &slot.scratch.logits,
-            prompt_tokens,
-            prefill_tokens.len(),
-            cache_hit,
-            prefill_start,
-            resume_from,
-        )?;
+            // Seed the target's hidden state into the drafter ring (chunked prefill
+            // with hidden extraction). Cache hit → seed only the suffix from
+            // `prefill_start`, reusing the prior turn's KV + recurrent state; miss →
+            // seed the full prompt (the seed fn resets target state itself).
+            let (ck_interval, ck_cap) = (self.ck_interval, self.ck_cap);
+            // This request's user-turn boundary: the seed snapshots at its newest
+            // chunk end at or before it; that snapshot stays pinned through the
+            // following tool-result requests until the next user turn. One-shot per
+            // request.
+            let mut turn = TurnCheckpoint {
+                boundary: self.turn_boundary.take(),
+                pin: self.pinned_boundary,
+            };
+            let ckpt_sink = Some(&mut self.checkpoints);
+            let aborted = if cache_hit {
+                seed_target_hidden_suffix_abortable(
+                    gpu,
+                    slot,
+                    &mut df.hidden_rb,
+                    prefill_tokens,
+                    prefill_start,
+                    prompt_tokens.get(..prefill_start).unwrap_or(&[]),
+                    abort,
+                    ckpt_sink,
+                    ck_interval,
+                    ck_cap,
+                    &mut turn,
+                )
+            } else {
+                seed_target_hidden_from_prompt_abortable(
+                    gpu,
+                    slot,
+                    &mut df.hidden_rb,
+                    capture_host.then_some(&mut host_hidden),
+                    prefill_tokens,
+                    abort,
+                    ckpt_sink,
+                    ck_interval,
+                    ck_cap,
+                    &mut turn,
+                )
+            }
+            .map_err(|e| {
+                hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::seed");
+                e.to_string()
+            })?;
+            self.pinned_boundary = turn.pin;
+            if aborted {
+                // Caller resets conversation state + emits aborted/done; the slot
+                // guard restores the target bundle on the way out.
+                return Ok(PrefillOutcome::Aborted);
+            }
+
+            // Prime/extend the draft's GPU target_hidden buffer, backfill, seed the
+            // thlog and read the post-prompt logits (shared with the VMM lane
+            // prefill: `dflash_prefill_finish`).
+            //
+            // First emit = target draw at the final prompt position (seed already
+            // ran the per-token forward; scratch.logits holds the post-prompt logits).
+            // temp≈0 stays the historical host argmax fold (byte-identical greedy).
+            // temp>0 uses the same host nucleus sampler as chain DFlash verify so the
+            // post-prefill seed is not a special greedy exception on distribution-
+            // preserving requests.
+            let first_logits = dflash_prefill_finish(
+                gpu,
+                df,
+                &host_hidden,
+                &slot.scratch.logits,
+                prompt_tokens,
+                prefill_tokens.len(),
+                cache_hit,
+                prefill_start,
+                resume_from,
+            )?;
+            // The prompt end of a cold prefill, after its final seal and before
+            // the first token is drawn (no chunk boundary, seal or forward is
+            // added): a later exact retry of this prompt restores it.
+            if !cache_hit && prefill_tokens == prompt_tokens {
+                self.prompt_end
+                    .capture(gpu, slot, df, prompt_tokens, &first_logits);
+            }
+            first_logits
+        };
         let first_token = dflash_first_token(
             &first_logits,
             crate::speculative::DflashSampleCfg {
@@ -2542,6 +3003,7 @@ impl Speculator for DflashSpeculator {
         if tokens.is_empty() {
             return Ok(true);
         }
+        self.prompt_end.note_write(start_pos);
         let slot = target
             .as_any_mut()
             .downcast_mut::<ModelSlot>()
@@ -2629,6 +3091,7 @@ impl Speculator for DflashSpeculator {
         seed: u32,
         _emitted: &[u32],
     ) -> Result<u32, String> {
+        self.prompt_end.note_write(position);
         let slot = target
             .as_any_mut()
             .downcast_mut::<ModelSlot>()
@@ -2711,6 +3174,7 @@ impl Speculator for DflashSpeculator {
         max_emit: usize,
     ) -> Result<SpecStep, String> {
         enter_non_ar_target_work(&mut gpu.replay);
+        self.prompt_end.note_write(position);
         let t0 = cycle_trace::enabled().then(std::time::Instant::now);
         let slot = target
             .as_any_mut()
@@ -3009,6 +3473,7 @@ impl Speculator for DflashSpeculator {
 
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         enter_non_ar_target_work(&mut gpu.replay);
+        self.prompt_end.release(gpu);
         if cycle_trace::enabled() {
             cycle_trace::emit(&cycle_trace::reset_line(std::process::id(), self.trace_seq));
         }
@@ -3060,6 +3525,7 @@ impl Speculator for DflashSpeculator {
         consumed: &[u32],
     ) -> Result<bool, String> {
         enter_non_ar_target_work(&mut gpu.replay);
+        self.prompt_end.note_write(window_start);
         if let Some(lk) = self.lookup.as_mut() {
             // `emitted` shrinks to the consumed prefix: rebuild the history.
             lk.mark_dirty();
@@ -3149,6 +3615,12 @@ impl Speculator for DflashSpeculator {
             .collect()
     }
 
+    fn prompt_end_checkpoint(&self) -> Option<(usize, u64)> {
+        // A vacant speculator (a VMM lane owns the state) holds no payload.
+        self.df.as_ref()?;
+        self.prompt_end.descriptor()
+    }
+
     fn rewind_to(
         &mut self,
         gpu: &mut Gpu,
@@ -3156,6 +3628,7 @@ impl Speculator for DflashSpeculator {
         position: usize,
     ) -> Result<usize, String> {
         enter_non_ar_target_work(&mut gpu.replay);
+        self.prompt_end.note_write(position);
         if let Some(lk) = self.lookup.as_mut() {
             // Divergent re-render: the request restarts from `prefill`; any
             // surviving history is rebuilt from the prompt.
@@ -3240,8 +3713,10 @@ impl Speculator for DflashSpeculator {
             vacant,
             checkpoints,
             railgun,
+            mut prompt_end,
             ..
         } = *self;
+        prompt_end.release(gpu);
         // Prepared windows and the builder's staging/selector buffers first:
         // nothing is in flight between windows.
         if let Some(owner) = railgun {
@@ -3566,6 +4041,7 @@ impl DflashSpeculator {
         }
         let assets = self.vmm_assets()?;
         quiesce_for_lane_move(gpu)?;
+        self.prompt_end.release(gpu);
         let df = self.df.take().ok_or_else(|| SINGLETON_VACANT.to_string())?;
         self.vacant = Some(assets);
         Ok(DflashLaneSnapshot {
@@ -3617,6 +4093,7 @@ impl DflashSpeculator {
             snap.free_gpu(gpu);
             return Err(e);
         }
+        self.prompt_end.release(gpu);
         let DflashLaneSnapshot {
             df,
             position: _,
@@ -4633,5 +5110,94 @@ mod admit_dflash_verify_pm4_tests {
         for (args, expected) in cases {
             assert_eq!(admit(args).unwrap_err(), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod prompt_end_store_tests {
+    use super::*;
+    use hipfire_runtime::dflash::TargetHiddenLog;
+
+    fn live(len: usize) -> PromptEndLive {
+        PromptEndLive {
+            key: PromptEndKey {
+                len,
+                prefix_hash: 7,
+            },
+            logits: vec![0.0; 4],
+            thlog: TargetHiddenLog::new().mark(),
+            feature_rows: 0,
+        }
+    }
+
+    #[test]
+    fn descriptor_is_the_payload_key_and_empty_without_one() {
+        let mut store = PromptEndStore::default();
+        assert_eq!(store.descriptor(), None);
+        store.live = Some(live(10));
+        assert_eq!(store.descriptor(), Some((10, 7)));
+        store.invalidate();
+        assert_eq!(store.descriptor(), None);
+    }
+
+    #[test]
+    fn only_writes_below_the_prompt_end_drop_the_payload() {
+        let mut store = PromptEndStore::default();
+        store.live = Some(live(10));
+        store.note_write(10);
+        assert_eq!(
+            store.descriptor(),
+            Some((10, 7)),
+            "append at the prompt end"
+        );
+        store.note_write(4096);
+        assert_eq!(store.descriptor(), Some((10, 7)), "append above it");
+        store.note_write(9);
+        assert_eq!(store.descriptor(), None, "a row below the prompt end");
+    }
+
+    #[test]
+    fn key_follows_length_and_every_token() {
+        let prompt = [1u32, 2, 3, 4, 5];
+        let key = PromptEndKey::of(&prompt);
+        assert_eq!(key.len, 5);
+        assert_eq!(key.prefix_hash, prefix_fingerprint(&prompt));
+        assert_eq!(key, PromptEndKey::of(&prompt));
+        assert_ne!(key, PromptEndKey::of(&[1, 2, 3, 4, 6]));
+        assert_ne!(key, PromptEndKey::of(&[1, 2, 3, 4]));
+    }
+}
+
+#[cfg(test)]
+mod prompt_end_request_tests {
+    use super::is_exact_prompt_end_request;
+
+    #[test]
+    fn only_the_whole_prompt_hit_with_nothing_to_fill_is_exact() {
+        let prompt = [1u32, 2, 3, 4];
+        assert!(is_exact_prompt_end_request(&prompt, &[], 4, true, None));
+        // A suffix hit, a checkpoint resume, a cold prefill and an empty
+        // prompt keep the ordinary prefill.
+        assert!(!is_exact_prompt_end_request(
+            &prompt,
+            &prompt[3..],
+            3,
+            true,
+            None
+        ));
+        assert!(!is_exact_prompt_end_request(&prompt, &[], 4, true, Some(2)));
+        assert!(!is_exact_prompt_end_request(
+            &prompt, &prompt, 0, false, None
+        ));
+        assert!(!is_exact_prompt_end_request(&[], &[], 0, true, None));
+        // Rows left to fill, or a start short of the prompt end.
+        assert!(!is_exact_prompt_end_request(
+            &prompt,
+            &prompt[2..],
+            4,
+            true,
+            None
+        ));
+        assert!(!is_exact_prompt_end_request(&prompt, &[], 3, true, None));
     }
 }

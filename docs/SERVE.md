@@ -936,6 +936,20 @@ Loads whose ack reports `cache_capable: true`, or whose route is continuous-batc
 capable, skip the per-request `reset` so multi-turn longest-common-prefix reuse
 can hit. Other loads reset every request (stateless OpenAI shape).
 
+An exact retry (the same rendered prompt sent again) right after a cold
+prefill reuses the whole prompt, with no rows to prefill, on Flash-Next native
+MTP (`qwen4_spec`, single device) and on the Qwen3.5-family native MTP and
+DFlash routes (one card): the cold prefill keeps a prompt-end payload (sealed
+recurrent state, last-row logits, the speculator's seed) and the retry restores
+it, then draws the first token with its own sampling config (#1198). The
+payload is held only from memory the admitted context does not need (DFlash
+on the 27B: up to 586 MiB), so it never lowers `max_seq`; a load without that
+headroom drops it. Every other case keeps checkpoint reuse: a retry resumes
+from the last DeltaNet checkpoint below the prompt end. That covers the AR
+routes (`qwen_ar`, `qwen4_ar`), a DFlash turn that started from a prefix hit,
+Flash-Next slow-link/mesh, pipeline- and expert-parallel and dense-TP loads,
+and the multi-slot engine.
+
 ### Client notes (Zed / OpenAI-compatible agents)
 
 Live-GPU endpoint validation on gfx1100 and gfx1201 exercised Zed-shaped

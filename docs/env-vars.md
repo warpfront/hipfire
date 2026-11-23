@@ -2200,6 +2200,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MTP_NGRAM_K` | scripts/serve_harness.py | harness |
 | `HIPFIRE_MTP_OWN_PREFILL` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-arch-qwen35/src/mtp_speculator.rs | developer |
 | `HIPFIRE_MTP_PHASE_TIMING` | crates/hipfire-arch-qwen35/src/mtp_cb.rs, crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
+| `HIPFIRE_MTP_PROMPT_END_HEAD` | crates/hipfire-arch-qwen35/tests/mtp_prompt_end_state_equality.rs | harness |
+| `HIPFIRE_MTP_PROMPT_END_MODEL` | crates/hipfire-arch-qwen35/tests/mtp_prompt_end_state_equality.rs | harness |
+| `HIPFIRE_MTP_PROMPT_END_TOKENS` | crates/hipfire-arch-qwen35/tests/mtp_prompt_end_state_equality.rs | harness |
 | `HIPFIRE_MTP_PROPOSAL_GRAPH` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_P_MIN` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_REF_PIN_MODEL` | crates/hipfire-arch-qwen4/tests/mtp_head_reference_pin_hw.rs | harness |
@@ -2288,6 +2291,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_PROMPT` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
 | `HIPFIRE_PROMPT_CACHE_CAP` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/lib.rs | stable |
 | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/lib.rs | experimental |
+| `HIPFIRE_PROMPT_END_MODEL` | crates/hipfire-arch-qwen4/tests/prompt_end_hw.rs | harness |
 | `HIPFIRE_PROMPT_FILE` | scripts/kernel-tune-loop.sh | harness |
 | `HIPFIRE_PROMPT_HEAT_JSON` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
@@ -2796,12 +2800,12 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_T5_GPU` | crates/hipfire-arch-diffusion/examples/gpu_pipeline_parity.rs, crates/hipfire-arch-diffusion/src/pipeline.rs | experimental |
 | `HIPFIRE_TARGET_ARCH` | crates/rdna-compute/src/dispatch.rs, scripts/kernel_atlas.py | developer |
 | `HIPFIRE_TEMP` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
-| `HIPFIRE_TEST_DRAFT` | crates/hipfire-arch-qwen35/examples/dflash_draft_emit_oracle.rs, crates/hipfire-arch-qwen35/tests/dflash_lookup_state_oracle.rs | harness |
+| `HIPFIRE_TEST_DRAFT` | crates/hipfire-arch-qwen35/examples/dflash_draft_emit_oracle.rs, crates/hipfire-arch-qwen35/tests/dflash_lookup_state_oracle.rs, crates/hipfire-arch-qwen35/tests/dflash_prompt_end_state_equality.rs | harness |
 | `HIPFIRE_TEST_MODEL` | scripts/test-ds4-heterogeneous-abort-resume.sh, scripts/test-qwen35-abort-resume.sh | harness |
 | `HIPFIRE_TEST_MOE_AWQ_SIDECAR_CHILD` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_TEST_REAL_HIPCC` | crates/rdna-compute/src/compiler.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_TEST_REQUIRE_ROCM` | crates/peacemaker-cdna/src/oracle.rs, crates/peacemaker-cdna/tests/enc_sop.rs | developer |
-| `HIPFIRE_TEST_TARGET` | crates/hipfire-arch-qwen35/examples/dflash_draft_emit_oracle.rs, crates/hipfire-arch-qwen35/tests/dflash_lookup_state_oracle.rs | harness |
+| `HIPFIRE_TEST_TARGET` | crates/hipfire-arch-qwen35/examples/dflash_draft_emit_oracle.rs, crates/hipfire-arch-qwen35/tests/dflash_lookup_state_oracle.rs, crates/hipfire-arch-qwen35/tests/dflash_prompt_end_state_equality.rs | harness |
 | `HIPFIRE_TEXT_OUT` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
 | `HIPFIRE_THINK_CONTINUATION` | crates/hipfire-arch-qwen35/src/spec_emit.rs, crates/hipfire-daemon/src/main.rs | developer |
 | `HIPFIRE_TIER_RATIO` | crates/hipfire-quantize/src/cli.rs | developer |

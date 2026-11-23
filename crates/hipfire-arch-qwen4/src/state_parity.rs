@@ -1230,12 +1230,12 @@ fn rollback_failure(
 }
 
 /// Position-zero cache hit refusal. A valid cache hit resumes a session
-/// snapshot at `0 < start_pos < prompt_len` with exactly the prompt suffix, so
+/// snapshot at `0 < start_pos <= prompt_len` with exactly the prompt suffix, so
 /// `start_pos == 0` with `cache_hit == true` is an invalid zero-length cached
 /// prefix (it is not an empty fill: the fill is the complete 3-token prompt).
 fn cache_suffix_refusal() -> Value {
     // expect_err: a cache hit at position zero is invalid; valid suffix cache
-    // hits (0 < start_pos < prompt_len) are supported and are not exercised here.
+    // hits (0 < start_pos <= prompt_len) are supported and are not exercised here.
     let refusal = validate_native_mtp_prefill_request(&[1, 2, 3], &[1, 2, 3], 0, true)
         .expect_err("position-zero cache hit must be refused");
     json!({

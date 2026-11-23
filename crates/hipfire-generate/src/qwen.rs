@@ -2784,8 +2784,10 @@ fn trace_qwen4_session_plan(
 /// the recurrent DeltaNet state valid by construction (the prior turn left it at
 /// exactly `prior_len`, so prefilling the suffix advances it correctly with no
 /// rewind). The exact-match edge (`lcp == rendered.len()`) degrades to a miss to
-/// avoid a 1-token DeltaNet over-advance. Caller must be in the
-/// `messages_history.is_some()` case.
+/// avoid a 1-token DeltaNet over-advance, unless the speculator advertises a
+/// prompt-end payload for exactly this prompt (`prompt_end`): then the plan
+/// reuses the whole prompt with no rows to prefill and the route restores the
+/// payload. Caller must be in the `messages_history.is_some()` case.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_prompt_cache(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
@@ -2801,6 +2803,9 @@ pub fn plan_prompt_cache(
     // divergence the plan picks the latest checkpoint `<= lcp && < rendered.len()`
     // to resume from.
     dflash_ckpt_positions: &[usize],
+    // The speculator's prompt-end descriptor (`Speculator::prompt_end_checkpoint`):
+    // the only way a whole-prompt exact retry is planned.
+    prompt_end: Option<(usize, u64)>,
 ) -> PromptCachePlan {
     let q_tokens = tokenizer.encode(prompt);
     let rendered = hipfire_runtime::prompt_frame::build_cached_history(
@@ -2825,8 +2830,31 @@ pub fn plan_prompt_cache(
         rendered,
         cache_eligible,
         dflash_ckpt_positions,
+        prompt_end,
         "dflash",
     )
+}
+
+/// Whether the speculator's prompt-end descriptor `(len, fingerprint)`
+/// authorises reusing the WHOLE `rendered` prompt (zero prefill rows): the
+/// descriptor covers exactly this token stream (length and
+/// [`prefix_fingerprint`](hipfire_runtime::checkpoint_pool::prefix_fingerprint))
+/// and the retained conversation begins with it, so the resident target KV
+/// prefix is this prompt's. A `None` descriptor, an ordinary DeltaNet
+/// checkpoint at the same length, a different prompt or a conversation that
+/// does not hold the prompt never qualifies.
+pub fn prompt_end_exact(
+    conversation_tokens: &[u32],
+    rendered: &[u32],
+    prompt_end: Option<(usize, u64)>,
+) -> bool {
+    let Some((len, fingerprint)) = prompt_end else {
+        return false;
+    };
+    !rendered.is_empty()
+        && len == rendered.len()
+        && conversation_tokens.starts_with(rendered)
+        && fingerprint == hipfire_runtime::checkpoint_pool::prefix_fingerprint(rendered)
 }
 
 /// LCP / hit / resume planner shared by the Plain canonical-render path
@@ -2841,6 +2869,8 @@ pub fn plan_from_rendered(
     rendered: Vec<u32>,
     cache_eligible: bool,
     dflash_ckpt_positions: &[usize],
+    // The speculator's prompt-end descriptor (`Speculator::prompt_end_checkpoint`).
+    prompt_end: Option<(usize, u64)>,
     trace_tag: &str,
 ) -> PromptCachePlan {
     if cache_eligible {
@@ -2872,6 +2902,20 @@ pub fn plan_from_rendered(
                 &conversation_tokens[lo..prior_hi],
                 &rendered[lo..rend_hi],
             );
+        }
+        if prompt_end_exact(conversation_tokens, &rendered, prompt_end) {
+            eprintln!(
+                "[qwen-cache exact {trace_tag}] prompt-end payload covers the whole prompt (len={}, prior_len={prior_len}) — restoring it, no rows to prefill",
+                rendered.len(),
+            );
+            return PromptCachePlan {
+                new_tokens: Vec::new(),
+                start_pos: rendered.len(),
+                cached_tokens: rendered.len(),
+                cache_hit: true,
+                resume_from: None,
+                rendered,
+            };
         }
         if lcp == prior_len && lcp < rendered.len() && lcp > 0 {
             return PromptCachePlan {
@@ -3683,6 +3727,15 @@ pub fn generate_dflash(
             attested_spec_checkpoint_positions(m.speculator.as_deref(), &m.conversation_tokens),
         )
     };
+    // The speculator's prompt-end payload descriptor (`None` unless it holds a
+    // complete one): the only authorisation for whole-prompt reuse.
+    let prompt_end: Option<(usize, u64)> = if session_reuse {
+        None
+    } else {
+        m.speculator
+            .as_deref()
+            .and_then(|spec| spec.prompt_end_checkpoint())
+    };
     let cache_eligible =
         !cache_disabled && messages_history.is_some() && !conversation_tokens.is_empty();
     let cache_plan: Option<PromptCachePlan> = if session_reuse {
@@ -3737,6 +3790,7 @@ pub fn generate_dflash(
                 rendered,
                 cache_eligible,
                 &dflash_ckpt_positions,
+                prompt_end,
                 if spec_name == "mtp" {
                     "mtp-jinja"
                 } else {
@@ -3760,6 +3814,7 @@ pub fn generate_dflash(
                 hist,
                 cache_disabled,
                 &dflash_ckpt_positions,
+                prompt_end,
             )
         })
     };
@@ -3770,13 +3825,29 @@ pub fn generate_dflash(
         Some(p) => p.rendered.clone(),
         None => prompt_tokens,
     };
+    // Whole-prompt reuse: only an advertised prompt-end payload of exactly this
+    // prompt, over a retained conversation that begins with it, authorises
+    // `start_pos == prompt.len()`. A request without a rendered history plans
+    // no prefix hit but may still take this exact edge.
+    let whole_prompt_hit = match &cache_plan {
+        Some(p) => p.reuses_whole_prompt(),
+        None => {
+            !cache_disabled && prompt_end_exact(conversation_tokens, &prompt_tokens, prompt_end)
+        }
+    };
     // The previous turn's deferred terminal seed (`LoadedModel::spec_deferred_seed`):
     // a cold prefill resets the state the seed extends, so it is dropped unfed
     // and this prefill never waits for its forward; every reuse of the live
     // state (prefix hit, checkpoint resume, session plan) feeds it first,
     // before this request configures the speculator. A failed feed resets the
     // live state, and the plan below then falls back to a cold prefill.
-    let live_state_survived = if session_reuse || cache_plan.as_ref().is_some_and(|p| p.cache_hit) {
+    let live_state_survived = if whole_prompt_hit {
+        // The restored payload overwrites the target and drafter state, so a
+        // deferred terminal seed (it belongs to the superseded answer) is
+        // dropped unfed rather than fed first.
+        drop_deferred_spec_seed(m);
+        true
+    } else if session_reuse || cache_plan.as_ref().is_some_and(|p| p.cache_hit) {
         settle_deferred_spec_seed(m, gpu)
     } else {
         drop_deferred_spec_seed(m);
@@ -3809,6 +3880,7 @@ pub fn generate_dflash(
             p.cache_hit,
             p.cached_tokens,
         ),
+        None if whole_prompt_hit => (Vec::new(), prompt_tokens.len(), true, prompt_tokens.len()),
         None => (prompt_tokens.clone(), 0, false, 0),
     };
     // A speculator that resumes from the target's session cache plans against
@@ -5582,6 +5654,17 @@ pub fn generate_spec(
         );
         let _ = stdout.flush();
         return None;
+    }
+
+    // Whole-prompt reuse (`prompt_end_exact`): the speculator restores its
+    // prompt-end payload in its prefill instead of prefilling a row, and the
+    // host record becomes exactly the prompt. Set after the capacity checks (a
+    // refusal above leaves the record as it was) and before the prefill (a
+    // failed restore rolls the record back with the live state).
+    if cache_hit && prefill_tokens.is_empty() && prefill_start == prompt_tokens.len() {
+        m.seq_pos = prompt_tokens.len();
+        m.conversation_tokens.clear();
+        m.conversation_tokens.extend_from_slice(&prompt_tokens);
     }
 
     // Prefill: the speculator seeds the target's hidden state (advancing its KV
@@ -9660,6 +9743,14 @@ pub struct PromptCachePlan {
     pub resume_from: Option<usize>,
 }
 
+impl PromptCachePlan {
+    /// Whole-prompt reuse ([`prompt_end_exact`]): nothing to prefill, the
+    /// speculator restores its prompt-end payload.
+    pub fn reuses_whole_prompt(&self) -> bool {
+        self.cache_hit && self.new_tokens.is_empty() && self.start_pos == self.rendered.len()
+    }
+}
+
 /// Opt-in per-window HIP host/API snapshot. Constructed only when
 /// `HIPFIRE_HOST_TIMING=1`; the disabled path never reads clocks or counters.
 pub struct MtpWindowTimingSnap {
@@ -11601,6 +11692,7 @@ pub(crate) fn render_qwen4_prompt_history(
             hist,
             true,
             &[],
+            None,
         )
         .rendered)
     }
