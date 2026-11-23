@@ -39,7 +39,8 @@ TIMING = re.compile(r"(_ms|_s|tok_s|_us|_ns|wall|time|timings?|elapsed)$")
 SPEC = re.compile(r"^(tau|cycles|rounds|accepted|mtp_windows|floor_ar_windows|ar_windows|mtp_retired"
                   r"|ngram_mod_.*|dflash_profit_ratio|dflash_retired|dflash_retire_cycle)$")
 # Greedy scenarios whose done envelopes feed G-spec (aborted requests excluded).
-GREEDY = ("cold", "multi_turn", "abort_prefill", "abort_decode", "eos_budget")
+GREEDY = ("cold", "multi_turn", "interleaved", "abort_prefill", "abort_decode", "eos_budget", "isolation")
+COLD = "Write one sentence about the sea."
 LONG = (
     "Summarize the following notes in two sentences.\n"
     + "".join(f"Note {i}: the {w} sensor on rack {i % 7} reported {i * 13 % 97} units. "
@@ -94,7 +95,7 @@ class Daemon:
         self.send(msg)
         if abort_now:
             self.send({"type": "abort", "id": rid, "attempt_id": 1})
-        events, n = [], 0
+        events, ids, n = [], [], 0
         while True:
             e = self.recv()
             if e.get("id") != rid:
@@ -105,13 +106,13 @@ class Daemon:
                 n += 1
                 if abort_at_token is not None and n == abort_at_token:
                     self.send({"type": "abort", "id": rid, "attempt_id": 1})
+            elif t == "committed":  # HIPFIRE_EMIT_TOKEN_IDS=1: exact token ids
+                ids.append([e.get("tok_id"), e.get("pos")])
             elif t == "commit_ready":
                 self.send({"type": "commit", "id": rid, "attempt_id": 1})
             elif t in ("done", "error"):
-                done = {k: v for k, v in e.items() if k not in ("type", "id", "attempt_id")}
-                text = "".join(x[1] for x in events)
-                return {"type": t, "events": events, "text": text, "max_tokens": req.get("max_tokens"),
-                        "sha": hashlib.sha256(text.encode()).hexdigest()[:16], "done": done}
+                return result(t, events, ids, req.get("max_tokens"),
+                              {k: v for k, v in e.items() if k not in ("type", "id", "attempt_id")})
 
     def close(self):
         try:
@@ -128,21 +129,32 @@ class Daemon:
         return self.p.returncode
 
 
+def result(typ, events, ids, max_tokens, done):
+    text = "".join(x[1] for x in events)
+    return {"type": typ, "events": events, "ids": ids, "text": text, "max_tokens": max_tokens,
+            "sha": hashlib.sha256(text.encode()).hexdigest()[:16], "done": done}
+
+
 def greedy(prompt, max_tokens, **kw):
     return {"prompt": prompt, "temperature": 0.0, "max_tokens": max_tokens, **kw}
+
+
+def arm_env(route, arm):
+    # committed token-id events make G-tok exact on ids, not only on decoded text
+    return {**os.environ, "HIPFIRE_EMIT_TOKEN_IDS": "1", **route.get("env", {}), "HIPFIRE_ENGINE_LOOP": arm}
 
 
 def run_arm(args, route, arm, out, eos_n=None):
     """All scenarios on one fresh daemon. Returns {scenario: [result, ...]}.
     eos_n: the eos_budget length to rerun with (default: this arm's own probe)."""
-    env = dict(os.environ, **route.get("env", {}), HIPFIRE_ENGINE_LOOP=arm)
+    env = arm_env(route, arm)
     d = Daemon(args.daemon, env, f"{out}/{route['name']}.{arm}", args.timeout)
     res = {}
     mt = route.get("max_tokens", 64)
     try:
         res["load"] = [{"done": d.load(route["model"], route.get("load", {}))}]
         # cold start: first request on a fresh load
-        res["cold"] = [d.generate("cold", greedy("Write one sentence about the sea.", mt))]
+        res["cold"] = [d.generate("cold", greedy(COLD, mt))]
         # multi-turn reuse: each turn resends the history; cached_tokens must match
         hist, turns = [], []
         for k, user in enumerate(["Name three primes.", "Now add them up.",
@@ -154,6 +166,17 @@ def run_arm(args, route, arm, out, eos_n=None):
             hist.append({"role": "assistant", "content": r["text"]})
             turns.append(r)
         res["multi_turn"] = turns
+        # two conversations interleaved A1 B1 A2 B2: a turn must reuse its own
+        # conversation's prefix with the other one's state live in between (N records)
+        convs = {c: [] for c in "AB"}
+        res["interleaved"] = []
+        for t, user in enumerate(["Name a {} fruit.", "Why is it {}?"]):
+            for c, color in (("A", "red"), ("B", "yellow")):
+                convs[c].append({"role": "user", "content": user.format(color)})
+                r = d.generate(f"il{c}{t}", greedy(convs[c][-1]["content"], mt, messages=list(convs[c]),
+                                                    thinking_enabled=False))
+                convs[c].append({"role": "assistant", "content": r["text"]})
+                res["interleaved"].append(r)
         # abort mid-prefill (long prompt, abort queued behind the request), then the
         # same prompt again: a partially prefilled prefix must not be reused wrongly
         res["abort_prefill"] = [d.generate("ap", greedy(LONG, mt), abort_now=True),
@@ -178,6 +201,9 @@ def run_arm(args, route, arm, out, eos_n=None):
         res["seeded_repro"] = [d.generate(f"s{k}", {"prompt": q, "seed": 1234, **sp}) for k in range(2)]
         res["seeded_sweep"] = [d.generate(f"sw{s}", {"prompt": q, "seed": s, **sp})
                                for s in range(args.seeds)]
+        # state leak: the cold prompt again after every scenario above (aborts,
+        # interleaved records, sampled requests) must give the cold tokens
+        res["isolation"] = [d.generate("iso", greedy(COLD, mt))]
     finally:
         res["daemon_rc"] = d.close()
     return res
@@ -229,8 +255,10 @@ def compare(sc, a, b, spec_noise=False):
         # coverage, judged on the legacy arm
         if sc == "eos_budget" and i == 0 and dx.get("finish_reason") != "stop":
             note(UNEXERCISED, "the probe hit its budget before EOS")
-        if sc == "multi_turn" and i > 0 and not dx.get("cached_tokens"):
+        if sc in ("multi_turn", "interleaved") and i >= (1 if sc == "multi_turn" else 2) and not dx.get("cached_tokens"):
             note(UNEXERCISED, f"[{i}] turn reused no prefix (cached_tokens {dx.get('cached_tokens')!r})")
+        if sc == "abort_decode" and i == 1 and not dx.get("cached_tokens"):
+            note(UNEXERCISED, "the follow-up after the abort reused no prefix")
         if sc == "abort_prefill" and i == 0 and x["events"]:
             note(UNEXERCISED, f"abort landed after {len(x['events'])} decode events, not in prefill")
         if sc == "abort_decode" and i == 0:
@@ -241,12 +269,15 @@ def compare(sc, a, b, spec_noise=False):
             if dx.get("finish_reason") != dy.get("finish_reason"):
                 note(DIFF, f"finish_reason {dx.get('finish_reason')} vs {dy.get('finish_reason')}")
             # the abort lands asynchronously: only the common prefix is compared
-            k = min(len(x["events"]), len(y["events"]))
-            if x["events"][:k] != y["events"][:k]:
-                note(DIFF, "streams diverge before the abort")
+            for f in ("events", "ids"):
+                xs, ys = x.get(f, []), y.get(f, [])
+                if xs[:len(ys)] != ys[:len(xs)]:
+                    note(DIFF, f"{f} diverge before the abort")
             continue
         if x["events"] != y["events"]:
             note(DIFF, f"[{i}] tokens differ ({x['sha']} vs {y['sha']})")
+        if x.get("ids", []) != y.get("ids", []):
+            note(DIFF, f"[{i}] token ids differ")
         for key in sorted(set(dx) | set(dy)):
             vx, vy = dx.get(key), dy.get(key)
             if vx == vy:
@@ -328,11 +359,16 @@ def judge(res, route, tvd_max, perf=None):
         g_spec = (len(taus["engine"]) == len(taus["legacy"])
                   and statistics.mean(taus["engine"]) >= 0.99 * statistics.mean(taus["legacy"]))
     loop_ok, loops = loop_checks(res, route.get("expect_engine", False))
+    # no state leak: within each arm the cold prompt rerun last gives the cold tokens and ids
+    isolation = {arm: [(r["events"], r.get("ids", [])) for r in (res[arm]["cold"][0], res[arm]["isolation"][0])]
+                 for arm in ARMS if "isolation" in res[arm]}
+    isolation = {arm: a == b for arm, (a, b) in isolation.items()}
     g_perf = perf["median"]["g_perf"] if perf else None
     ok = (all(s["status"] != DIFF for s in scenarios.values()) and sampled["ok"] and g_spec is not False
-          and loop_ok and g_perf is not False and res["legacy"]["daemon_rc"] == res["engine"]["daemon_rc"] == 0)
+          and loop_ok and all(isolation.values()) and g_perf is not False
+          and res["legacy"]["daemon_rc"] == res["engine"]["daemon_rc"] == 0)
     return {"ok": ok, "scenarios": scenarios, "sampled": sampled, "tau": taus, "g_spec": g_spec,
-            "loop_ok": loop_ok, "loop": loops, "g_perf": g_perf}
+            "loop_ok": loop_ok, "loop": loops, "isolation": isolation, "g_perf": g_perf}
 
 
 def self_test():
@@ -370,15 +406,17 @@ def self_test():
     assert st("cold", sx, sy, spec_noise=True) == "equal"
     assert st("cold", sx, [r("ab", cycles=5)], spec_noise=True) == "diff"
     # aborts
-    ab = [r("abcd", finish_reason="aborted"), r("x")]
-    assert st("abort_decode", ab, [r("abc", finish_reason="aborted"), r("x")]) == "equal"
-    assert st("abort_decode", ab, [r("abX", finish_reason="aborted"), r("x")]) == "diff"
-    assert st("abort_decode", ab, [r("abcd", finish_reason="stop"), r("x")]) == "diff"
-    assert st("abort_decode", ab, [r("abcd", finish_reason="aborted"), r("y")]) == "diff"
-    assert st("abort_decode", [r("ab", finish_reason="stop"), r("x")],
-              [r("ab", finish_reason="stop"), r("x")]) == "diff"
-    assert st("abort_decode", [r("a" * 40, finish_reason="aborted"), r("x")],
-              [r("a" * 40, finish_reason="aborted"), r("x")]) == "unexercised"
+    fx = r("x", cached_tokens=3)  # a follow-up that reused the prompt prefix
+    ab = [r("abcd", finish_reason="aborted"), fx]
+    assert st("abort_decode", ab, [r("abc", finish_reason="aborted"), fx]) == "equal"
+    assert st("abort_decode", ab, [r("abX", finish_reason="aborted"), fx]) == "diff"
+    assert st("abort_decode", ab, [r("abcd", finish_reason="stop"), fx]) == "diff"
+    assert st("abort_decode", ab, [r("abcd", finish_reason="aborted"), r("y", cached_tokens=3)]) == "diff"
+    assert st("abort_decode", [r("ab", finish_reason="stop"), fx],
+              [r("ab", finish_reason="stop"), fx]) == "diff"
+    assert st("abort_decode", [r("a" * 40, finish_reason="aborted"), fx],
+              [r("a" * 40, finish_reason="aborted"), fx]) == "unexercised"
+    assert st("abort_decode", [ab[0], r("x")], [ab[0], r("x")]) == "unexercised"  # no reuse after the abort
     assert st("abort_prefill", [r("", "error", message="m"), r("x")], [r("", "error", message="m"), r("x")]) != "diff"
     assert st("abort_decode", ab, [ab[0], r("", "error", message="m")]) == "diff"
     assert st("abort_decode", [ab[0], r("", "error", message="m")], [ab[0], r("", "error", message="m")]) == "diff"
@@ -394,14 +432,25 @@ def self_test():
     # sampled requests: tokens free, prompt-side fields exact
     assert st("seeded_sweep", [r("ab", cached_tokens=0)], [r("xy", cached_tokens=0)]) == "equal"
     assert st("seeded_sweep", [r("ab", cached_tokens=0)], [r("xy", cached_tokens=5)]) == "diff"
+    # token ids: exact, aborts on the common prefix
+    ids = lambda x, i: {**x, "ids": i}
+    assert st("cold", [ids(r("ab"), [[1, 0]])], [ids(r("ab"), [[2, 0]])]) == "diff"
+    assert st("abort_decode", [ids(ab[0], [[1, 0], [2, 1]]), r("x", cached_tokens=3)],
+              [ids(ab[0], [[1, 0]]), r("x", cached_tokens=3)]) == "equal"
+    assert st("abort_decode", [ids(ab[0], [[1, 0], [2, 1]]), r("x", cached_tokens=3)],
+              [ids(ab[0], [[1, 0], [3, 1]]), r("x", cached_tokens=3)]) == "diff"
+    il = [r("a", cached_tokens=0), r("b", cached_tokens=0), r("c", cached_tokens=5), r("d", cached_tokens=0)]
+    assert st("interleaved", il, il) == "unexercised"
+    assert st("interleaved", il[:3], il[:3]) == "equal"
+    assert st("interleaved", il[:3], il[:2] + [r("c", cached_tokens=4)]) == "diff"
 
     # gates
-    def arm(loop=None, tau=1.0, sweep=("abc", "bcd", "cde", "def"), repro=("p", "p"), rc=0):
+    def arm(loop=None, tau=1.0, sweep=("abc", "bcd", "cde", "def"), repro=("p", "p"), rc=0, iso="ab"):
         def d(text):
             g = r(text, finish_reason="stop", tokens=len(text), cached_tokens=0, tau=tau, loop=loop)
             g["done"] = {k: v for k, v in g["done"].items() if v is not None}
             return g
-        return {"load": [{"done": {"arch": "x"}}], "cold": [d("ab")],
+        return {"load": [{"done": {"arch": "x"}}], "cold": [d("ab")], "isolation": [d(iso)],
                 "seeded_repro": [d(repro[0]), d(repro[1])], "seeded_sweep": [d(s) for s in sweep], "daemon_rc": rc}
 
     def ok(eng, leg=None, route=None, perf=None):
@@ -429,7 +478,83 @@ def self_test():
     assert not perf_ok({"prefill_tok_s_delta_pct": -2.1, "decode_tok_s_delta_pct": 0.0})
     assert not perf_ok({"prefill_tok_s_delta_pct": 0.0, "decode_tok_s_delta_pct": 2.1})
     assert not perf_ok({"prefill_tok_s_delta_pct": None, "decode_tok_s_delta_pct": 0.0})
+    assert not ok(arm(iso="ax"), leg=arm(iso="ax"))  # state leaked into a later request
+    conc_self_test()
     print("self-test ok")
+
+
+def conc_self_test():
+    # wire parsing: warmups skipped, k from the sample number, turn from attempt_id
+    order = bench_order(["stateless", "multiturn"], [1, 4], 2)
+    assert order[:3] == [("stateless", 1), ("stateless", 4), ("stateless", 1)] and order[4] == ("multiturn", 1)
+    w = [json.dumps(x) for x in (
+        {"type": "token", "id": "bench-noslots-2-W1-0", "text": "w"},
+        {"type": "done", "id": "bench-noslots-2-W1-0", "attempt_id": 1},
+        {"type": "token", "id": "bench-noslots-2-Q1-3", "text": "a"},
+        {"type": "committed", "id": "bench-noslots-2-Q1-3", "tok_id": 7, "pos": 9, "t_ms": 1},
+        {"type": "done", "id": "bench-noslots-2-Q1-3", "attempt_id": 1, "cached_tokens": 0},
+        {"type": "token", "id": "bench-noslots-5-Q1-3", "text": "b"},
+        {"type": "done", "id": "bench-noslots-5-Q1-3", "attempt_id": 2, "cached_tokens": 4})] + ["junk"]
+    got = wire_requests(w, order)
+    assert sorted(got) == ["multiturn/1/1/3/1", "stateless/4/1/3/0"], got
+    assert got["stateless/4/1/3/0"]["ids"] == [[7, 9]] and got["stateless/4/1/3/0"]["text"] == "a"
+    # metrics: tok/s over the sample wall, TTFT from t_send (queue wait included)
+    s = lambda t_send, t_first, t_end, tokens: {"t_send": t_send, "t_first": t_first, "t_end": t_end,
+                                                 "tokens": tokens, "ok": True}
+    m = cell_metrics({"status": "ok", "rejected_samples": [], "samples": [
+        {"overlap": {}, "streams": [s(0, 1, 3, 11), s(0, 2, 4, 11)]}]})
+    assert (m["out_tok_s"], m["ttft_p50_ms"], m["tpot_p50_ms"]) == (5.5, 1500.0, 200.0), m
+    assert abs(pctl([1, 2, 3, 4], 0.99) - 3.97) < 1e-9
+
+    # gates
+    def req(text="ab", cached=0, tau=None, loop="engine", typ="done"):
+        done = {k: v for k, v in (("cached_tokens", cached), ("tau", tau), ("loop", loop)) if v is not None}
+        return result(typ, [["t", c] for c in text], [[ord(c), i] for i, c in enumerate(text)], None, done)
+
+    def conc_arm(loop, backend, tok_s=30.0, ttft=1000.0, k4=None, cached=5, tau=None, rc=0, stamp=None):
+        reqs, stamp = {}, stamp or loop
+        for wl in ("stateless", "multiturn"):
+            for k in (1, 4):
+                reqs[f"{wl}/{k}/1/0/0"] = req(tau=tau, loop=stamp)
+                if wl == "multiturn":
+                    reqs[f"{wl}/{k}/1/0/1"] = req("cd", cached=cached, tau=tau, loop=stamp)
+        if k4:
+            reqs["stateless/4/1/0/0"] = k4
+        cells = {f"{wl}/{k}": {"out_tok_s": tok_s, "ttft_p50_ms": ttft, "ttft_p99_ms": ttft}
+                 for wl in ("stateless", "multiturn") for k in (1, 4)}
+        return {"loop": loop, "backend": backend, "rc": rc, "cells": cells, "reqs": reqs}
+
+    def cj(eng=None, leg=None, batch=None, c=None, expect=True):
+        arms = {"legacy-noslots": leg or conc_arm("legacy", "noslots"),
+                "engine-noslots": eng or conc_arm("engine", "noslots"),
+                # fn-lanes are not row-exact: a legacy arm's own C1 != CN is never gated
+                "legacy-batch": batch or conc_arm("legacy", "batch", tok_s=60.0, ttft=900.0,
+                                                  k4=req("XY", loop="legacy"))}
+        return judge_conc(arms, {"target": ["legacy", "batch"]} if c is None else c, expect)
+    good = conc_arm("engine", "noslots", tok_s=61.0, ttft=900.0)
+    assert cj(eng=good)["ok"], cj(eng=good)
+    assert not cj()["ok"]  # serialized engine: below the fn-lanes target
+    assert cj(c={})["ok"]  # no target: correctness gates only
+    c1 = cj(eng=conc_arm("engine", "noslots", k4=req("ax")), leg=conc_arm("legacy", "noslots", k4=req("ax")), c={})
+    assert c1["fails"] == ["engine-noslots: C1 != CN 1"], c1["fails"]
+    assert not cj(eng=conc_arm("engine", "noslots", k4=req("ax")), c={})["ok"]  # != ref
+    bad_ids = req()
+    bad_ids["ids"] = [[0, 0]]
+    assert not cj(eng=conc_arm("engine", "noslots", k4=bad_ids), c={})["ok"]
+    assert not cj(eng=conc_arm("engine", "noslots", stamp="legacy"), c={})["ok"]  # silent fallback
+    assert cj(eng=conc_arm("engine", "noslots", stamp="legacy"), c={}, expect=False)["ok"]
+    assert not cj(eng=conc_arm("engine", "noslots", k4=req(typ="error")), c={})["ok"]
+    assert not cj(eng=conc_arm("engine", "noslots", cached=4), c={})["ok"]  # reuses less than legacy
+    assert cj(eng=conc_arm("engine", "noslots", cached=9), c={})["ok"]
+    unex = cj(eng=conc_arm("engine", "noslots", cached=0), leg=conc_arm("legacy", "noslots", cached=0), c={})
+    assert unex["ok"] and unex["unexercised"]
+    assert not cj(eng=conc_arm("engine", "noslots", tau=2.9), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
+    assert cj(eng=conc_arm("engine", "noslots", tau=2.98), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
+    assert not cj(eng=conc_arm("engine", "noslots", tau=None), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
+    assert not cj(eng=conc_arm("engine", "noslots", tok_s=58.0, ttft=900.0))["ok"]  # throughput below target
+    assert not cj(eng=conc_arm("engine", "noslots", tok_s=61.0, ttft=950.0))["ok"]  # TTFT above target
+    assert not cj(eng=good, batch=conc_arm("legacy", "batch", rc=1))["ok"]  # an arm that did not run
+    assert cj(eng=good)["engine"]["engine-noslots"]["target"] == {"stateless/4": True, "multiturn/4": True}
 
 
 def host_state(own_pid=None):
@@ -488,6 +613,185 @@ def run_perf(args, route, out):
     return {"reps": rows, "median": summary}
 
 
+# ── Concurrency matrix (`--conc`, HIPF-472) ─────────────────────────────────
+# `hipfire bench --concurrency` per (loop, backend) arm, the daemon behind a wire
+# tap: the bench JSON gives the timing, the tapped wire every request's tokens,
+# token ids and done envelope.
+TAP = '#!/usr/bin/env bash\n"$TAP_DAEMON" "$@" | tee -a "$TAP_OUT"\nexit "${PIPESTATUS[0]}"\n'
+WORKLOADS = ("stateless", "multiturn")  # bench's order for `--workload both`
+
+
+def bench_order(workloads, points, runs):
+    """(workload, k) of bench sample n at index n-1: one backend per bench process,
+    workloads in turn, k interleaved within each round (bench_concurrency.rs
+    sweep_backend / sweep_order)."""
+    return [(wl, k) for wl in workloads for _ in range(runs) for k in points]
+
+
+def wire_requests(lines, order):
+    """Measured requests from a tapped wire, keyed `workload/k/round/conv/turn`.
+    Bench ids are `bench-<backend>-<sample>-<nonce>-<conv>`, attempt = turn + 1."""
+    live, out = {}, {}
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rid = e.get("id")
+        if not isinstance(rid, str) or not rid.startswith("bench-"):
+            continue
+        sample, nonce, conv = rid.split("-")[-3:]
+        if not nonce.startswith("Q"):  # W = warmup
+            continue
+        t = e.get("type")
+        cur = live.setdefault(rid, ([], []))
+        if t in ("token", "reasoning"):
+            cur[0].append([t[0], e.get("text", "")])
+        elif t == "committed":
+            cur[1].append([e.get("tok_id"), e.get("pos")])
+        elif t in ("done", "error"):
+            del live[rid]
+            wl, k = order[int(sample) - 1]
+            done = {x: v for x, v in e.items() if x not in ("type", "id", "attempt_id")}
+            out[f"{wl}/{k}/{nonce[1:]}/{conv}/{e.get('attempt_id', 1) - 1}"] = result(t, *cur, None, done)
+    return out
+
+
+def pctl(xs, p):
+    """Linear-interpolated percentile (numpy's default, as bench_concurrency.rs)."""
+    xs = sorted(xs)
+    if not xs:
+        return None
+    i = (len(xs) - 1) * p
+    lo = int(i)
+    return xs[lo] + (xs[min(lo + 1, len(xs) - 1)] - xs[lo]) * (i - lo)
+
+
+def cell_metrics(cell):
+    """Median over a bench cell's samples of output tok/s and per-sample TTFT/TPOT
+    p50/p99 (ms). Overlap-rejected samples count too: a loop that serializes is
+    measured as it is. TTFT runs from t_send, so a client-side queue wait counts."""
+    rows = []
+    for s in cell["samples"] + cell["rejected_samples"]:
+        st = [x for x in s["streams"] if x["ok"] and x["t_first"] is not None]
+        if not st:
+            continue
+        ttft = [x["t_first"] - x["t_send"] for x in st]
+        tpot = [(x["t_end"] - x["t_first"]) / (x["tokens"] - 1) for x in st if x["tokens"] > 1]
+        wall = max(x["t_end"] for x in s["streams"]) - min(x["t_send"] for x in s["streams"])
+        row = {"out_tok_s": sum(x["tokens"] for x in st) / wall if wall > 0 else None,
+               "decode_concurrency": s["overlap"].get("decode_concurrency")}
+        for name, xs in (("ttft", ttft), ("tpot", tpot)):
+            for p in (50, 99):
+                v = pctl(xs, p / 100)
+                row[f"{name}_p{p}_ms"] = None if v is None else 1000 * v
+        rows.append(row)
+    m = {"status": cell["status"], "samples": len(rows)}
+    for key in ("out_tok_s", "ttft_p50_ms", "ttft_p99_ms", "tpot_p50_ms", "tpot_p99_ms", "decode_concurrency"):
+        xs = [r[key] for r in rows if r[key] is not None]
+        m[key] = round(statistics.median(xs), 2) if xs else None
+    return m
+
+
+def run_conc(args, route, out):
+    """One `hipfire bench --concurrency` process per `conc.arms` entry."""
+    c = route["conc"]
+    points = sorted({int(x) for x in str(c.get("k", "1,2,4")).split(",")})
+    workloads = [w for w in WORKLOADS if w in c.get("workloads", WORKLOADS)]
+    runs = c.get("runs", 3)
+    tap = out / "daemon-tap.sh"
+    tap.write_text(TAP)
+    tap.chmod(0o755)
+    arms = {}
+    for loop, backend in c.get("arms", [["legacy", "noslots"], ["engine", "noslots"]]):
+        base = out / f"{route['name']}.conc.{loop}-{backend}"
+        wire = Path(f"{base}.wire.jsonl")
+        wire.write_text("")
+        env = {**arm_env(route, loop), "HIPFIRE_DAEMON_BIN": str(tap),
+               "TAP_DAEMON": os.path.realpath(args.daemon), "TAP_OUT": str(wire)}
+        cmd = [args.hipfire, "bench", route["model"], "--concurrency", ",".join(map(str, points)),
+               "--backend", backend, "--workload", workloads[0] if len(workloads) == 1 else "both",
+               "--runs", str(runs), "-j", *c.get("args", [])]
+        host = host_state()
+        with open(f"{base}.json", "w") as fo, open(f"{base}.log", "w") as fe:
+            rc = subprocess.run(cmd, env=env, stdout=fo, stderr=fe).returncode
+        try:
+            cells = json.loads(Path(f"{base}.json").read_text())["cells"]
+        except (json.JSONDecodeError, KeyError):
+            cells = []
+        with wire.open() as f:
+            reqs = wire_requests(f, bench_order(workloads, points, runs))
+        arms[f"{loop}-{backend}"] = {
+            "loop": loop, "backend": backend, "rc": rc, "cmd": " ".join(cmd), "host": host,
+            "cells": {f"{x['workload']}/{x['k']}": cell_metrics(x) for x in cells}, "reqs": reqs}
+    return arms
+
+
+def judge_conc(arms, c, expect_engine):
+    """Concurrency gates on every engine arm; legacy arms are reference rows
+    (legacy fn-lanes are not row-exact by default, HIPF-469). Pure: --self-test
+    drives it with fakes. Per engine arm:
+    - every request ends in `done`; `loop` stamps as in loop_checks
+    - C1 == CN: each k>1 request's tokens and ids equal the same request at k=1
+    - G-tok: tokens and ids equal the `ref` arm's (default legacy-noslots)
+    - cache: each multi-turn follow-up reuses at least the ref arm's `cached_tokens`
+    - G-spec: mean tau per cell >= ref - 1 %
+    - target (k>1): out tok/s >= target - tol, TTFT p50 and p99 <= target + tol"""
+    tol = c.get("tol_pct", 2.0) / 100
+    ref = arms.get("-".join(c.get("ref", ["legacy", "noslots"])))
+    target = arms.get("-".join(c["target"])) if c.get("target") else None
+    fails, unexercised, report = [], [], {}
+    if ref is None or (c.get("target") and target is None):
+        fails.append("ref or target arm missing")
+    for tag, a in arms.items():
+        if a["rc"] != 0 or not a["cells"] or not a["reqs"]:
+            fails.append(f"{tag}: bench rc {a['rc']}, {len(a['cells'])} cells, {len(a['reqs'])} requests")
+    same = lambda x, y: x is not None and y is not None and (x["events"], x["ids"]) == (y["events"], y["ids"])
+    for tag, a in arms.items():
+        if a["loop"] != "engine":
+            continue
+        reqs, rr = a["reqs"], (ref or {}).get("reqs", {})
+        r = report[tag] = {}
+        r["errors"] = sorted(k for k, x in reqs.items() if x["type"] != "done")
+        loops = [x["done"].get("loop") for x in reqs.values() if x["type"] == "done"]
+        r["loop"] = {str(v): loops.count(v) for v in set(loops)}
+        loop_bad = (any(v not in (None, "legacy", "engine") for v in loops)
+                    or (None in loops and any(v is not None for v in loops))
+                    or (expect_engine and any(v != "engine" for v in loops)))
+        r["c1_ne_cn"] = sorted(k for k, x in reqs.items() if k.split("/")[1] != "1" and not same(
+            x, reqs.get("/".join([k.split("/")[0], "1", *k.split("/")[2:]]))))
+        r["ne_ref"] = sorted(k for k, x in reqs.items() if not same(x, rr.get(k)))
+        follow = [k for k in reqs if k.startswith("multiturn/") and not k.endswith("/0")]
+        cached = lambda x: (x or {"done": {}})["done"].get("cached_tokens") or 0
+        r["cache_below_ref"] = sorted(k for k in follow if cached(reqs[k]) < cached(rr.get(k)))
+        r["cache_hits"] = [sum(cached(reqs[k]) > 0 for k in follow), sum(cached(rr.get(k)) > 0 for k in follow),
+                           len(follow)]
+        if follow and not r["cache_hits"][0]:
+            unexercised.append(f"{tag}: no multi-turn follow-up reused a prefix")
+        r["g_spec"], r["target"] = {}, {}
+        for cell, m in a["cells"].items():
+            taus = [[x["done"]["tau"] for k, x in rs.items() if k.startswith(cell + "/") and "tau" in x["done"]]
+                    for rs in (reqs, rr)]
+            if taus[1]:
+                r["g_spec"][cell] = (len(taus[0]) == len(taus[1])
+                                     and statistics.mean(taus[0]) >= 0.99 * statistics.mean(taus[1]))
+            t = (target or {}).get("cells", {}).get(cell)
+            if target and int(cell.split("/")[1]) > 1:
+                r["target"][cell] = bool(t) and all(m[x] is not None and t[x] is not None for x in (
+                    "out_tok_s", "ttft_p50_ms", "ttft_p99_ms")) and (
+                    m["out_tok_s"] >= t["out_tok_s"] * (1 - tol)
+                    and m["ttft_p50_ms"] <= t["ttft_p50_ms"] * (1 + tol)
+                    and m["ttft_p99_ms"] <= t["ttft_p99_ms"] * (1 + tol))
+        for name, bad in (("errors", r["errors"]), ("loop", loop_bad), ("C1 != CN", r["c1_ne_cn"]),
+                          ("tokens != ref", r["ne_ref"]), ("cached_tokens < ref", r["cache_below_ref"]),
+                          ("G-spec", not all(r["g_spec"].values())),
+                          ("target", [k for k, v in r["target"].items() if not v])):
+            if bad:
+                fails.append(f"{tag}: {name}" + (f" {len(bad)}" if isinstance(bad, list) else ""))
+    return {"ok": not fails, "fails": fails, "unexercised": unexercised, "engine": report,
+            "cells": {tag: a["cells"] for tag, a in arms.items()}}
+
+
 def sha256_cached(path, out):
     """Fixture sha256, cached on (path, size, mtime) because the files are large."""
     st = os.stat(path)
@@ -515,6 +819,9 @@ def main():
     ap.add_argument("--perf", action="store_true", help="also run the perf arm")
     ap.add_argument("--perf-reps", type=int, default=3)
     ap.add_argument("--timeout", type=float, default=1800, help="per-event timeout, seconds")
+    ap.add_argument("--conc", action="store_true", help="also run the route's concurrency matrix (`conc`)")
+    ap.add_argument("--conc-only", action="store_true", help="run only the concurrency matrix")
+    ap.add_argument("--hipfire", help="hipfire CLI for --conc (default: next to --daemon)")
     args = ap.parse_args()
     if args.self_test:
         return self_test()
@@ -522,21 +829,44 @@ def main():
         ap.error("--daemon, --route and --out are required")
     route = json.loads(Path(args.route).read_text())
     route.setdefault("name", Path(args.route).stem)
+    conc_on = args.conc or args.conc_only
+    if conc_on and "conc" not in route:
+        ap.error("--conc needs a `conc` block in the route file")
+    args.hipfire = args.hipfire or str(Path(args.daemon).with_name("hipfire"))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     model = os.path.expanduser(route["model"])
     route["model"] = model
 
-    res, t0 = {}, time.time()
-    for arm in ARMS:
-        res[arm] = run_arm(args, route, arm, out,
-                           None if arm == "legacy" else res["legacy"]["eos_budget"][0]["done"].get("tokens", 0))
-    perf = run_perf(args, route, out) if args.perf else None
-    j = judge(res, route, args.tvd_max, perf)
-    ok = j["ok"]
-    # a pass with unexercised scenarios must not be citable as covering them
-    unex = [k for k, v in j["scenarios"].items() if v["status"] == UNEXERCISED]
+    res, t0, j, perf, conc, unex, summary = {}, time.time(), {"ok": True}, None, None, [], []
+    if not args.conc_only:
+        for arm in ARMS:
+            res[arm] = run_arm(args, route, arm, out,
+                               None if arm == "legacy" else res["legacy"]["eos_budget"][0]["done"].get("tokens", 0))
+        perf = run_perf(args, route, out) if args.perf else None
+        j = judge(res, route, args.tvd_max, perf)
+        # a pass with unexercised scenarios must not be citable as covering them
+        unex = [k for k, v in j["scenarios"].items() if v["status"] == UNEXERCISED]
+        sampled = j["sampled"]
+        summary.append(", ".join(f"{k}={v['status']}" for k, v in j["scenarios"].items()))
+        summary.append(f"sampled tvd={sampled['tvd_first8']} repro={sampled['legacy_reproducible']}/"
+                       f"{sampled['engine_reproducible']} distinct={sampled['legacy_distinct']}/{sampled['engine_distinct']}")
+        summary.append(f"loop={j['loop']['engine']}" + ("" if j["loop_ok"] else " (FAIL)"))
+        summary.append(f"isolation={j['isolation']}")
+        if j["g_spec"] is not None:
+            summary.append(f"G-spec={j['g_spec']}")
+        if perf:
+            m = perf["median"]
+            summary.append(f"G-perf={m['g_perf']} prefill {m['prefill_tok_s_delta_pct']}% "
+                           f"decode {m['decode_tok_s_delta_pct']}%")
+    if conc_on:
+        arms = run_conc(args, route, out)
+        conc = judge_conc(arms, route["conc"], route.get("expect_engine", False))
+        unex += conc["unexercised"]
+        summary.append("conc=" + ("pass" if conc["ok"] else "FAIL: " + "; ".join(conc["fails"])))
+    ok = j["ok"] and (conc is None or conc["ok"])
     verdict = ("pass-partial" if unex else "pass") if ok else "fail"
+    summary = ", ".join(summary)
 
     me = Path(__file__).resolve()
     git = lambda *a: subprocess.run(["git", "-C", str(me.parent), *a], capture_output=True, text=True).stdout.strip()
@@ -552,23 +882,17 @@ def main():
     }
     if perf:
         receipt["perf"] = perf
-    rpath = out / f"{route['name']}.json"
+    if conc:
+        receipt["hipfire"] = {"path": os.path.realpath(args.hipfire),
+                              "md5": hashlib.md5(Path(args.hipfire).read_bytes()).hexdigest()}
+        receipt["conc"] = {**conc, "arms": arms}
+    rpath = out / f"{route['name']}{'.conc' if args.conc_only else ''}.json"
     rpath.write_text(json.dumps(receipt, indent=1))
 
     ev = out / "EVIDENCE.md"
     if not ev.exists():
         ev.write_text("| route | harness sha256 | daemon md5 | fixture sha256 | command | receipt | result | disposition |\n"
                       "|---|---|---|---|---|---|---|---|\n")
-    sampled = j["sampled"]
-    summary = ", ".join(f"{k}={v['status']}" for k, v in j["scenarios"].items())
-    summary += (f", sampled tvd={sampled['tvd_first8']} repro={sampled['legacy_reproducible']}/"
-                f"{sampled['engine_reproducible']} distinct={sampled['legacy_distinct']}/{sampled['engine_distinct']}")
-    summary += f", loop={j['loop']['engine']}" + ("" if j["loop_ok"] else " (FAIL)")
-    if j["g_spec"] is not None:
-        summary += f", G-spec={j['g_spec']}"
-    if perf:
-        m = perf["median"]
-        summary += f", G-perf={m['g_perf']} prefill {m['prefill_tok_s_delta_pct']}% decode {m['decode_tok_s_delta_pct']}%"
     with ev.open("a") as f:
         f.write(f"| {route['name']} | {receipt['harness']['sha256'][:12]} | {receipt['daemon']['md5'][:8]} | "
                 f"{receipt['fixture_sha256'][:16]} | `{' '.join(sys.argv)}` | {rpath} | {summary} | "
