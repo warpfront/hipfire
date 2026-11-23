@@ -511,6 +511,22 @@ impl Driver {
     }
 }
 
+/// Free every conversation the engine keeps in a lane (a full reset).
+pub fn forget_records(m: &mut LoadedModel) {
+    let Some(records) = m
+        .engine
+        .as_mut()
+        .map(|runner| std::mem::take(&mut runner.records))
+    else {
+        return;
+    };
+    if let Some(lanes) = lanes_of(m) {
+        for record in records {
+            lanes.free_lane(record.tag);
+        }
+    }
+}
+
 /// The load's engine lanes, when its family staged them.
 fn lanes_of(m: &mut LoadedModel) -> Option<&mut dyn MeshLanes> {
     m.state

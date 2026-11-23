@@ -24,7 +24,9 @@
 //!   one epoch per tick (a prompt chunk, a decode, or the move into a lane);
 //!   once its request moved into a lane the next queued request takes it in
 //!   the same tick, so a burst of short prompts all prefill before the lane
-//!   epoch that runs their first tokens.
+//!   epoch that runs their first tokens. The requests that moved this tick
+//!   stream their first lane token together right before that epoch, not
+//!   after it ran them; one that this token ends never runs it.
 //! - A request that is not greedy (host sampler) never parks: it decodes on
 //!   the resident state until it finishes, while lanes keep decoding.
 //! - An abort or failure ends only its own request; [`Ended`] names where its
@@ -97,6 +99,12 @@ struct Req {
     place: Place,
     /// `None` while queued.
     run: Option<RequestRun>,
+    /// Moved into its lane this tick; its next row's token is not streamed
+    /// yet ([`Scheduler::stream_fresh`]).
+    fresh: bool,
+    /// The next lane row's token was already streamed, with this
+    /// classification: the lane epoch only runs it.
+    ahead: Option<(Verdict, Vec<u32>)>,
 }
 
 #[derive(Default)]
@@ -121,6 +129,8 @@ impl Scheduler {
         self.reqs[idx] = Some(Req {
             place: Place::Queued,
             run: None,
+            fresh: false,
+            ahead: None,
         });
         self.queue.push_back(idx);
     }
@@ -166,7 +176,9 @@ impl Scheduler {
             idx,
             place: req.place,
             exit,
-            generated: req.run.as_ref().map_or(0, RequestRun::generated),
+            // A token streamed ahead of its lane row counts too.
+            generated: req.run.as_ref().map_or(0, RequestRun::generated)
+                + usize::from(req.ahead.is_some()),
         }
     }
 
@@ -258,24 +270,57 @@ impl Scheduler {
             _ => return false,
         };
         let remaining = run.remaining();
-        match b.park(idx, seed, remaining) {
-            Ok(()) => {
-                self.resident = None;
-                self.reqs[idx]
-                    .as_mut()
-                    .expect("parked request is live")
-                    .place = Place::Lane;
-                true
-            }
-            Err(error) => {
-                ended.push(self.end(idx, Exit::Failed(error)));
-                false
+        if let Err(error) = b.park(idx, seed, remaining) {
+            ended.push(self.end(idx, Exit::Failed(error)));
+            return false;
+        }
+        self.resident = None;
+        let req = self.reqs[idx].as_mut().expect("parked request is live");
+        req.place = Place::Lane;
+        req.fresh = true;
+        true
+    }
+
+    /// Stream the first lane token of every request that moved into its lane
+    /// this tick, all at once before the lane epoch runs them (a burst's
+    /// first tokens go out together, one lane step earlier than run-then-
+    /// emit). A token that ends its request never runs.
+    fn stream_fresh(&mut self, b: &mut impl Batch, ended: &mut Vec<Ended>) {
+        let fresh: Vec<usize> = self
+            .lanes()
+            .filter(|&idx| self.reqs[idx].as_ref().is_some_and(|req| req.fresh))
+            .collect();
+        for idx in fresh {
+            let req = self.reqs[idx].as_mut().expect("a lane request is live");
+            req.fresh = false;
+            let run = req.run.as_mut().expect("a lane request has its run");
+            let Work::Decode { token: Some(seed) } = run.next_work() else {
+                continue;
+            };
+            let remaining = run.remaining();
+            match b.emit(idx, seed) {
+                Ok((verdict, close)) if verdict == Verdict::Continue && remaining > 1 => {
+                    self.reqs[idx]
+                        .as_mut()
+                        .expect("a lane request is live")
+                        .ahead = Some((verdict, close));
+                }
+                Ok((verdict, close)) => {
+                    let run = self.run_mut(idx);
+                    // The pick is never read: the request finishes on this token.
+                    run.apply_decode(Next::Top1(seed), verdict, &close, b.history(idx));
+                    if let Work::Done(finish) = run.next_work() {
+                        ended.push(self.end(idx, Exit::Finished(finish)));
+                    }
+                }
+                Err(error) => ended.push(self.end(idx, Exit::Failed(error))),
             }
         }
     }
 
     /// One decode epoch over at most `lane_rows` decoding lanes, round-robin.
     fn lane_epoch(&mut self, b: &mut impl Batch, ended: &mut Vec<Ended>) {
+        self.stream_fresh(b, ended);
         let lanes: Vec<usize> = self.lanes().collect();
         if lanes.is_empty() {
             return;
@@ -309,7 +354,8 @@ impl Scheduler {
             }
         };
         for (&(idx, token), pick) in rows.iter().zip(picks) {
-            let emitted = b.emit(idx, token);
+            let ahead = self.reqs[idx].as_mut().and_then(|req| req.ahead.take());
+            let emitted = ahead.map_or_else(|| b.emit(idx, token), Ok);
             let run = self.run_mut(idx);
             match emitted {
                 Ok((verdict, close)) => {
@@ -391,6 +437,7 @@ mod tests {
         Decode { idx: usize, keep: bool },
         Park(usize),
         Lanes(Vec<usize>),
+        Emit(usize),
     }
 
     #[derive(Default)]
@@ -519,6 +566,7 @@ mod tests {
         }
 
         fn emit(&mut self, idx: usize, token: u32) -> Result<(Verdict, Vec<u32>), String> {
+            self.calls.push(Call::Emit(idx));
             self.emitted.entry(idx).or_default().push(token);
             self.history.get_mut(&idx).unwrap().push(token);
             let verdict = if token == self.eos {
@@ -636,13 +684,15 @@ mod tests {
         for _ in 0..4 {
             s.tick(&mut b);
         }
-        assert_eq!(b.calls.last(), Some(&Call::Decode { idx: 0, keep: true }));
+        let last_forward = b.calls.iter().rev().find(|c| !matches!(c, Call::Emit(_)));
+        assert_eq!(last_forward, Some(&Call::Decode { idx: 0, keep: true }));
         s.admit(2);
         b.calls.clear();
         s.tick(&mut b);
         // A peer queued: one drained decode brings the token to the host, the
         // request moves into a lane, the peer's first prompt epoch takes the
-        // resident state and the lane decodes, all in this tick.
+        // resident state, then the lane's token streams and its row runs,
+        // all in this tick.
         assert_eq!(
             b.calls,
             vec![
@@ -650,27 +700,34 @@ mod tests {
                     idx: 0,
                     keep: false
                 },
+                Call::Emit(0),
                 Call::Park(0),
                 Call::Prefill(2),
+                Call::Emit(0),
                 Call::Lanes(vec![0])
             ]
         );
         b.calls.clear();
         s.tick(&mut b);
-        assert_eq!(b.calls, vec![Call::Prefill(2), Call::Lanes(vec![0])]);
+        assert_eq!(
+            b.calls,
+            vec![Call::Prefill(2), Call::Lanes(vec![0]), Call::Emit(0)]
+        );
     }
 
     #[test]
-    fn a_burst_of_short_prompts_shares_its_first_lane_epoch() {
+    fn a_burst_of_short_prompts_streams_first_tokens_before_its_lane_epoch() {
         let prompts = vec![vec![1, 2], vec![3, 4, 5], vec![6], vec![7, 8, 9, 10]];
         let mut b = fake(&prompts, 4, 4);
+        b.eos = u32::MAX;
         let mut s = Scheduler::default();
         for idx in 0..4 {
             s.admit(idx);
         }
         s.tick(&mut b);
-        // Prompts of one epoch each: all four prefill and park, then one lane
-        // epoch runs every first token. The fourth prompt takes two epochs.
+        // Prompts of one epoch each: each prefills and moves into a lane;
+        // then every first token streams together and one lane epoch runs
+        // them. The fourth prompt takes two epochs.
         assert_eq!(
             b.calls,
             vec![
@@ -681,8 +738,34 @@ mod tests {
                 Call::Prefill(2),
                 Call::Park(2),
                 Call::Prefill(3),
+                Call::Emit(0),
+                Call::Emit(1),
+                Call::Emit(2),
                 Call::Lanes(vec![0, 1, 2])
             ]
+        );
+    }
+
+    #[test]
+    fn a_first_token_that_ends_the_request_never_runs_in_its_lane() {
+        let prompts = vec![vec![1, 2], vec![3, 4, 5, 6]];
+        let mut b = fake(&prompts, 4, 4);
+        b.eos = pick(&prompts[0]);
+        let mut s = Scheduler::default();
+        s.admit(0);
+        s.admit(1);
+        let ended = s.tick(&mut b);
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].idx, 0);
+        assert_eq!(ended[0].place, Place::Lane);
+        assert_eq!(ended[0].exit, Exit::Finished(super::super::Finish::Stop));
+        assert_eq!(b.emitted[&0], vec![b.eos]);
+        assert!(
+            !b.calls
+                .iter()
+                .any(|c| matches!(c, Call::Lanes(rows) if rows.contains(&0))),
+            "{:?}",
+            b.calls
         );
     }
 

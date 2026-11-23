@@ -263,6 +263,9 @@ pub fn production_fail_closed_rollback(
     }
     m.seq_pos = 0;
     m.conversation_tokens.clear();
+    // The full reset forgets every conversation, those the engine keeps in
+    // lanes too.
+    crate::engine::serve::forget_records(m);
     fail_closed_reset_target_and_spec(m, gpu, slot, spec)
 }
 
