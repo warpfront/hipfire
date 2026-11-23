@@ -374,10 +374,12 @@ fixture are in
   separate from its historical single-token retained receipts.
 
 - **MTP `auto` (`speculation.mtp = auto`, the schema default) arms native MTP
-  only for a producer that declares a measured AR floor. Today that is Qwen4
+  for a producer that declares a measured AR floor, and for a dense Qwen3.5
+  (arch 5) load that `dense_mtp_auto` admits at load
+  (`crates/hipfire-runtime/src/config.rs`). The floor producer today is Qwen4
   (Flash-Next, arch 16), except on MQ4R-SKU loads (HFQ `hipfire_route_sku`
   metadata or the registry card, never the file extension), which keep the
-  retained Redline AR route. Qwen3.5-class (arch 5/6, dense and MoE), DeepSeek V4 and
+  retained Redline AR route. Qwen3.5 MoE (arch 6), DeepSeek V4 and
   Gemma 4 declare no floor (the DS4 native-MTP audit found none), so `auto`
   resolves to AR there even when a head is present. An explicit
   `speculation.mtp = on` / `--spec mtp` still attaches any present head on
@@ -386,10 +388,14 @@ fixture are in
   speculative rejection sampling against the AR sampler's distribution
   (oracle: `crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs`).
   Sampled MTP output matches AR in distribution, not byte for byte.
-  Non-neutral penalties keep native MTP for sampled requests when
+  Qwen4 non-neutral penalties keep native MTP for sampled requests when
   `supports_temp_verify` is true (since `9f1ea2171`, shipped in v0.4.1);
-  greedy requests with penalties run AR
-  (`crates/hipfire-generate/src/ar.rs:1715–1734`).
+  Qwen4 greedy requests with penalties run AR (the arch-16 arm of
+  `select_generation_route`, `crates/hipfire-generate/src/ar.rs`). Qwen3.5
+  native MTP keeps penalized greedy and sampled requests on MTP: every verify
+  row is penalized against the generated history before the argmax or the
+  acceptance test (`mtp_apply_verify_penalties`,
+  `crates/hipfire-arch-qwen35/src/mtp_spec.rs`).
   Flash-Next batch lanes refuse non-neutral repeat/presence/frequency penalties
   (`crates/hipfire-generate/src/batch.rs`, `qwen4_lane_request_supported`), but
   batch sampled neutral-penalty requests under `serve.batch_sampled`: AR lanes
