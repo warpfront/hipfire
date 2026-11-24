@@ -1886,7 +1886,7 @@
   {
    "commands": {
     "positive": [
-     "HIPFIRE_DENSE_FIXTURE=$MODEL_DIR cargo test -p hipfire-generate --locked --test dense_rollback_gpu -- glimmer_dflash_request_that_fits_max_seq_completes --exact --ignored --test-threads=1 --nocapture"
+     "HIPFIRE_DENSE_FIXTURE=$MODEL_DIR cargo test -p hipfire-generate --locked --test dense_rollback_gpu -- glimmer_dflash_request_that_fits_max_seq_completes glimmer_client_abort_stops_decode --exact --ignored --test-threads=1 --nocapture"
     ]
    },
    "env": {
@@ -1903,14 +1903,14 @@
    ],
    "id": "g11-glimmer-dflash-max-seq",
    "milestone": "G11",
-   "note": "HIPF-86 regression: a greedy DFlash request that fits max_seq completes on DFlash. Own row so hosts without the 20 GB Glimmer pair keep g4-dense-rollback current (an absent fixture blocks the whole row).",
+   "note": "HIPF-86 regression (a greedy DFlash request that fits max_seq completes on DFlash) plus the Glimmer client-abort test (HIPF-276). Own row so hosts without the 20 GB Glimmer pair keep g4-dense-rollback current (an absent fixture blocks the whole row).",
    "predicate": {
     "forbid": [
      "skip: dense fixture",
      "skip: no GPU"
     ],
     "kind": "cargo",
-    "min_passed": 1
+    "min_passed": 2
    },
    "probe": "existing",
    "route": "single/glimmer-dflash-max-seq"
@@ -1932,7 +1932,7 @@
    ],
    "id": "g7-minimax-dense-rollback",
    "milestone": "G7",
-   "note": "G7 MiniMax dense rollback + COR-007 eight-cycle unload drift (#884). gfx1151 only: the fixture is 79 GB. Own row so the G4.10 row is not blocked on hosts without it. Timeout: about 2x the measured halo row time (562 s, 550 s; HIPF-232).",
+   "note": "G7 MiniMax dense rollback + COR-007 eight-cycle unload drift (#884). gfx1151 only: the fixture is 79 GB. Own row so the G4.10 row is not blocked on hosts without it. Timeout: measured halo row time 550-648 s (HIPF-232, HIPF-535), about 1.7x headroom incl. a cold test build.",
    "predicate": {
     "forbid": [
      "skip: dense fixture",
