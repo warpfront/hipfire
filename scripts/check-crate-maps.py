@@ -1,46 +1,49 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generate and drift-check per-crate map.md files.
+"""Generate and check per-crate maps.
 
-Each crate may carry a map.md at its crate root. The mechanical half of the
-map — source module list with each module's exported symbols, direct and
-reverse dependencies — lives between explicit markers:
+Each crate may carry a map.md at its crate root. It is hand-written judgement
+(purpose, status, gotchas) plus one pointer fenced by explicit markers:
 
     <!-- crate-map:generated:begin -->
-    ...
+    ...pointer to map.generated.md...
     <!-- crate-map:generated:end -->
 
-and is regenerated from the tree by this script. Everything outside the
-markers is hand-written judgement (purpose, status, gotchas) and is preserved
-byte-for-byte on regeneration.
+The mechanical half of the map -- source module list with each module's
+exported symbols, direct and reverse dependencies -- is written by this script
+to `map.generated.md` beside map.md. That file is NOT committed (it is in
+.gitignore): it is derived from the tree, so committing it only made 21.7% of
+commits touch a map (friction/FRICTION.md F4). `cargo xtask regen` writes it;
+map.md keeps only the pointer, byte-for-byte as STUB below.
 
-The block deliberately carries no volatile stats (line/item/test counts) and
-no totals: it changes only when a file is added/removed, an exported symbol is
-added/removed/renamed, or a dependency edge changes. Every list (exports are a
-sub-list under their module) is sorted alphabetically with one entry per line,
-so two branches that each add an entry merge without conflict unless the
-entries are adjacent.
+The generated file deliberately carries no volatile stats (line/item/test
+counts) and no totals. Every list (exports are a sub-list under their module)
+is sorted alphabetically with one entry per line.
 
 Usage:
-    scripts/check-crate-maps.py <crate>...        generate/refresh those maps
-    scripts/check-crate-maps.py --check [crate...]  fail on drift or broken links
-        (no crate named = every map.md present under crates/)
+    scripts/check-crate-maps.py <crate>...        write map.generated.md and
+                                                  normalise map.md's pointer
+    scripts/check-crate-maps.py --check [crate...]  fail on a map.md that is not
+        in committed form, or on a broken link (no crate named = every map.md
+        present under crates/). Read-only.
 
---check validates two things per map.md:
-  1. The generated block matches the tree (modules from actual src/**/*.rs
-     files, exports, dependencies, reverse dependencies, link hrefs).
-  2. Every local markdown link in the WHOLE file -- inside and outside the
-     markers, even when the generated block is otherwise fresh -- resolves to
-     an existing path. Inline links, images and reference definitions are
-     checked; targets are relative to the crate directory (a leading `/` is
-     relative to the repo root), `#fragment` / `?query` suffixes are stripped
-     before the lookup, and fragment-only links, external schemes (https:,
-     mailto:, ...) and `//host` links are ignored. Fenced code, inline code and
-     HTML comments are not scanned. Anchors themselves are not verified.
+--check validates per map.md:
+  1. The span between the markers is exactly STUB: a hand-edit inside the
+     markers, or a generated block committed by an older script, is drift.
+  2. Every local markdown link in the WHOLE file resolves to an existing path.
+     Inline links, images and reference definitions are checked; targets are
+     relative to the crate directory (a leading `/` is relative to the repo
+     root), `#fragment` / `?query` suffixes are stripped before the lookup, and
+     fragment-only links, external schemes (https:, mailto:, ...) and `//host`
+     links are ignored. Fenced code, inline code and HTML comments are not
+     scanned. Anchors themselves are not verified.
+  3. The generated file can be produced for the crate (the manifest and every
+     src/**/*.rs read cleanly). Its content is never compared with anything:
+     a file that is not committed cannot drift.
 
 Exit codes in --check mode (mirrors scripts/check-env-docs.py):
-    0 - every checked map matches the tree and all local links resolve
+    0 - every checked map is in committed form and all local links resolve
     1 - drift or a broken local link found (details printed, one line per
         finding, with the map.md line number for link problems)
     2 - usage error or a named crate has no map.md
@@ -59,6 +62,13 @@ CRATES = ROOT / "crates"
 
 BEGIN = "<!-- crate-map:generated:begin -->"
 END = "<!-- crate-map:generated:end -->"
+GENERATED_NAME = "map.generated.md"
+STUB = (
+    f"{BEGIN}\n\n"
+    "Modules, exported symbols and dependencies are generated, not committed: see\n"
+    f"`{GENERATED_NAME}` in this directory (`cargo xtask regen` writes it).\n\n"
+    f"{END}"
+)
 
 # Leading whitespace is REQUIRED to be optional here. Anchoring `^pub` at column
 # zero silently reported 0 public items for `rdna-compute/src/gemm.rs`, a file with
@@ -166,13 +176,14 @@ def bullet_list(names: list[str]) -> list[str]:
     return [f"- `{n}`" for n in names] or ["—"]
 
 
-def generated_block(crate: Path) -> str:
+def generated_text(crate: Path) -> str:
+    """Content of `<crate>/map.generated.md` (derived from the tree, not committed)."""
     deps = parse_manifest(crate)
     lines = [
-        BEGIN,
+        f"# {crate.name} — generated map",
         "",
-        "_Generated by `scripts/check-crate-maps.py` from the tree — do not edit "
-        "inside the markers._",
+        "_Generated by `scripts/check-crate-maps.py` (run `cargo xtask regen`) "
+        "from the tree; not committed. The hand-written half is [`map.md`](map.md)._",
         "",
         "### Modules and exported symbols",
         "",
@@ -193,44 +204,8 @@ def generated_block(crate: Path) -> str:
         "",
         *bullet_list(reverse_dependencies(crate)),
         "",
-        END,
     ]
     return "\n".join(lines)
-
-
-def parse_block_sections(block: str) -> dict[str, set[str]]:
-    """First backticked name of every top-level `- ` line, keyed by its `### ` section."""
-    out: dict[str, set[str]] = {}
-    section = ""
-    for line in block.splitlines():
-        if line.startswith("### "):
-            section = line[4:]
-            out[section] = set()
-        elif section and line.startswith("- "):
-            m = re.search(r"`([^`]+)`", line)
-            if m:
-                out[section].add(m.group(1))
-    return out
-
-
-def parse_block_modules(block: str) -> dict[str, set[str]]:
-    """Module path -> its exported-symbol sub-list."""
-    out: dict[str, set[str]] = {}
-    rel = None
-    for line in block.splitlines():
-        if m := re.match(r"- \[`(src/[^`]+)`\]", line):
-            rel = m.group(1)
-            out[rel] = set()
-        elif rel and (m := re.match(r"  - `([^`]+)`", line)):
-            out[rel].add(m.group(1))
-        elif not line.startswith("  "):
-            rel = None
-    return out
-
-
-def parse_block_hrefs(block: str) -> dict[str, str]:
-    """Module path -> the href its generated bullet links to."""
-    return dict(re.findall(r"^- \[`(src/[^`]+)`\]\(([^)]*)\)$", block, re.MULTILINE))
 
 
 def mask_non_link_text(text: str) -> str:
@@ -288,70 +263,36 @@ def check_crate(crate: Path) -> list[str]:
     text = map_path.read_text(encoding="utf-8", errors="ignore")
     if BEGIN not in text or END not in text:
         return [f"{crate.name}: map.md is missing the generated-block markers"]
-    link_problems = check_links(crate, text)
-    old_block = text[text.index(BEGIN):text.index(END) + len(END)]
-    fresh = generated_block(crate)
-    if old_block == fresh:
-        return link_problems
-
-    problems: list[str] = []
-    old = parse_block_sections(old_block)
-    old_modules = parse_block_modules(old_block)
-    new_modules = {rel: set(names) for rel, names in module_inventory(crate)}
-    for rel in sorted(new_modules.keys() - old_modules.keys()):
-        problems.append(f"{crate.name}: module exists with no map entry: {rel}")
-    for rel in sorted(old_modules.keys() - new_modules.keys()):
-        problems.append(f"{crate.name}: map lists a module that no longer exists: {rel}")
-    for rel in sorted(new_modules.keys() & old_modules.keys()):
-        for name in sorted(new_modules[rel] - old_modules[rel]):
-            problems.append(f"{crate.name}: export missing from map: {rel}::{name}")
-        for name in sorted(old_modules[rel] - new_modules[rel]):
-            problems.append(f"{crate.name}: map lists a removed export: {rel}::{name}")
-
-    old_deps = old.get("Dependencies (from `Cargo.toml`)", set())
-    new_deps = set().union(*parse_manifest(crate).values())
-    for name in sorted(old_deps - new_deps):
-        problems.append(f"{crate.name}: stale declared dependency in map: {name}")
-    for name in sorted(new_deps - old_deps):
-        problems.append(f"{crate.name}: dependency missing from map: {name}")
-
-    old_rev, new_rev = old.get("Reverse dependencies", set()), set(reverse_dependencies(crate))
-    for name in sorted(old_rev - new_rev):
-        problems.append(f"{crate.name}: stale reverse dependency in map: {name}")
-    for name in sorted(new_rev - old_rev):
-        problems.append(f"{crate.name}: reverse dependency missing from map: {name}")
-
-    for rel, href in sorted(parse_block_hrefs(old_block).items()):
-        if href != rel and rel in new_modules:
-            problems.append(
-                f"{crate.name}: map link for {rel} points at {href}, expected {rel}"
-            )
-
-    if not problems:
+    problems = check_links(crate, text)
+    if text[text.index(BEGIN):text.index(END) + len(END)] != STUB:
         problems.append(
-            f"{crate.name}: generated block is stale — "
-            f"run cargo xtask regen (or scripts/check-crate-maps.py {crate.name})"
+            f"{crate.name}: map.md carries something other than the generated-map pointer "
+            f"between its markers — the mechanical half lives in {GENERATED_NAME}, which is "
+            f"not committed; run cargo xtask regen (or scripts/check-crate-maps.py "
+            f"{crate.name}) to restore the pointer"
         )
-    return problems + link_problems
+    try:
+        generated_text(crate)
+    except (OSError, ValueError) as exc:
+        problems.append(f"{crate.name}: cannot produce {GENERATED_NAME}: {exc}")
+    return problems
 
 
 def generate_crate(crate: Path) -> bool:
     map_path = crate / "map.md"
-    block = generated_block(crate)
+    changed = False
     if map_path.is_file():
         text = map_path.read_text(encoding="utf-8", errors="ignore")
         if BEGIN not in text or END not in text:
             print(f"{crate.name}: map.md exists but has no generated-block markers", file=sys.stderr)
             return False
-        new_text = text[:text.index(BEGIN)] + block + text[text.index(END) + len(END):]
+        new_text = text[:text.index(BEGIN)] + STUB + text[text.index(END) + len(END):]
         if new_text != text:
             map_path.write_text(new_text, encoding="utf-8")
-            print(f"{crate.name}: refreshed generated block")
-        else:
-            print(f"{crate.name}: already up to date")
-        return True
-
-    skeleton = f"""# {crate.name} — map
+            changed = True
+            print(f"{crate.name}: map.md now carries the generated-map pointer")
+    else:
+        skeleton = f"""# {crate.name} — map
 
 > **Status:** `production` / `research` / `legacy` — pick exactly one
 > (vocabulary owned by [`docs/GLOSSARY.md`](../../docs/GLOSSARY.md)).
@@ -369,10 +310,20 @@ def generate_crate(crate: Path) -> bool:
 
 ## Crate map
 
-{block}
+{STUB}
 """
-    map_path.write_text(skeleton, encoding="utf-8")
-    print(f"{crate.name}: wrote new map.md skeleton with generated block")
+        map_path.write_text(skeleton, encoding="utf-8")
+        changed = True
+        print(f"{crate.name}: wrote new map.md skeleton")
+
+    generated = crate / GENERATED_NAME
+    fresh = generated_text(crate)
+    if not generated.is_file() or generated.read_text(encoding="utf-8") != fresh:
+        generated.write_text(fresh, encoding="utf-8")
+        changed = True
+        print(f"{crate.name}: wrote {GENERATED_NAME}")
+    if not changed:
+        print(f"{crate.name}: already up to date")
     return True
 
 
@@ -399,12 +350,12 @@ def main(argv: list[str]) -> int:
             problems.extend(check_crate(crate))
         without = len(list(CRATES.glob("*/Cargo.toml"))) - len(crates)
         if problems:
-            print("crate maps have drifted from the tree or contain broken links:")
+            print("crate maps are not in committed form or contain broken links:")
             for p in problems:
                 print(f"  {p}")
             return 1
         print(
-            f"crate-maps: {len(crates)} map(s) match the tree "
+            f"crate-maps: {len(crates)} map(s) in committed form "
             f"({without} crates without a map, not enforced)"
         )
         return 0

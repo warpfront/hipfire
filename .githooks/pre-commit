@@ -76,7 +76,7 @@ if [[ -z "${SKIP_GATES_CHECK:-}" ]]; then
         echo "=== Crate maps ===" >&2
         if ! python3 scripts/check-crate-maps.py --check; then
             echo "" >&2
-            echo "✗ crate maps stale — run cargo xtask regen and git add the map.md" >&2
+            echo "✗ a crate map.md is not in committed form (or has a broken link) — run cargo xtask regen and git add the map.md" >&2
             exit 1
         fi
         echo "=== Leanup ratchets ===" >&2

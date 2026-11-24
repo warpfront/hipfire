@@ -2,9 +2,11 @@
 
 Each crate may carry a `map.md` at its crate root (`crates/<name>/map.md`) so
 humans and agents can navigate the workspace without reading source first.
-The first screen of every map is summary plus table of contents; the
-mechanical half is **generated**, because hand-written structure rots (the
-pre-saddle daemon path survived in docs for weeks after the file moved).
+`map.md` is hand-written (purpose, status, gotchas). The mechanical half
+(modules with exported symbols, dependencies) is **generated** into
+`map.generated.md` beside it and is **not committed**, because hand-written
+structure rots (the pre-saddle daemon path survived in docs for weeks after the
+file moved) and a committed generated file made one commit in five touch a map.
 
 ## What a map owns — and what it does not
 
@@ -25,19 +27,20 @@ restate what existing docs already own:
 
 ## Marker convention
 
-The mechanical section is fenced by explicit markers:
+`map.md` keeps one fenced pointer where the mechanical section used to be:
 
 ```text
 <!-- crate-map:generated:begin -->
-...modules with exported symbols, dependencies, reverse dependencies...
+...pointer to map.generated.md (the exact text is STUB in scripts/check-crate-maps.py)...
 <!-- crate-map:generated:end -->
 ```
 
-Regeneration replaces **only** the text between the markers; everything
-outside (purpose, status, gotchas) is hand-written judgement and is preserved
-byte-for-byte. Never hand-edit inside the markers — rerun the generator.
+Regeneration rewrites **only** the text between the markers (back to the
+pointer) and writes `map.generated.md`; everything outside the markers is
+hand-written judgement and is preserved byte-for-byte.
 
-The generated section carries only stable structure, measured from the tree:
+`map.generated.md` is listed in `.gitignore`. It carries only stable structure,
+measured from the tree:
 
 - modules and exported symbols: every `src/**/*.rs` (doubles as the TOC, with
   relative links), each followed by a sub-list of the names of its textual
@@ -51,41 +54,44 @@ The generated section carries only stable structure, measured from the tree:
 - reverse dependencies: workspace crates whose manifest has a path dependency
   on this one, of any kind.
 
-Every list and sub-list is sorted alphabetically with one entry per line, so
-two branches that each add an entry merge cleanly unless the entries are
-adjacent. It deliberately carries no line/item/test counts and no totals, so a
-change that only edits function bodies never requires a map regen.
+Every list and sub-list is sorted alphabetically with one entry per line. It
+deliberately carries no line/item/test counts and no totals.
 
 ## Running it
 
 ```bash
-# Generate or refresh one or more maps (safe to rerun; touches only the
-# generated block). A crate with no map.md gets a skeleton: Status/Layer
-# header, Purpose and Gotchas placeholders to fill in by hand, and the block.
+# Write map.generated.md for one or more crates (safe to rerun). A crate with
+# no map.md gets a skeleton: Status/Layer header, Purpose and Gotchas
+# placeholders to fill in by hand, and the pointer.
 scripts/check-crate-maps.py saddle-core
 
-# Drift check — every map present under crates/, or a named subset:
+# Every map, and everything else regenerated from the tree:
+cargo xtask regen
+
+# Committed-form check — every map present under crates/, or a named subset:
 scripts/check-crate-maps.py --check
 scripts/check-crate-maps.py --check saddle-core
 ```
 
+A fresh checkout or worktree has no `map.generated.md` until
+`cargo xtask regen` (or the generator above) has run; the pre-commit
+hook runs it on every commit.
+
 Exit codes mirror [`scripts/check-env-docs.py`](../scripts/check-env-docs.py):
-`0` clean, `1` drift found (one line per finding), `2` usage error, a named
+`0` clean, `1` problem found (one line per finding), `2` usage error, a named
 crate without a map (`--check`), or a failed generation (missing crate
 directory, or a `map.md` without the markers). CI runs the unscoped
-`--check` in the `gates` job (`.github/workflows/ci.yml`).
+`--check` in the `gates` job (`.github/workflows/ci.yml`). `--check` is
+read-only and never compares `map.generated.md` with anything: an uncommitted
+file cannot drift. It fails when:
 
-`--check` fails when:
+- the text between the markers is not exactly the pointer (a hand edit, or a
+  generated block committed by an older version of the script);
+- the `map.md` is missing its markers;
+- a local markdown link anywhere in `map.md` does not resolve;
+- the generated file cannot be produced for the crate.
 
-- a `src/**/*.rs` file exists with no map entry;
-- the map lists a file that no longer exists;
-- a file gained, lost, or renamed an exported (`pub`) symbol;
-- a declared dependency (or reverse dependency) in the map is stale or
-  missing relative to `Cargo.toml`;
-- the `map.md` is missing its generated-block markers, or the block differs
-  from a fresh generation in any other way.
-
-Fix drift by rerunning the generator for that crate — never by editing inside
-the markers. Crates without a `map.md` are reported as a count but do not
-fail the check; adoption is incremental, exemplar
+Fix a failure by rerunning the generator for that crate — never by editing
+inside the markers. Crates without a `map.md` are reported as a count but do
+not fail the check; adoption is incremental, exemplar
 [`crates/saddle-core/map.md`](../crates/saddle-core/map.md).

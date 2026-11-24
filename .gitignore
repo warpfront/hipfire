@@ -34,6 +34,10 @@ kernels/compiled/
 .hipfire_kernels/
 .hipfire_kernels_*/
 
+# Derived from the tree by `cargo xtask regen` (the mechanical half of
+# each crate map; map.md carries only a pointer to it)
+crates/*/map.generated.md
+
 # Agent / tool state
 .serena/
 .remember/

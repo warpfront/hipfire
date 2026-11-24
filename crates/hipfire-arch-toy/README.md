@@ -158,10 +158,10 @@ registering it, running every gate, and then reverting. What that exercise found
 | 3 | `crates/hipfire-loader/src/lib.rs` | one `REGISTRY` line |
 | 4 | `crates/hipfire-loader/src/carriers.rs` | the `Carrier` impl — it cannot live in the arch crate, `Carrier::load` returns `LoadedModel` |
 | 5 | `scripts/layering.txt` | **new**, added by the 3A.2 layering gate |
-| 6 | `crates/*/map.md` | **new-ish**, the crate-map drift check flags the unlisted crate |
+| 6 | `crates/*/map.md` | **new-ish**, the hand-written half only (`scripts/check-crate-maps.py <name>` seeds it); other crates' modules and reverse dependencies are in the uncommitted `map.generated.md` |
 
-**Two of those six are gates added during Phase 3.** `check-layering.py` fails with
-`layer_unlisted_crates 1` and `check-crate-maps.py --check` reports a missing reverse
+**Two of those six were gates added during Phase 3.** `check-layering.py` fails with
+`layer_unlisted_crates 1`, and `check-crate-maps.py --check` used to report a missing reverse
 dependency. Both are cheap and both are correct to demand — an unlisted crate is exempt
 from every layering rule, which is exactly the silent gap the gate exists to close — but
 they are honestly part of the tax and the number should say so rather than quietly grow.

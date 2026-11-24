@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only regression tests for local-link validation in
-scripts/check-crate-maps.py, run against throwaway crates in a temp dir."""
+"""CPU-only regression tests for scripts/check-crate-maps.py (committed form of
+map.md, local-link validation, and the uncommitted map.generated.md), run
+against throwaway crates in a temp dir."""
 
 import contextlib
 import importlib.util
@@ -20,7 +21,7 @@ HAND_WRITTEN_HEAD = "# demo — map\n\n## Purpose\n\nFacade over the engine.\n\n
 HAND_WRITTEN_TAIL = "\n## Gotchas\n\nNothing yet.\n"
 
 
-class CrateMapLinkTests(unittest.TestCase):
+class CrateMapTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -35,6 +36,8 @@ class CrateMapLinkTests(unittest.TestCase):
         (self.crate / "src" / "engine.rs").write_text("pub struct Engine;\n")
         (self.root / "docs").mkdir()
         (self.root / "docs" / "ARCH.md").write_text("# arch\n")
+        for name in ("GLOSSARY.md", "ARCHITECTURE.md"):
+            (self.root / "docs" / name).write_text("# skeleton link target\n")
 
         for name, value in (("ROOT", self.root), ("CRATES", self.crates)):
             patcher = unittest.mock.patch.object(cm, name, value)
@@ -43,7 +46,7 @@ class CrateMapLinkTests(unittest.TestCase):
 
     def write_map(self, head: str = HAND_WRITTEN_HEAD, tail: str = HAND_WRITTEN_TAIL,
                   block: str | None = None) -> None:
-        block = cm.generated_block(self.crate) if block is None else block
+        block = cm.STUB if block is None else block
         (self.crate / "map.md").write_text(head + block + "\n" + tail)
 
     def run_check(self) -> tuple[int, str]:
@@ -52,21 +55,54 @@ class CrateMapLinkTests(unittest.TestCase):
             code = cm.main(["--check"])
         return code, out.getvalue()
 
-    def test_fresh_map_with_valid_handwritten_links_passes(self) -> None:
+    def test_committed_form_with_valid_handwritten_links_passes(self) -> None:
         self.write_map(head=HAND_WRITTEN_HEAD + "See [facade](src/lib.rs) and "
                        "[arch](../../docs/ARCH.md).\n\n")
         self.assertEqual(cm.check_crate(self.crate), [])
         code, _ = self.run_check()
         self.assertEqual(code, 0)
 
-    def test_fresh_block_with_broken_handwritten_link_fails(self) -> None:
-        # The generated block is byte-for-byte fresh; only prose outside the
-        # markers carries the dead link (a `llama.rs` that does not exist).
-        self.write_map(head=HAND_WRITTEN_HEAD + "Backend: [llama](src/llama.rs).\n\n")
-        text = (self.crate / "map.md").read_text()
-        old_block = text[text.index(cm.BEGIN):text.index(cm.END) + len(cm.END)]
-        self.assertEqual(old_block, cm.generated_block(self.crate))
+    def test_check_does_not_need_or_read_the_generated_file(self) -> None:
+        self.write_map()
+        self.assertFalse((self.crate / cm.GENERATED_NAME).exists())
+        self.assertEqual(cm.check_crate(self.crate), [])
+        (self.crate / cm.GENERATED_NAME).write_text("stale, uncommitted, never compared\n")
+        self.assertEqual(cm.check_crate(self.crate), [])
 
+    def test_committed_generated_block_fails_and_names_the_fix(self) -> None:
+        old_block = (
+            cm.BEGIN + "\n\n### Modules and exported symbols\n\n- [`src/lib.rs`](src/lib.rs)\n"
+            "  - `facade`\n\n" + cm.END
+        )
+        self.write_map(block=old_block)
+        problems = cm.check_crate(self.crate)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("cargo xtask regen", problems[0])
+        code, out = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("demo", out)
+
+    def test_handedit_between_markers_fails(self) -> None:
+        self.write_map(block=cm.STUB.replace("generated, not committed", "hand-edited"))
+        self.assertTrue(cm.check_crate(self.crate))
+
+    def test_missing_markers_fail(self) -> None:
+        (self.crate / "map.md").write_text(HAND_WRITTEN_HEAD)
+        problems = cm.check_crate(self.crate)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("markers", problems[0])
+
+    def test_pointer_to_the_uncommitted_file_is_not_a_link(self) -> None:
+        # The stub names map.generated.md in code spans only; the file is absent in a
+        # clean checkout and must not count as a broken link.
+        self.write_map()
+        self.assertFalse((self.crate / cm.GENERATED_NAME).exists())
+        self.assertEqual(cm.check_links(self.crate, (self.crate / "map.md").read_text()), [])
+
+    def test_broken_handwritten_link_fails(self) -> None:
+        # Only prose outside the markers carries the dead link (a `llama.rs` that
+        # does not exist).
+        self.write_map(head=HAND_WRITTEN_HEAD + "Backend: [llama](src/llama.rs).\n\n")
         problems = cm.check_crate(self.crate)
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("demo", problems[0])
@@ -82,27 +118,6 @@ class CrateMapLinkTests(unittest.TestCase):
         problems = cm.check_crate(self.crate)
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("src/gone.rs", problems[0])
-
-    def test_altered_generated_href_with_valid_label_fails(self) -> None:
-        block = cm.generated_block(self.crate)
-        tampered = block.replace("](src/engine.rs)", "](src/missing.rs)")
-        self.assertNotEqual(block, tampered)
-        self.write_map(block=tampered)
-
-        problems = cm.check_crate(self.crate)
-        joined = "\n".join(problems)
-        self.assertIn("src/missing.rs", joined)
-        self.assertIn("src/engine.rs", joined)
-        code, _ = self.run_check()
-        self.assertEqual(code, 1)
-
-    def test_altered_generated_href_pointing_at_existing_file_fails(self) -> None:
-        block = cm.generated_block(self.crate)
-        tampered = block.replace("](src/engine.rs)", "](src/lib.rs)")
-        self.write_map(block=tampered)
-        problems = cm.check_crate(self.crate)
-        self.assertTrue(problems)
-        self.assertTrue(any("src/engine.rs" in p and "src/lib.rs" in p for p in problems))
 
     def test_valid_facade_lib_rs_link_passes(self) -> None:
         self.write_map(head=HAND_WRITTEN_HEAD + "Docs live in [`src/lib.rs`](src/lib.rs).\n\n")
@@ -142,6 +157,47 @@ class CrateMapLinkTests(unittest.TestCase):
         self.assertEqual(
             rels, ["src/dir.rs/inner.rs", "src/engine.rs", "src/lib.rs"]
         )
+
+    def test_generate_writes_the_uncommitted_file_and_restores_the_pointer(self) -> None:
+        old_block = cm.BEGIN + "\n\nold generated content\n\n" + cm.END
+        self.write_map(head=HAND_WRITTEN_HEAD + "Prose stays.\n\n", block=old_block)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(cm.generate_crate(self.crate))
+        text = (self.crate / "map.md").read_text()
+        self.assertEqual(
+            text, HAND_WRITTEN_HEAD + "Prose stays.\n\n" + cm.STUB + "\n" + HAND_WRITTEN_TAIL
+        )
+        generated = (self.crate / cm.GENERATED_NAME).read_text()
+        self.assertIn("### Modules and exported symbols", generated)
+        self.assertIn("- [`src/engine.rs`](src/engine.rs)", generated)
+        self.assertIn("  - `Engine`", generated)
+        self.assertIn("- `serde`", generated)
+        self.assertEqual(cm.check_crate(self.crate), [])
+
+    def test_generate_is_idempotent_and_refreshes_a_stale_file(self) -> None:
+        self.write_map()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cm.generate_crate(self.crate)
+            first = (self.crate / cm.GENERATED_NAME).read_text()
+            self.assertIn("wrote", out.getvalue())
+            out.seek(0)
+            out.truncate()
+            cm.generate_crate(self.crate)
+            self.assertEqual(out.getvalue().strip(), "demo: already up to date")
+            (self.crate / "src" / "extra.rs").write_text("pub fn extra() {}\n")
+            cm.generate_crate(self.crate)
+        second = (self.crate / cm.GENERATED_NAME).read_text()
+        self.assertNotEqual(first, second)
+        self.assertIn("`src/extra.rs`", second)
+
+    def test_new_crate_gets_a_skeleton_with_the_pointer(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(cm.generate_crate(self.crate))
+        text = (self.crate / "map.md").read_text()
+        self.assertIn(cm.STUB, text)
+        self.assertEqual(cm.check_crate(self.crate), [])
+        self.assertTrue((self.crate / cm.GENERATED_NAME).is_file())
 
 
 if __name__ == "__main__":

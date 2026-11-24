@@ -27,11 +27,14 @@ Emits a fourth shrink-only metric, `scripts_top_level_files` (files directly in 
 not directories): a new script goes into `cargo xtask` as a subcommand, or under a
 subdirectory that is archived, never into the top level. Its ceiling is in the same file.
 
-Also emits six informational gauges (`gauge_*`, no ceiling line, never fail; they
+Also emits eight informational gauges (`gauge_*`, no ceiling line, never fail; they
 feed the Monday digest): `gauge_generate_entry_fns` (`pub fn generate_*` in
 hipfire-generate/src), `gauge_generation_routes` (variants of `GenerationRoute`),
 `gauge_engine_routes` (entries of `ENGINE_ROUTES`), `gauge_map_md_files` (committed
-`crates/**/map.md`), `gauge_typed_arch_compares` (`== GfxArch::X`, `matches!(.., GfxArch::..)`,
+`crates/**/map.md`), `gauge_committed_generated_files` (plan gauge T6: committed files
+that `cargo xtask regen` writes, counted by the rule in `committed_generated`
+below -- a `map.md` counts only while it still carries a generated block),
+`gauge_typed_arch_compares` (`== GfxArch::X`, `matches!(.., GfxArch::..)`,
 `.is_gfx*()` lines outside the arch-capability owners: arch coupling that the string
 ratchet stops seeing once strings become typed), `gauge_ci_gate_steps` (`run` lines in scripts/ci-gates.sh)
 and `gauge_scripts_total` (every file under `scripts/`, so that moving files into subdirectories is visible).
@@ -197,6 +200,29 @@ def sites(texts: list[tuple[str, str]] | None = None) -> dict[str, list[str]]:
     return found
 
 
+# Files `cargo xtask regen` writes that are committed. A map.md is one only while it
+# still carries a generated block (between its markers) instead of the pointer to the
+# uncommitted map.generated.md. The flags goldens, TUI snapshots and the two doc tables stay
+# committed on purpose (their diff is the review of a changed default or flag); the gauge
+# counts them so it falls only when a class leaves git.
+COMMITTED_GENERATED_GLOBS = (
+    "tests/golden/flags-defaults/*.tsv",
+    "tests/golden/flags-legacy-spelling/*.tsv",
+    "crates/hipfire-tui/tests/snapshots/*.txt",
+    "docs/CONFIG.md",
+    "docs/env-vars.md",
+)
+
+
+def committed_generated() -> int:
+    maps = 0
+    for p in ROOT.glob("crates/*/map.md"):
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        if "### Modules and exported symbols" in text:
+            maps += 1
+    return maps + sum(1 for g in COMMITTED_GENERATED_GLOBS for p in ROOT.glob(g) if p.is_file())
+
+
 def gauges(texts: list[tuple[str, str]]) -> dict[str, int]:
     """Informational counts; `texts` is `sources()`."""
     entry_fns = 0
@@ -230,6 +256,7 @@ def gauges(texts: list[tuple[str, str]]) -> dict[str, int]:
         "gauge_generation_routes": routes,
         "gauge_engine_routes": engine_routes,
         "gauge_map_md_files": sum(1 for p in ROOT.glob("crates/**/map.md") if "target" not in p.relative_to(ROOT).parts),
+        "gauge_committed_generated_files": committed_generated(),
         "gauge_typed_arch_compares": typed,
         "gauge_ci_gate_steps": len(re.findall(r"^\s*run\s", ci, re.M)),
         "gauge_scripts_total": sum(1 for p in (ROOT / "scripts").rglob("*") if p.is_file() and "__pycache__" not in p.parts),

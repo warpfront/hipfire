@@ -17,7 +17,8 @@
 //!
 //! ```text
 //! Fast set                                     tool                                      drift gate
-//!   crates/*/map.md generated blocks           check-crate-maps.py <crate>...            check-crate-maps.py --check
+//!   crates/*/map.generated.md (NOT committed;
+//!     .gitignore) and the pointer in map.md    check-crate-maps.py <crate>...            check-crate-maps.py --check
 //!   tests/golden/flags-defaults/
 //!     developer-callsites.tsv                  flags-golden-extract.py --write           flags-golden-extract.py
 //!   docs/CONFIG.md lifecycle table,
@@ -46,6 +47,9 @@ use crate::slot::Slot;
 
 pub const USAGE: &str = "usage: cargo xtask regen [--all|--staged]";
 
+// `crates/*/map.generated.md` is git-ignored, so `snapshot` (which excludes
+// ignored files) never reports it and the pre-commit hook never stages it; only
+// a map.md whose pointer was restored is listed.
 const FAST_OUTPUTS: &[&str] = &[
     "crates/*/map.md",
     "tests/golden/flags-defaults/developer-callsites.tsv",
