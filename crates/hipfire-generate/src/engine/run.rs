@@ -43,8 +43,9 @@ pub struct Request {
     pub seed: u32,
     /// The route already emitted `gen_start` (before its prompt render).
     pub opened: bool,
-    /// Clamp `max_tokens` to the context left (the route decodes to the
-    /// cache cap, as legacy Gemma 4 does) instead of refusing it.
+    /// Clamp `max_tokens` to the
+    /// context left (prompt + budget + 1 trailer row <= max_seq; legacy Gemma 4
+    /// emits 2 more tokens at the cap) instead of refusing it.
     pub context_fit: bool,
 }
 

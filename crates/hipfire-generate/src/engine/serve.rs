@@ -380,7 +380,7 @@ impl Driver {
             .and_then(|v| v.as_bool())
             == Some(true);
         let budget = match admit_budget(prompt.len(), req.max_tokens, m.max_seq, |n, p, s| {
-            // Gemma 4 decodes to the cache cap, as its legacy route does.
+            // Gemma 4 clamps to the context left (intended diff: 2 tokens short of legacy at the cap).
             if route == GenerationRoute::Gemma4Ar {
                 n.min(s.saturating_sub(p))
             } else {

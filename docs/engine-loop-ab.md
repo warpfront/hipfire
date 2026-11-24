@@ -133,6 +133,11 @@ These are reported as `intended` and do not fail the run:
    allowed when `cached_tokens + prefill_tokens` (the prompt) is equal and the
    tokens are equal (M1 gate: N live records, a reusable session after an
    abort). Less reuse than legacy is a diff.
+5. **Gemma 4 at the cache cap** (not a harness scenario; judged by hand,
+   HIPF-546). A request whose `max_tokens` exceeds the context left is clamped
+   to `max_seq - prompt - 1` on the engine and ends `length` 2 tokens before
+   legacy (whose last picks are emitted without running); the ids are a prefix
+   of legacy's. A prompt of `max_seq - 1` tokens is refused on the engine.
 
 Every other difference is a diff.
 

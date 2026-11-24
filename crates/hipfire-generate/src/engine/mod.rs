@@ -58,9 +58,10 @@ pub fn admit_budget(
     let required = prompt_len
         .checked_add(budget)
         .and_then(|n| n.checked_add(1));
-    if required.is_none_or(|n| n > max_seq) {
+    // A fit that leaves no decode row is a refusal too.
+    if budget == 0 || required.is_none_or(|n| n > max_seq) {
         return Err(format!(
-            "request exceeds context window: prompt={prompt_len} + max_tokens={budget} + trailer=1 > max_seq={max_seq}"
+            "request exceeds context window: prompt={prompt_len} + max_tokens={max_tokens} + trailer=1 > max_seq={max_seq}"
         ));
     }
     Ok(budget)
@@ -638,6 +639,10 @@ mod tests {
         assert!(admit_budget(10, 0, 64, no_fit).is_err());
         let fit = |max: usize, used: usize, cap: usize| max.min(cap - used);
         assert_eq!(admit_budget(10, 100, 16, fit), Ok(5));
+        assert!(
+            admit_budget(15, 100, 16, fit).is_err(),
+            "a fit that leaves no decode row is refused"
+        );
     }
 
     use std::cell::Cell;
