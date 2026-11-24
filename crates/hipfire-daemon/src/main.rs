@@ -3883,7 +3883,6 @@ fn main() {
                         // VL route refuses a tools request at the gate above
                         // rather than silently dropping the schemas.
                         tools: tools_json.as_deref(),
-                        messages_history: messages_history.as_deref(),
                     };
                     match vision_route {
                         hipfire_loader::VisionRoute::DotsOcr => {

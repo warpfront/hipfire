@@ -1455,7 +1455,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-lfm3-audio"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-lfm3-omni"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-lfm3",
@@ -1480,7 +1480,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-lfm3-vl"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",

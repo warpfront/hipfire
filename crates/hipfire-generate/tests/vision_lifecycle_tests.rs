@@ -769,7 +769,6 @@ fn vl_params<'a>(
         assistant_prefix: AssistantPrefix::Plain,
         seed: 0xC10C,
         tools: None,
-        messages_history: None,
     }
 }
 

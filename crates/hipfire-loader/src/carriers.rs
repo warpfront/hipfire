@@ -19259,7 +19259,6 @@ impl Carrier for Lfm3Carrier {
             meta.arch_id,
             None,
             None,
-            true,
             ctx.max_seq,
             ctx.spec,
         );

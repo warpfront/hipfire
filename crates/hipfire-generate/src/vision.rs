@@ -239,10 +239,6 @@ pub struct GenerateVLParams<'a> {
     /// a tools request on those routes before reaching here rather than
     /// silently dropping the schemas.
     pub tools: Option<&'a [serde_json::Value]>,
-    /// Conversation history. The tools path needs it: a tool-using turn has to
-    /// replay prior assistant `tool_calls` and `tool` results through the
-    /// template, which a single `prompt` string cannot express.
-    pub messages_history: Option<&'a [hipfire_runtime::prompt_frame::Message]>,
 }
 
 impl<'a> GenerateVLParams<'a> {
@@ -1160,7 +1156,6 @@ pub fn generate_vl(
         // no tool format in its template, so the daemon refuses a tools
         // request before dispatch instead of silently dropping the schemas.
         tools: _,
-        messages_history: _,
     } = *params;
     // Render the conversation (CPU only) BEFORE the stream opener: the opener's
     // `started_in_think` is read off the rendered prompt tail, like the text

@@ -604,7 +604,7 @@ pub fn generate_lfm3_vl(
         id,
         prompt,
         system_prompt,
-        image_source: ref image_source,
+        image_sources: _,
         temp,
         top_p,
         max_tokens,
@@ -648,6 +648,13 @@ pub fn generate_lfm3_vl(
     let vision_start_id = vision_config.vision_start_token_id;
     let vision_end_id = vision_config.vision_end_token_id;
     let sms = vision_config.spatial_merge_size;
+    let image_source = match params.single_image() {
+        Ok(source) => source,
+        Err(e) => {
+            write_error(stdout, id, &format!("lfm3-vl: {e}"));
+            return;
+        }
+    };
 
     // ── Image preprocessing (CPU decode + smart resize + patch extract) ──
     // VL-RESIZE-1: LFM3-VL has its own pixel budget (HF `Lfm3VlImageProcessor`
@@ -786,8 +793,23 @@ pub fn generate_lfm3_vl(
         // message array); a plain turn keeps the single-prompt `render()` it
         // has always used, so non-tool VL output is byte-identical.
         let rendered = if tools.is_some_and(|t| !t.is_empty()) || messages_history.is_some() {
+            // The gateway marks each image's position with `IMAGE_SLOT`; this
+            // route renders one image and splices it before the live user text
+            // (anchored below), so the markers are dropped from the history.
+            let unslotted: Option<Vec<hipfire_runtime::prompt_frame::Message>> =
+                messages_history.map(|h| {
+                    h.iter()
+                        .map(|msg| {
+                            let mut msg = msg.clone();
+                            msg.content = msg
+                                .content
+                                .replace(hipfire_runtime::prompt_frame::IMAGE_SLOT, "");
+                            msg
+                        })
+                        .collect()
+                });
             let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match &unslotted {
                 Some(h) => h,
                 None => {
                     let mut v = Vec::new();
