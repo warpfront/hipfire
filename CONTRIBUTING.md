@@ -100,6 +100,13 @@ review — see
 changes still owe claim-matched GPU/model evidence for direct review; that
 evidence is not a separate required CI check.
 
+### Changelog entries
+
+Do not edit `CHANGELOG.md` for a new entry: add `changelog.d/<issue-or-slug>.md`
+whose first line is the `### ` heading it belongs under, then the bullet(s).
+`scripts/changelog-assemble.py` folds fragments into `## Unreleased` at release
+prep. Format and checks: [changelog.d/README.md](changelog.d/README.md).
+
 ### Tokenizer differential test (HF oracle)
 
 `hipfire_runtime::tokenizer::Tokenizer::from_hf_json` is checked against the
