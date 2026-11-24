@@ -138,6 +138,10 @@ These are reported as `intended` and do not fail the run:
    to `max_seq - prompt - 1` on the engine and ends `length` 2 tokens before
    legacy (whose last picks are emitted without running); the ids are a prefix
    of legacy's. A prompt of `max_seq - 1` tokens is refused on the engine.
+6. **Committed positions.** Every engine route stamps a `committed` token with
+   its conversation position; legacy Gemma 4 EAGLE counts from the first
+   generated token. Equal token ids at different positions are `intended`
+   (HIPF-471).
 
 Every other difference is a diff.
 

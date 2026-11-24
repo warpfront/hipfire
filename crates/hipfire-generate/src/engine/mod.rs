@@ -15,7 +15,8 @@
 //! the budget, metrics, the terminal and the one attested rollback for every
 //! error and abort exit. [`sched::Scheduler`] steps N requests at once
 //! (mixed prompt and decode epochs); [`serve::drive`] serves it to the
-//! daemon's continuous batch.
+//! daemon's continuous batch. A speculative request owns its drafter
+//! ([`spec::Drafting`]) and decodes in windows ([`Work::Verify`]).
 //!
 //! Intended differences from the legacy loops: the RNG is per request (not
 //! the process-global sampler state), an EOS token is not counted in
@@ -27,8 +28,10 @@ pub mod mesh;
 pub mod run;
 pub mod sched;
 pub mod serve;
+pub mod spec;
 
 use hipfire_runtime::sampler::{apply_logit_policy_cpu, SamplerConfig};
+use hipfire_runtime::spec::{SpecStep, Speculator};
 use std::collections::VecDeque;
 use std::ops::Range;
 
@@ -40,6 +43,7 @@ pub fn runs_on_engine(route: crate::ar::GenerationRoute) -> bool {
 
 const ENGINE_ROUTES: &[crate::ar::GenerationRoute] = &[
     crate::ar::GenerationRoute::Qwen4Ar,
+    crate::ar::GenerationRoute::Qwen4Spec,
     crate::ar::GenerationRoute::Gemma4Ar,
 ];
 
@@ -78,6 +82,19 @@ pub enum Work {
     /// of the last row, known on the host once the forward ran.
     Decode {
         token: Option<u32>,
+    },
+    /// One speculative window from the target's position on `seed`, the
+    /// last committed token (not yet run), committing at most `max_emit`
+    /// tokens; with `ar` the drafter's one-token AR step (retired).
+    Verify {
+        seed: u32,
+        max_emit: usize,
+        ar: bool,
+    },
+    /// Run committed `tokens` through target and drafter: forced template
+    /// tokens ahead of the seed, or the terminal flush.
+    Advance {
+        tokens: Vec<u32>,
     },
     Done(Finish),
 }
@@ -146,6 +163,8 @@ pub struct RequestRun {
     prompt_base: usize,
     /// A contained prompt fault already reran the prompt (once at most).
     reran: bool,
+    /// A speculative request's drafter and windows.
+    draft: Option<spec::Drafting>,
 }
 
 impl RequestRun {
@@ -171,10 +190,48 @@ impl RequestRun {
             rng: seed.max(1),
             prompt_base: reused,
             reran: false,
+            draft: None,
         }
     }
 
+    /// A speculative request: it decodes in windows of `drafting`'s drafter,
+    /// which it owns until [`Self::into_drafting`].
+    pub fn with_drafting(mut self, drafting: spec::Drafting) -> Self {
+        self.draft = Some(drafting);
+        self
+    }
+
+    pub fn drafting(&self) -> Option<&spec::Drafting> {
+        self.draft.as_ref()
+    }
+
+    pub fn into_drafting(self) -> Option<spec::Drafting> {
+        self.draft
+    }
+
     pub fn next_work(&self) -> Work {
+        if let Some(d) = &self.draft {
+            return match self.finish {
+                Some(finish) if d.owed.is_empty() => Work::Done(finish),
+                Some(_) => Work::Advance {
+                    tokens: d.owed.clone(),
+                },
+                // Nothing is committed before the drafter's prompt fill, which
+                // runs even when the session restores the whole prompt (it
+                // then only picks the first token).
+                None if d.owed.is_empty() => Work::Prefill {
+                    rows: self.position..self.prompt_len,
+                },
+                None if d.owed.len() > 1 => Work::Advance {
+                    tokens: d.owed[..d.owed.len() - 1].to_vec(),
+                },
+                None => Work::Verify {
+                    seed: d.owed[0],
+                    max_emit: self.remaining(),
+                    ar: d.retire.is_retired(),
+                },
+            };
+        }
         if let Some(finish) = self.finish {
             Work::Done(finish)
         } else if self.position < self.prompt_len {
@@ -277,6 +334,77 @@ impl RequestRun {
         Ok(())
     }
 
+    /// A speculative request committed and emitted `token` as `verdict`;
+    /// `close` are template tokens forced next. It is owed to the target
+    /// until a forward runs it. Whether the request continues without a
+    /// forced token.
+    fn spec_commit(&mut self, token: u32, verdict: Verdict, close: &[u32]) -> bool {
+        let d = self.draft.as_mut().expect("a speculative request");
+        d.owed.push(token);
+        d.emitted.push(token);
+        if verdict != Verdict::Eos {
+            self.generated += 1;
+        }
+        if verdict != Verdict::Continue {
+            self.finish = Some(Finish::of(true));
+            return false;
+        }
+        if self.generated >= self.budget {
+            self.finish = Some(Finish::of(false));
+            return false;
+        }
+        self.forced.extend(close);
+        close.is_empty()
+    }
+
+    /// The window from `start` committed `step.emit`, of which the request
+    /// kept the first `kept`; `trim` is what became of the rest.
+    fn apply_window(
+        &mut self,
+        start: usize,
+        step: &SpecStep,
+        kept: usize,
+        ar: bool,
+        trim: Option<spec::Trim>,
+    ) {
+        let prompt_len = self.prompt_len;
+        let d = self.draft.as_mut().expect("a speculative request");
+        match trim {
+            // The window ran its seed and every kept token but the last.
+            None | Some(spec::Trim::Repaired) => {
+                self.position = start + kept;
+                d.owed.drain(..kept);
+            }
+            Some(spec::Trim::Reset) => {
+                self.position = 0;
+                d.owed.clear();
+                d.invalidated = true;
+            }
+            Some(spec::Trim::Realigned) => {
+                self.position = prompt_len + d.emitted.len() - 1;
+                d.owed.drain(..d.owed.len() - 1);
+            }
+        }
+        if ar {
+            d.tally.ar_steps += 1;
+            return;
+        }
+        d.tally.windows += 1;
+        d.tally.accepted += step.accepted;
+        // A window verifies its seed row plus the drafts it proposed.
+        if d.retire
+            .observe(step.emit.len(), step.proposed + 1, self.position)
+        {
+            eprintln!(
+                "[spec-retire] drafter={} retired to AR at position {} (generated {}, {} windows)",
+                d.drafter.name(),
+                self.position,
+                self.generated,
+                d.tally.windows,
+            );
+        }
+    }
+
     fn sample(&mut self, row: &mut [f32], history: &[u32]) -> u32 {
         apply_logit_policy_cpu(row, history, &self.sampler);
         hipfire_runtime::llama::sample_top_k_p_with_state(
@@ -345,7 +473,60 @@ pub trait Forwards {
     fn prefill_rerun(&mut self) -> Result<Option<usize>, String> {
         Ok(None)
     }
+    /// Speculative: the prompt from `start` through the request's drafter
+    /// (which owns its chunking); its first pick, `None` when aborted.
+    fn draft_prefill(
+        &mut self,
+        _d: &mut dyn Speculator,
+        _start: usize,
+    ) -> Result<Option<u32>, String> {
+        Err(NO_DRAFTER.into())
+    }
+    /// Speculative: the drafter's prompt fill it left owed behind the first
+    /// token, after that token went out.
+    fn finish_prefill(&mut self, _d: &mut dyn Speculator) -> Result<(), String> {
+        Err(NO_DRAFTER.into())
+    }
+    /// Speculative: one window ([`Work::Verify`]) from `position`; `emitted`
+    /// is the request's decode history.
+    fn verify(
+        &mut self,
+        _d: &mut dyn Speculator,
+        _position: usize,
+        _seed: u32,
+        _emitted: &[u32],
+        _max_emit: usize,
+        _ar: bool,
+    ) -> Result<SpecStep, String> {
+        Err(NO_DRAFTER.into())
+    }
+    /// Speculative: run committed `tokens` from `position` ([`Work::Advance`]).
+    fn advance(
+        &mut self,
+        _d: &mut dyn Speculator,
+        _tokens: &[u32],
+        _position: usize,
+    ) -> Result<(), String> {
+        Err(NO_DRAFTER.into())
+    }
+    /// Speculative: the window from `start` on `seed` committed past `kept`:
+    /// repair it, else reset the live state (a terminal, `replay` `None`) or
+    /// re-prefill the prompt plus `replay` (the decode tokens the target
+    /// must hold).
+    fn trim(
+        &mut self,
+        _d: &mut dyn Speculator,
+        _start: usize,
+        _seed: u32,
+        _kept: &[u32],
+        _ar: bool,
+        _replay: Option<&[u32]>,
+    ) -> Result<spec::Trim, String> {
+        Err(NO_DRAFTER.into())
+    }
 }
+
+const NO_DRAFTER: &str = "these forwards run no drafter";
 
 /// A request's wire side for [`drive`]: commits and classifies tokens.
 pub trait Emit {
@@ -357,6 +538,11 @@ pub trait Emit {
     /// Committed conversation the host sampler penalizes over.
     fn history(&self) -> &[u32];
     fn aborted(&self) -> bool;
+    /// The most tokens a speculative window may commit so that a forced
+    /// intervention (think-budget close) can only fall on its last one.
+    fn window_cap(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// How [`drive`] left a request: finished (still uncommitted), or an exit
@@ -390,9 +576,12 @@ pub fn drive(
 
 /// One forward of a request and its apply: the next prompt epoch (reporting
 /// `prefill_progress`; a contained fault reruns the prompt once from the
-/// model's re-planned start) or one decode, whose token is emitted. `Err`:
-/// the request failed.
+/// model's re-planned start), one decode, whose token is emitted, or one
+/// speculative window or advance ([`spec_step`]). `Err`: the request failed.
 pub fn step(run: &mut RequestRun, io: &mut (impl Forwards + Emit + ?Sized)) -> Result<(), String> {
+    if run.draft.is_some() {
+        return spec_step(run, io);
+    }
     match run.next_work() {
         Work::Prefill { rows } => {
             let _phase = hipfire_runtime::prefill_progress::prompt_phase();
@@ -425,8 +614,99 @@ pub fn step(run: &mut RequestRun, io: &mut (impl Forwards + Emit + ?Sized)) -> R
             run.apply_decode(next, verdict, &close, io.history());
             Ok(())
         }
+        Work::Verify { .. } | Work::Advance { .. } => Err("an AR request has no drafter".into()),
         Work::Done(_) => Ok(()),
     }
+}
+
+/// [`step`] of a speculative request. The prompt runs through the drafter,
+/// whose first pick goes out at once (before the fill it left owed). A
+/// window's tokens are emitted in order until one stops or forces template
+/// tokens; a window committed past that point is trimmed back
+/// ([`Forwards::trim`]). Forced tokens are emitted when forced and run ahead
+/// of the next window; the terminal flush runs the tokens still owed.
+fn spec_step(run: &mut RequestRun, io: &mut (impl Forwards + Emit + ?Sized)) -> Result<(), String> {
+    match run.next_work() {
+        Work::Prefill { rows } => {
+            let first = {
+                let _phase = hipfire_runtime::prefill_progress::prompt_phase();
+                let d = run.draft.as_mut().expect("a speculative request");
+                io.draft_prefill(&mut *d.drafter, rows.start)?
+            };
+            // Aborted: the next poll ends the request.
+            let Some(first) = first else {
+                return Ok(());
+            };
+            io.commit_prompt();
+            run.position = run.prompt_len;
+            let (verdict, close) = io.emit(first)?;
+            run.spec_commit(first, verdict, &close);
+            let d = run.draft.as_mut().expect("a speculative request");
+            io.finish_prefill(&mut *d.drafter)?;
+            spec_emit_forced(run, io)
+        }
+        Work::Verify { seed, max_emit, ar } => {
+            let max_emit = io.window_cap().map_or(max_emit, |cap| max_emit.min(cap));
+            let start = run.position;
+            let d = run.draft.as_mut().expect("a speculative request");
+            let window = io.verify(&mut *d.drafter, start, seed, &d.emitted, max_emit, ar)?;
+            if window.emit.is_empty() || window.emit.len() > max_emit {
+                return Err(format!(
+                    "a window of at most {max_emit} committed {} tokens",
+                    window.emit.len()
+                ));
+            }
+            let mut kept = 0;
+            for &token in &window.emit {
+                let (verdict, close) = io.emit(token)?;
+                kept += 1;
+                if !run.spec_commit(token, verdict, &close) {
+                    break;
+                }
+            }
+            let trim = if kept < window.emit.len() {
+                let finishing = run.finish.is_some();
+                let d = run.draft.as_mut().expect("a speculative request");
+                // A continuing request re-prefills every committed token
+                // but the next seed.
+                let replay = (!finishing).then(|| &d.emitted[..d.emitted.len() - 1]);
+                Some(io.trim(
+                    &mut *d.drafter,
+                    start,
+                    seed,
+                    &window.emit[..kept],
+                    ar,
+                    replay,
+                )?)
+            } else {
+                None
+            };
+            run.apply_window(start, &window, kept, ar, trim);
+            spec_emit_forced(run, io)
+        }
+        Work::Advance { tokens } => {
+            let d = run.draft.as_mut().expect("a speculative request");
+            io.advance(&mut *d.drafter, &tokens, run.position)?;
+            run.position += tokens.len();
+            d.owed.drain(..tokens.len());
+            Ok(())
+        }
+        Work::Decode { .. } => Err("a speculative request decodes in windows".into()),
+        Work::Done(_) => Ok(()),
+    }
+}
+
+/// Emit the template tokens the last emission forced (they run ahead of the
+/// next window), until the request finishes.
+fn spec_emit_forced(run: &mut RequestRun, io: &mut (impl Emit + ?Sized)) -> Result<(), String> {
+    while run.finish.is_none() {
+        let Some(token) = run.forced.pop_front() else {
+            break;
+        };
+        let (verdict, close) = io.emit(token)?;
+        run.spec_commit(token, verdict, &close);
+    }
+    Ok(())
 }
 
 /// A request's [`Forwards`] and [`Emit`] as one [`step`] seam.
@@ -443,6 +723,51 @@ impl<F: Forwards, E: ?Sized> Forwards for Both<'_, F, E> {
 
     fn prefill_rerun(&mut self) -> Result<Option<usize>, String> {
         self.0.prefill_rerun()
+    }
+
+    fn draft_prefill(
+        &mut self,
+        d: &mut dyn Speculator,
+        start: usize,
+    ) -> Result<Option<u32>, String> {
+        self.0.draft_prefill(d, start)
+    }
+
+    fn finish_prefill(&mut self, d: &mut dyn Speculator) -> Result<(), String> {
+        self.0.finish_prefill(d)
+    }
+
+    fn verify(
+        &mut self,
+        d: &mut dyn Speculator,
+        position: usize,
+        seed: u32,
+        emitted: &[u32],
+        max_emit: usize,
+        ar: bool,
+    ) -> Result<SpecStep, String> {
+        self.0.verify(d, position, seed, emitted, max_emit, ar)
+    }
+
+    fn advance(
+        &mut self,
+        d: &mut dyn Speculator,
+        tokens: &[u32],
+        position: usize,
+    ) -> Result<(), String> {
+        self.0.advance(d, tokens, position)
+    }
+
+    fn trim(
+        &mut self,
+        d: &mut dyn Speculator,
+        start: usize,
+        seed: u32,
+        kept: &[u32],
+        ar: bool,
+        replay: Option<&[u32]>,
+    ) -> Result<spec::Trim, String> {
+        self.0.trim(d, start, seed, kept, ar, replay)
     }
 }
 
@@ -461,6 +786,10 @@ impl<F, E: Emit + ?Sized> Emit for Both<'_, F, E> {
 
     fn aborted(&self) -> bool {
         self.1.aborted()
+    }
+
+    fn window_cap(&self) -> Option<usize> {
+        self.1.window_cap()
     }
 }
 

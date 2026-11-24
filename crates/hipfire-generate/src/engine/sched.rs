@@ -32,8 +32,15 @@
 //!   tokens are the singleton's for the same seed.
 //! - An abort or failure ends only its own request; [`Ended`] names where its
 //!   state was, so the caller releases exactly that.
+//! - A speculative request ([`super::spec`]) never moves into a lane: it runs
+//!   one window ([`Work::Verify`]) per tick on the resident state, beside the
+//!   lane epoch of the AR requests, until it finishes; the next queued
+//!   request takes the resident state after it. [`Ended`] hands its drafter
+//!   back.
 
+use super::spec::{Drafting, Trim};
 use super::{step, Emit, Exit, Forwards, Next, RequestRun, Verdict, Work};
+use hipfire_runtime::spec::{SpecStep, Speculator};
 use std::collections::VecDeque;
 use std::ops::Range;
 
@@ -85,6 +92,13 @@ pub trait Batch {
     fn history(&self, idx: usize) -> &[u32];
     /// [`Emit::aborted`] of `idx`.
     fn aborted(&self, idx: usize) -> bool;
+    /// [`Emit::window_cap`] of `idx`.
+    fn window_cap(&self, idx: usize) -> Option<usize>;
+    /// The speculative forwards of the resident `idx`.
+    type Draft<'a>: Forwards
+    where
+        Self: 'a;
+    fn draft(&mut self, idx: usize) -> Result<Self::Draft<'_>, String>;
 }
 
 /// A request that left the scheduler: how, and where its state was.
@@ -95,6 +109,10 @@ pub struct Ended {
     pub exit: Exit,
     /// Completion tokens it counted.
     pub generated: usize,
+    /// A speculative request's drafter and windows.
+    pub drafting: Option<Drafting>,
+    /// Rows its model state ran (prompt included).
+    pub fed: usize,
 }
 
 struct Req {
@@ -115,8 +133,11 @@ pub struct Scheduler {
     /// Admitted requests waiting for the resident state, oldest first.
     queue: VecDeque<usize>,
     resident: Option<usize>,
-    /// A finished request still holds the resident state (its terminal is
-    /// not settled): [`Self::release_resident`].
+    /// A request that ended on the resident state still holds it until the
+    /// caller settled it ([`Self::release_resident`]): a finished one until
+    /// its terminal commits, an aborted or failed one until its rollback ran
+    /// (and a speculative one's drafter is back), so the next request never
+    /// begins on a state that rollback then resets.
     held: bool,
     /// Round-robin start of the next lane epoch.
     cursor: usize,
@@ -137,10 +158,30 @@ impl Scheduler {
         self.queue.push_back(idx);
     }
 
-    /// The finished resident request's terminal settled: the resident state
-    /// takes the next request.
+    /// The resident request that ended was settled: the resident state takes
+    /// the next request.
     pub fn release_resident(&mut self) {
         self.held = false;
+    }
+
+    /// The drafter a live speculative request holds (route decisions read
+    /// the load's drafter while it is out).
+    pub fn drafter(&self) -> Option<&dyn Speculator> {
+        self.reqs
+            .iter()
+            .flatten()
+            .find_map(|req| req.run.as_ref()?.drafting())
+            .map(|d| &*d.drafter)
+    }
+
+    /// Every live speculative request's drafting, taken out of its run (a
+    /// driver that stops serving hands the drafter back to its load).
+    pub fn take_drafting(&mut self) -> Vec<Drafting> {
+        self.reqs
+            .iter_mut()
+            .flatten()
+            .filter_map(|req| req.run.take().and_then(RequestRun::into_drafting))
+            .collect()
     }
 
     /// Whether a tick would run anything.
@@ -171,16 +212,19 @@ impl Scheduler {
         let req = self.reqs[idx].take().expect("ending a live request");
         if self.resident == Some(idx) {
             self.resident = None;
-            self.held = matches!(exit, Exit::Finished(_));
+            self.held = true;
         }
         self.queue.retain(|&queued| queued != idx);
+        // A token streamed ahead of its lane row counts too.
+        let generated =
+            req.run.as_ref().map_or(0, RequestRun::generated) + usize::from(req.ahead.is_some());
         Ended {
             idx,
             place: req.place,
             exit,
-            // A token streamed ahead of its lane row counts too.
-            generated: req.run.as_ref().map_or(0, RequestRun::generated)
-                + usize::from(req.ahead.is_some()),
+            generated,
+            fed: req.run.as_ref().map_or(0, |run| run.position),
+            drafting: req.run.and_then(RequestRun::into_drafting),
         }
     }
 
@@ -414,6 +458,55 @@ impl<B: Batch> Forwards for One<'_, B> {
     fn prefill_rerun(&mut self) -> Result<Option<usize>, String> {
         self.b.prefill_rerun(self.idx)
     }
+
+    fn draft_prefill(
+        &mut self,
+        d: &mut dyn Speculator,
+        start: usize,
+    ) -> Result<Option<u32>, String> {
+        self.b.draft(self.idx)?.draft_prefill(d, start)
+    }
+
+    fn finish_prefill(&mut self, d: &mut dyn Speculator) -> Result<(), String> {
+        self.b.draft(self.idx)?.finish_prefill(d)
+    }
+
+    fn verify(
+        &mut self,
+        d: &mut dyn Speculator,
+        position: usize,
+        seed: u32,
+        emitted: &[u32],
+        max_emit: usize,
+        ar: bool,
+    ) -> Result<SpecStep, String> {
+        self.b
+            .draft(self.idx)?
+            .verify(d, position, seed, emitted, max_emit, ar)
+    }
+
+    fn advance(
+        &mut self,
+        d: &mut dyn Speculator,
+        tokens: &[u32],
+        position: usize,
+    ) -> Result<(), String> {
+        self.b.draft(self.idx)?.advance(d, tokens, position)
+    }
+
+    fn trim(
+        &mut self,
+        d: &mut dyn Speculator,
+        start: usize,
+        seed: u32,
+        kept: &[u32],
+        ar: bool,
+        replay: Option<&[u32]>,
+    ) -> Result<Trim, String> {
+        self.b
+            .draft(self.idx)?
+            .trim(d, start, seed, kept, ar, replay)
+    }
 }
 
 impl<B: Batch> Emit for One<'_, B> {
@@ -431,6 +524,10 @@ impl<B: Batch> Emit for One<'_, B> {
 
     fn aborted(&self) -> bool {
         self.b.aborted(self.idx)
+    }
+
+    fn window_cap(&self) -> Option<usize> {
+        self.b.window_cap(self.idx)
     }
 }
 
@@ -459,6 +556,7 @@ mod tests {
         Park(usize),
         Lanes(Vec<usize>),
         Emit(usize),
+        Window(usize),
     }
 
     #[derive(Default)]
@@ -480,7 +578,85 @@ mod tests {
         sampled: Vec<usize>,
         /// `(a, b)`: the client aborts `b` while `a` prefills (mid-tick).
         abort_during_prefill: Option<(usize, usize)>,
+        /// Requests that decode in speculative windows of 3 greedy tokens.
+        spec: Vec<usize>,
         calls: Vec<Call>,
+    }
+
+    /// A speculative request's forwards on the fake model.
+    struct FakeDraft<'a> {
+        idx: usize,
+        prompt: &'a [u32],
+        state: &'a mut Vec<u32>,
+        calls: &'a mut Vec<Call>,
+    }
+
+    impl Forwards for FakeDraft<'_> {
+        fn prefill(&mut self, _: Range<usize>) -> Result<(usize, Option<Vec<f32>>), String> {
+            unreachable!()
+        }
+        fn decode(&mut self, _: Option<u32>, _: bool) -> Result<(u32, Next), String> {
+            unreachable!()
+        }
+        fn draft_prefill(
+            &mut self,
+            _: &mut dyn Speculator,
+            _: usize,
+        ) -> Result<Option<u32>, String> {
+            self.calls.push(Call::Prefill(self.idx));
+            *self.state = self.prompt.to_vec();
+            Ok(Some(pick(self.state)))
+        }
+        fn finish_prefill(&mut self, _: &mut dyn Speculator) -> Result<(), String> {
+            Ok(())
+        }
+        fn verify(
+            &mut self,
+            _: &mut dyn Speculator,
+            position: usize,
+            seed: u32,
+            _: &[u32],
+            max_emit: usize,
+            _: bool,
+        ) -> Result<SpecStep, String> {
+            self.calls.push(Call::Window(self.idx));
+            assert_eq!(self.state.len(), position);
+            self.state.push(seed);
+            let n = max_emit.min(3);
+            let mut emit = Vec::new();
+            for i in 0..n {
+                emit.push(pick(self.state));
+                if i + 1 < n {
+                    self.state.push(*emit.last().unwrap());
+                }
+            }
+            let last = *emit.last().unwrap();
+            Ok(SpecStep::new(emit, last, n - 1, n - 1))
+        }
+        fn advance(
+            &mut self,
+            _: &mut dyn Speculator,
+            tokens: &[u32],
+            position: usize,
+        ) -> Result<(), String> {
+            assert_eq!(self.state.len(), position);
+            self.state.extend_from_slice(tokens);
+            Ok(())
+        }
+        fn trim(
+            &mut self,
+            _: &mut dyn Speculator,
+            start: usize,
+            seed: u32,
+            kept: &[u32],
+            _: bool,
+            _: Option<&[u32]>,
+        ) -> Result<Trim, String> {
+            self.state.truncate(start);
+            self.state.push(seed);
+            self.state.extend_from_slice(&kept[..kept.len() - 1]);
+            Ok(Trim::Repaired)
+        }
     }
 
     /// A logits row over the state's history for a sampled request: several
@@ -532,13 +708,12 @@ mod tests {
             } else {
                 greedy()
             };
-            Ok(RequestRun::new(
-                len,
-                0,
-                self.budget,
-                sampler,
-                7 + idx as u32,
-            ))
+            let run = RequestRun::new(len, 0, self.budget, sampler, 7 + idx as u32);
+            Ok(if self.spec.contains(&idx) {
+                run.with_drafting(Drafting::new(Box::new(super::super::spec::NoDrafter), None))
+            } else {
+                run
+            })
         }
 
         fn prefill(
@@ -648,6 +823,21 @@ mod tests {
         fn aborted(&self, idx: usize) -> bool {
             self.aborted.get(&idx).copied().unwrap_or(false)
         }
+
+        fn window_cap(&self, _: usize) -> Option<usize> {
+            None
+        }
+
+        type Draft<'a> = FakeDraft<'a>;
+
+        fn draft(&mut self, idx: usize) -> Result<FakeDraft<'_>, String> {
+            Ok(FakeDraft {
+                idx,
+                prompt: &self.prompts[&idx],
+                state: self.state.get_mut(&idx).unwrap(),
+                calls: &mut self.calls,
+            })
+        }
     }
 
     fn fake(prompts: &[Vec<u32>], capacity: usize, rows: usize) -> Fake {
@@ -680,7 +870,7 @@ mod tests {
                 return ended;
             }
             for e in s.tick(b) {
-                if e.place == Place::Resident && matches!(e.exit, Exit::Finished(_)) {
+                if e.place == Place::Resident {
                     s.release_resident();
                 }
                 ended.push(e);
@@ -743,6 +933,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_speculative_request_verifies_on_the_resident_state_beside_the_lanes() {
+        let reference = alone();
+        let prompts = prompts();
+        let mut b = fake(&prompts, 4, 4);
+        b.spec = vec![2];
+        let mut s = Scheduler::default();
+        for idx in 0..prompts.len() {
+            s.admit(idx);
+        }
+        let ended = run_all(&mut s, &mut b);
+        for (idx, tokens) in reference.iter().enumerate() {
+            assert_eq!(&b.emitted[&idx], tokens, "request {idx}");
+        }
+        assert!(
+            !b.calls.contains(&Call::Park(2)),
+            "a speculative request keeps the resident state"
+        );
+        // A window and a lane epoch share a tick.
+        let windows: Vec<usize> = (0..b.calls.len())
+            .filter(|&i| b.calls[i] == Call::Window(2))
+            .collect();
+        assert!(windows.len() > 1);
+        assert!(
+            b.calls[windows[0]..windows[1]]
+                .iter()
+                .any(|c| matches!(c, Call::Lanes(_))),
+            "AR lanes decode between windows"
+        );
+        let spec = ended.iter().find(|e| e.idx == 2).unwrap();
+        assert!(
+            spec.drafting.is_some(),
+            "the drafter comes back with its request"
+        );
+        assert!(ended
+            .iter()
+            .filter(|e| e.idx != 2)
+            .all(|e| e.drafting.is_none()));
     }
 
     #[test]
@@ -905,6 +1135,38 @@ mod tests {
             assert_eq!(b.emitted[&idx], reference[idx], "request {idx}");
         }
         assert!(!b.emitted.contains_key(&3));
+    }
+
+    #[test]
+    fn the_next_request_waits_for_an_aborted_resident_requests_rollback() {
+        let prompts = prompts();
+        let mut b = fake(&prompts, 4, 4);
+        // Request 2 speculates: it keeps the resident state while it decodes.
+        b.spec = vec![2];
+        let mut s = Scheduler::default();
+        s.admit(2);
+        s.admit(3);
+        while !b.calls.contains(&Call::Window(2)) {
+            assert!(s.tick(&mut b).is_empty());
+        }
+        b.aborted.insert(2, true);
+        b.calls.clear();
+        let ended = s.tick(&mut b);
+        assert_eq!(ended.len(), 1);
+        assert_eq!(
+            (&ended[0].exit, ended[0].place),
+            (&Exit::Aborted, Place::Resident)
+        );
+        assert!(ended[0].drafting.is_some());
+        assert!(
+            !b.calls.contains(&Call::Prefill(3)),
+            "nothing begins on the resident state before its rollback"
+        );
+        assert!(s.tick(&mut b).is_empty());
+        assert!(!b.calls.contains(&Call::Prefill(3)));
+        s.release_resident();
+        s.tick(&mut b);
+        assert!(b.calls.contains(&Call::Prefill(3)));
     }
 
     #[test]

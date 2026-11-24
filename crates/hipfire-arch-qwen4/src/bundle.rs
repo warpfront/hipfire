@@ -6808,6 +6808,10 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
         Some(self)
     }
 
+    fn spec_target(&mut self) -> Option<&mut dyn hipfire_runtime::spec::SpecTarget> {
+        Some(self)
+    }
+
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {
         if let Err(error) = Qwen4Bundle::free_gpu(*self, gpu) {
             eprintln!("Qwen4 bundle teardown failed: {error}");

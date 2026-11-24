@@ -157,6 +157,21 @@ impl Gemma4Bundle {
         reused: usize,
         route: SessionRoute,
     ) -> Result<Vec<f32>, String> {
+        self.prefill_abortable(gpu, prompt, reused, route, &|| false)
+            .map(|logits| logits.expect("a never-abort prefill finishes"))
+    }
+
+    /// [`Self::prefill`] that polls `abort` before every forward segment (the
+    /// snapshot-boundary cadence, so the chunks are the same); `None`: the
+    /// client aborted, the state holds a partial prompt.
+    pub fn prefill_abortable(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        reused: usize,
+        route: SessionRoute,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>, String> {
         if reused >= prompt.len() {
             return Err(format!(
                 "gemma4 prefill: reusing {reused} of {} prompt tokens leaves nothing to compute",
@@ -178,6 +193,9 @@ impl Gemma4Bundle {
         }
         let mut pos = reused;
         loop {
+            if abort() {
+                return Ok(None);
+            }
             let boundary = self.session.as_ref().and_then(SessionDriver::next_boundary);
             let stop = boundary.unwrap_or(prompt.len()).min(prompt.len());
             if stop == prompt.len() {
@@ -186,7 +204,7 @@ impl Gemma4Bundle {
                     self.with_session(|session, bundle| session.at_boundary(gpu, bundle, prompt))
                         .unwrap_or(Ok(()))?;
                 }
-                return Ok(logits);
+                return Ok(Some(logits));
             }
             self.forward_rows_silent(gpu, &prompt[pos..stop], pos)?;
             self.with_session(|session, bundle| session.at_boundary(gpu, bundle, &prompt[..stop]))
@@ -413,6 +431,9 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
         b.weights.free_gpu(gpu);
     }
     fn mesh_family(&mut self) -> Option<&mut dyn hipfire_runtime::mesh_family::MeshFamily> {
+        Some(self)
+    }
+    fn spec_target(&mut self) -> Option<&mut dyn hipfire_runtime::spec::SpecTarget> {
         Some(self)
     }
 }

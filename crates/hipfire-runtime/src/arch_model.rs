@@ -244,6 +244,12 @@ pub trait ArchModel: Send + std::any::Any {
     fn mesh_family(&mut self) -> Option<&mut dyn crate::mesh_family::MeshFamily> {
         None
     }
+
+    /// The model as the speculative verifier ([`crate::spec::SpecTarget`])
+    /// its drafter drives. `None` (the default): no speculative target.
+    fn spec_target(&mut self) -> Option<&mut dyn crate::spec::SpecTarget> {
+        None
+    }
 }
 
 #[cfg(test)]

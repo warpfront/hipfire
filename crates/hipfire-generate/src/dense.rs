@@ -2326,19 +2326,14 @@ pub fn generate_gemma4(
         return;
     }
 
-    // Tool-free requests that fit one verify block past their budget go to
-    // the EAGLE speculator. Greedy ones commit the target's batched verify
-    // argmax, which can differ from AR decode on near-tied logits; sampled
-    // and penalized ones draw each verify row with the AR sampler.
-    let spec = !tools_nonempty
-        && hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
-            .ok()
-            .as_deref()
-            == Some("1")
-        && m.speculator.as_ref().is_some_and(|s| {
-            (temp <= 1e-6 || !s.requires_greedy())
-                && spec_ctx_request_fits(prompt_ids.len(), max_tokens, s.block_size(), cache_cap)
-        });
+    let spec = gemma4_eagle_admits(
+        m.speculator.as_deref(),
+        tools_nonempty,
+        temp,
+        prompt_ids.len(),
+        max_tokens,
+        cache_cap,
+    );
     let route = if spec {
         hipfire_runtime::session_cache::SessionRoute::Mtp
     } else {
@@ -2348,6 +2343,46 @@ pub fn generate_gemma4(
     // prefill grid or a cached snapshot. Prefill resumes there and computes
     // only the rest.
     let reused = hipfire_runtime::arch_model::ArchModel::session_plan(&*bundle, &prompt_ids, route);
+    // G12: on the engine loop when the flag is set and the load admits it,
+    // AR and EAGLE alike; a decline (nothing emitted) keeps the loops below.
+    // Logprobs stay legacy.
+    if logprobs_top_k.is_none()
+        && crate::engine::runs_on_engine(crate::ar::GenerationRoute::Gemma4Ar)
+    {
+        let protocol = crate::engine::gemma::Gemma4Wire {
+            enable_thinking,
+            max_think_tokens,
+            tools: tools_nonempty,
+            stop: &stop_set,
+        };
+        let request = crate::engine::run::Request {
+            sampler: sampler_cfg.clone(),
+            max_tokens,
+            seed: request_seed,
+            opened: true,
+            // A speculative request fits one window past its budget already.
+            context_fit: !spec,
+            spec: spec.then(|| crate::engine::spec::SpecRequest {
+                config: gemma4_spec_config(&sampler_cfg, request_seed, false),
+                stamp: gemma4_eagle_engine_done,
+            }),
+        };
+        match crate::engine::run::run(
+            m,
+            gpu,
+            stdout,
+            id,
+            crate::ar::GenerationRoute::Gemma4Ar,
+            &prompt_ids,
+            &protocol,
+            request,
+        ) {
+            crate::engine::run::Outcome::Served => return,
+            crate::engine::run::Outcome::Declined(reason) => {
+                eprintln!("[engine] gemma4_ar declined, legacy loop: {reason}");
+            }
+        }
+    }
     if spec {
         generate_gemma4_spec(
             m,
@@ -2365,40 +2400,6 @@ pub fn generate_gemma4(
             logprobs_top_k,
         );
         return;
-    }
-    // G12: on the engine loop when the flag is set and the load admits it; a
-    // decline (nothing emitted) keeps the loop below. Logprobs stay legacy.
-    if logprobs_top_k.is_none()
-        && crate::engine::runs_on_engine(crate::ar::GenerationRoute::Gemma4Ar)
-    {
-        let protocol = crate::engine::gemma::Gemma4Wire {
-            enable_thinking,
-            max_think_tokens,
-            tools: tools_nonempty,
-            stop: &stop_set,
-        };
-        let request = crate::engine::run::Request {
-            sampler: sampler_cfg.clone(),
-            max_tokens,
-            seed: request_seed,
-            opened: true,
-            context_fit: true,
-        };
-        match crate::engine::run::run(
-            m,
-            gpu,
-            stdout,
-            id,
-            crate::ar::GenerationRoute::Gemma4Ar,
-            &prompt_ids,
-            &protocol,
-            request,
-        ) {
-            crate::engine::run::Outcome::Served => return,
-            crate::engine::run::Outcome::Declined(reason) => {
-                eprintln!("[engine] gemma4_ar declined, legacy loop: {reason}");
-            }
-        }
     }
     let bundle = m
         .state
@@ -2936,19 +2937,11 @@ fn generate_gemma4_spec(
     logprobs_top_k: Option<usize>,
 ) {
     if let Some(spec) = m.speculator.as_mut() {
-        spec.configure_request(SpecRequestConfig {
-            temp: sampler_cfg.temperature,
-            top_p: sampler_cfg.top_p,
-            top_k: sampler_cfg.top_k,
-            min_p: sampler_cfg.min_p.unwrap_or(0.0),
-            rng_seed: request_seed as u64,
-            repeat_penalty: sampler_cfg.repeat_penalty,
-            repeat_window: sampler_cfg.repeat_window,
-            presence_penalty: sampler_cfg.presence_penalty,
-            frequency_penalty: sampler_cfg.frequency_penalty,
-            logprobs: logprobs_top_k.is_some(),
-            ..SpecRequestConfig::default()
-        });
+        spec.configure_request(gemma4_spec_config(
+            sampler_cfg,
+            request_seed,
+            logprobs_top_k.is_some(),
+        ));
     }
     // Host mirrors match the reused prefix; the bundle owns device state.
     let prompt_tokens = prompt_ids.len();
@@ -3017,6 +3010,70 @@ fn generate_gemma4_spec(
             state.session_commit();
         }
     }
+}
+
+/// The EAGLE drafter's request configuration: the request's sampler
+/// (temperature, top-p/k, min-p, penalties, seed) and logprobs.
+pub(crate) fn gemma4_spec_config(
+    sampler_cfg: &hipfire_runtime::sampler::SamplerConfig,
+    request_seed: u32,
+    logprobs: bool,
+) -> SpecRequestConfig {
+    SpecRequestConfig {
+        temp: sampler_cfg.temperature,
+        top_p: sampler_cfg.top_p,
+        top_k: sampler_cfg.top_k,
+        min_p: sampler_cfg.min_p.unwrap_or(0.0),
+        rng_seed: request_seed as u64,
+        repeat_penalty: sampler_cfg.repeat_penalty,
+        repeat_window: sampler_cfg.repeat_window,
+        presence_penalty: sampler_cfg.presence_penalty,
+        frequency_penalty: sampler_cfg.frequency_penalty,
+        logprobs,
+        ..SpecRequestConfig::default()
+    }
+}
+
+/// The EAGLE route's `done` fields for an engine-loop request, as
+/// [`generate_gemma4_spec`] writes them (`tau`: tokens committed per window).
+pub(crate) fn gemma4_eagle_engine_done(
+    done: &mut serde_json::Value,
+    s: &crate::engine::spec::SpecDone,
+) {
+    let t = &s.tally;
+    let tau = if t.windows > 0 {
+        (t.accepted + t.windows) as f64 / t.windows as f64
+    } else {
+        0.0
+    };
+    done["spec"] = "gemma4_eagle".into();
+    done["rounds"] = t.windows.into();
+    done["tau"] = ((tau * 1000.0).round() / 1000.0).into();
+    done["draft_len"] = s.block.into();
+}
+
+/// Whether a Gemma 4 request goes to the EAGLE speculator (`drafter`): the
+/// developer opt-in `HIPFIRE_GEMMA4_EAGLE=1`, tool-free, and one verify block
+/// past its budget fits `cache_cap`. Greedy ones commit the target's batched
+/// verify argmax, which can differ from AR decode on near-tied logits;
+/// sampled and penalized ones draw each verify row with the AR sampler.
+pub(crate) fn gemma4_eagle_admits(
+    drafter: Option<&dyn hipfire_runtime::spec::Speculator>,
+    tools: bool,
+    temp: f32,
+    prompt_len: usize,
+    max_tokens: usize,
+    cache_cap: usize,
+) -> bool {
+    !tools
+        && hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        && drafter.is_some_and(|s| {
+            (temp <= 1e-6 || !s.requires_greedy())
+                && spec_ctx_request_fits(prompt_len, max_tokens, s.block_size(), cache_cap)
+        })
 }
 
 /// Muse Glimmer dense text (arch_id=14) eager AR path.

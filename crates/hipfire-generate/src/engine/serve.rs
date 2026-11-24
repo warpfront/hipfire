@@ -20,6 +20,7 @@
 use super::chatml::{ChatMl, ChatMlStream, Host, WireProtocol};
 use super::gemma::{Gemma4Stream, Gemma4Wire};
 use super::sched::{Batch, Ended, Place, Scheduler};
+use super::spec::{DraftForwards, Plan, SpecDone, SpecRequest};
 use super::{admit_budget, DoneMetrics, Exit, Finish, Next, RequestRun, Verdict};
 use crate::ar::*;
 use crate::batch::{drain_qwen_batch_inbox, is_vmm_batch_request_eligible};
@@ -38,6 +39,7 @@ use hipfire_runtime::mesh_family::{
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::sampler::SamplerConfig;
 use hipfire_runtime::session_cache::SessionRoute;
+use hipfire_runtime::spec::Speculator;
 use hipfire_runtime::tokenizer::Tokenizer;
 use std::io::{Stdout, Write};
 use std::ops::Range;
@@ -70,6 +72,7 @@ pub fn drive(
         core: Scheduler::default(),
         max_batch_tokens: params.max_batch_tokens,
         route,
+        gpu_arch: gpu.arch.clone(),
     };
     let result = super::run::on_one_owner(m, gpu, n_layers, |m, runner, gpus| {
         let result = driver.serve(sched, m, runner, gpus, stdout, inbox);
@@ -104,6 +107,12 @@ struct Live {
     /// The committed conversation and stream kept past `commit_ready`.
     history: Vec<u32>,
     streamed: Vec<u32>,
+    /// A speculative request: its drafter's configuration and `done` fields.
+    spec: Option<SpecRequest>,
+    /// The session route its drafter resumes on.
+    spec_route: Option<SessionRoute>,
+    /// An unrepaired terminal window reset its live state.
+    invalidated: bool,
 }
 
 /// A request's wire protocol and its stream state, as its route declares it.
@@ -173,6 +182,18 @@ impl Wire {
         }
     }
 
+    /// [`super::Emit::window_cap`] of the request's stream.
+    fn window_cap(&self) -> Option<usize> {
+        match self {
+            Wire::ChatMl {
+                started_in_think,
+                stream,
+                ..
+            } => stream.window_cap(*started_in_think),
+            Wire::Gemma { .. } => None,
+        }
+    }
+
     fn finish(
         &mut self,
         out: &mut Stdout,
@@ -232,6 +253,8 @@ struct Driver {
     core: Scheduler,
     max_batch_tokens: usize,
     route: GenerationRoute,
+    /// The device's arch (a drafter's n-gram takeover is per GPU).
+    gpu_arch: String,
 }
 
 /// One tick's view of the model, the devices and the requests.
@@ -247,6 +270,8 @@ struct Ctx<'a> {
     seq_pos: &'a mut usize,
     asst_turn_cache: &'a mut AsstTurnCache,
     spec_deferred_seed: &'a mut Option<hipfire_loader::DeferredSpecSeed>,
+    /// The load's drafter, while no speculative request owns it.
+    speculator: &'a mut Option<Box<dyn Speculator>>,
     max_batch_tokens: usize,
     route: GenerationRoute,
 }
@@ -462,6 +487,21 @@ impl Driver {
             top_k: s.top_k,
             min_p: s.min_p,
         };
+        let seed = request_seed_for(&key, req.client_seed);
+        let stops = matches!(&wire, Wire::ChatMl { stop, .. } if !stop.is_empty());
+        let spec = speculative(
+            m,
+            route,
+            &req,
+            &sampler,
+            seed,
+            prompt.len(),
+            budget,
+            stops,
+            &self.gpu_arch,
+            // A running speculative request holds the load's drafter.
+            m.speculator.as_deref().or(self.core.drafter()),
+        );
         let tag = NEXT_TAG
             .fetch_update(
                 std::sync::atomic::Ordering::Relaxed,
@@ -474,7 +514,7 @@ impl Driver {
             lane.prompt_len = prompt.len();
         }
         let live = Live {
-            seed: request_seed_for(&key, req.client_seed),
+            seed,
             key,
             admission: ticket.admission,
             prompt,
@@ -489,6 +529,9 @@ impl Driver {
             held: None,
             history: Vec::new(),
             streamed: Vec::new(),
+            spec,
+            spec_route: None,
+            invalidated: false,
         };
         self.lives[idx] = Some(live);
         self.core.admit(idx);
@@ -535,17 +578,45 @@ impl Driver {
                             state,
                             asst_turn_cache,
                             spec_deferred_seed,
+                            speculator,
                             ..
                         } = &mut *m;
                         let state = state.as_deref_mut().ok_or("the model has no state")?;
-                        let released = rollback(
-                            state,
-                            runner,
-                            gpus,
-                            asst_turn_cache,
-                            spec_deferred_seed,
-                            None,
-                        );
+                        // A finished speculative turn the client left: a
+                        // target that keeps sessions keeps it live, as the
+                        // legacy cancel does; else target and drafter reset.
+                        let fed = if live.invalidated {
+                            0
+                        } else {
+                            live.history.len()
+                        };
+                        let kept = live.spec.is_some()
+                            && super::spec::keep_fed(
+                                state,
+                                gpus,
+                                &live.history,
+                                fed,
+                                live.prompt.len(),
+                            );
+                        let released = if kept {
+                            Ok(())
+                        } else {
+                            match (live.spec.is_some(), speculator.as_deref_mut()) {
+                                (true, Some(drafter)) => reset_drafting(state, gpus, drafter, true),
+                                (true, None) => Err("the drafter did not come back".into()),
+                                (false, _) => Ok(()),
+                            }
+                            .and_then(|()| {
+                                rollback(
+                                    state,
+                                    runner,
+                                    gpus,
+                                    asst_turn_cache,
+                                    spec_deferred_seed,
+                                    None,
+                                )
+                            })
+                        };
                         let generated =
                             done.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                         let cancelled = cancel(self.route, stdout, &key.id, generated, released);
@@ -587,10 +658,15 @@ impl Driver {
                 Some(Place::Resident) => {
                     // The singleton's commit, then the conversation moves into
                     // a lane record so another conversation's turn on the
-                    // resident state does not drop it.
+                    // resident state does not drop it. An unrepaired terminal
+                    // window left no live state: its snapshots only.
+                    let kept: &[u32] = if live.invalidated { &[] } else { &live.history };
                     let state = m.state.as_deref_mut().ok_or("the model has no state")?;
-                    state.session_commit_live_mesh(gpus, &live.history);
-                    if keeps_records {
+                    state.session_commit_live_mesh(gpus, kept);
+                    // A speculative turn keeps no lane record: its follow-up
+                    // continues the live state with the drafter's own state,
+                    // which a lane does not hold.
+                    if keeps_records && !live.invalidated && live.spec.is_none() {
                         if let Some(lanes) = lanes_of(m) {
                             keep_record(lanes, runner, gpus, live.tag, &live.history);
                         }
@@ -623,6 +699,10 @@ impl Driver {
         stdout: &mut Stdout,
         error: &str,
     ) {
+        // A speculative request's drafter goes back to the load.
+        for drafting in self.core.take_drafting() {
+            m.speculator.get_or_insert(drafting.drafter);
+        }
         for idx in 0..self.lives.len() {
             let Some(live) = self.lives[idx].take() else {
                 continue;
@@ -692,6 +772,55 @@ fn lanes_of(m: &mut LoadedModel) -> Option<&mut dyn MeshLanes> {
         .as_deref_mut()
         .and_then(|state| state.mesh_family())
         .and_then(|family| family.mesh_lanes())
+}
+
+/// The speculative route a batched request takes on this load, as its
+/// singleton would: native Qwen4 MTP or DFlash2 (the route selector picks
+/// `Qwen4Spec`), or Gemma 4 EAGLE (the opt-in, one window past the budget
+/// fits). `None`: it decodes AR.
+#[allow(clippy::too_many_arguments)]
+fn speculative(
+    m: &LoadedModel,
+    route: GenerationRoute,
+    req: &BatchPendingRequest,
+    sampler: &SamplerConfig,
+    seed: u32,
+    prompt_len: usize,
+    budget: usize,
+    stops: bool,
+    gpu_arch: &str,
+    drafter: Option<&dyn Speculator>,
+) -> Option<SpecRequest> {
+    let drafter = drafter?;
+    if route == GenerationRoute::Gemma4Ar {
+        let cache_cap = m.gemma4()?.state.max_seq;
+        return crate::dense::gemma4_eagle_admits(
+            Some(drafter),
+            false,
+            sampler.temperature,
+            prompt_len,
+            budget,
+            cache_cap,
+        )
+        .then(|| SpecRequest {
+            config: crate::dense::gemma4_spec_config(sampler, seed, false),
+            stamp: crate::dense::gemma4_eagle_engine_done,
+        });
+    }
+    (crate::batch::batch_generation_route(&req.original_msg, m, Some(drafter))
+        == GenerationRoute::Qwen4Spec)
+        .then(|| SpecRequest {
+            config: crate::qwen::qwen_spec_config(
+                m,
+                drafter,
+                gpu_arch,
+                sampler,
+                u64::from(seed),
+                stops,
+                0.0,
+            ),
+            stamp: crate::qwen::qwen_spec_engine_done,
+        })
 }
 
 /// The record whose conversation `prompt` continues (the longest): its
@@ -779,6 +908,23 @@ fn unattested(error: String) -> String {
     format!("engine rollback not attested; process restart required: {error}")
 }
 
+/// The speculative half of a resident rollback, ahead of [`rollback`]: a
+/// client `cancel` keeps the snapshots its prompt captured; the target's
+/// session state and the drafter reset.
+fn reset_drafting(
+    state: &mut dyn ArchModel,
+    gpus: &mut Gpus,
+    drafter: &mut dyn Speculator,
+    cancel: bool,
+) -> Result<(), String> {
+    if cancel {
+        state.session_commit_live_mesh(gpus, &[]);
+    }
+    let gpu = &mut gpus.devices[0];
+    state.reset_session_state(gpu)?;
+    drafter.reset(gpu)
+}
+
 /// The attested rollback of the resident state (the singleton's): the
 /// request's outputs drained and freed, the turn cache and deferred seed
 /// dropped, every owner reset.
@@ -820,6 +966,7 @@ impl<'a> Ctx<'a> {
             conversation_tokens,
             asst_turn_cache,
             spec_deferred_seed,
+            speculator,
             ..
         } = m;
         Ok(Self {
@@ -834,6 +981,7 @@ impl<'a> Ctx<'a> {
             seq_pos,
             asst_turn_cache,
             spec_deferred_seed,
+            speculator,
             max_batch_tokens,
             route,
         })
@@ -878,21 +1026,28 @@ impl<'a> Ctx<'a> {
             place,
             exit,
             generated,
+            drafting,
+            fed,
         } = ended;
         let (key, admission) = {
             let live = self.live(idx);
             (live.key.clone(), live.admission)
         };
         let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+        // A speculative request's drafter goes back to the load, its windows
+        // stamped on a finished request's `done`.
+        let (done_spec, spec_reset) = match drafting {
+            Some(drafting) => {
+                let done_spec = (SpecDone::of(&drafting), drafting.invalidated);
+                *self.speculator = Some(drafting.drafter);
+                (Some(done_spec), true)
+            }
+            None => (None, false),
+        };
         let exit = match exit {
-            Exit::Finished(finish) => match self.finish(idx, place, finish) {
+            Exit::Finished(finish) => match self.finish(idx, place, finish, done_spec) {
                 Ok(()) => return Ok(()),
-                Err(error) => {
-                    if place == Place::Resident {
-                        core.release_resident();
-                    }
-                    Exit::Failed(error)
-                }
+                Err(error) => Exit::Failed(error),
             },
             exit => exit,
         };
@@ -900,10 +1055,37 @@ impl<'a> Ctx<'a> {
             .take()
             .expect("an ended request is admitted");
         let released = match place {
+            Place::Resident if spec_reset => {
+                let cancel = matches!(exit, Exit::Aborted);
+                let prompt_len = live.prompt.len();
+                let history = match &self.sched.lanes[idx] {
+                    BatchLane::Running(lane) => lane.conversation_tokens.as_slice(),
+                    _ => &[],
+                };
+                // A client abort past the prompt keeps what the target ran
+                // live where it keeps sessions.
+                if cancel
+                    && super::spec::keep_fed(&mut *self.state, self.gpus, history, fed, prompt_len)
+                {
+                    Ok(())
+                } else {
+                    match self.speculator.as_deref_mut() {
+                        Some(drafter) => {
+                            reset_drafting(&mut *self.state, self.gpus, drafter, cancel)
+                        }
+                        None => Err("the drafter did not come back".into()),
+                    }
+                    .and_then(|()| self.rollback(live.request))
+                }
+            }
             Place::Resident => self.rollback(live.request),
             Place::Lane => self.lanes().map(|lanes| lanes.free_lane(live.tag)),
             Place::Queued => Ok(()),
         };
+        // Rolled back (or kept): the next request may take the resident state.
+        if place == Place::Resident {
+            core.release_resident();
+        }
         let settled = match exit {
             Exit::Aborted => cancel(self.route, self.stdout, &key.id, generated, released),
             Exit::Failed(error) => {
@@ -927,7 +1109,13 @@ impl<'a> Ctx<'a> {
     /// A finished request: its stream flushed, its state kept where it ran
     /// until the terminal settles (a lane then becomes its conversation's
     /// record), its `done` staged and `commit_ready` written.
-    fn finish(&mut self, idx: usize, place: Place, finish: Finish) -> Result<(), String> {
+    fn finish(
+        &mut self,
+        idx: usize,
+        place: Place,
+        finish: Finish,
+        spec: Option<(SpecDone, bool)>,
+    ) -> Result<(), String> {
         if place == Place::Resident {
             // Greedy decode leaves its last epochs in flight.
             if let Some(request) = self.live(idx).request.take() {
@@ -958,6 +1146,10 @@ impl<'a> Ctx<'a> {
         };
         let mut done = metrics.done_value(&live.key.id, finish_reason);
         live.wire.stamp_done(&mut done, &metrics);
+        if let (Some((spec_done, invalidated)), Some(spec)) = (spec, live.spec.as_ref()) {
+            (spec.stamp)(&mut done, &spec_done);
+            live.invalidated = invalidated;
+        }
         stage_terminal_tool_calls(&mut done, finish_reason, &tool_calls);
         attach_continuous_batch_route_evidence(
             &mut done,
@@ -1021,6 +1213,37 @@ impl Batch for Ctx<'_> {
                     lanes.free_lane(record.tag);
                 }
             }
+        }
+        if let Some(spec) = live.spec.as_ref() {
+            // Speculative: the drafter's session plan; the request owns the
+            // load's drafter until it ends ([`Ended::drafting`]).
+            if let Some(reason) = self.runner.quarantined() {
+                return Err(format!(
+                    "engine mesh quarantined; process restart required: {reason}"
+                ));
+            }
+            let drafter = self
+                .speculator
+                .as_deref_mut()
+                .ok_or("the load's drafter is held by another request")?;
+            let plan = Plan::new(
+                &*self.state,
+                drafter,
+                prompt,
+                &spec.config,
+                live.sampler.temperature,
+            )?;
+            let drafter = self.speculator.take().expect("checked above");
+            live.reused = plan.reused;
+            live.spec_route = plan.route;
+            return Ok(RequestRun::new(
+                prompt.len(),
+                plan.reused,
+                budget,
+                live.sampler.clone(),
+                live.seed,
+            )
+            .with_drafting(plan.drafting(drafter)));
         }
         self.state
             .session_request_write_limit(prompt.len().saturating_add(budget).saturating_add(1));
@@ -1248,6 +1471,39 @@ impl Batch for Ctx<'_> {
     fn aborted(&self, idx: usize) -> bool {
         self.lives[idx].as_ref().is_some_and(|live| {
             batch_check_abort(&live.key.id, live.key.attempt_id, live.admission)
+        })
+    }
+
+    fn window_cap(&self, idx: usize) -> Option<usize> {
+        self.lives[idx]
+            .as_ref()
+            .and_then(|live| live.wire.window_cap())
+    }
+
+    type Draft<'b>
+        = DraftForwards<'b>
+    where
+        Self: 'b;
+
+    /// The resident speculative request's forwards on the one device.
+    fn draft(&mut self, idx: usize) -> Result<DraftForwards<'_>, String> {
+        let live = self.lives[idx]
+            .as_mut()
+            .ok_or("draft of a missing request")?;
+        let target = self
+            .state
+            .spec_target()
+            .ok_or("the model is no speculative target")?;
+        Ok(DraftForwards {
+            gpu: &mut self.gpus.devices[0],
+            target,
+            id: &live.key.id,
+            prompt: &live.prompt,
+            route: live.spec_route,
+            budget: live.budget,
+            temperature: live.sampler.temperature,
+            prompt_done: &mut live.prompt_done,
+            attempt: Some(live.key.attempt_id),
         })
     }
 }

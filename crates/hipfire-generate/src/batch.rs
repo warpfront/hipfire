@@ -286,60 +286,7 @@ pub fn is_batch_request_eligible(
     let caps = hipfire_loader::carrier_for(m.arch_id)
         .map(|c| c.caps())
         .unwrap_or_default();
-    // For route check we need temp etc to compute GenerationRoute; use resolved sampling temp
-    let sampling = resolve_batch_sampling(msg, m);
-    let user_explicit = [
-        "top_p",
-        "top_k",
-        "min_p",
-        "repeat_penalty",
-        "presence_penalty",
-        "frequency_penalty",
-    ]
-    .iter()
-    .any(|k| msg.get(*k).is_some());
-    let ngram_can_sample = m
-        .speculator
-        .as_ref()
-        .map(|s| !s.requires_greedy())
-        .unwrap_or(false);
-    let supports_temp_verify = m
-        .speculator
-        .as_ref()
-        .is_some_and(|s| s.supports_temp_verify());
-    let supports_chain_nucleus_verify = m
-        .speculator
-        .as_ref()
-        .is_some_and(|s| s.supports_chain_nucleus_verify());
-    let route_inputs = GenerationRouteInputs {
-        arch_id: m.arch_id,
-        ep: m.ep.is_some(),
-        dense_tp: matches!(
-            m.ep.as_ref().map(|e| &e.inner),
-            Some(hipfire_loader::EpArch::Qwen35DenseTp { .. })
-        ),
-        pp: m.pp,
-        has_speculator: has_spec,
-        speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
-        speculator_is_dflash2: m.speculator.as_ref().is_some_and(|s| s.name() == "dflash2"),
-        speculator_supports_penalties: m
-            .speculator
-            .as_ref()
-            .is_some_and(|s| s.supports_penalties()),
-        deepseek4_spec_requested: false,
-        ngram_can_sample,
-        temp: sampling.temp,
-        user_explicit_sampling: user_explicit,
-        min_p: sampling.min_p,
-        nonneutral_penalties: sampling.repeat_penalty != 1.0
-            || sampling.presence_penalty != 0.0
-            || sampling.frequency_penalty != 0.0,
-        force_ar_chat: false,
-        supports_temp_verify,
-        supports_chain_nucleus_verify,
-        kv_adaptive: has_adaptive,
-    };
-    let route = select_generation_route(&route_inputs);
+    let route = batch_generation_route(msg, m, m.speculator.as_deref());
     if caps.supports_continuous_batch {
         // Qwen4 continuous batching is the fn-lanes route only; the fixed
         // Qwen35 lanes must never take a Qwen4Bundle.
@@ -413,6 +360,56 @@ pub fn is_batch_request_eligible(
         return false;
     }
     true
+}
+
+/// The generation route a batched request would take as a singleton
+/// ([`select_generation_route`] over the request's resolved sampling) with
+/// `drafter` as the load's speculator (passed explicitly: a speculative
+/// request on the engine holds the load's drafter while it runs).
+pub(crate) fn batch_generation_route(
+    msg: &serde_json::Value,
+    m: &LoadedModel,
+    drafter: Option<&dyn hipfire_runtime::spec::Speculator>,
+) -> GenerationRoute {
+    let sampling = resolve_batch_sampling(msg, m);
+    let user_explicit = [
+        "top_p",
+        "top_k",
+        "min_p",
+        "repeat_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+    ]
+    .iter()
+    .any(|k| msg.get(*k).is_some());
+    let ngram_can_sample = drafter.map(|s| !s.requires_greedy()).unwrap_or(false);
+    let supports_temp_verify = drafter.is_some_and(|s| s.supports_temp_verify());
+    let supports_chain_nucleus_verify = drafter.is_some_and(|s| s.supports_chain_nucleus_verify());
+    select_generation_route(&GenerationRouteInputs {
+        arch_id: m.arch_id,
+        ep: m.ep.is_some(),
+        dense_tp: matches!(
+            m.ep.as_ref().map(|e| &e.inner),
+            Some(hipfire_loader::EpArch::Qwen35DenseTp { .. })
+        ),
+        pp: m.pp,
+        has_speculator: drafter.is_some(),
+        speculator_is_mtp: drafter.is_some_and(|s| s.name() == "mtp"),
+        speculator_is_dflash2: drafter.is_some_and(|s| s.name() == "dflash2"),
+        speculator_supports_penalties: drafter.is_some_and(|s| s.supports_penalties()),
+        deepseek4_spec_requested: false,
+        ngram_can_sample,
+        temp: sampling.temp,
+        user_explicit_sampling: user_explicit,
+        min_p: sampling.min_p,
+        nonneutral_penalties: sampling.repeat_penalty != 1.0
+            || sampling.presence_penalty != 0.0
+            || sampling.frequency_penalty != 0.0,
+        force_ar_chat: false,
+        supports_temp_verify,
+        supports_chain_nucleus_verify,
+        kv_adaptive: m.kv_adaptive.is_some(),
+    })
 }
 
 /// Batch eligibility predicate shape shared by the Qwen continuous-batch
@@ -2974,12 +2971,12 @@ fn qwen4_lone_request_takes_lane_for(msg: &serde_json::Value, m: &LoadedModel) -
 }
 
 /// The engine's N-request scheduler serves this load's staged lanes (G12):
-/// the engine loop runs Qwen4 AR and the load staged single-card AR lanes
-/// with no drafter. A lone request enters it too: it decodes on the resident
-/// state, as the singleton does, until a peer arrives.
+/// the engine loop runs Qwen4 AR and the load staged single-card AR lanes.
+/// A lone request enters it too: it decodes on the resident state, as the
+/// singleton does, until a peer arrives. A drafter's requests (native MTP,
+/// DFlash2) verify on the resident state beside the lanes.
 pub(crate) fn engine_serves_lanes(m: &LoadedModel) -> bool {
     crate::engine::runs_on_engine(GenerationRoute::Qwen4Ar)
-        && m.speculator.is_none()
         && m.qwen4().is_some_and(|b| {
             b.lane_topology() == "single" && b.lanes().is_some_and(|store| store.spec().is_none())
         })
@@ -2987,15 +2984,14 @@ pub(crate) fn engine_serves_lanes(m: &LoadedModel) -> bool {
 
 /// The route whose staged lanes the engine's N-request scheduler serves on
 /// this load: Qwen4 AR ([`engine_serves_lanes`]) or Gemma 4 AR (its engine
-/// lanes, staged only on the engine loop, with no drafter attached).
+/// lanes, staged only on the engine loop; an EAGLE drafter's requests verify
+/// on the resident state).
 pub fn engine_lanes_route(m: &LoadedModel) -> Option<GenerationRoute> {
     if engine_serves_lanes(m) {
         return Some(GenerationRoute::Qwen4Ar);
     }
-    (crate::engine::runs_on_engine(GenerationRoute::Gemma4Ar)
-        && m.speculator.is_none()
-        && gemma4_engine_lanes_staged(m))
-    .then_some(GenerationRoute::Gemma4Ar)
+    (crate::engine::runs_on_engine(GenerationRoute::Gemma4Ar) && gemma4_engine_lanes_staged(m))
+        .then_some(GenerationRoute::Gemma4Ar)
 }
 
 /// Qwen4 lane admission: greedy requests, or sampled ones when the store is

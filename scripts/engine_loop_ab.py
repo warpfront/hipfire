@@ -231,6 +231,11 @@ PROMPT_SIDE = ("cached_tokens", "prefill_tokens")
 MORE_REUSE = {"interleaved": 2, "abort_prefill": 1, "abort_decode": 1}
 
 
+def toks(r):
+    """A result's committed token ids, without their positions."""
+    return [t for t, _ in r.get("ids", [])]
+
+
 def compare(sc, a, b, spec_noise=False):
     """Diff two result lists (a = legacy, b = engine). Returns (status, notes);
     notes are [kind, text]; status is diff|unexercised|intended|equal."""
@@ -279,15 +284,19 @@ def compare(sc, a, b, spec_noise=False):
             if dx.get("finish_reason") != dy.get("finish_reason"):
                 note(DIFF, f"finish_reason {dx.get('finish_reason')} vs {dy.get('finish_reason')}")
             # the abort lands asynchronously: only the common prefix is compared
-            for f in ("events", "ids"):
-                xs, ys = x.get(f, []), y.get(f, [])
+            for f, xs, ys in (("events", x["events"], y["events"]), ("ids", toks(x), toks(y))):
                 if xs[:len(ys)] != ys[:len(xs)]:
                     note(DIFF, f"{f} diverge before the abort")
             continue
         if x["events"] != y["events"]:
             note(DIFF, f"[{i}] tokens differ ({x['sha']} vs {y['sha']})")
-        if x.get("ids", []) != y.get("ids", []):
+        if toks(x) != toks(y):
             note(DIFF, f"[{i}] token ids differ")
+        elif x.get("ids", []) != y.get("ids", []):
+            # Intended diff 4: an engine route stamps every committed token with
+            # its conversation position; legacy Gemma 4 EAGLE counts from the
+            # first generated token.
+            note(INTENDED, f"[{i}] committed positions differ, token ids equal")
         for key in sorted(set(dx) | set(dy)):
             vx, vy = dx.get(key), dy.get(key)
             if vx == vy:
@@ -455,6 +464,7 @@ def self_test():
     # token ids: exact, aborts on the common prefix
     ids = lambda x, i: {**x, "ids": i}
     assert st("cold", [ids(r("ab"), [[1, 0]])], [ids(r("ab"), [[2, 0]])]) == "diff"
+    assert st("cold", [ids(r("ab"), [[1, 0]])], [ids(r("ab"), [[1, 5]])]) == "intended"
     assert st("abort_decode", [ids(ab[0], [[1, 0], [2, 1]]), r("x", cached_tokens=3)],
               [ids(ab[0], [[1, 0]]), r("x", cached_tokens=3)]) == "equal"
     assert st("abort_decode", [ids(ab[0], [[1, 0], [2, 1]]), r("x", cached_tokens=3)],

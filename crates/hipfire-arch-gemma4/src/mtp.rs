@@ -240,10 +240,17 @@ impl MtpDrafter for Gemma4Drafter {
         _fill_tokens: &[u32],
         start_pos: usize,
         _cache_hit: bool,
-        _abort: &dyn Fn() -> bool,
+        abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
         let bundle = gemma4(target)?;
-        let logits = bundle.prefill(gpu, prompt_tokens, start_pos, SessionRoute::Mtp)?;
+        let Some(logits) =
+            bundle.prefill_abortable(gpu, prompt_tokens, start_pos, SessionRoute::Mtp, abort)?
+        else {
+            // As every speculative target does on a cancelled prefill.
+            target.reset_recurrent(gpu)?;
+            return Ok(PrefillOutcome::Aborted);
+        };
+        let bundle = gemma4(target)?;
         self.take_target_hidden(gpu, bundle)?;
         let first_token = match self.policy.as_mut() {
             None => argmax(&logits),

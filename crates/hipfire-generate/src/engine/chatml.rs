@@ -169,6 +169,19 @@ impl ChatMlStream {
         )
     }
 
+    /// [`Emit::window_cap`]: the think budget's room, so a forced close or
+    /// a spent budget only falls on a window's last token.
+    pub fn window_cap(&self, started_in_think: bool) -> Option<usize> {
+        if !self.think_budget.enabled() {
+            return None;
+        }
+        let in_think = hipfire_runtime::emit_text::currently_in_think(
+            std::str::from_utf8(&self.stream_bytes).unwrap_or(""),
+            started_in_think,
+        );
+        self.think_budget.window_cap(in_think)
+    }
+
     /// Flush the stream; the finish reason and the calls the terminal carries.
     pub fn finish(
         &mut self,
@@ -243,6 +256,10 @@ impl Emit for ChatMlEmit<'_> {
 
     fn aborted(&self) -> bool {
         check_abort(self.host.id)
+    }
+
+    fn window_cap(&self) -> Option<usize> {
+        self.stream.window_cap(self.spec.started_in_think)
     }
 }
 

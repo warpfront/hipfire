@@ -105,10 +105,9 @@ pub fn stage_continuous_batch(
     if let Some(req) = vmm {
         if requested > 1 {
             // Gemma 4 batches only on the engine loop: its N-request
-            // scheduler over whole-step lanes (no legacy batch driver). A
-            // drafter load keeps the sequential route (the engine's
-            // scheduler declines it, `engine_lanes_route`).
-            if hipfire_runtime::config::get().engine_loop && m.speculator.is_none() {
+            // scheduler over whole-step lanes (no legacy batch driver); an
+            // EAGLE drafter's requests verify on its resident state.
+            if hipfire_runtime::config::get().engine_loop {
                 let max_seq = m.max_seq;
                 if let Some(bundle) = m.gemma4_mut() {
                     return Ok(
@@ -741,13 +740,18 @@ fn stage_qwen4_lanes(
         other => other.to_string(),
     };
     // PP stages AR lanes only: a spec config is never forwarded there. EP
-    // stages native-MTP lanes.
+    // stages native-MTP lanes. A single card on the engine loop stages AR
+    // lanes: its scheduler verifies speculative requests on the resident
+    // state.
     let spec_off_reason: Option<String> = match (natural_spec_off, topology) {
         (None, "pp") => {
             eprintln!(
                 "[daemon] qwen4 fn-lanes: native-MTP lanes are not supported under topology.pp yet; staging AR lanes"
             );
             Some("native-MTP unsupported under topology.pp".to_string())
+        }
+        (None, "single") if hipfire_runtime::config::get().engine_loop => {
+            Some("engine loop: speculative requests verify on the resident state".to_string())
         }
         (reason, _) => reason.map(str::to_string),
     };

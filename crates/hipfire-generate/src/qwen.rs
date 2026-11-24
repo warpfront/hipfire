@@ -2688,7 +2688,7 @@ fn spec_session_route(
 /// ([`plan_resumable`]), 0 = cold. Host-only.
 ///
 /// [`plan_resumable`]: hipfire_runtime::session_cache::plan_resumable
-fn plan_spec_session(
+pub(crate) fn plan_spec_session(
     model: &dyn hipfire_runtime::arch_model::ArchModel,
     spec: &dyn hipfire_runtime::spec::Speculator,
     prompt: &[u32],
@@ -3719,6 +3719,70 @@ pub fn generate_dflash(
     } else {
         prompt_tokens
     };
+    let sampler = SamplerConfig {
+        temperature: temp,
+        top_p,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        blocked_tokens: Vec::new(),
+        top_k,
+        min_p: Some(min_p),
+    };
+    // `None` only without a speculator (the spec route requires one).
+    let spec_config = m.speculator.as_deref().map(|drafter| {
+        qwen_spec_config(
+            m,
+            drafter,
+            &gpu.arch,
+            &sampler,
+            request_seed,
+            !stop.is_empty(),
+            cactus_delta,
+        )
+    });
+    // G12: native Qwen4 MTP / DFlash2 on the engine loop when the flag is set
+    // and the load admits it; a decline (nothing emitted) keeps the loop below.
+    if let Some(config) = spec_config.filter(|_| {
+        is_qwen4 && crate::engine::runs_on_engine(crate::ar::GenerationRoute::Qwen4Spec)
+    }) {
+        let eos = m.qwen4().map_or(0, |bundle| bundle.config.eos_token_id);
+        let protocol = crate::engine::chatml::ChatMl {
+            started_in_think,
+            tools: tools.is_some(),
+            stop,
+            min_tokens,
+            max_think_tokens,
+            eos: &[eos],
+        };
+        let request = crate::engine::run::Request {
+            sampler,
+            max_tokens,
+            seed: request_seed as u32,
+            opened: false,
+            context_fit: false,
+            spec: Some(crate::engine::spec::SpecRequest {
+                config,
+                stamp: qwen_spec_engine_done,
+            }),
+        };
+        match crate::engine::run::run(
+            m,
+            gpu,
+            stdout,
+            id,
+            crate::ar::GenerationRoute::Qwen4Spec,
+            &prompt_tokens,
+            &protocol,
+            request,
+        ) {
+            crate::engine::run::Outcome::Served => return true,
+            crate::engine::run::Outcome::Declined(reason) => {
+                eprintln!("[engine] qwen4_spec declined, legacy loop: {reason}");
+            }
+        }
+    }
     let (conversation_tokens, dflash_ckpt_positions): (&[u32], Vec<usize>) = if session_reuse {
         (&[][..], Vec::new())
     } else {
@@ -3967,39 +4031,9 @@ pub fn generate_dflash(
     // (`EmitSpec::Qwen35`), and the epilogue (asst-turn cache store + `done`
     // envelope). A future ds4 wrapper (Phase 4 T4c-2) builds its DSML render +
     // ds4 cache plan + `EmitSpec::Deepseek4` and writes its own ds4 `done`.
-    //
-    // Thread the request's sampling into the speculator BEFORE the step loop.
-    // SpecRequestConfig is installed once; greedy (temp 0) is unchanged.
-    // ngram-mod takeovers ride every MTP request the producer can verify
-    // (greedy or sampled, thinking on or off) when `speculation.mtp_ngram`
-    // (env HIPFIRE_MTP_NGRAM) resolves on for this model and GPU: `auto`, the
-    // default, arms native Qwen4 MTP on gfx1151/gfx1201 only.
-    // Raon's AR producer penalizes generated tokens only
-    // (`penalty_generated_only`); the speculative route must follow.
-    let penalty_generated_only = m.raon().is_some();
-    if let Some(spec) = m.speculator.as_mut() {
-        spec.configure_request(SpecRequestConfig {
-            temp,
-            top_p,
-            top_k,
-            min_p,
-            cactus_delta,
-            rng_seed: request_seed,
-            allow_ngram_modifier: spec_name == "mtp"
-                && !pp_mesh
-                && hipfire_config::mtp_ngram_enabled_for_arch(m.arch_id, &gpu.arch),
-            repeat_penalty,
-            repeat_window,
-            presence_penalty,
-            frequency_penalty,
-            // A stop sequence can end a native Qwen4 window strictly inside it;
-            // the drafter keeps its pre-window target/head snapshots reopenable
-            // for `repair_terminal_prefix` only when the request may need that.
-            stop_sequences: !stop.is_empty(),
-            // The Qwen spec routes emit no logprobs.
-            logprobs: false,
-            penalty_generated_only,
-        });
+    // The request's sampling (`spec_config`) reaches the speculator here.
+    if let (Some(spec), Some(config)) = (m.speculator.as_mut(), spec_config) {
+        spec.configure_request(config);
     }
     let prefill_tokens_full = prefill_tokens.len();
     // The Jinja prompt can open `<think>` without emitting that token during
@@ -4410,12 +4444,83 @@ fn spec_retire_done_fields(done: &mut serde_json::Value, run: &SpecRun) {
     }
 }
 
+/// The Qwen speculator's request configuration: the request's sampler and
+/// seed, installed once before the windows (greedy, temperature 0, is
+/// unchanged). ngram-mod takeovers ride every native MTP request the
+/// producer can verify when `speculation.mtp_ngram` (env HIPFIRE_MTP_NGRAM)
+/// resolves on for this model and GPU (`auto`, the default, arms native
+/// Qwen4 MTP on gfx1151/gfx1201 only), never under a pipeline mesh. A stop
+/// sequence can end a native Qwen4 window strictly inside it: the drafter
+/// then keeps its pre-window snapshots reopenable for
+/// `repair_terminal_prefix`. Raon's AR producer penalizes generated tokens
+/// only; the speculative route follows. The Qwen spec routes emit no
+/// logprobs.
+pub(crate) fn qwen_spec_config(
+    m: &LoadedModel,
+    drafter: &dyn Speculator,
+    gpu_arch: &str,
+    sampler: &SamplerConfig,
+    seed: u64,
+    stop_sequences: bool,
+    cactus_delta: f32,
+) -> SpecRequestConfig {
+    let mtp = drafter.name() == "mtp";
+    let pp_mesh = m.qwen4().is_some_and(|bundle| bundle.pp_mesh_active());
+    SpecRequestConfig {
+        temp: sampler.temperature,
+        top_p: sampler.top_p,
+        top_k: sampler.top_k,
+        min_p: sampler.min_p.unwrap_or(0.0),
+        cactus_delta,
+        rng_seed: seed,
+        allow_ngram_modifier: mtp
+            && !pp_mesh
+            && hipfire_config::mtp_ngram_enabled_for_arch(m.arch_id, gpu_arch),
+        repeat_penalty: sampler.repeat_penalty,
+        repeat_window: sampler.repeat_window,
+        presence_penalty: sampler.presence_penalty,
+        frequency_penalty: sampler.frequency_penalty,
+        stop_sequences,
+        logprobs: false,
+        penalty_generated_only: m.raon().is_some(),
+    }
+}
+
+/// The Qwen spec route's speculative `done` fields for an engine-loop
+/// request, as the legacy wrapper writes them: `dflash`, `tau` (accepted
+/// drafts per window), `cycles` (windows), the retirement fields and, for
+/// native MTP, [`qwen_mtp_done_fields`].
+pub(crate) fn qwen_spec_engine_done(
+    done: &mut serde_json::Value,
+    s: &crate::engine::spec::SpecDone,
+) {
+    let t = &s.tally;
+    let tau = if t.windows > 0 {
+        t.accepted as f64 / t.windows as f64
+    } else {
+        0.0
+    };
+    done["dflash"] = true.into();
+    done["tau"] = ((tau * 100.0).round() / 100.0).into();
+    done["cycles"] = t.windows.into();
+    if let Some(at) = t.retired_at {
+        done["spec_retired"] = true.into();
+        done["spec_retired_at"] = at.into();
+    }
+    if t.retired_at.is_some() || t.ar_steps > 0 {
+        done["ar_tokens"] = t.ar_steps.into();
+    }
+    if s.drafter == "mtp" {
+        qwen_mtp_done_fields(done, t.accepted, Some(s.stats.clone()));
+    }
+}
+
 /// Break-even line of the spec → AR retirement policy: `HIPFIRE_SPEC_RETIRE`
 /// (`raw`) when set (see [`hipfire_runtime::spec_retire::parse_break_even`]),
 /// else the drafter's measured line (`drafter`), else the shared default. A
 /// malformed value turns retirement off and says so, rather than guessing a
 /// line.
-fn spec_retire_break_even(
+pub(crate) fn spec_retire_break_even(
     raw: Option<&str>,
     drafter: Option<hipfire_runtime::spec_retire::BreakEven>,
 ) -> Option<hipfire_runtime::spec_retire::BreakEven> {
@@ -11869,6 +11974,7 @@ pub fn generate_qwen4_ar(
             seed: request_seed,
             opened: false,
             context_fit: false,
+            spec: None,
         };
         match crate::engine::run::run(
             m,
@@ -12555,7 +12661,7 @@ pub fn drop_deferred_spec_seed(m: &mut LoadedModel) {
 /// Qwen4 model. The mesh form mirrors `MtpSpeculator::prefill`: a cache hit
 /// fills the suffix from `prefill_start`, a miss fills the whole prompt.
 #[allow(clippy::too_many_arguments)]
-fn spec_prefill(
+pub(crate) fn spec_prefill(
     pp: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
     gpu: &mut rdna_compute::Gpu,
     spec: &mut dyn Speculator,
@@ -12659,7 +12765,7 @@ fn spec_step(
 /// pipeline-parallel Qwen4 model. The mesh drafter always advances the target
 /// itself: `Ok(false)` would send the caller to the single-card
 /// `spec_advance`, which a mesh bundle cannot run, so it is an error here.
-fn spec_forced_advance(
+pub(crate) fn spec_forced_advance(
     pp: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
     gpu: &mut rdna_compute::Gpu,
     spec: &mut dyn Speculator,
@@ -12684,7 +12790,7 @@ fn spec_forced_advance(
 /// `Speculator::repair_terminal_prefix` of the spec loop, on the mesh for a
 /// pipeline-parallel Qwen4 model (`Ok(false)` leaves the caller on its reset
 /// or realign path).
-fn spec_repair_terminal_prefix(
+pub(crate) fn spec_repair_terminal_prefix(
     pp: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
     gpu: &mut rdna_compute::Gpu,
     spec: &mut dyn Speculator,
@@ -12704,7 +12810,7 @@ fn spec_repair_terminal_prefix(
 /// an unrepaired terminal (`after_terminal`) or before a prefix-realign
 /// replay; the first failure's message, if any. On the mesh both are the
 /// all-band reset (a Qwen4 target's terminal reset is its ordinary reset).
-fn spec_reset_for_realign(
+pub(crate) fn spec_reset_for_realign(
     pp: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
     gpu: &mut rdna_compute::Gpu,
     spec: &mut dyn Speculator,
