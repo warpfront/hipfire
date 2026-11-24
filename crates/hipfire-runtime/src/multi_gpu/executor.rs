@@ -716,7 +716,7 @@ trait DrainBackend {
     fn rank_count(&self) -> usize;
     fn synchronize(&mut self, owner: usize) -> Result<()>;
     fn poison(&mut self);
-    fn quarantine(&mut self);
+    fn quarantine(&mut self, reason: &str);
 }
 
 trait Backend: DrainBackend {
@@ -1127,7 +1127,7 @@ fn drain(backend: &mut impl DrainBackend) -> Result<()> {
     }
     if let Some(error) = failure {
         backend.poison();
-        backend.quarantine();
+        backend.quarantine(&error);
         return Err(format!("mesh drain failed; resources quarantined: {error}"));
     }
     Ok(())
@@ -1216,13 +1216,13 @@ impl DrainBackend for HipBackend<'_> {
     fn poison(&mut self) {
         self.gpus.mesh_execution.poison();
     }
-    fn quarantine(&mut self) {
+    fn quarantine(&mut self, reason: &str) {
         self.gpus.mesh_execution.quarantined = true;
         // Reached only after a failed device synchronization (see `drain` and
         // `reset_all`): like `HipDrain`, keep device ownership until teardown
         // because in-flight work may still reference registered VMM/host state.
         if self.gpus.mesh_execution.lent {
-            quarantine_lent(&mut self.gpus.devices);
+            quarantine_lent(&mut self.gpus.devices, reason);
         } else {
             std::mem::forget(std::mem::take(&mut self.gpus.devices));
         }
@@ -2132,7 +2132,7 @@ fn reset_all<B: OwnerOps>(backend: &mut B, epoch: &ForwardEpoch) -> Result<()> {
         // A device that cannot synchronize may still run work against its
         // state: quarantine exactly like a failed drain.
         backend.poison();
-        backend.quarantine();
+        backend.quarantine(&failures.join("; "));
     }
     fail_closed(backend);
     Err(format!(
@@ -2241,12 +2241,12 @@ impl DrainBackend for HipDrain<'_> {
     fn poison(&mut self) {
         self.state.poison();
     }
-    fn quarantine(&mut self) {
+    fn quarantine(&mut self, reason: &str) {
         self.state.quarantined = true;
         // Gpu::drop frees registered VMM/host-mapped state; a failed drain keeps
         // device ownership until process teardown.
         if self.state.lent {
-            quarantine_lent(self.devices);
+            quarantine_lent(self.devices, reason);
         } else {
             std::mem::forget(std::mem::take(self.devices));
         }
@@ -2256,9 +2256,11 @@ impl DrainBackend for HipDrain<'_> {
 /// A lent device goes back to its owner (the daemon), which outlives this
 /// mesh: mark the device itself, so every later route, load and unload on it
 /// refuses GPU work and its frees until process restart.
-fn quarantine_lent(devices: &mut [Gpu]) {
+fn quarantine_lent(devices: &mut [Gpu], reason: &str) {
     for gpu in devices {
-        gpu.quarantine_retained_replay_owners("engine mesh device synchronization failed");
+        gpu.quarantine_retained_replay_owners(format!(
+            "engine mesh synchronization failed: {reason}"
+        ));
     }
 }
 
@@ -2875,7 +2877,7 @@ mod tests {
             self.poisoned = true;
             self.state.poison();
         }
-        fn quarantine(&mut self) {
+        fn quarantine(&mut self, _reason: &str) {
             self.quarantined = true;
             self.state.quarantined = true;
         }
@@ -4753,7 +4755,7 @@ mod lifecycle_tests {
             self.poisoned = true;
             self.state.poison();
         }
-        fn quarantine(&mut self) {
+        fn quarantine(&mut self, _reason: &str) {
             self.quarantined = true;
             self.state.quarantined = true;
         }
@@ -5436,9 +5438,16 @@ mod lifecycle_tests {
                 devices: &mut gpus.devices,
                 state,
             }
-            .quarantine();
+            .quarantine("injected");
             assert!(gpus.mesh_quarantined());
         });
+        let reason = gpu
+            .quarantined()
+            .expect("the daemon's exit-75 guard reads this");
+        assert!(
+            reason.contains("engine mesh synchronization failed: injected"),
+            "{reason}"
+        );
         assert!(gpu.bind_thread().is_err(), "any route binds first");
         assert!(gpu.zeros(&[16], DType::F32).is_err(), "a reload allocates");
         assert!(gpu.free_tensor(held).is_err(), "an unload frees nothing");

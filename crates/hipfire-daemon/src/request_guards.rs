@@ -63,12 +63,19 @@ pub(crate) fn dflash_block(
 /// new process gets a live one. The request that hit it has already been
 /// answered, so exit 75 (EX_TEMPFAIL): `hipfire serve` respawns the daemon
 /// and reloads the model instead of failing every later request.
-pub(crate) fn exit_if_gpu_poisoned(stdout: &mut impl Write) {
+pub(crate) fn exit_if_gpu_poisoned(stdout: &mut impl Write, gpu: &rdna_compute::Gpu) {
     if let Some(poison) = hipfire_runtime::reset_core::gpu_poison() {
         eprintln!(
             "[daemon] GPU context dead after sticky HipError({}) at {}; exiting (75) for a process restart",
             poison.code, poison.site,
         );
+        let _ = stdout.flush();
+        std::process::exit(75);
+    }
+    // A quarantined device refuses all work, frees included, until restart;
+    // exit skips `Gpu::drop`, so nothing it guards is freed.
+    if let Some(reason) = gpu.quarantined() {
+        eprintln!("[daemon] {reason}; exiting (75) for a process restart");
         let _ = stdout.flush();
         std::process::exit(75);
     }

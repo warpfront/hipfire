@@ -3042,6 +3042,12 @@ impl Gpu {
         self.retain_unknown_replay_owners();
     }
 
+    /// Why this device refuses all GPU work until process restart, if it does.
+    pub fn quarantined(&self) -> Option<String> {
+        // bind_thread: skip — host-only state query; binding would refuse here.
+        self.retained_quarantine.check().err()
+    }
+
     #[inline]
     fn refuse_retained_quarantine(&self) -> HipResult<()> {
         self.retained_quarantine

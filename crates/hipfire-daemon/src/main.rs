@@ -1333,7 +1333,7 @@ fn main() {
     });
     let mut inbox = DaemonInbox::new(msg_rx);
     loop {
-        request_guards::exit_if_gpu_poisoned(&mut stdout);
+        request_guards::exit_if_gpu_poisoned(&mut stdout, &gpu);
         let Ok(daemon_msg) = recv_settling_deferred_seed(&mut inbox, &mut model, &mut gpu) else {
             break;
         };
