@@ -3575,6 +3575,104 @@ fn main() {
                 let has_image =
                     image_base64.is_some() || image.is_some() || !images_list.is_empty();
                 let vision_route = hipfire_loader::vision_route(m.arch_id);
+
+                // LFM3-Omni TTS (audio OUT) / LFM3-Audio ASR (audio IN):
+                // arch 24 routes keyed on the pre-merge top-level request
+                // fields (`tts` / `audio` / `audio_base64`). Checked before the
+                // generic text route; VL still flows through the vision branch.
+                if m.arch_id == 24 {
+                    let tts = msg.get("tts").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if tts {
+                        if m.lfm3_depth_weights().is_some() {
+                            let mode = msg
+                                .get("mode")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| *s == "audio" || *s == "interleaved")
+                                .unwrap_or("audio");
+                            let stream = msg
+                                .get("stream")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let max_steps = msg
+                                .get("max_steps")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as usize);
+                            let voice = msg.get("voice").and_then(|v| v.as_str());
+                            hipfire_generate::lfm3::generate_lfm3_omni(
+                                m,
+                                &mut gpu,
+                                &mut stdout,
+                                id,
+                                prompt,
+                                system,
+                                voice,
+                                temp,
+                                top_p,
+                                max_tokens,
+                                mode,
+                                stream,
+                                max_steps,
+                            );
+                        } else {
+                            write_error(
+                                &mut stdout,
+                                id,
+                                "model has no depth decoder (not an LFM3-Omni model); tts=true needs arch_id 24 + depth decoder",
+                            );
+                        }
+                        continue;
+                    }
+                    let audio_base64 = msg.get("audio_base64").and_then(|v| v.as_str());
+                    let audio_path = msg.get("audio").and_then(|v| v.as_str());
+                    if audio_base64.is_some() || audio_path.is_some() {
+                        if m.lfm3_audio_weights().is_none() {
+                            write_error(&mut stdout, id, "model has no audio encoder");
+                            continue;
+                        }
+                        let audio_bytes: Vec<u8> = if let Some(b64) = audio_base64 {
+                            match base64::engine::general_purpose::STANDARD.decode(
+                                b64.strip_prefix("data:")
+                                    .and_then(|r| r.split_once(',').map(|(_, a)| a))
+                                    .unwrap_or(b64),
+                            ) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    write_error(
+                                        &mut stdout,
+                                        id,
+                                        &format!("failed to decode base64 audio: {e}"),
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else {
+                            match std::fs::read(audio_path.unwrap()) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    write_error(
+                                        &mut stdout,
+                                        id,
+                                        &format!("failed to read audio file: {e}"),
+                                    );
+                                    continue;
+                                }
+                            }
+                        };
+                        hipfire_generate::lfm3::generate_lfm3_audio(
+                            m,
+                            &mut gpu,
+                            &mut stdout,
+                            id,
+                            prompt,
+                            system,
+                            temp,
+                            top_p,
+                            max_tokens,
+                            &audio_bytes,
+                        );
+                        continue;
+                    }
+                }
                 // Declared bundle capability covers streamed and resident
                 // towers, including the Flash-Next Qwen4 (arch 16) route.
                 let has_vl = m.has_vision_encoder();
@@ -3756,6 +3854,14 @@ fn main() {
                         }
                         hipfire_loader::VisionRoute::Lfm2Vl => {
                             hipfire_generate::vision::generate_lfm2_vl(
+                                m,
+                                &mut gpu,
+                                &mut stdout,
+                                &params,
+                            )
+                        }
+                        hipfire_loader::VisionRoute::Lfm3Vl => {
+                            hipfire_generate::lfm3::generate_lfm3_vl(
                                 m,
                                 &mut gpu,
                                 &mut stdout,

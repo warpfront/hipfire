@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+[package]
+name = "hipfire-arch-lfm3-omni"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LFM3-Omni (audio output / TTS + omni generation) architecture for hipfire"
+
+[features]
+# The depth decoder + codec reuse the GPU conv/attention/RoPE/GQA primitives
+# wired through the `deltanet` feature on rdna-compute / hipfire-runtime (same
+# gating as hipfire-arch-lfm3 / -lfm3-vl / -lfm3-audio). The crate defaults to
+# `deltanet` like its siblings.
+default = ["deltanet"]
+deltanet = [
+    "hipfire-runtime/deltanet",
+    "rdna-compute/deltanet",
+    "hipfire-dispatch/from-hip-error",
+]
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-arch-lfm3 = { path = "../hipfire-arch-lfm3" }
+hipfire-dispatch = { path = "../hipfire-dispatch", optional = true }
+rdna-compute = { path = "../rdna-compute" }
+hip-bridge = { path = "../hip-bridge" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

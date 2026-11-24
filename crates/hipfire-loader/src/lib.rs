@@ -35,6 +35,10 @@ use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_gemma4 as gemma4;
 use hipfire_arch_inkling2 as inkling2;
 use hipfire_arch_lfm2moe as lfm2moe;
+use hipfire_arch_lfm3 as lfm3;
+use hipfire_arch_lfm3_audio::lfm3_audio;
+use hipfire_arch_lfm3_omni as lfm3_omni;
+use hipfire_arch_lfm3_vl::lfm3_vl;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_qwen35::qwen35::{self};
@@ -512,6 +516,7 @@ pub enum VisionRoute {
     QwenVl,
     Qwen4Vl,
     Lfm2Vl,
+    Lfm3Vl,
     None,
 }
 pub fn vision_route(arch_id: u32) -> VisionRoute {
@@ -533,6 +538,7 @@ pub fn vision_route(arch_id: u32) -> VisionRoute {
         5 | 6 => VisionRoute::QwenVl,
         16 => VisionRoute::Qwen4Vl,
         11 => VisionRoute::Lfm2Vl,
+        24 => VisionRoute::Lfm3Vl,
         _ => VisionRoute::None,
     }
 }
@@ -690,6 +696,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &Deepseek4Carrier,
     &MinimaxCarrier,
     &Lfm2MoeCarrier,
+    &Lfm3Carrier,
     &Cohere2MoeCarrier,
     &MapleCarrier,
     &Gemma4Carrier,
@@ -975,6 +982,72 @@ pub use lfm2moe::Lfm2MoeBundle;
 pub use raon::RaonBundle;
 
 pub use inkling2::Inkling2Bundle;
+
+/// LFM3 (arch_id=24) GPU bundle.
+///
+/// Defined here rather than in `hipfire-arch-lfm3` because it carries the
+/// optional VL / audio / omni tower state, whose types live in
+/// `hipfire-arch-lfm3-{vl,audio,omni}` — crates the LFM3 text crate must not
+/// depend on (they depend on it). Orphan rule leaves no choice; the `ArchModel`
+/// impl lives here too, mirroring `MuseGlimmerBundle` /
+/// `Deepseek4HeterogeneousBundle`.
+pub struct Lfm3Bundle {
+    pub config: lfm3::config::Lfm3Config,
+    pub weights: lfm3::lfm3::Lfm3Weights,
+    pub state: lfm3::lfm3::Lfm3State,
+    pub eos_tok: u32,
+    /// VL vision tower + multi-modal projector (None for the text-only
+    /// checkpoint; detected by `model.vision_tower.patchifier.weight`).
+    pub vision_config: Option<lfm3_vl::VisionConfig>,
+    pub vision_weights: Option<lfm3_vl::VisionWeights>,
+    /// Audio speech encoder + projector (None unless audio tensors present).
+    pub audio_config: Option<lfm3_audio::AudioConfig>,
+    pub audio_weights: Option<lfm3_audio::AudioWeights>,
+    /// Omni depth decoder + codebook embedding (None unless present).
+    pub depth_config: Option<lfm3_omni::DepthConfig>,
+    pub depth_weights: Option<lfm3_omni::DepthWeights>,
+}
+
+impl hipfire_runtime::arch_model::ArchModel for Lfm3Bundle {
+    fn dim(&self) -> usize {
+        self.config.hidden_size
+    }
+    fn n_layers(&self) -> usize {
+        self.config.num_hidden_layers
+    }
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+    fn arch_key(&self) -> &'static str {
+        "lfm3"
+    }
+    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
+        // LFM3 keeps its KV inside `Lfm3State` rather than owning a runtime
+        // `KvCache` directly, so there is nothing to hand back.
+        None
+    }
+    fn reset_session_state(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        // Drops the hybrid conv + attention KV/conv state for a new session.
+        self.state.reset(gpu)
+    }
+    fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
+        // State/weights first, then any tower weights. Every side is mandatory:
+        // freeing only one leaks the towers over repeated load cycles.
+        let b = *self;
+        b.state.free_gpu(gpu);
+        b.weights.free_gpu(gpu);
+        if let Some(w) = b.vision_weights {
+            w.free_gpu(gpu);
+        }
+        if let Some(w) = b.audio_weights {
+            w.free_gpu(gpu);
+        }
+        if let Some(w) = b.depth_weights {
+            w.free_gpu(gpu);
+        }
+    }
+}
+
 /// MiniMax-M2 (arch_id=10) GPU bundle. Re-exported from the arch crate, which
 /// owns it so `impl SpecTarget for MiniMaxBundle` (the n-gram verify seam) can
 /// live next to the forward it drives (orphan rule). Field-identical to the
@@ -1582,6 +1655,48 @@ impl LoadedModel {
         }
     }
 
+    /// LFM3 bundle if this model is arch_id=24, else None.
+    pub fn lfm3(&self) -> Option<&Lfm3Bundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<Lfm3Bundle>())
+    }
+
+    pub fn lfm3_mut(&mut self) -> Option<&mut Lfm3Bundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<Lfm3Bundle>())
+    }
+
+    /// LFM3-VL vision config, if this model is arch_id=24 and a vision tower was
+    /// loaded (detected by `model.vision_tower.patchifier.weight`). Text-only
+    /// LFM3 returns None.
+    pub fn lfm3_vision_config(&self) -> Option<&lfm3_vl::VisionConfig> {
+        self.lfm3().and_then(|b| b.vision_config.as_ref())
+    }
+
+    pub fn lfm3_vision_weights(&self) -> Option<&lfm3_vl::VisionWeights> {
+        self.lfm3().and_then(|b| b.vision_weights.as_ref())
+    }
+
+    /// LFM3-Audio speech-encoder config, if a speech encoder was loaded.
+    pub fn lfm3_audio_config(&self) -> Option<&lfm3_audio::AudioConfig> {
+        self.lfm3().and_then(|b| b.audio_config.as_ref())
+    }
+
+    pub fn lfm3_audio_weights(&self) -> Option<&lfm3_audio::AudioWeights> {
+        self.lfm3().and_then(|b| b.audio_weights.as_ref())
+    }
+
+    /// LFM3-Omni depth-decoder config, if a depth decoder was loaded.
+    pub fn lfm3_depth_config(&self) -> Option<&lfm3_omni::DepthConfig> {
+        self.lfm3().and_then(|b| b.depth_config.as_ref())
+    }
+
+    pub fn lfm3_depth_weights(&self) -> Option<&lfm3_omni::DepthWeights> {
+        self.lfm3().and_then(|b| b.depth_weights.as_ref())
+    }
+
     /// MiniMax-M2 bundle if this model is arch_id=10, else None.
     pub fn minimax(&self) -> Option<&MiniMaxBundle> {
         self.state
@@ -1705,6 +1820,9 @@ impl LoadedModel {
         if self.embeddinggemma2().is_some_and(|b| b.vision.is_some()) {
             return true;
         }
+        if self.lfm3().is_some_and(|b| b.vision_config.is_some()) {
+            return true;
+        }
         self.qwen4().is_some_and(|b| b.vision.is_some())
             || self.qwen35().is_some_and(|b| b.vision_config.is_some())
     }
@@ -1714,6 +1832,9 @@ impl LoadedModel {
     /// pack as the vision tower); every other arch answers `false`, matching
     /// the embed body's per-modality refusals.
     pub fn has_audio_encoder(&self) -> bool {
+        if self.lfm3().is_some_and(|b| b.audio_config.is_some()) {
+            return true;
+        }
         self.embeddinggemma2().is_some_and(|b| b.audio.is_some())
     }
 

@@ -1732,7 +1732,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]),
         "deinterleave_f32" => Some(vec![read(0), write(8), write(16)]),
         "rmsnorm_f32" | "rmsnorm_f32_rowsplit" => Some(vec![read(0), read(8), write(16)]),
-        "rope_partial_halfsplit_f32" | "rope_partial_halfsplit_f32_headgrid" => {
+        "rope_partial_halfsplit_f32" | "rope_partial_halfsplit_f32_headgrid" | "rope_zero_tail_f32" => {
             Some(vec![write(0), write(8), read(16)])
         }
         "kv_cache_write_asym_k_fwht3" => {
@@ -2233,7 +2233,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "repeat_interleave_qk_f32"
         | "rope_partial_halfsplit_f32"
         | "rope_partial_halfsplit_f32_headgrid"
-        | "conv1d_gated_decode_f32" => Some(48),
+        | "conv1d_gated_decode_f32"
+        | "rope_zero_tail_f32" => Some(48),
         // 6 pointers + K + eps = 56 explicit bytes, padded to 16 B. Same ABI as
         // `fused_rmsnorm_mq_rotate_awq_f16`, plus nothing: the AWQ scale is its
         // own pointer slot, which `_f16` also carries.
@@ -4104,11 +4105,13 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
         "repeat_interleave_qk_f32"
             | "rope_partial_halfsplit_f32"
             | "rope_partial_halfsplit_f32_headgrid"
+            | "rope_zero_tail_f32"
     ) || matches!(
         current,
         "repeat_interleave_qk_f32"
             | "rope_partial_halfsplit_f32"
             | "rope_partial_halfsplit_f32_headgrid"
+            | "rope_zero_tail_f32"
     )
 }
 
@@ -4132,6 +4135,7 @@ fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Opti
                 | "mq_rotate_x"
                 | "rope_partial_halfsplit_f32"
                 | "rope_partial_halfsplit_f32_headgrid"
+                | "rope_zero_tail_f32"
         ))
         || (Some(current) != excluded
             && matches!(
@@ -4140,6 +4144,7 @@ fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Opti
                     | "fused_silu_mul_mq_rotate"
                     | "rope_partial_halfsplit_f32"
                     | "rope_partial_halfsplit_f32_headgrid"
+                    | "rope_zero_tail_f32"
             ))
 }
 

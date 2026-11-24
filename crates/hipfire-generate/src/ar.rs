@@ -1937,6 +1937,10 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
                 GenerationRoute::LfmAr
             };
         }
+        // LFM3 (arch 24): AR-only (no `SpecTarget` yet) → the LFM AR route.
+        24 => {
+            return GenerationRoute::LfmAr;
+        }
         12 => {
             let spec_ok = i.has_speculator && (i.temp <= 1e-6 || i.ngram_can_sample);
             return if spec_ok {
@@ -3453,6 +3457,23 @@ pub fn generate(
             return;
         }
         GenerationRoute::LfmAr => {
+            if m.arch_id == 24 {
+                crate::lfm3::generate_lfm3(
+                    m,
+                    gpu,
+                    stdout,
+                    id,
+                    prompt,
+                    system_prompt,
+                    temp,
+                    top_p,
+                    max_tokens,
+                    max_think_tokens,
+                    tools,
+                    messages_history,
+                );
+                return;
+            }
             let _ = (
                 budget_alert_at_tok,
                 budget_alert_text,

@@ -1,0 +1,91 @@
+{
+  "conv_in.weight": {
+    "shape": [
+      256,
+      1,
+      3,
+      3
+    ],
+    "numel": 2304
+  },
+  "conv_in.bias": {
+    "shape": [
+      256
+    ],
+    "numel": 256
+  },
+  "conv_mid.weight": {
+    "shape": [
+      256,
+      1,
+      3,
+      3
+    ],
+    "numel": 2304
+  },
+  "conv_mid.bias": {
+    "shape": [
+      256
+    ],
+    "numel": 256
+  },
+  "lin_mid.weight": {
+    "shape": [
+      256,
+      256,
+      1,
+      1
+    ],
+    "numel": 65536
+  },
+  "lin_mid.bias": {
+    "shape": [
+      256
+    ],
+    "numel": 256
+  },
+  "conv_end.weight": {
+    "shape": [
+      256,
+      1,
+      3,
+      3
+    ],
+    "numel": 2304
+  },
+  "conv_end.bias": {
+    "shape": [
+      256
+    ],
+    "numel": 256
+  },
+  "lin_end.weight": {
+    "shape": [
+      256,
+      256,
+      1,
+      1
+    ],
+    "numel": 65536
+  },
+  "lin_end.bias": {
+    "shape": [
+      256
+    ],
+    "numel": 256
+  },
+  "lin_out.weight": {
+    "shape": [
+      768,
+      4096,
+      1
+    ],
+    "numel": 3145728
+  },
+  "lin_out.bias": {
+    "shape": [
+      768
+    ],
+    "numel": 768
+  }
+}

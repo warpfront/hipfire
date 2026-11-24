@@ -39,6 +39,8 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) mod anthropic;
+pub(crate) mod audio;
+pub(crate) mod realtime;
 // Windows-only at runtime; compiled everywhere so its tests run on Linux.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod management;

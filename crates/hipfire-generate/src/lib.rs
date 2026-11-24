@@ -77,6 +77,9 @@ pub mod vision;
 /// Flash-Next image-conditioned AR generation.
 pub mod qwen4_vision;
 
+/// LFM3 (arch_id 24) generation bodies (text / VL / audio / omni).
+pub mod lfm3;
+
 /// Redline capture/replay fixtures lifted out of the daemon.
 pub mod redline;
 
