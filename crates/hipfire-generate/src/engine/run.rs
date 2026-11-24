@@ -43,6 +43,9 @@ pub struct Request {
     pub seed: u32,
     /// The route already emitted `gen_start` (before its prompt render).
     pub opened: bool,
+    /// Clamp `max_tokens` to the context left (the route decodes to the
+    /// cache cap, as legacy Gemma 4 does) instead of refusing it.
+    pub context_fit: bool,
 }
 
 /// Serve `prompt` on the engine loop.
@@ -172,7 +175,13 @@ impl Job<'_> {
             prompt.len(),
             request.max_tokens,
             *max_seq,
-            crate::common::fit_max_tokens,
+            |n, used, cap| {
+                if request.context_fit {
+                    n.min(cap.saturating_sub(used))
+                } else {
+                    crate::common::fit_max_tokens(n, used, cap)
+                }
+            },
         ) {
             Ok(budget) => budget,
             Err(message) => {

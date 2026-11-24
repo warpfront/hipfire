@@ -2382,6 +2382,7 @@ pub fn generate_gemma4(
             max_tokens,
             seed: request_seed,
             opened: true,
+            context_fit: true,
         };
         match crate::engine::run::run(
             m,
@@ -2467,6 +2468,13 @@ pub fn generate_gemma4(
             emit_gemma4_malformed_tool_call(stdout, id, &error);
             return;
         }
+        crate::common::emit_committed_event(
+            stdout,
+            id,
+            next_tok,
+            m.conversation_tokens.len(),
+            t0.elapsed().as_millis() as u64,
+        );
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 

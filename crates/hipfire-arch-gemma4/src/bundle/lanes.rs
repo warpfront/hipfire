@@ -34,6 +34,8 @@ struct Lane {
 pub(super) struct Gemma4Lanes {
     lanes: Vec<Lane>,
     top1: GpuTensor,
+    /// Sampled requests may take a lane (`serve.batch_sampled`).
+    sampled: bool,
 }
 
 impl Gemma4Lanes {
@@ -68,9 +70,10 @@ fn copy_rows(gpu: &mut Gpu, dst: &KvCache, src: &KvCache, rows: usize) -> Result
 }
 
 impl Gemma4Bundle {
-    /// Stage `n` engine lanes, each a KV set shaped like the resident caches.
-    /// Q8 caches only (a park copies Q8 rows).
-    pub fn stage_engine_lanes(&mut self, gpu: &mut Gpu, n: usize) -> Result<()> {
+    /// Stage `n` engine lanes, each a KV set shaped like the resident caches;
+    /// `sampled` admits sampled requests to them. Q8 caches only (a park
+    /// copies Q8 rows).
+    pub fn stage_engine_lanes(&mut self, gpu: &mut Gpu, n: usize, sampled: bool) -> Result<()> {
         if self.lanes.is_some() {
             return Err("gemma4 engine lanes are already staged".into());
         }
@@ -84,6 +87,7 @@ impl Gemma4Bundle {
         let mut staged = Gemma4Lanes {
             lanes: Vec::with_capacity(n),
             top1,
+            sampled,
         };
         for _ in 0..n {
             let lane =
@@ -114,6 +118,11 @@ impl Gemma4Bundle {
     /// Whether [`Self::stage_engine_lanes`] staged lanes on this load.
     pub fn engine_lanes_staged(&self) -> bool {
         self.lanes.is_some()
+    }
+
+    /// The staged lanes' `sampled` flag; `None` without lanes.
+    pub fn engine_lanes_sampled(&self) -> Option<bool> {
+        self.lanes.as_ref().map(|staged| staged.sampled)
     }
 }
 

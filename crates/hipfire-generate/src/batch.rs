@@ -2875,11 +2875,13 @@ pub fn is_vmm_batch_request_eligible(
         return false;
     }
     let sampling = resolve_batch_sampling(msg, m);
-    // Gemma 4 lanes sample on the host with the request's own sampler; the
-    // singleton route refuses stop sequences and min_tokens, so do they.
-    if gemma4_engine_lanes_staged(m) {
-        return hipfire_runtime::stop_sequence::parse_stop_field(msg.get("stop"))
-            .is_ok_and(|stop| stop.is_empty());
+    // Gemma 4 lanes take sampled requests only when the store is sampled
+    // (`serve.batch_sampled`); the singleton route refuses stop sequences
+    // and min_tokens, so do they.
+    if let Some(sampled) = m.gemma4().and_then(|b| b.engine_lanes_sampled()) {
+        return (sampling.temp <= 0.0 || sampled)
+            && hipfire_runtime::stop_sequence::parse_stop_field(msg.get("stop"))
+                .is_ok_and(|stop| stop.is_empty());
     }
     if m.qwen4().is_some() {
         let store_sampled = m

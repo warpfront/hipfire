@@ -380,7 +380,12 @@ impl Driver {
             .and_then(|v| v.as_bool())
             == Some(true);
         let budget = match admit_budget(prompt.len(), req.max_tokens, m.max_seq, |n, p, s| {
-            fit_max_tokens_if(fit, n, p, s)
+            // Gemma 4 decodes to the cache cap, as its legacy route does.
+            if route == GenerationRoute::Gemma4Ar {
+                n.min(s.saturating_sub(p))
+            } else {
+                fit_max_tokens_if(fit, n, p, s)
+            }
         }) {
             Ok(budget) => budget,
             Err(message) => {

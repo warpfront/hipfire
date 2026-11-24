@@ -120,6 +120,13 @@ impl Gemma4Stream {
         self.turn
             .push(host.out, host.id, &frag, || None)
             .map_err(|error| format!("malformed Gemma 4 tool call: {error}"))?;
+        crate::common::emit_committed_event(
+            host.out,
+            host.id,
+            token,
+            host.conversation.len(),
+            host.t0.elapsed().as_millis() as u64,
+        );
         host.conversation.push(token);
         *host.seq_pos += 1;
         Ok((Verdict::Continue, Vec::new()))
