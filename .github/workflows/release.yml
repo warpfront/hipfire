@@ -6,7 +6,7 @@ name: release-kernel-packs
 # inside a ROCm dev image and uploads, per arch, to the tag's GitHub release
 # (created as a draft when the tag has none yet; an existing release keeps its
 # draft/prerelease/latest state):
-#   hipfire-kernels-<tag>-<arch>.tar.gz          manifest.json + <arch>/*.{hsaco,hash,index.json}
+#   hipfire-kernels-<tag>-<arch>.tar.gz          manifest.json + <arch>/*.{hsaco,hash,index.json,radiowave.json}
 #   hipfire-kernels-<tag>-<arch>.tar.gz.sha256
 #   hipfire-kernels-<tag>-<arch>.manifest.json
 # `install.sh --tag` / `install.ps1 -Tag` download the pack for the detected
