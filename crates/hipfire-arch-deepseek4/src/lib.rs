@@ -84,6 +84,7 @@ pub mod sampling;
 pub mod spec_decode;
 pub mod spec_emit;
 pub mod spec_impl;
+mod verify_rollback;
 
 pub use arch::{DeepseekV4, DeepseekV4HeterogeneousFault, DeepseekV4HeterogeneousProjection};
 pub use carrier::{

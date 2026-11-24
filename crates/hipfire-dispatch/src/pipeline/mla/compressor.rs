@@ -184,6 +184,16 @@ pub struct CompressorRope {
     pub rope_dim: usize,
 }
 
+/// Copy of a speculative verify window's projected rows (`kv`, and `score`
+/// with the APE bias added), taken after the op's own APE add. The verifier
+/// rebuilds the committed prefix's rings from it when a rejected row closed a
+/// compressor window. `rows` counts from row 0 of the window's projections.
+pub struct CompressorStash<'a> {
+    pub kv: &'a GpuTensor,
+    pub score: &'a GpuTensor,
+    pub rows: usize,
+}
+
 /// One compressor commit: a decode row, or a batched window of `rows` rows.
 pub struct KvCompressOp<'a> {
     /// Rows this op commits (1 on the decode route).
@@ -206,6 +216,8 @@ pub struct KvCompressOp<'a> {
     pub indexer: bool,
     pub layer: usize,
     pub route: KvCompressRoute<'a>,
+    /// Speculative verify window only: copy the window's rows here.
+    pub stash: Option<CompressorStash<'a>>,
 }
 
 /// The decode and batched chains differ only in these knobs.
@@ -402,6 +414,7 @@ fn execute_decode(gpu: &mut Gpu, op: &KvCompressOp<'_>) -> Result<(), DispatchEr
     }
     comp_dbg(gpu, op, "kv_buf(gemv)", kv_buf, proj_dim);
     comp_dbg(gpu, op, "score_buf(gemv+ape)", score_buf, proj_dim);
+    stash_rows(gpu, op, input.kv, input.score, proj_dim)?;
 
     let pos = pos_array.sub_offset(pos_index, 1);
     match commit {
@@ -430,6 +443,26 @@ fn execute_decode(gpu: &mut Gpu, op: &KvCompressOp<'_>) -> Result<(), DispatchEr
             )
         }
     }
+}
+
+/// [`KvCompressOp::stash`]: the window's rows `0..rows` of `kv` / `score`. A
+/// kernel copy, so captured and retained verify bodies record it.
+fn stash_rows(
+    gpu: &mut Gpu,
+    op: &KvCompressOp<'_>,
+    kv: &GpuTensor,
+    score: &GpuTensor,
+    proj_dim: usize,
+) -> Result<(), DispatchError> {
+    let Some(stash) = &op.stash else {
+        return Ok(());
+    };
+    let n = stash.rows * proj_dim;
+    for (dst, src, what) in [(stash.kv, kv, "kv"), (stash.score, score, "score")] {
+        gpu.copy_f32_buffer(dst, &src.sub_offset(0, n), n)
+            .map_err(|e| hip_err(format_args!("comp stash {what} l{}", op.layer), e))?;
+    }
+    Ok(())
 }
 
 fn execute_batched(gpu: &mut Gpu, op: &KvCompressOp<'_>) -> Result<(), DispatchError> {
@@ -462,6 +495,7 @@ fn execute_batched(gpu: &mut Gpu, op: &KvCompressOp<'_>) -> Result<(), DispatchE
         start_pos as i32,
     )
     .map_err(|e| hip_err(format_args!("comp ape batched l{l}"), e))?;
+    stash_rows(gpu, op, kv, score, proj_dim)?;
     let slot_base = start_pos as usize % ratio;
     if slot_base == 0 && events > 0 {
         if let Some(local_row) = local_row {

@@ -1588,6 +1588,7 @@ pub(crate) fn compressor_op<'a>(
             gfx1151_route: weights.mq2r_backend.is_gfx1151(),
             debug,
         },
+        stash: None,
     }))
 }
 

@@ -315,6 +315,8 @@ fn speculative_decode_impl(
             k + 1
         ));
     }
+    let verify_start = last_position as usize + 1;
+    state.arm_verify_rollback(gpu, cfg, verify_start, k + 1, false)?;
     forward::forward_prefill_batch_chunk(
         cfg,
         weights,
@@ -430,16 +432,11 @@ fn speculative_decode_impl(
     // FIRST emitted token. After emitting all accepted_tokens, next
     // position is initial_n_tokens + accepted_tokens.len(). Same thing.
     //
-    // Stale-cache caveat: MTP layer's SWA cache has writes at positions
-    // [N+1 .. N+K] from the draft loop; the main layers' SWA caches
-    // have writes at the same positions from the verify pass. Positions
-    // BEYOND n_accept were computed using rejected draft tokens (input
-    // mismatch with what the caller will treat as committed). Those
-    // entries get naturally invalidated when the caller's next forward
-    // overwrites them via ring buffer. Bug only manifests when a
-    // forward READS those stale slots before overwriting — happens
-    // only in narrow windows and is documented as a production-hardening
-    // follow-up.
+    // The trunk's rejected verify rows clobbered committed history in the
+    // SWA and compressor rings; restore it (`crate::verify_rollback`). The MTP
+    // layer's own SWA ring keeps the draft loop's rows at [N+1 .. N+K]; the
+    // rejected ones only feed later drafts, never committed tokens.
+    state.rollback_verify(gpu, cfg, verify_start, k + 1, n_accept)?;
     state.n_tokens = initial_n_tokens + accepted_tokens.len() as u64;
 
     Ok(SpecStepResult {

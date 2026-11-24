@@ -41,10 +41,9 @@ pub struct Deepseek4Bundle {
     pub pbs: Option<PrefillBatchScratch>,
 }
 
-/// Thin verify scratch for the DSpark `DsparkDrafter` path. DeepSeek V4's SWA
-/// attention is stateless (no recurrent rewind needed between verify and
-/// commit_prefix), so the scratch carries no GPU buffers — the PBS lives in
-/// `state.dspark_verify_pbs` and is reused across windows.
+/// Thin verify scratch for the DSpark `DsparkDrafter` path. It carries no GPU
+/// buffers: the PBS lives in `state.dspark_verify_pbs` and is reused across
+/// windows, and the rejected-row rollback state in `state.verify_rollback`.
 pub struct Deepseek4DsparkScratch;
 
 /// Capture identity returned by the diagnostic DSpark retained-verify oracle.
@@ -388,6 +387,35 @@ impl Deepseek4Bundle {
                 .as_deref()
                 == Some("1")
             && (graph_batch == 0 || graph_batch == n_verify);
+        // Save what the window's rejected rows can destroy (SWA columns,
+        // compressor rings); `commit_prefix` restores it. A captured or
+        // retained body replays at other positions, so it arms every
+        // compressor. Retained replay is not ordered after HIP-stream work:
+        // the saves must land before it.
+        let armed = self
+            .state
+            .arm_verify_rollback(
+                gpu,
+                &self.config,
+                position,
+                n_verify,
+                graph_enabled || retained_enabled,
+            )
+            .and_then(|()| {
+                if retained_enabled {
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|e| format!("sync after rollback arm: {e:?}"))
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(error) = armed {
+            self.state.dspark_verify_pbs = Some(pbs);
+            return Err(format!(
+                "Deepseek4Bundle::verify_block rollback arm: {error}"
+            ));
+        }
         let fwd_result = if graph_enabled {
             (|| -> Result<(), String> {
                 upload_prefill_batch_inputs(
@@ -973,17 +1001,22 @@ impl SpecTarget for Deepseek4Bundle {
         Ok((picks, captured))
     }
 
-    /// Advance `state.n_tokens` to reflect the committed prefix. DeepSeek
-    /// V4's SWA attention is stateless so no recurrent rewind is needed;
-    /// the next verify forward simply overwrites the rejected tail slots.
+    /// Commit the seed plus `accept_len` drafts of the verified `block`:
+    /// restore what its rejected rows destroyed in the finite rings (SWA
+    /// window, compressor windows; `crate::verify_rollback`) and advance
+    /// `state.n_tokens`. Every other cache is position-indexed: the next
+    /// verify rewrites the rejected rows before any row reads them.
     fn commit_prefix(
         &mut self,
-        _gpu: &mut Gpu,
-        _block: &[u32],
+        gpu: &mut Gpu,
+        block: &[u32],
         accept_len: usize,
         position: usize,
         _scratch: &mut dyn SpecScratch,
     ) -> Result<(), String> {
+        self.state
+            .rollback_verify(gpu, &self.config, position, block.len(), accept_len)
+            .map_err(|e| format!("Deepseek4Bundle::commit_prefix: {e}"))?;
         // Mirrors the old inline drafter:
         // `bundle.state.n_tokens = (position + committed.len()) as u64`
         // where `committed.len() = accept_len + 1` (accepted drafts + bonus).

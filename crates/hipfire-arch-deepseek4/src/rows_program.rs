@@ -959,7 +959,7 @@ fn compressed_attention_rows<'a>(
                 } else {
                     (&pbs.comp_main_kv_batch, &pbs.comp_main_score_batch)
                 };
-                let op = compressor_op(
+                let mut op = compressor_op(
                     cfg,
                     weights,
                     state,
@@ -972,6 +972,13 @@ fn compressed_attention_rows<'a>(
                     Some((pos_slots, attn_slots)),
                 )?
                 .ok_or_else(|| format!("compressor does not run on layer {layer_idx}"))?;
+                // The last row's op stashes the whole window (every row's APE
+                // add has run by then).
+                if b + 1 == rows {
+                    op.stash = state
+                        .verify_rollback
+                        .compressor_stash(layer_idx, is_indexer, start_pos, rows);
+                }
                 program.steps.push(Step::KvCompress(op));
                 program.stages.push(Stage::Other);
             }
@@ -1265,6 +1272,9 @@ fn kv_compress_rows<'a>(
             local_row: state.compressor_cache_placement.global_to_local(first_row),
             event_positions,
         },
+        stash: state
+            .verify_rollback
+            .compressor_stash(layer_idx, is_indexer, start_pos, rows),
     })
 }
 

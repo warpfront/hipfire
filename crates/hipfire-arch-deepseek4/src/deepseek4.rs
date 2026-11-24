@@ -1987,6 +1987,9 @@ pub struct DeepseekV4State {
     /// and sized to the DSpark block, not the trunk verify window).
     /// Lazily allocated by `capture_seed_main_hidden` / `new_spec_scratch`.
     pub dspark_verify_pbs: Option<crate::forward::PrefillBatchScratch>,
+    /// What the armed speculative verify window's rejected rows can destroy,
+    /// restored on its commit (`crate::verify_rollback`).
+    pub(crate) verify_rollback: crate::verify_rollback::VerifyRollback,
 
     /// Monotonic position counter — how many tokens this session has
     /// processed. Used to compute the SWA cache slot (`pos % window`)
@@ -2112,6 +2115,7 @@ impl DeepseekV4State {
             dspark_cap_ones: None,
             dspark_main_hidden: None,
             dspark_verify_pbs: None,
+            verify_rollback: Default::default(),
             n_tokens: 0,
             _scaffold: (),
         })
@@ -2177,6 +2181,8 @@ impl DeepseekV4State {
         // is one extra direct-dispatch decode per turn, which is
         // dwarfed by the prefill it follows.
         self.ar_forward_warmed_up = false;
+        // A new conversation commits no window armed by the previous one.
+        self.verify_rollback.disarm();
         // Other transient scratch tensors (`tmp`, `tmp_plain`, residual_streams,
         // attn_state_host, …) are pure per-step working memory: each
         // forward step writes them before reading, so stale contents
@@ -2356,6 +2362,7 @@ impl DeepseekV4State {
         if let Some(pbs) = self.dspark_verify_pbs.take() {
             pbs.free_gpu(gpu);
         }
+        self.verify_rollback.free_gpu(gpu);
     }
 }
 
