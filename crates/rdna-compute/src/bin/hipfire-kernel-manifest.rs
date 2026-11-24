@@ -72,6 +72,15 @@ fn run() -> Result<(), String> {
         "no device compiler resolves; a pack must be verified against its build toolchain",
     )?;
     let verified = kernel_pack::verify_dir(&arch, &extra_flags, &dir, Some(&local))?;
+    // A pack without sidecars loads fine but never certifies, so every
+    // Radiowave-gated route (gfx11 PM4 VMEM acquires) is silently off.
+    if verified.radiowave_certified != verified.modules {
+        return Err(format!(
+            "{}/{} modules ship a verified .radiowave.json sidecar; the build host needs the ROCm LLVM tools \
+             (clang-offload-bundler, llvm-readobj, llvm-objdump; RADIOWAVE_* overrides them)",
+            verified.radiowave_certified, verified.modules
+        ));
+    }
     let hip_version = verified
         .toolchain_id
         .strip_prefix("HIP version:")

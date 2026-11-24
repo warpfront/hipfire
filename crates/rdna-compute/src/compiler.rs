@@ -1196,9 +1196,25 @@ impl KernelCompiler {
     ) -> Result<PathBuf, String> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let index = self.pack_index(module, source, symbols.to_vec(), object)?;
+        let sidecar = dir.join(format!("{module}.radiowave.json"));
         let _ = std::fs::remove_file(dir.join(format!("{module}.index.json")));
+        // A sidecar left from an older object must never sit beside the new one.
+        let _ = std::fs::remove_file(&sidecar);
         publish_pair(dir, module, object, &index.packaging_key, true)
             .and_then(|_| publish_index(dir, &index))?;
+        // Ship the Radiowave certification the compile wrote beside the cache
+        // object: packs have no `.hip` source, so the runtime cannot certify
+        // them itself and VMEM-classified acquires would otherwise never fire.
+        let certified = object.with_extension("radiowave.json");
+        if certified.is_file() {
+            let temp = dir.join(format!(".{module}.{}.radiowave.tmp", unique_token()));
+            std::fs::copy(&certified, &temp)
+                .and_then(|_| std::fs::rename(&temp, &sidecar))
+                .map_err(|e| {
+                    let _ = std::fs::remove_file(&temp);
+                    format!("{module}: radiowave sidecar: {e}")
+                })?;
+        }
         Ok(dir.join(format!("{module}.hsaco")))
     }
 
@@ -3828,6 +3844,12 @@ mod tests {
         assert_eq!(verified.modules, 2);
         assert_eq!(verified.toolchain_id, "hipcc 7.2");
         assert_eq!(verified.code_object_version, 6);
+        assert_eq!(verified.radiowave_certified, 0);
+        // A shipped sidecar that does not certify the object is a broken pack.
+        let sidecar = pack.join("alpha.radiowave.json");
+        std::fs::write(&sidecar, "{}").unwrap();
+        assert!(verify(None).unwrap_err().contains("alpha.radiowave.json"));
+        std::fs::remove_file(&sidecar).unwrap();
         assert!(verify(Some("hipcc 7.2")).is_ok());
         // A different local compiler would reject every object at load time.
         assert!(verify(Some("hipcc 9.9"))
