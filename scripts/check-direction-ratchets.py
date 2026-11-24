@@ -23,11 +23,20 @@ scripts/ratchet-diff.sh):
                                  CENTRAL_CONFIG_READERS of scripts/check-env-docs.py).
                                  Add a typed key to hipfire-config instead.
 
+Also emits five informational gauges (`gauge_*`, no ceiling line, never fail; they
+feed the Monday digest): `gauge_generate_entry_fns` (`pub fn generate_*` in
+hipfire-generate/src), `gauge_generation_routes` (variants of `GenerationRoute`),
+`gauge_engine_routes` (entries of `ENGINE_ROUTES`), `gauge_map_md_files` (committed
+`crates/**/map.md`) and `gauge_ci_gate_steps` (`run` lines in scripts/ci-gates.sh).
+
 Only non-test code counts: `crates/*/src/**/*.rs`, excluding build.rs, comments,
 `#[cfg(test)]` items and out-of-line `#[cfg(test)] mod x;` files.
 
 Usage:
     scripts/check-direction-ratchets.py --metrics       `name value` lines (leanup-ratchets.sh)
+    scripts/check-direction-ratchets.py --lower         rewrite each direction_* ceiling in
+                                                        scripts/leanup-thresholds.txt that sits above
+                                                        its measured value down to that value; never raises
     scripts/check-direction-ratchets.py --list METRIC   every counted site, file:line
     scripts/check-direction-ratchets.py --explain [METRIC...]  guidance + per-file counts
 """
@@ -131,7 +140,7 @@ def sources() -> list[tuple[str, str]]:
         if path.name == "build.rs":
             continue
         raw = path.read_text(encoding="utf-8", errors="ignore")
-        if any(token in raw for token in ("downcast_", "gfx", "HIPFIRE_")):
+        if any(token in raw for token in ("downcast_", "gfx", "HIPFIRE_", "fn generate_", "enum GenerationRoute", "ENGINE_ROUTES")):
             texts[path] = production_text(path, raw, test_files)
         elif "cfg(" in raw:  # only the out-of-line test modules matter here
             for m in CFG_TEST.finditer(raw):
@@ -146,9 +155,9 @@ def line_of(text: str, idx: int) -> int:
     return text.count("\n", 0, idx) + 1
 
 
-def sites() -> dict[str, list[str]]:
+def sites(texts: list[tuple[str, str]] | None = None) -> dict[str, list[str]]:
     found = {name: [] for name in GUIDANCE}
-    for rel, text in sources():
+    for rel, text in (texts if texts is not None else sources()):
         crate = rel.split("/")[1]
         if crate in SHARED_CRATES:
             for m in DOWNCAST.finditer(text):
@@ -170,12 +179,65 @@ def sites() -> dict[str, list[str]]:
     return found
 
 
+def gauges(texts: list[tuple[str, str]]) -> dict[str, int]:
+    """Informational counts; `texts` is `sources()`."""
+    entry_fns = 0
+    routes = 0
+    engine_routes = 0
+    for rel, text in texts:
+        if rel.startswith("crates/hipfire-generate/src/"):
+            entry_fns += len(re.findall(r"\bpub(?:\([a-z]+\))?\s+fn\s+generate_\w+", text))
+        if rel == "crates/hipfire-generate/src/ar.rs":
+            m = re.search(r"\benum\s+GenerationRoute\s*\{", text)
+            if m:
+                body = text[m.end():match_close(text, m.end() - 1)]
+                routes = len(re.findall(r"^\s*[A-Z]\w*\s*(?:=[^,]*)?,", body, re.M))
+        if rel == "crates/hipfire-generate/src/engine/mod.rs":
+            m = re.search(r"\bconst\s+ENGINE_ROUTES\b[^=]*=\s*&\[", text)
+            if m:
+                body = text[m.end():text.index("]", m.end())]
+                engine_routes = len(re.findall(r"GenerationRoute::\w+", body))
+    ci = (ROOT / "scripts/ci-gates.sh").read_text(encoding="utf-8", errors="ignore")
+    return {
+        "gauge_generate_entry_fns": entry_fns,
+        "gauge_generation_routes": routes,
+        "gauge_engine_routes": engine_routes,
+        "gauge_map_md_files": sum(1 for p in ROOT.glob("crates/**/map.md") if "target" not in p.relative_to(ROOT).parts),
+        "gauge_ci_gate_steps": len(re.findall(r"^\s*run\s", ci, re.M)),
+    }
+
+
+def lower(found: dict[str, list[str]]) -> int:
+    """Rewrite `direction_* <= N` ceilings above the measured count down to it. Never raises."""
+    path = ROOT / "scripts/leanup-thresholds.txt"
+    out, changed = [], 0
+    for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
+        m = re.match(r"(direction_\w+)(\s+<=\s+)(\d+)(\s*)$", line.rstrip("\n"))
+        if m and m.group(1) in found and len(found[m.group(1)]) < int(m.group(3)):
+            now = len(found[m.group(1)])
+            print(f"{m.group(1)}: {m.group(3)} -> {now}")
+            line = f"{m.group(1)}{m.group(2)}{now}\n"
+            changed += 1
+        out.append(line)
+    if changed:
+        path.write_text("".join(out), encoding="utf-8")
+    else:
+        print("nothing to lower")
+    return 0
+
+
 def main(argv: list[str]) -> int:
-    found = sites()
     if argv == ["--metrics"]:
+        texts = sources()
+        found = sites(texts)
         for name, where in found.items():
             print(f"{name} {len(where)}")
+        for name, n in gauges(texts).items():
+            print(f"{name} {n}")
         return 0
+    found = sites()
+    if argv == ["--lower"]:
+        return lower(found)
     if len(argv) == 2 and argv[0] == "--list" and argv[1] in found:
         print("\n".join(found[argv[1]]))
         return 0
