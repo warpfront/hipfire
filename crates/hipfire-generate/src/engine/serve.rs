@@ -73,6 +73,7 @@ pub fn drive(
         max_batch_tokens: params.max_batch_tokens,
         route,
         gpu_arch: gpu.arch.clone(),
+        poisoned: false,
     };
     let result = super::run::on_one_owner(m, gpu, n_layers, |m, runner, gpus| {
         let result = driver.serve(sched, m, runner, gpus, stdout, inbox);
@@ -82,7 +83,11 @@ pub fn drive(
         result
     })
     .and_then(|result| result);
-    result.map_err(BatchDriveError::Gpu)
+    // An unattested rollback poisons the batch: the daemon drops the scheduler.
+    result.map_err(|error| match driver.poisoned {
+        true => BatchDriveError::Poisoned(error),
+        false => BatchDriveError::Gpu(error),
+    })
 }
 
 /// One admitted request's host side.
@@ -258,6 +263,8 @@ struct Driver {
     route: GenerationRoute,
     /// The device's arch (a drafter's n-gram takeover is per GPU).
     gpu_arch: String,
+    /// A rollback was not attested: the resident state must never serve again.
+    poisoned: bool,
 }
 
 /// One tick's view of the model, the devices and the requests.
@@ -354,7 +361,7 @@ impl Driver {
             for ended in ended {
                 attested = attested.and(ctx.settle(&mut self.core, ended));
             }
-            attested?;
+            attested.inspect_err(|_| self.poisoned = true)?;
         }
     }
 
@@ -626,7 +633,7 @@ impl Driver {
                         let cancelled = cancel(self.route, stdout, &key.id, generated, released);
                         let _ = sched.abort_lane(idx, &key, admission);
                         // An unattested state is never handed to the next request.
-                        cancelled?;
+                        cancelled.inspect_err(|_| self.poisoned = true)?;
                         self.core.release_resident();
                         continue;
                     }
