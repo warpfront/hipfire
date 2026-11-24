@@ -37,6 +37,8 @@ pub trait WireProtocol {
     /// Whether the rendered prompt left the model inside a reasoning span.
     fn started_in_think(&self) -> bool;
     fn open<'a>(&'a self, host: Host<'a>) -> Box<dyn ProtocolEmit + 'a>;
+    /// Fold route-specific fields into the done envelope.
+    fn stamp_done(&self, _done: &mut serde_json::Value, _metrics: &super::DoneMetrics) {}
 }
 
 /// One request's emitter: [`Emit`] for the loop, plus the terminal.

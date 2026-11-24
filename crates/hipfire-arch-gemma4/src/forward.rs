@@ -74,11 +74,24 @@ pub fn decode_step(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
-    prepare_token_inputs(cfg, weights, state, gpu, token_id)?;
-    stage_position(state, gpu, position)?;
-    decode_step_body(cfg, weights, state, gpu, position, None)?;
+    decode_step_device(cfg, weights, state, gpu, token_id, position)?;
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("gemma4: download logits: {e:?}"))
+}
+
+/// [`decode_step`] with the logits left in `state.logits` (nothing waits on
+/// the device).
+pub fn decode_step_device(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    state: &mut Gemma4State,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+) -> Result<(), String> {
+    prepare_token_inputs(cfg, weights, state, gpu, token_id)?;
+    stage_position(state, gpu, position)?;
+    decode_step_body(cfg, weights, state, gpu, position, None)
 }
 
 /// Stage `position` into the device scalar every position-reading kernel
@@ -170,8 +183,30 @@ pub fn decode_step_with_graph(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
+    if decode_step_with_graph_device(cfg, weights, state, gpu, token_id, position)? {
+        // Ordered on the active stream behind the replayed kernels (no legacy
+        // null-stream hop per token).
+        gpu.download_f32_stream_ordered(&state.logits)
+            .map_err(|e| format!("gemma4 graph: download logits: {e:?}"))
+    } else {
+        gpu.download_f32(&state.logits)
+            .map_err(|e| format!("gemma4: download logits: {e:?}"))
+    }
+}
+
+/// [`decode_step_with_graph`] with the logits left in `state.logits`; `true`
+/// when the step ran as a captured graph on the active stream, `false` when
+/// it ran eager ([`decode_step_device`]).
+pub fn decode_step_with_graph_device(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    state: &mut Gemma4State,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+) -> Result<bool, String> {
     if !graph_exact(weights, gpu) {
-        return decode_step(cfg, weights, state, gpu, token_id, position);
+        return decode_step_device(cfg, weights, state, gpu, token_id, position).map(|()| false);
     }
 
     // Warmup: first decode after a fresh load runs eager (JITs kernels + settles
@@ -180,7 +215,7 @@ pub fn decode_step_with_graph(
     if !state.ar_warmed_up {
         state.ar_warmed_up = true;
         gpu.graphs.graph_exec = None;
-        return decode_step(cfg, weights, state, gpu, token_id, position);
+        return decode_step_device(cfg, weights, state, gpu, token_id, position).map(|()| false);
     }
 
     // Capture + replay both need an explicit (non-null) stream.
@@ -242,11 +277,7 @@ pub fn decode_step_with_graph(
             .map_err(|e| format!("gemma4 graph_launch (replay): {e:?}"))?;
     }
     state.n_tokens = position as usize + 1;
-
-    // Logits download is outside the captured region, ordered on the active stream behind the
-    // replayed kernels (no legacy null-stream hop per token).
-    gpu.download_f32_stream_ordered(&state.logits)
-        .map_err(|e| format!("gemma4 graph: download logits: {e:?}"))
+    Ok(true)
 }
 
 /// Embedding lookup → x, then scale by sqrt(dim). Kept separate from the body
@@ -748,6 +779,25 @@ pub fn forward_batch_spec(
         per_pos_argmax_out,
         per_pos_logits_out,
         true,
+    )?;
+    gpu.download_f32(&state.logits)
+        .map_err(|e| format!("gemma4 forward_batch download logits: {e:?}"))
+}
+
+/// The batched program over `tokens` at `[start_pos, start_pos + B)` (B up
+/// to [`GEMMA4_FORWARD_BATCH_MAX`]); with `head` the last row's logits are
+/// left in `state.logits` (nothing waits on the device).
+pub fn forward_rows_device(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    state: &mut Gemma4State,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    start_pos: usize,
+    head: bool,
+) -> Result<(), String> {
+    forward_rows(
+        cfg, weights, state, gpu, tokens, start_pos, None, None, None, head,
     )
 }
 
@@ -777,8 +827,7 @@ pub fn forward_prefill_batch(
 }
 
 /// The batched program over `tokens` at `[start_pos, start_pos + B)`; with
-/// `last_logits` the last row's logits are computed, downloaded and returned
-/// (else an empty vector).
+/// `last_logits` the last row's logits are computed into `state.logits`.
 #[allow(clippy::too_many_arguments)]
 fn forward_rows(
     cfg: &Gemma4Config,
@@ -791,7 +840,7 @@ fn forward_rows(
     mut per_pos_argmax_out: Option<&mut Vec<u32>>,
     mut per_pos_logits_out: Option<&mut Vec<f32>>,
     last_logits: bool,
-) -> Result<Vec<f32>, String> {
+) -> Result<(), String> {
     let b = tokens.len();
     if b == 0 {
         return Err("gemma4 forward_batch: empty token slice".to_string());
@@ -1132,7 +1181,7 @@ fn forward_rows(
     }
 
     if !last_logits {
-        return Ok(Vec::new());
+        return Ok(());
     }
     // ── Final RMSNorm + tied lm_head on the LAST row only (verify needs the
     //    last position's logits). ──
@@ -1148,11 +1197,7 @@ fn forward_rows(
         gpu.logit_softcap_f32(&state.logits, cfg.vocab_size, cfg.final_logit_softcapping)
             .map_err(|e| format!("gemma4 forward_batch logit softcap: {e:?}"))?;
     }
-    let logits = gpu
-        .download_f32(&state.logits)
-        .map_err(|e| format!("gemma4 forward_batch download logits: {e:?}"))?;
-
-    Ok(logits)
+    Ok(())
 }
 
 /// Embedding lookup for one token into a [dim] buffer (no √dim scale — the

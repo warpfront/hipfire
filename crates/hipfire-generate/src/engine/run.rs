@@ -41,6 +41,8 @@ pub struct Request {
     pub max_tokens: usize,
     /// Seeds this request's sampler RNG.
     pub seed: u32,
+    /// The route already emitted `gen_start` (before its prompt render).
+    pub opened: bool,
 }
 
 /// Serve `prompt` on the engine loop.
@@ -196,7 +198,9 @@ impl Job<'_> {
             t0,
         });
         emitter.clear_history();
-        emit_generation_start(route, emitter.out(), id, protocol.started_in_think());
+        if !request.opened {
+            emit_generation_start(route, emitter.out(), id, protocol.started_in_think());
+        }
         let family = state
             .mesh_family()
             .expect("the family admitted this request above");
@@ -308,15 +312,14 @@ impl Job<'_> {
             total_ms: millis(end - t0),
         };
         let mut done = metrics.done_value(id, finish_reason);
+        protocol.stamp_done(&mut done, &metrics);
         stage_terminal_tool_calls(&mut done, finish_reason, &tool_calls);
         if await_client_terminal_commit(emitter.out(), id, &done) != ClientTerminalDecision::Commit
         {
             rollback(&mut *emitter, family, runner, gpus, None, run.generated());
             return Outcome::Served;
         }
-        if state.spec_session_reuse() {
-            state.session_commit_live_mesh(gpus, emitter.history());
-        }
+        state.session_commit_live_mesh(gpus, emitter.history());
         emitter.commit_turn(asst_turn_cache);
         emit_active_route_done_value(emitter.out(), &done);
         Outcome::Served

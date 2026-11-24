@@ -11867,6 +11867,7 @@ pub fn generate_qwen4_ar(
             },
             max_tokens,
             seed: request_seed,
+            opened: false,
         };
         match crate::engine::run::run(
             m,

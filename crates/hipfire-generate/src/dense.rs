@@ -2460,6 +2460,44 @@ pub fn generate_gemma4(
         );
         return;
     }
+    // G12: on the engine loop when the flag is set and the load admits it; a
+    // decline (nothing emitted) keeps the loop below. Logprobs stay legacy.
+    if logprobs_top_k.is_none()
+        && crate::engine::runs_on_engine(crate::ar::GenerationRoute::Gemma4Ar)
+    {
+        let protocol = crate::engine::gemma::Gemma4Wire {
+            enable_thinking,
+            max_think_tokens,
+            tools: tools_nonempty,
+            stop: &stop_set,
+        };
+        let request = crate::engine::run::Request {
+            sampler: sampler_cfg.clone(),
+            max_tokens,
+            seed: request_seed,
+            opened: true,
+        };
+        match crate::engine::run::run(
+            m,
+            gpu,
+            stdout,
+            id,
+            crate::ar::GenerationRoute::Gemma4Ar,
+            &prompt_ids,
+            &protocol,
+            request,
+        ) {
+            crate::engine::run::Outcome::Served => return,
+            crate::engine::run::Outcome::Declined(reason) => {
+                eprintln!("[engine] gemma4_ar declined, legacy loop: {reason}");
+            }
+        }
+    }
+    let bundle = m
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Gemma4Bundle>())
+        .expect("the gemma4 bundle was resolved above");
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     let t0 = Instant::now();

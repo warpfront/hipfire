@@ -22,6 +22,7 @@
 //! `tokens`, and a stop on the last budget token finishes `stop`.
 
 pub mod chatml;
+pub mod gemma;
 pub mod mesh;
 pub mod run;
 pub mod sched;
@@ -37,7 +38,10 @@ pub fn runs_on_engine(route: crate::ar::GenerationRoute) -> bool {
     hipfire_runtime::config::get().engine_loop && ENGINE_ROUTES.contains(&route)
 }
 
-const ENGINE_ROUTES: &[crate::ar::GenerationRoute] = &[crate::ar::GenerationRoute::Qwen4Ar];
+const ENGINE_ROUTES: &[crate::ar::GenerationRoute] = &[
+    crate::ar::GenerationRoute::Qwen4Ar,
+    crate::ar::GenerationRoute::Gemma4Ar,
+];
 
 /// The budget a request may decode, or the `context_length` refusal, decided
 /// before `gen_start`: `prompt + max_tokens + 1` trailer row must fit `max_seq`.

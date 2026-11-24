@@ -18,6 +18,8 @@
 //! prompt and the decoded reply. Decode and batched prefill write different
 //! KV bits, so the decoded rows are never reused.
 
+mod mesh_family;
+
 use crate::config::Gemma4Config;
 use crate::forward;
 use crate::gemma4::{Gemma4State, Gemma4Weights};
@@ -75,6 +77,8 @@ pub struct Gemma4Bundle {
     /// Prefill snapshot cache shared by every session plus this
     /// conversation's committed live state; `None` = off.
     session: Option<SessionDriver>,
+    /// The KV state the engine loop's step program declares.
+    mesh_state: Vec<hipfire_runtime::weight_manifest::StateEntry>,
 }
 
 /// Bytes of one position of one Q8_0 cache slot (K or V): 34-byte blocks of
@@ -102,6 +106,7 @@ impl Gemma4Bundle {
         }
         Self {
             eos_tok: config.eos_token,
+            mesh_state: mesh_family::gemma4_state_manifest(&config),
             config,
             weights,
             state,
@@ -399,6 +404,9 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
         }
         b.state.free_gpu(gpu);
         b.weights.free_gpu(gpu);
+    }
+    fn mesh_family(&mut self) -> Option<&mut dyn hipfire_runtime::mesh_family::MeshFamily> {
+        Some(self)
     }
 }
 
