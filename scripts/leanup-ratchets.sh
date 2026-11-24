@@ -9,7 +9,9 @@
 #
 # Every metric this script emits is ASSERTED by scripts/leanup-thresholds.txt:
 # a violation exits non-zero, and so does an emitted metric with no threshold
-# (a number nobody asserts is not a gate). `--report` prints without asserting.
+# (a number nobody asserts is not a gate) -- except check-direction-ratchets.py
+# metrics, which are printed until a threshold names them. `--report` prints
+# without asserting.
 set -uo pipefail
 REPORT_ONLY=0
 if [ "${1:-}" = "--report" ]; then REPORT_ONLY=1; shift; fi
@@ -126,6 +128,18 @@ while read -r _k _v; do
   case "$_k" in [a-z]*) p "$_k" "$_v" ;; esac
 done < <(bash scripts/check-topology-arch-arms.sh --metrics 2>/dev/null | grep -E '^[a-z_]+[[:space:]]+[0-9]+$')
 
+# --- direction ratchets ------------------------------------------------------
+# Shrink-only counts of couplings the design moves away from: shared crates
+# downcasting to concrete model bundles, GPU-arch string matches outside
+# ArchCaps, and raw HIPFIRE_* env reads outside hipfire-config. A failing
+# direction_* ceiling prints what to do instead (--explain below). A metric
+# from this checker with no line in leanup-thresholds.txt is informational:
+# printed, never asserted (the ceilings themselves live in that file).
+declare -A INFORMATIONAL
+while read -r _k _v; do
+  case "$_k" in [a-z]*) p "$_k" "$_v"; INFORMATIONAL["$_k"]=1 ;; esac
+done < <(python3 scripts/check-direction-ratchets.py --metrics 2>/dev/null | grep -E '^[a-z_]+[[:space:]]+[0-9]+$')
+
 # --- assertion -------------------------------------------------------------
 # The point of the file. A metric named in scripts/leanup-thresholds.txt must
 # satisfy its threshold or this exits non-zero.
@@ -144,6 +158,7 @@ fi
 
 fails=0
 checked=0
+failed_direction=()
 declare -A THRESHOLDED
 while read -r metric op want; do
   case "$metric" in ''|'#'*) continue ;; esac
@@ -159,18 +174,23 @@ while read -r metric op want; do
     "==") [ "$got" = "$want" ] || { echo "leanup-ratchets: FAIL $metric = $got, must be $want"; fails=$((fails+1)); } ;;
     "<=") if [ "$got" -gt "$want" ] 2>/dev/null; then
             echo "leanup-ratchets: FAIL $metric = $got, ceiling $want"; fails=$((fails+1))
+            case "$metric" in direction_*) failed_direction+=("$metric") ;; esac
           fi ;;
     *) echo "leanup-ratchets: FAIL — unknown operator '$op' for $metric"; fails=$((fails+1)) ;;
   esac
 done < "$THRESH"
 for metric in "${!METRIC[@]}"; do
-  if [ -z "${THRESHOLDED[$metric]:-}" ]; then
+  if [ -z "${THRESHOLDED[$metric]:-}" ] && [ -z "${INFORMATIONAL[$metric]:-}" ]; then
     echo "leanup-ratchets: FAIL — metric '$metric' is emitted but has no threshold in $THRESH."
     fails=$((fails+1))
   fi
 done
 
 echo
+if [ "${#failed_direction[@]}" -gt 0 ]; then
+  python3 scripts/check-direction-ratchets.py --explain "${failed_direction[@]}"
+  echo
+fi
 if [ "$fails" -gt 0 ]; then
   echo "leanup-ratchets: $fails violation(s) across $checked asserted metric(s)."
   echo "  Lowering a ceiling after an improvement is expected. Raising one needs a"
