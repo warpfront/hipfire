@@ -2,6 +2,7 @@
 # (scripts/route_plan_walk.py); do not edit. Columns: route kind module symbols sha256
 # (HIP: effective source; embedded: image). native_mtp rows include every ar row.
 # Re-pin (sources at origin/beta 536ea66081 + cons05-A1): HIP row sha256 updated in place for landed source edits, module sets and symbols unchanged from the walk: gated_delta_chunk_wmma (2c504b1aec causal F32 WY products), gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151 and gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4 (0291cb1747 dead-row stores), tensor_ops (c85a2bede1 / 3a87c48f4f / a3229fd274), qwen4_gemv_q8_0 (35ca891555).
+# Re-pin (sources at origin/beta-candidate 1958644c0d): HIP row sha256 updated in place for landed source edits, module sets and symbols unchanged from the walk: mq_rotate_x_i4 (48e43d95ec gfx1150 admission: `defined(__gfx1150__)` added to block_i4_128_quant.hip's arch guards; hipcc -E device text byte-identical on gfx1100/gfx1151/gfx1201).
 #! family qwen3.8-flash-next
 #! model_arch 16
 #! arch gfx1201
@@ -52,7 +53,7 @@ ar	hip	moe_router_softmax_top10_f32_fast	moe_router_softmax_top10_f32_fast	56641
 ar	hip	moe_scatter_fused_top10	moe_scatter_fused_top10,moe_scatter_fused_top10_serial	e0c7b4dab79c6bb736a274bbef6bd904b3493ea74bb73ae77aa12189977d284f
 ar	hip	mq_rotate_x	mq_rotate_x	0f4efbebb43c5d7b630c6383e9048549b18a338699b39411c8151dbb6061b51b
 ar	hip	mq_rotate_x_128_v2	mq_rotate_x_128_v2,mq_rotate_x_128_v2_silu_bf16	59ea18d4b80625ad95dd94dc2707275cb356e04ceacea6d4d3852bc56c6b1888
-ar	hip	mq_rotate_x_i4	mq_rotate_x_i4	d4426c94c6c27e30abba642235a730b49c623f1b34f6164608ce8bd4a2be11cd
+ar	hip	mq_rotate_x_i4	mq_rotate_x_i4	11a13a049577a76c1ac507ec0b446cc551a8dcf85f8729503bd5a582d76c0b88
 ar	hip	mq_rotate_x_i8_gfx12	mq_rotate_x_i8_gfx12	e455ba957e9fd4de8c24dc9c7d1fad40e3b10d360ca8827b8a9898b3d2a4a3e3
 ar	hip	qsa_bf16_scores	indexed_attention_select_scores_rows16_bf16,indexed_attention_select_scores_rows8_bf16	1226e777abfe7eb2db2fb5ddfc2d5a87bc806d154775250d35acba40bd5a1d44
 ar	hip	qsa_filter_select	qsa_filter_compact,qsa_filter_finish,qsa_filter_threshold	99f0cdb2aa0313fef50a62a63175647b3eae559018abd254249e33f401a0bc4d
@@ -121,7 +122,7 @@ native_mtp	hip	moe_router_softmax_top10_f32_fast	moe_router_softmax_top10_f32_fa
 native_mtp	hip	moe_scatter_fused_top10	moe_scatter_fused_top10,moe_scatter_fused_top10_serial	e0c7b4dab79c6bb736a274bbef6bd904b3493ea74bb73ae77aa12189977d284f
 native_mtp	hip	mq_rotate_x	mq_rotate_x	0f4efbebb43c5d7b630c6383e9048549b18a338699b39411c8151dbb6061b51b
 native_mtp	hip	mq_rotate_x_128_v2	mq_rotate_x_128_v2,mq_rotate_x_128_v2_silu_bf16	59ea18d4b80625ad95dd94dc2707275cb356e04ceacea6d4d3852bc56c6b1888
-native_mtp	hip	mq_rotate_x_i4	mq_rotate_x_i4	d4426c94c6c27e30abba642235a730b49c623f1b34f6164608ce8bd4a2be11cd
+native_mtp	hip	mq_rotate_x_i4	mq_rotate_x_i4	11a13a049577a76c1ac507ec0b446cc551a8dcf85f8729503bd5a582d76c0b88
 native_mtp	hip	mq_rotate_x_i8_gfx12	mq_rotate_x_i8_gfx12	e455ba957e9fd4de8c24dc9c7d1fad40e3b10d360ca8827b8a9898b3d2a4a3e3
 native_mtp	hip	qsa_bf16_scores	indexed_attention_select_scores_rows16_bf16,indexed_attention_select_scores_rows8_bf16	1226e777abfe7eb2db2fb5ddfc2d5a87bc806d154775250d35acba40bd5a1d44
 native_mtp	hip	qsa_filter_select	qsa_filter_compact,qsa_filter_finish,qsa_filter_threshold	99f0cdb2aa0313fef50a62a63175647b3eae559018abd254249e33f401a0bc4d
