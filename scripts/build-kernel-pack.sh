@@ -10,7 +10,7 @@
 # against the sources, the build compiler and each object's kernel exports, and records the provenance.
 #
 # Outputs, per arch, in --out:
-#   hipfire-kernels-<tag>-<arch>.tar.gz         manifest.json + <arch>/*.{hsaco,hash,index.json}
+#   hipfire-kernels-<tag>-<arch>.tar.gz         manifest.json + <arch>/*.{hsaco,hash,index.json,radiowave.json}
 #   hipfire-kernels-<tag>-<arch>.tar.gz.sha256  `sha256sum` line for the tarball
 #   hipfire-kernels-<tag>-<arch>.manifest.json  copy of the manifest in the tarball
 #
@@ -162,7 +162,7 @@ BUILD_ENV+=("HIPFIRE_PACK_JOBS=$MODULE_JOBS")
 # Caller device/job selection passes through untouched: the pack build itself
 # runs no GPU work, but the caller's ROCR/HIP visibility and cargo job budget
 # must reach the compile workers unchanged (never defaulted or clamped here).
-for name in ROCM_PATH HIP_PATH HIPFIRE_ROCM_ROOT HIPFIRE_ROCM_PATH HIPFIRE_HIPCC HIPFIRE_ROCM_STRICT RUSTUP_TOOLCHAIN ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES HIPFIRE_DEVICES CUDA_VISIBLE_DEVICES CARGO_BUILD_JOBS; do
+for name in ROCM_PATH HIP_PATH HIPFIRE_ROCM_ROOT HIPFIRE_ROCM_PATH HIPFIRE_HIPCC HIPFIRE_ROCM_STRICT RADIOWAVE_BUNDLER RADIOWAVE_READOBJ RADIOWAVE_OBJDUMP RUSTUP_TOOLCHAIN ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES HIPFIRE_DEVICES CUDA_VISIBLE_DEVICES CARGO_BUILD_JOBS; do
     if [ -n "${!name:-}" ]; then
         BUILD_ENV+=("$name=${!name}")
     fi

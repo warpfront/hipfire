@@ -116,7 +116,7 @@ tag's exact commit by `scripts/build-kernel-pack.sh` (hipcc, no GPU):
 
 | Release asset | Contents |
 |---|---|
-| `hipfire-kernels-<tag>-<arch>.tar.gz` | `manifest.json` and `<arch>/` with every registry module's `.hsaco`, `.hash` and `.index.json` |
+| `hipfire-kernels-<tag>-<arch>.tar.gz` | `manifest.json` and `<arch>/` with every registry module's `.hsaco`, `.hash`, `.index.json` and `.radiowave.json` (Radiowave certification; the retained-PM4 VMEM acquires need it) |
 | `hipfire-kernels-<tag>-<arch>.tar.gz.sha256` | `sha256sum` line for the tarball |
 | `hipfire-kernels-<tag>-<arch>.manifest.json` | copy of the manifest: commit, ROCm and HIP version, compiler identity, code-object version, admitted ROCm range |
 

@@ -33,7 +33,7 @@ pub struct PackManifest {
     /// Full commit the objects were compiled from.
     pub commit: String,
     pub arch: String,
-    /// Registry module count; every module has `.hsaco`, `.hash` and `.index.json`.
+    /// Registry module count; every module has `.hsaco`, `.hash`, `.index.json` and (since HIPF-530) `.radiowave.json`.
     pub modules: usize,
     pub kernel_cache_abi: u32,
     /// Registry extra hipcc flags (default `FeatureFlags` for `arch`).
@@ -62,6 +62,8 @@ pub struct VerifiedPack {
     pub modules: usize,
     pub toolchain_id: String,
     pub code_object_version: u32,
+    /// Modules whose `.radiowave.json` sidecar verifies against the object.
+    pub radiowave_certified: usize,
 }
 
 /// Verify an installed-layout `<arch>` directory against the registry this
@@ -174,6 +176,7 @@ pub(crate) fn verify_entries(
     let mut expected = BTreeSet::new();
     let mut toolchain: Option<String> = None;
     let mut code_object: Option<u32> = None;
+    let mut radiowave_certified = 0;
     for entry in entries {
         let key =
             KernelCompiler::packaging_hash_for(arch, entry.module, entry.source(), extra_flags);
@@ -211,7 +214,15 @@ pub(crate) fn verify_entries(
             }
             Some(_) => {}
         }
-        for suffix in ["hsaco", "hash", "index.json"] {
+        // Optional (older packs have none), but a sidecar that is shipped must
+        // certify these exact bytes: the runtime would silently ignore it.
+        let sidecar = dir.join(format!("{}.radiowave.json", entry.module));
+        if let Ok(json) = std::fs::read_to_string(&sidecar) {
+            radiowave::CodeObjectCertification::from_json(&bytes, &json)
+                .map_err(|e| format!("{}: {e}", sidecar.display()))?;
+            radiowave_certified += 1;
+        }
+        for suffix in ["hsaco", "hash", "index.json", "radiowave.json"] {
             expected.insert(format!("{}.{suffix}", entry.module));
         }
     }
@@ -229,6 +240,7 @@ pub(crate) fn verify_entries(
         modules: entries.len(),
         toolchain_id: toolchain.ok_or_else(|| format!("{arch}: empty registry"))?,
         code_object_version: code_object.ok_or_else(|| format!("{arch}: empty registry"))?,
+        radiowave_certified,
     })
 }
 
