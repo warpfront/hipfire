@@ -3598,9 +3598,9 @@ fn slots_model_arch(arch_id: u32) -> &'static str {
 ///
 /// Without this the multi-slot executor never called
 /// `configure_model_default`, so an explicit `HIPFIRE_REPLAY_BACKEND=pm4`
-/// or an automatic `.mq4r` / gfx1201 dense default left the controller on
-/// HIP. MoE is not an automatic gfx1201 default (`qwen3_5` only); a
-/// `.mq4r` A3B still follows the extension predicate, matching sequential.
+/// or an automatic gfx1201 dense MQ4R default left the controller on
+/// HIP. MoE is not an automatic gfx1201 default (`qwen3_5` only); an
+/// A3B load still follows the route-SKU predicate, matching sequential.
 ///
 /// **MoE (arch 6) is admitted.** The slots body is the per-slot descriptor
 /// path, not the sequential dense tape, so it needed its own receipt: on
@@ -3623,13 +3623,13 @@ fn configure_slots_redline(
     let path = model_path.to_string_lossy();
     let arch = slots_model_arch(arch_id);
     // The multi-slot retained tape is validated on gfx1100 (the paged pool's
-    // supported arch) and on gfx1201 (the documented `.mq4r` policy). On any
+    // supported arch) and on gfx1201 (the documented MQ4R policy). On any
     // other arch the slots engine keeps the eager HIP route: gfx1151 never had
     // a slots tape, and arming one there is unvalidated.
     let slots_arch_supported = matches!(gpu.arch.as_str(), "gfx1100" | "gfx1201");
     // Route identity is the same one the single-slot loader derives from the
-    // file (`route_sku::resolve_path`), so a `.mq4r`/`.mq4rs` slots load gets
-    // the same `.mq4r` policy; an unresolvable route yields `None`, which is
+    // file (`route_sku::identify_path`), so an MQ4R/MQ4RS slots load gets
+    // the same MQ4R policy; an unresolvable route yields `None`, which is
     // the "do not auto-arm" direction.
     // One open yields the SKU and the dense decode weight format (tensor
     // index + HFQ metadata, never the name), as the daemon derives them.
