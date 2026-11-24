@@ -357,11 +357,8 @@ module	gemm_gate_up_hfq3g256_dp4a	non-target-arch	Only non-target gfx906/gfx942/
 module	gemm_gate_up_hfq3g256_fp16	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; hipfire-dispatch/src/families/fused_qkv.rs:1268-1272
 module	gemm_gate_up_hfq3g256_mmq_x16	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:8196
 module	gemm_gate_up_hfq3g256_mmq_x32	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:8200
-module	gemm_gate_up_hfq4g256_dot2	developer-opt-in	Non-default developer override: HIPFIRE_QKVZA_SPLIT_TAIL; rdna-compute/src/feature_flags.rs:965
 module	gemm_gate_up_hfq4g256_fp16	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:7224
 module	gemm_gate_up_hfq4g256_fp16_wave64	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:7175
-module	gemm_gate_up_hfq4g256_mmq_x16	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:9215
-module	gemm_gate_up_hfq4g256_mmq_x32	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:9219
 module	gemm_gate_up_hfq4g256_wave64_dp4a	developer-opt-in	Non-default developer override: HIPFIRE_GEMV_DP4A; rdna-compute/src/feature_flags.rs:831
 module	gemm_gate_up_hfq4g256_wmma_2tile	developer-opt-in	Non-default developer override: HIPFIRE_GATE_UP_VARIANT; rdna-compute/src/gemm.rs:13124-13166
 module	gemm_gate_up_hfq4g256_wmma_gfx12_ldsstage	developer-opt-in	Non-default developer override: HIPFIRE_HFQ4G256_LDSSTAGE; rdna-compute/src/gemm.rs:35078-35084
@@ -436,8 +433,6 @@ module	gemm_hfq4g256_residual_mfma_v3_gfx942	non-target-arch	Only non-target gfx
 module	gemm_hfq4g256_residual_mfma_v4_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:19120-19143
 module	gemm_hfq4g256_residual_mmq_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_WO_MMQ; rdna-compute/src/gemm.rs:19903-19920
 module	gemm_hfq4g256_residual_mmq_rdna2	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:19186
-module	gemm_hfq4g256_residual_mmq_x16	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:8884
-module	gemm_hfq4g256_residual_mmq_x32_y64	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:8886
 module	gemm_hfq4g256_residual_wave64_dp4a	developer-opt-in	Non-default developer override: HIPFIRE_GEMV_DP4A; rdna-compute/src/feature_flags.rs:831
 module	gemm_hfq4g256_residual_wmma	developer-opt-in	Non-default developer override: HIPFIRE_WO_WMMA_VARIANT; rdna-compute/src/gemm.rs:22511-22561
 module	gemm_hfq4g256_residual_wmma_gfx12_ldsstage	developer-opt-in	Non-default developer override: HIPFIRE_HFQ4G256_LDSSTAGE; rdna-compute/src/gemm.rs:13845-13885
@@ -559,8 +554,6 @@ module	gemm_qkv_hfq3g256_mmq_x32	non-target-arch	Only non-target gfx906/gfx942/g
 module	gemm_qkv_hfq4g256_dot2	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:6367
 module	gemm_qkv_hfq4g256_fp16	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:6372
 module	gemm_qkv_hfq4g256_fp16_wave64	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:6316
-module	gemm_qkv_hfq4g256_mmq_x16	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:9060
-module	gemm_qkv_hfq4g256_mmq_x32	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:9064
 module	gemm_qkv_hfq4g256_wave64_dp4a	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:6312
 module	gemm_qkv_hfq4g256_wmma_gfx12_mq2v2	codec-outside-core-rungs	MQ2G256V2/MQ2V2 route absent from admitted core artifact rungs; docs/QUANTIZATION.md:68
 module	gemm_qkv_hfq4g256_wmma_gfx12_mq5v2	codec-outside-core-rungs	Non-slab MQ5G256V2 layout absent from core XTS artifact rungs; rdna-compute/src/gemm.rs:41418-42059
@@ -729,7 +722,6 @@ module	gemv_hfq4g256_multirow_gfx1151_k2048_mq4v2	developer-opt-in	Non-default d
 module	gemv_hfq4g256_multirow_rdna3	developer-opt-in	Non-default developer override: HIPFIRE_GEMV_ROWS; rdna-compute/src/arch_caps.rs:166-172
 module	gemv_hfq4g256_multirow_rdna3_mq3v2	developer-opt-in	Non-default developer override: HIPFIRE_GEMV_ROWS; rdna-compute/src/arch_caps.rs:166-172
 module	gemv_hfq4g256_multirow_rdna3_mq4v2	developer-opt-in	Non-default developer override: HIPFIRE_GEMV_ROWS; rdna-compute/src/arch_caps.rs:166-172
-module	gemv_hfq4g256_rdna2v1	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/kernels.rs:6946-6962
 module	gemv_hfq4g256_rdna2v2	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/kernels.rs:6946-6962
 module	gemv_hfq4g256_rdna2v3	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/kernels.rs:6946-6962
 module	gemv_hfq4g256_rdna2v4	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/kernels.rs:6946-6962
@@ -1002,6 +994,7 @@ module	latent_attention_serial	non-core-family	DeepSeek4/Raon MLA serial attenti
 module	latent_attention_split	non-core-family	DeepSeek4/Raon MLA split-KV and RMS rows via latent-attention pipeline; hipfire-dispatch/src/pipeline/latent_attention.rs:349
 module	layernorm_f32	config-opt-in	Non-default configuration: vision.mode / vision.rs; qwen35_vl.rs:1329
 module	layernorm_modulate	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/flux_gpu.rs:1971
+module	lloyd_fit	developer-opt-in	Offline quantizer only, never an inference load: hipfire-quantize JITs its own kernels/lloyd_fit.hip (MQ4V2-Lloyd free fit + polish) solely under the non-default developer override HIPFIRE_QUANT_GPU=1; hipfire-quantize/src/lloyd_gpu.rs:94-97
 module	logit_softcap_f32	non-core-family	Non-core family route: Muse Glimmer, Gemma, LFM2; forward.rs:507-3897
 module	max_prob	developer-opt-in	Only forward_early_exit (llama.rs) calls max_prob, and its only callers are the bench_early_exit/sweep_exit examples; hipfire-runtime/src/llama.rs:4914
 module	modulate_f32	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/flux_gpu.rs:3114
