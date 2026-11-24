@@ -22,7 +22,10 @@ use super::sched::{Batch, Ended, Place, Scheduler};
 use super::{admit_budget, DoneMetrics, Exit, Finish, Next, RequestRun, Verdict};
 use crate::ar::*;
 use crate::batch::{drain_qwen_batch_inbox, is_vmm_batch_request_eligible};
-use crate::common::fit_max_tokens_if;
+use crate::common::{
+    emit_fail_closed_error_for_route, fit_max_tokens_if, RollbackEpilogue,
+    UNATTESTED_CANCEL_MESSAGE,
+};
 use hipfire_engine::emit::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
@@ -212,9 +215,11 @@ impl Driver {
                 stdout,
             )?;
             let ended = self.core.tick(&mut ctx);
+            let mut attested = Ok(());
             for ended in ended {
-                ctx.settle(&mut self.core, ended);
+                attested = attested.and(ctx.settle(&mut self.core, ended));
             }
+            attested?;
         }
     }
 
@@ -399,7 +404,7 @@ impl Driver {
                             ..
                         } = &mut *m;
                         let state = state.as_deref_mut().ok_or("the model has no state")?;
-                        let rolled_back = rollback(
+                        let released = rollback(
                             state,
                             runner,
                             gpus,
@@ -407,10 +412,14 @@ impl Driver {
                             spec_deferred_seed,
                             None,
                         );
-                        if let Err(error) = rolled_back {
-                            eprintln!("[engine] rollback of {}: {error}", key.id);
-                        }
+                        let generated =
+                            done.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let cancelled = cancel(stdout, &key.id, generated, released);
+                        let _ = sched.abort_lane(idx, &key, admission);
+                        // An unattested state is never handed to the next request.
+                        cancelled?;
                         self.core.release_resident();
+                        continue;
                     }
                     _ => {
                         if let Some(lanes) = lanes_of(m) {
@@ -587,6 +596,44 @@ fn keep_record(
     }
 }
 
+/// A cancel's terminal after its release: the engine `aborted` done when the
+/// release was attested, else the singleton's fail-closed error
+/// (`rolled_back: false`, no `done`) and `Err` so the driver stops serving
+/// the unattested state.
+fn cancel(
+    stdout: &mut impl Write,
+    id: &str,
+    generated: usize,
+    released: Result<(), String>,
+) -> Result<(), String> {
+    match released {
+        Ok(()) => {
+            emit_engine_cancel(ROUTE, stdout, id, generated);
+            Ok(())
+        }
+        Err(error) => {
+            let epilogue = RollbackEpilogue {
+                rolled_back: false,
+                context: Some(error.clone()),
+            };
+            emit_fail_closed_error_for_route(
+                ROUTE,
+                stdout,
+                Some(id),
+                UNATTESTED_CANCEL_MESSAGE,
+                "validation",
+                false,
+                &epilogue,
+            );
+            Err(unattested(error))
+        }
+    }
+}
+
+fn unattested(error: String) -> String {
+    format!("engine rollback not attested; process restart required: {error}")
+}
+
 /// The attested rollback of the resident state (the singleton's): the
 /// request's outputs drained and freed, the turn cache and deferred seed
 /// dropped, every owner reset.
@@ -677,7 +724,8 @@ impl<'a> Ctx<'a> {
 
     /// Give an ended request its terminal: release what its state held, then
     /// `commit_ready` (finished) or the cancel / error.
-    fn settle(&mut self, core: &mut Scheduler, ended: Ended) {
+    /// `Err`: the resident rollback was not attested; the driver fails closed.
+    fn settle(&mut self, core: &mut Scheduler, ended: Ended) -> Result<(), String> {
         let Ended {
             idx,
             place,
@@ -691,7 +739,7 @@ impl<'a> Ctx<'a> {
         let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
         let exit = match exit {
             Exit::Finished(finish) => match self.finish(idx, place, finish) {
-                Ok(()) => return,
+                Ok(()) => return Ok(()),
                 Err(error) => {
                     if place == Place::Resident {
                         core.release_resident();
@@ -709,12 +757,9 @@ impl<'a> Ctx<'a> {
             Place::Lane => self.lanes().map(|lanes| lanes.free_lane(live.tag)),
             Place::Queued => Ok(()),
         };
-        match exit {
-            Exit::Aborted => {
-                emit_engine_cancel(ROUTE, self.stdout, &key.id, generated);
-            }
+        let settled = match exit {
+            Exit::Aborted => cancel(self.stdout, &key.id, generated, released),
             Exit::Failed(error) => {
-                let rolled_back = released.is_ok();
                 emit_generation_error(
                     ROUTE,
                     self.stdout,
@@ -722,12 +767,14 @@ impl<'a> Ctx<'a> {
                     &format!("{} engine: {error}", ROUTE.name()),
                     "gpu",
                     false,
-                    rolled_back,
+                    released.is_ok(),
                 );
+                released.map_err(unattested)
             }
             Exit::Finished(_) => unreachable!("handled above"),
-        }
+        };
         let _ = self.sched.abort_lane(idx, &key, admission);
+        settled
     }
 
     /// A finished request: its stream flushed, its state kept where it ran
@@ -1060,5 +1107,54 @@ impl Batch for Ctx<'_> {
         self.lives[idx].as_ref().is_some_and(|live| {
             batch_check_abort(&live.key.id, live.key.attempt_id, live.admission)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(out: &[u8]) -> Vec<serde_json::Value> {
+        String::from_utf8_lossy(out)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// Emit `id`'s start then its cancel after `released`, as the driver
+    /// does inside an admitted attempt's scope; the wire after the start.
+    fn cancelled(
+        id: &str,
+        attempt: u64,
+        released: Result<(), String>,
+    ) -> (Result<(), String>, Vec<serde_json::Value>) {
+        let admission = batch_announce_terminal(id, attempt).expect("batch admission");
+        let _scope = BatchAttemptScope::enter_for_generation(id, attempt, admission);
+        let mut out = Vec::new();
+        emit_generation_start(ROUTE, &mut out, id, false);
+        let started = out.len();
+        let result = cancel(&mut out, id, 3, released);
+        (result, lines(&out[started..]))
+    }
+
+    #[test]
+    fn a_cancel_whose_rollback_fails_fails_closed_without_done() {
+        let _guard = crate::ar::generation_test_lock();
+        let (result, wire) = cancelled("hipf533-unattested", 5331, Err("reset failed".into()));
+        let error = result.unwrap_err();
+        assert!(error.contains("process restart required"), "{error}");
+        assert_eq!(wire.len(), 1, "one terminal, no done: {wire:?}");
+        assert_eq!(wire[0]["type"], "error", "{wire:?}");
+        assert_eq!(wire[0]["rolled_back"], false, "{wire:?}");
+        assert!(wire[0]["message"].as_str().is_some_and(|m| m
+            .starts_with(UNATTESTED_CANCEL_MESSAGE)
+            && m.contains("reset failed")));
+
+        let (result, wire) = cancelled("hipf533-attested", 5332, Ok(()));
+        result.unwrap();
+        assert!(
+            wire.iter().any(|line| line["finish_reason"] == "aborted"),
+            "{wire:?}"
+        );
     }
 }
