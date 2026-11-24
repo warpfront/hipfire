@@ -27,7 +27,9 @@ Also emits five informational gauges (`gauge_*`, no ceiling line, never fail; th
 feed the Monday digest): `gauge_generate_entry_fns` (`pub fn generate_*` in
 hipfire-generate/src), `gauge_generation_routes` (variants of `GenerationRoute`),
 `gauge_engine_routes` (entries of `ENGINE_ROUTES`), `gauge_map_md_files` (committed
-`crates/**/map.md`) and `gauge_ci_gate_steps` (`run` lines in scripts/ci-gates.sh).
+`crates/**/map.md`), `gauge_typed_arch_compares` (`== GfxArch::X`, `matches!(.., GfxArch::..)`,
+`.is_gfx*()` lines outside the arch-capability owners: arch coupling that the string
+ratchet stops seeing once strings become typed)  and `gauge_ci_gate_steps` (`run` lines in scripts/ci-gates.sh).
 
 Only non-test code counts: `crates/*/src/**/*.rs`, excluding build.rs, comments,
 `#[cfg(test)]` items and out-of-line `#[cfg(test)] mod x;` files.
@@ -100,6 +102,7 @@ GUIDANCE = {
 
 DOWNCAST = re.compile(r"\bdowncast_(?:ref|mut)\s*::\s*<\s*([A-Za-z_][\w:]*)")
 GFX_CMP = re.compile(r'(?:==|!=)\s*"gfx|"gfx[^"\n]*"\s*(?:==|!=)|starts_with\(\s*"gfx')
+TYPED_ARCH_CMP = re.compile(r"(?:==|!=)\s*GfxArch::\w+|GfxArch::\w+\s*(?:==|!=)|\.is_gfx\w*\(\)")
 MATCHES = re.compile(r"\bmatches!\s*\(")
 ENV_LIT = re.compile(r'\benv::var(?:_os)?\(\s*"HIPFIRE_[A-Z0-9_]+"\s*\)')
 ENV_CALL = re.compile(r"\benv::var(?:_os)?\(\s*([A-Z][A-Z0-9_]*)\s*\)")
@@ -140,7 +143,7 @@ def sources() -> list[tuple[str, str]]:
         if path.name == "build.rs":
             continue
         raw = path.read_text(encoding="utf-8", errors="ignore")
-        if any(token in raw for token in ("downcast_", "gfx", "HIPFIRE_", "fn generate_", "enum GenerationRoute", "ENGINE_ROUTES")):
+        if any(token in raw for token in ("downcast_", "gfx", "HIPFIRE_", "fn generate_", "GfxArch::", ".is_gfx", "enum GenerationRoute", "ENGINE_ROUTES")):
             texts[path] = production_text(path, raw, test_files)
         elif "cfg(" in raw:  # only the out-of-line test modules matter here
             for m in CFG_TEST.finditer(raw):
@@ -197,12 +200,22 @@ def gauges(texts: list[tuple[str, str]]) -> dict[str, int]:
             if m:
                 body = text[m.end():text.index("]", m.end())]
                 engine_routes = len(re.findall(r"GenerationRoute::\w+", body))
+    typed = 0
+    for rel, text in texts:
+        if rel in ARCH_OWNER_FILES or ARCH_OWNER_CRATES.match(rel.split("/")[1]):
+            continue
+        hits = {line_of(text, m.start()) for m in TYPED_ARCH_CMP.finditer(text)}
+        for m in MATCHES.finditer(text):
+            if "GfxArch::" in text[m.end():match_close(text, m.end() - 1)]:
+                hits.add(line_of(text, m.start()))
+        typed += len(hits)
     ci = (ROOT / "scripts/ci-gates.sh").read_text(encoding="utf-8", errors="ignore")
     return {
         "gauge_generate_entry_fns": entry_fns,
         "gauge_generation_routes": routes,
         "gauge_engine_routes": engine_routes,
         "gauge_map_md_files": sum(1 for p in ROOT.glob("crates/**/map.md") if "target" not in p.relative_to(ROOT).parts),
+        "gauge_typed_arch_compares": typed,
         "gauge_ci_gate_steps": len(re.findall(r"^\s*run\s", ci, re.M)),
     }
 
