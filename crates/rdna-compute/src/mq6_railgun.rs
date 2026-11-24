@@ -104,10 +104,7 @@ fn digest(bytes: &[u8]) -> String {
 
 fn check_gpu(gpu: &Gpu) -> Result<PciBusId, Mq6RailgunError> {
     gpu.bind_thread().map_err(failure)?;
-    require(
-        gpu.arch == "gfx1151" && gpu.arch_caps.is_gfx1151(),
-        "exact gfx1151 required",
-    )?;
+    require(gpu.arch_caps.is_gfx1151(), "exact gfx1151 required")?;
     require(
         !gpu.replay.is_recording() && !gpu.replay.is_g0_observing(),
         "explicit programs cannot participate in Redline recording/G0 observation",

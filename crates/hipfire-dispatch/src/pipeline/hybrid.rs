@@ -178,7 +178,7 @@ fn is_mq4_rot(gpu: &Gpu, dtype: DType) -> bool {
 /// is a fail-closed escape hatch.
 fn gdn_compact2(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> bool {
     let arch_enabled =
-        (gpu.arch_caps.is_gfx1201() || gpu.arch_caps.arch() == "gfx1100" || gfx1151_radiowave(gpu))
+        (gpu.arch_caps.is_gfx1201() || gpu.arch_caps.is_gfx1100() || gfx1151_radiowave(gpu))
             && gpu.flags.gdn_compact2;
     arch_enabled && q8_state && dims.linear_key_heads * 2 == dims.linear_value_heads
 }
@@ -382,7 +382,7 @@ pub fn conv_scalar_prep(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> bool {
 
 pub fn conv_qknorm(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> bool {
     let arch_enabled = (gpu.arch_caps.is_gfx1201()
-        || gpu.arch_caps.arch() == "gfx1100"
+        || gpu.arch_caps.is_gfx1100()
         || gfx1101_campaign(gpu)
         || gfx1151_radiowave(gpu))
         && gpu.flags.conv_qknorm;

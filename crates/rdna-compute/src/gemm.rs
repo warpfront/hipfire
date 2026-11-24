@@ -39504,7 +39504,7 @@ impl Gpu {
 
     /// Shared exact-gfx1151 / shape precondition of the `*_gfx1151_xlds` launchers.
     fn gfx1151_xlds_check(&self, what: &str, batch_size: usize, k: usize) -> HipResult<()> {
-        if !(self.arch_caps.is_gfx1151() && self.arch == "gfx1151") {
+        if !self.arch_caps.is_gfx1151() {
             return Err(hip_bridge::HipError::new(
                 1,
                 &format!("{what}: exact gfx1151 only"),
@@ -40215,7 +40215,7 @@ impl Gpu {
                 ),
             ));
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.is_gfx1100() {
             return Err(hip_bridge::HipError::new(
                 1,
                 &format!(
@@ -40328,7 +40328,7 @@ impl Gpu {
             }
             return self.gemm_mq4g256v2_residual_wmma(a_raw, x, y, m, k, batch_size);
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.is_gfx1100() {
             return Err(hip_bridge::HipError::new(
                 1,
                 &format!(

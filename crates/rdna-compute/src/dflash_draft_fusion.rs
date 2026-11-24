@@ -114,7 +114,7 @@ impl Gpu {
         batch: usize,
         has_awq: bool,
     ) -> DraftCollapseV2 {
-        if !self.arch_caps.is_gfx1100() || self.arch != "gfx1100" {
+        if !self.arch_caps.is_gfx1100() {
             return DraftCollapseV2::Off;
         }
         if self.flags.draft_collapse_off {

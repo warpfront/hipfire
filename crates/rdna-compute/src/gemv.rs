@@ -8748,7 +8748,7 @@ impl Gpu {
             "gemv_mfp4g32_e8_soa requires K%256==0, got K={k}"
         );
 
-        if self.arch_caps.arch() == "gfx1201" {
+        if self.arch_caps.is_gfx1201() {
             const KERNEL: &str = "gemv_mfp4g32_e8_soa_gfx1201";
             self.ensure_kernel(KERNEL, kernels::GEMV_MFP4G32_E8_SOA_GFX1201_SRC, KERNEL)?;
             let a_ptr = a_raw.buf.as_ptr();

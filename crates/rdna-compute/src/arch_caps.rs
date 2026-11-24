@@ -971,4 +971,23 @@ mod tests {
             assert!(caps.should_use_mmq(128), "{arch} should use mmq at 128");
         }
     }
+
+    /// Dropping `arch == "gfxN"` beside `is_gfxN()` (and `arch() == "gfxN"` for
+    /// `is_gfxN()`) is behaviour-preserving only while every atom is exactly the
+    /// string compare and `arch()` echoes the constructor string.
+    #[test]
+    fn atom_equals_arch_string_compare_for_every_arch() {
+        let all = [
+            "gfx906", "gfx908", "gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032",
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+            "gfx1201", "gfx940", "gfx941", "gfx942", "gfx1036", "gfx000",
+        ];
+        for arch in all {
+            let c = make_caps(arch);
+            assert_eq!(c.arch(), arch);
+            assert_eq!(c.is_gfx1100(), arch == "gfx1100", "{arch}");
+            assert_eq!(c.is_gfx1151(), arch == "gfx1151", "{arch}");
+            assert_eq!(c.is_gfx1201(), arch == "gfx1201", "{arch}");
+        }
+    }
 }
