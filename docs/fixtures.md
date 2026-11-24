@@ -646,3 +646,39 @@ fixture are in
   fixture). Bitwise gates for lane changes therefore compare candidate against
   incumbent under the same setting, never a lane against the singleton
   ([`lessons-0.4.5.md`](methodology/lessons-0.4.5.md) § 7).
+
+## Dense Q8 attention conformance fixture (generated)
+
+`pin:model/dense-q8-llama.hfq` is generated in-tree, not downloaded: a seeded
+2-layer LLaMA-class HFQM that the production carrier loads
+(`hipfire_arch_llama::load_llama_bundle`, route `ManifestPlainLlama`) with every
+2D weight in `Q8F16` (quant type 3). It is the input of the I10 absolute anchor
+for attention-only families (V2-PLAN B2.x and B2.r).
+
+- **Writer:** `crates/hipfire-arch-llama/src/fixture.rs`
+  (`write_dense_q8_fixture`). Integer-only SplitMix64 keyed by the tensor name,
+  no float math and no clock, so the bytes are identical on every host
+  (checked on hiptrx and hipx by `fixture_matches_the_pinned_digest`).
+- **Geometry:** hidden 256, 2 layers, 4 query and 2 KV heads of `head_dim` 128
+  (GQA ratio 2), intermediate 512, vocab 64, 64 positions, `rope_theta` 500000,
+  separate `lm_head`. Shrunk: depth, vocabulary, context. Kept real-size:
+  `head_dim`, GQA ratio, `K % 32 == 0` on every projection.
+- **Q8F16 layout:** blocks of 34 bytes along the flattened row-major weights:
+  `f16 scale` (little endian) then 32 `i8`; element = `i8 * scale`; HFQM index
+  `quant_type = 3`, `group_size = 32`. Norms are F16. The decode is documented
+  next to the writer and decoded independently by the CPU reference.
+- **CPU reference:** `crates/hipfire-arch-llama/src/cpu_reference.rs`.
+  Independent Q8F16/F16 decode and a teacher-forced `f64` LLaMA forward (RMSNorm,
+  half-split RoPE, grouped-query attention, SwiGLU, untied head). `BUDGET`
+  (max |dlogit| 0.16, max KLD 7e-4, mean KLD 3e-4 per row set) was frozen from a
+  gfx1201 pilot on four prompts disjoint from `PROMPTS` before the gate prompts
+  were compared; it is never loosened to fit a run.
+- **The row:** `cargo test -p hipfire-arch-llama --test dense_q8_anchor_gpu`
+  inside a fabric job (`B2R_REQUIRE_GPU=1` turns a missing GPU from a skip into
+  a failure; `B2R_RECEIPT=<path>` writes the row as JSON; `B2R_PROMPT_SET=pilot`
+  re-measures the budget set). It loads the fixture, asserts every projection is
+  `Q8_0` on the GPU, compares decode logits per position and the batched-prefill
+  last row against the reference on the three `PROMPTS` (5, 11 and 19 tokens),
+  checks every embedding row bit for bit, compares greedy generation where the
+  reference pick is separated by at least twice the logit budget, and requires a
+  planted wrong dequant scale on the CPU side to fail the same budget.

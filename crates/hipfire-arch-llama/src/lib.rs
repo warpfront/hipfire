@@ -50,8 +50,12 @@
 pub mod arch;
 pub mod arch_model;
 pub mod carrier;
+/// CPU reference for the dense Q8 fixture (B2.r, the I10 anchor).
+pub mod cpu_reference;
 /// DSpark qwen3-8B drafter sidecar loader.
 pub mod dspark_body;
+/// Seeded tiny Q8F16 LLaMA-family HFQM (B2.x) for conformance rows.
+pub mod fixture;
 /// LLaMA-family implementation of the arch-generic speculative-decode seam.
 pub mod spec_impl;
 
