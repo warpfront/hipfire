@@ -158,6 +158,46 @@ pub trait MeshLanes {
     fn keeps_records(&self) -> bool {
         true
     }
+    /// Whether these lanes run speculative windows: a request parks with its
+    /// drafter's state ([`Self::park_window`]) and steps in windows
+    /// ([`Self::step_windows`]); an AR request does not park.
+    fn windows(&self) -> bool {
+        false
+    }
+    /// [`Self::park`] of a speculative request at a window boundary: it ran
+    /// `prompt` and every `emitted` token but the last, its next window's
+    /// seed; `drafter` holds its draft state, which moves into the lane (the
+    /// caller resets the drafter after).
+    fn park_window(
+        &mut self,
+        _gpus: &mut Gpus,
+        _tag: u64,
+        _prompt: &[u32],
+        _emitted: &[u32],
+        _drafter: &mut dyn crate::spec::Speculator,
+        _remaining: usize,
+    ) -> Result<()> {
+        Err("these lanes run no speculative windows".into())
+    }
+    /// One epoch of windows: every `(tag, drafts)` lane verifies at most
+    /// `drafts` drafts on its pending seed; returns, in order, each lane's
+    /// committed tokens (the last is its next seed). On `Err` the step's
+    /// lanes are poisoned (free them).
+    fn step_windows(
+        &mut self,
+        _gpus: &mut Gpus,
+        _rows: &[(u64, usize)],
+    ) -> Result<Vec<LaneWindow>> {
+        Err("these lanes run no speculative windows".into())
+    }
+}
+
+/// One lane's window ([`MeshLanes::step_windows`]).
+pub struct LaneWindow {
+    pub committed: Vec<u32>,
+    /// Drafts it verified (0: an AR row).
+    pub drafted: usize,
+    pub accepted: usize,
 }
 
 /// A committed conversation whose state stays in lane `tag`, holding exactly

@@ -357,6 +357,39 @@ impl RequestRun {
         close.is_empty()
     }
 
+    /// A speculative request at a window boundary leaves its drafting for a
+    /// lane that runs its windows: its next row is its seed (already
+    /// emitted). `None`: not at a window boundary, nothing changed.
+    fn take_window_drafting(&mut self) -> Option<spec::Drafting> {
+        let d = self.draft.as_ref()?;
+        if self.finish.is_some() || d.owed.len() != 1 || !self.forced.is_empty() {
+            return None;
+        }
+        let d = self.draft.take()?;
+        self.pending = Some(Some(d.owed[0]));
+        Some(d)
+    }
+
+    /// A lane window committed `token` and the driver emitted it as
+    /// `verdict`; while the request continues it is the next row's seed.
+    /// Whether it continues.
+    fn apply_window_token(&mut self, token: u32, verdict: Verdict) -> bool {
+        self.pending = None;
+        if verdict != Verdict::Eos {
+            self.generated += 1;
+        }
+        if verdict != Verdict::Continue {
+            self.finish = Some(Finish::of(true));
+            return false;
+        }
+        if self.generated >= self.budget {
+            self.finish = Some(Finish::of(false));
+            return false;
+        }
+        self.pending = Some(Some(token));
+        true
+    }
+
     /// The window from `start` committed `step.emit`, of which the request
     /// kept the first `kept`; `trim` is what became of the rest.
     fn apply_window(

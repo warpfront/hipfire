@@ -113,6 +113,9 @@ struct Live {
     spec_route: Option<SessionRoute>,
     /// An unrepaired terminal window reset its live state.
     invalidated: bool,
+    /// A speculative request in a window lane: its drafter's `done` fields
+    /// at the park, its lane windows counted on.
+    lane_spec: Option<SpecDone>,
 }
 
 /// A request's wire protocol and its stream state, as its route declares it.
@@ -532,6 +535,7 @@ impl Driver {
             spec,
             spec_route: None,
             invalidated: false,
+            lane_spec: None,
         };
         self.lives[idx] = Some(live);
         self.core.admit(idx);
@@ -1042,7 +1046,8 @@ impl<'a> Ctx<'a> {
                 *self.speculator = Some(drafting.drafter);
                 (Some(done_spec), true)
             }
-            None => (None, false),
+            // A window lane's drafter went back at its park.
+            None => (self.live(idx).lane_spec.take().map(|s| (s, false)), false),
         };
         let exit = match exit {
             Exit::Finished(finish) => match self.finish(idx, place, finish, done_spec) {
@@ -1397,6 +1402,76 @@ impl Batch for Ctx<'_> {
         Ok(())
     }
 
+    /// Greedy speculative requests on lanes that run windows (their windows
+    /// are the singleton's greedy accept), AR ones on AR lanes. A minimum
+    /// token count or a think budget keeps a speculative request resident:
+    /// the lane's windows stop at EOS and are never forced.
+    fn lane_takes(&mut self, idx: usize) -> bool {
+        let windows = self.lanes().is_ok_and(|lanes| lanes.windows());
+        let live = self.live(idx);
+        match &live.spec {
+            None => !windows,
+            Some(_) => {
+                windows
+                    && live.sampler.temperature <= 0.0
+                    && hipfire_runtime::sampler::PenaltyTable::flags_for(&live.sampler) == 0
+                    && matches!(
+                        live.wire,
+                        Wire::ChatMl {
+                            min_tokens: 0,
+                            max_think_tokens: 0,
+                            ..
+                        }
+                    )
+            }
+        }
+    }
+
+    /// The drafter's state moves into the lane with the resident state; the
+    /// drafter, reset, goes back to the load for the next request (the
+    /// legacy promotion's release: the resident graphs are re-captured).
+    fn park_window(&mut self, idx: usize, run: &mut RequestRun) -> Result<(), String> {
+        let remaining = run.remaining();
+        let live = self.lives[idx]
+            .as_mut()
+            .ok_or("park of a missing request")?;
+        let d = run.draft.as_mut().ok_or("a window lane needs a drafter")?;
+        self.state
+            .mesh_family()
+            .and_then(|family| family.mesh_lanes())
+            .ok_or("the load staged no engine lanes")?
+            .park_window(
+                self.gpus,
+                live.tag,
+                &live.prompt,
+                &d.emitted,
+                &mut *d.drafter,
+                remaining,
+            )?;
+        let mut d = run
+            .take_window_drafting()
+            .ok_or("a parked speculative request was not at a window boundary")?;
+        live.lane_spec = Some(SpecDone::of(&d));
+        let gpu = &mut self.gpus.devices[0];
+        let reset = d.drafter.reset(gpu);
+        crate::common::fail_closed_invalidate_graphs_and_replay(gpu);
+        gpu.replay.rearm_after_layout_growth();
+        *self.speculator = Some(d.drafter);
+        if let Err(error) = reset {
+            // The request fails from the resident state, which rolls back:
+            // its lane is freed here.
+            if let Some(lanes) = self
+                .state
+                .mesh_family()
+                .and_then(|family| family.mesh_lanes())
+            {
+                lanes.free_lane(live.tag);
+            }
+            return Err(format!("drafter reset after its park: {error}"));
+        }
+        Ok(())
+    }
+
     fn step_lanes(&mut self, rows: &[(usize, u32, bool)]) -> Result<Vec<Next>, String> {
         let tagged: Vec<(u64, u32, bool)> = rows
             .iter()
@@ -1415,6 +1490,34 @@ impl Batch for Ctx<'_> {
                 DecodeOut::Top1(id) => Next::Top1(id),
                 DecodeOut::Logits(row) => Next::Logits(row),
                 DecodeOut::Device => unreachable!("lane rows come back to the host"),
+            })
+            .collect())
+    }
+
+    fn step_windows(&mut self, rows: &[(usize, usize)]) -> Result<Vec<Vec<u32>>, String> {
+        let tagged: Vec<(u64, usize)> = rows
+            .iter()
+            .map(|&(idx, drafts)| (self.live(idx).tag, drafts))
+            .collect();
+        let windows = self
+            .state
+            .mesh_family()
+            .and_then(|family| family.mesh_lanes())
+            .ok_or("the load staged no engine lanes")?
+            .step_windows(self.gpus, &tagged)?;
+        Ok(rows
+            .iter()
+            .zip(windows)
+            .map(|(&(idx, _), window)| {
+                if let Some(spec) = self.live(idx).lane_spec.as_mut() {
+                    if window.drafted > 0 {
+                        spec.tally.windows += 1;
+                        spec.tally.accepted += window.accepted;
+                    } else {
+                        spec.tally.ar_steps += 1;
+                    }
+                }
+                window.committed
             })
             .collect())
     }

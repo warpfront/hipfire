@@ -32,11 +32,15 @@
 //!   tokens are the singleton's for the same seed.
 //! - An abort or failure ends only its own request; [`Ended`] names where its
 //!   state was, so the caller releases exactly that.
-//! - A speculative request ([`super::spec`]) never moves into a lane: it runs
-//!   one window ([`Work::Verify`]) per tick on the resident state, beside the
-//!   lane epoch of the AR requests, until it finishes; the next queued
-//!   request takes the resident state after it. [`Ended`] hands its drafter
-//!   back.
+//! - A speculative request ([`super::spec`]) runs one window ([`Work::Verify`])
+//!   per tick on the resident state, beside the lane epoch of the AR
+//!   requests. Where the lanes run windows ([`Batch::lane_takes`]) it moves
+//!   into a lane at a window boundary like a decoding AR request, its
+//!   drafter's state with it, and the drafter goes back to the load for the
+//!   next one; every tick then runs one window epoch over the window lanes.
+//!   Otherwise it stays resident until it finishes and the next queued
+//!   request takes the resident state after it. [`Ended`] hands a resident
+//!   one's drafter back.
 
 use super::spec::{Drafting, Trim};
 use super::{step, Emit, Exit, Forwards, Next, RequestRun, Verdict, Work};
@@ -81,9 +85,19 @@ pub trait Batch {
     ) -> Result<(u32, Next), String>;
     /// Move the resident `idx` into a lane; its next row runs `seed`.
     fn park(&mut self, idx: usize, seed: u32, remaining: usize) -> Result<(), String>;
+    /// Whether `idx` may decode in a lane: an AR request in AR lanes, a
+    /// speculative one in lanes that run windows.
+    fn lane_takes(&mut self, idx: usize) -> bool;
+    /// Move the resident speculative `idx`, at a window boundary, into a
+    /// lane that runs its windows ([`RequestRun::take_window_drafting`]); on
+    /// `Err` `run` is unchanged.
+    fn park_window(&mut self, idx: usize, run: &mut RequestRun) -> Result<(), String>;
     /// One lane epoch: each `(idx, token, logits)` runs `token`; each row's
     /// argmax ([`Next::Top1`]) or, with `logits`, the row ([`Next::Logits`]).
     fn step_lanes(&mut self, rows: &[(usize, u32, bool)]) -> Result<Vec<Next>, String>;
+    /// One window epoch: each `(idx, drafts)` lane verifies at most `drafts`
+    /// drafts on its seed; returns each one's committed tokens.
+    fn step_windows(&mut self, rows: &[(usize, usize)]) -> Result<Vec<Vec<u32>>, String>;
     /// [`Emit::commit_prompt`] of `idx`.
     fn commit_prompt(&mut self, idx: usize);
     /// [`Emit::emit`] of `idx`.
@@ -125,6 +139,8 @@ struct Req {
     /// The next lane row's token was already streamed, with this
     /// classification: the lane epoch only runs it.
     ahead: Option<(Verdict, Vec<u32>)>,
+    /// Its lane runs speculative windows.
+    window: bool,
 }
 
 #[derive(Default)]
@@ -154,6 +170,7 @@ impl Scheduler {
             run: None,
             fresh: false,
             ahead: None,
+            window: false,
         });
         self.queue.push_back(idx);
     }
@@ -291,8 +308,9 @@ impl Scheduler {
 
     /// The resident request's next epoch; a request that decodes while
     /// others are live moves into a lane (after one drained decode when its
-    /// next token is still on the device). Whether the resident state is
-    /// free for the next request (it moved or was aborted).
+    /// next token is still on the device; a speculative one at its next
+    /// window boundary). Whether the resident state is free for the next
+    /// request (it moved or was aborted).
     fn resident_epoch(&mut self, b: &mut impl Batch, ended: &mut Vec<Ended>) -> bool {
         let Some(idx) = self.resident else {
             return false;
@@ -303,11 +321,19 @@ impl Scheduler {
         }
         let lanes = self.lanes().count();
         let others = lanes > 0 || !self.queue.is_empty();
-        let parks = others && lanes < b.lane_capacity();
+        let parks = others && lanes < b.lane_capacity() && b.lane_takes(idx);
+        // Where a request moves: its seed is host-known (a speculative
+        // request's already emitted).
+        let boundary = |work: &Work| {
+            matches!(
+                work,
+                Work::Decode { token: Some(_) } | Work::Verify { ar: false, .. }
+            )
+        };
         let run = self.run_mut(idx);
-        // A parking request whose next token is host-known moves without an
-        // epoch; every other resident request runs one.
-        if !(parks && matches!(run.next_work(), Work::Decode { token: Some(_) })) {
+        // A parking request at its boundary moves without an epoch; every
+        // other resident request runs one.
+        if !(parks && boundary(&run.next_work())) {
             let mut one = One {
                 b,
                 idx,
@@ -319,23 +345,34 @@ impl Scheduler {
             }
         }
         let run = self.run_mut(idx);
-        let seed = match run.next_work() {
-            Work::Done(finish) => {
-                ended.push(self.end(idx, Exit::Finished(finish)));
-                return false;
+        let work = run.next_work();
+        if let Work::Done(finish) = work {
+            ended.push(self.end(idx, Exit::Finished(finish)));
+            return false;
+        }
+        if !(parks && boundary(&work)) {
+            return false;
+        }
+        let window = matches!(work, Work::Verify { .. });
+        let parked = match work {
+            Work::Decode {
+                token: Some(seed), ..
+            } => {
+                let remaining = run.remaining();
+                b.park(idx, seed, remaining)
             }
-            Work::Decode { token: Some(seed) } if parks => seed,
-            _ => return false,
+            _ => b.park_window(idx, run),
         };
-        let remaining = run.remaining();
-        if let Err(error) = b.park(idx, seed, remaining) {
+        if let Err(error) = parked {
             ended.push(self.end(idx, Exit::Failed(error)));
             return false;
         }
         self.resident = None;
         let req = self.reqs[idx].as_mut().expect("parked request is live");
         req.place = Place::Lane;
-        req.fresh = true;
+        // A window lane's seed was streamed on the resident state.
+        req.fresh = !window;
+        req.window = window;
         true
     }
 
@@ -380,7 +417,8 @@ impl Scheduler {
         }
     }
 
-    /// One decode epoch over at most `lane_rows` decoding lanes, round-robin.
+    /// One decode epoch over at most `lane_rows` decoding lanes, round-robin
+    /// (window lanes run theirs as one window epoch).
     fn lane_epoch(&mut self, b: &mut impl Batch, ended: &mut Vec<Ended>) {
         self.stream_fresh(b, ended);
         let lanes: Vec<usize> = self.lanes().collect();
@@ -389,14 +427,20 @@ impl Scheduler {
         }
         let take = lanes.len().min(b.lane_rows().max(1));
         let mut rows = Vec::with_capacity(take);
+        let mut windows = Vec::new();
         for j in 0..take {
             let idx = lanes[(self.cursor + j) % lanes.len()];
             if b.aborted(idx) {
                 ended.push(self.end(idx, Exit::Aborted));
                 continue;
             }
+            let window = self.reqs[idx].as_ref().is_some_and(|req| req.window);
             let run = self.run_mut(idx);
             match run.next_work() {
+                // A window commits at most its drafts plus one.
+                Work::Decode { token: Some(_) } if window => {
+                    windows.push((idx, run.remaining() - 1));
+                }
                 Work::Decode { token: Some(token) } => rows.push((idx, token, !run.greedy())),
                 work => {
                     let error = format!("a lane request has no host token to run: {work:?}");
@@ -405,6 +449,9 @@ impl Scheduler {
             }
         }
         self.cursor = (self.cursor + take) % lanes.len();
+        if !windows.is_empty() {
+            self.window_epoch(b, &windows, ended);
+        }
         if rows.is_empty() {
             return;
         }
@@ -432,6 +479,57 @@ impl Scheduler {
                 }
             }
             if let Work::Done(finish) = run.next_work() {
+                ended.push(self.end(idx, Exit::Finished(finish)));
+            }
+        }
+    }
+
+    /// One window epoch: every `(idx, drafts)` window lane commits a window,
+    /// whose tokens are emitted in order until one ends the request (the
+    /// rest is dropped with the lane).
+    fn window_epoch(
+        &mut self,
+        b: &mut impl Batch,
+        rows: &[(usize, usize)],
+        ended: &mut Vec<Ended>,
+    ) {
+        let windows = match b.step_windows(rows) {
+            Ok(windows) if windows.len() == rows.len() => windows,
+            failed => {
+                let error = failed.err().unwrap_or_else(|| {
+                    format!(
+                        "a window epoch of {} lanes returned another count",
+                        rows.len()
+                    )
+                });
+                for &(idx, _) in rows {
+                    ended.push(self.end(idx, Exit::Failed(error.clone())));
+                }
+                return;
+            }
+        };
+        for (&(idx, _), committed) in rows.iter().zip(windows) {
+            let mut failed = None;
+            for token in committed {
+                let continues = match b.emit(idx, token) {
+                    // Template tokens are never forced on a window lane
+                    // ([`Batch::lane_takes`]).
+                    Ok((_, close)) if !close.is_empty() => {
+                        Err("a window lane was forced template tokens".to_string())
+                    }
+                    Ok((verdict, _)) => Ok(self.run_mut(idx).apply_window_token(token, verdict)),
+                    Err(error) => Err(error),
+                };
+                match continues {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => failed = Some(error),
+                }
+                break;
+            }
+            if let Some(error) = failed {
+                ended.push(self.end(idx, Exit::Failed(error)));
+            } else if let Work::Done(finish) = self.run_mut(idx).next_work() {
                 ended.push(self.end(idx, Exit::Finished(finish)));
             }
         }
@@ -557,6 +655,7 @@ mod tests {
         Lanes(Vec<usize>),
         Emit(usize),
         Window(usize),
+        Windows(Vec<usize>),
     }
 
     #[derive(Default)]
@@ -580,6 +679,10 @@ mod tests {
         abort_during_prefill: Option<(usize, usize)>,
         /// Requests that decode in speculative windows of 3 greedy tokens.
         spec: Vec<usize>,
+        /// The lanes run speculative windows (only speculative requests park).
+        windows: bool,
+        /// A window lane's pending seed.
+        seeds: HashMap<usize, u32>,
         calls: Vec<Call>,
     }
 
@@ -781,6 +884,22 @@ mod tests {
             Ok(())
         }
 
+        fn lane_takes(&mut self, idx: usize) -> bool {
+            self.spec.contains(&idx) == self.windows
+        }
+
+        fn park_window(&mut self, idx: usize, run: &mut RequestRun) -> Result<(), String> {
+            self.calls.push(Call::Park(idx));
+            run.take_window_drafting()
+                .ok_or("not at a window boundary")?;
+            let Work::Decode { token: Some(seed) } = run.next_work() else {
+                return Err("a window lane runs its seed next".into());
+            };
+            self.seeds.insert(idx, seed);
+            self.in_lane.insert(idx, true);
+            Ok(())
+        }
+
         fn step_lanes(&mut self, rows: &[(usize, u32, bool)]) -> Result<Vec<Next>, String> {
             self.calls
                 .push(Call::Lanes(rows.iter().map(|r| r.0).collect()));
@@ -796,6 +915,30 @@ mod tests {
                     } else {
                         Next::Top1(pick(state))
                     }
+                })
+                .collect())
+        }
+
+        /// The fake's resident window ([`FakeDraft::verify`]) in a lane.
+        fn step_windows(&mut self, rows: &[(usize, usize)]) -> Result<Vec<Vec<u32>>, String> {
+            self.calls
+                .push(Call::Windows(rows.iter().map(|r| r.0).collect()));
+            Ok(rows
+                .iter()
+                .map(|&(idx, drafts)| {
+                    assert!(self.in_lane.contains_key(&idx));
+                    let state = self.state.get_mut(&idx).unwrap();
+                    state.push(self.seeds[&idx]);
+                    let n = (drafts + 1).min(3);
+                    let mut committed = Vec::new();
+                    for i in 0..n {
+                        committed.push(pick(state));
+                        if i + 1 < n {
+                            state.push(*committed.last().unwrap());
+                        }
+                    }
+                    self.seeds.insert(idx, *committed.last().unwrap());
+                    committed
                 })
                 .collect())
         }
@@ -973,6 +1116,48 @@ mod tests {
             .iter()
             .filter(|e| e.idx != 2)
             .all(|e| e.drafting.is_none()));
+    }
+
+    #[test]
+    fn speculative_requests_run_their_windows_together_in_window_lanes() {
+        let reference = alone();
+        for (capacity, rows) in [(4, 4), (4, 2), (2, 2), (1, 1)] {
+            let prompts = prompts();
+            let mut b = fake(&prompts, capacity, rows);
+            b.spec = vec![0, 2, 3];
+            b.windows = true;
+            let mut s = Scheduler::default();
+            for idx in 0..prompts.len() {
+                s.admit(idx);
+            }
+            let ended = run_all(&mut s, &mut b);
+            assert!(ended.iter().all(|e| matches!(e.exit, Exit::Finished(_))));
+            for (idx, tokens) in reference.iter().enumerate() {
+                assert_eq!(
+                    &b.emitted[&idx], tokens,
+                    "request {idx} at capacity {capacity}, rows {rows}"
+                );
+            }
+            assert!(
+                !b.calls.contains(&Call::Park(1)),
+                "an AR request does not park in window lanes"
+            );
+            if capacity > 1 && rows > 1 {
+                assert!(
+                    b.calls
+                        .iter()
+                        .any(|c| matches!(c, Call::Windows(lanes) if lanes.len() > 1)),
+                    "window lanes verify together"
+                );
+            }
+            // A parked request's drafter went back to the load at its park.
+            for e in &ended {
+                assert_eq!(
+                    e.drafting.is_some(),
+                    e.place == Place::Resident && e.idx != 1
+                );
+            }
+        }
     }
 
     #[test]

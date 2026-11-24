@@ -12,7 +12,7 @@ use crate::gpu_forward::Qwen4MeshHead;
 use crate::mesh_bindings::{Qwen4MeshBindings, Qwen4RankBand};
 use crate::program::qwen4_step_graph_with_output;
 use hipfire_dispatch::pipeline::step_graph::StepGraph;
-use hipfire_runtime::mesh_family::{DecodeOut, EpochInput, MeshFamily, MeshLanes};
+use hipfire_runtime::mesh_family::{DecodeOut, EpochInput, LaneWindow, MeshFamily, MeshLanes};
 use hipfire_runtime::multi_gpu::executor::{MeshStepBindings, Result};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::slot_batch::{
@@ -46,6 +46,52 @@ impl Qwen4Bundle {
         let result = body(self, &mut forward);
         self.execution = Some(forward);
         result
+    }
+
+    /// Move the resident request into lane `tag` ([`Self::prepare_promotion`]
+    /// with `generated` ending in its pending seed, then the swap); its
+    /// context is mapped for `remaining` decode rows.
+    fn promote(
+        &mut self,
+        gpu: &mut Gpu,
+        tag: u64,
+        prompt: &[u32],
+        generated: Vec<u32>,
+        remaining: usize,
+        parts: Option<crate::mtp_spec::Qwen4PromotionParts<'_>>,
+    ) -> Result<()> {
+        let epoch = lane_epoch(tag);
+        let seed = *generated.last().ok_or("park: no pending seed")?;
+        let position = prompt.len() + generated.len() - 1;
+        if self.state.position != position {
+            return Err(format!(
+                "park: the resident state sits at {}, not after its {position} tokens",
+                self.state.position
+            ));
+        }
+        self.prepare_promotion(
+            gpu,
+            epoch,
+            prompt.to_vec(),
+            generated,
+            seed,
+            position,
+            parts,
+        )
+        .map_err(text)?;
+        // The prompt's boundary snapshots stay published: the reset that
+        // follows the swap drops the resident turn.
+        self.session_publish_captures();
+        if let Err(error) = self.commit_promotion(gpu, &epoch) {
+            let _ = self.release_lane(&epoch);
+            return Err(format!("lane promotion: {error}"));
+        }
+        if remaining > 0 {
+            self.lane_executor()
+                .map_err(text)?
+                .map_ahead_decode(gpu, &epoch, remaining);
+        }
+        Ok(())
     }
 }
 
@@ -187,11 +233,11 @@ impl MeshFamily for Qwen4Bundle {
         })
     }
 
-    /// The staged AR lanes of a Single load (MTP lanes verify drafts: not
-    /// this epoch).
+    /// The staged lanes of a Single load: AR lanes, or MTP lanes that run
+    /// speculative windows ([`MeshLanes::step_windows`]).
     fn mesh_lanes(&mut self) -> Option<&mut dyn MeshLanes> {
-        let ar = self.lanes()?.spec().is_none();
-        (ar && self.lane_topology() == "single").then_some(self as &mut dyn MeshLanes)
+        self.lanes()?;
+        (self.lane_topology() == "single").then_some(self as &mut dyn MeshLanes)
     }
 }
 
@@ -203,9 +249,10 @@ fn lane_epoch(tag: u64) -> RequestEpoch {
     }
 }
 
-/// Qwen4's multi-request decode epoch: the fn-lanes executor's mixed-row step
-/// with AR rows only. A request enters through promotion (the resident state
-/// swaps into the lane), the path byte-identical to the singleton's decode.
+/// Qwen4's multi-request decode epoch: the fn-lanes executor's mixed-row step,
+/// AR rows on an AR store, native-MTP windows on an MTP store. A request
+/// enters through promotion (the resident state, and on an MTP store the
+/// drafter's state, swaps into the lane), the legacy promotion path.
 impl MeshLanes for Qwen4Bundle {
     fn lane_capacity(&self) -> usize {
         self.lanes().map_or(0, |store| store.max_lanes())
@@ -229,33 +276,130 @@ impl MeshLanes for Qwen4Bundle {
         seed: u32,
         remaining: usize,
     ) -> Result<()> {
-        let gpu = device(gpus)?;
-        let epoch = lane_epoch(tag);
         // The lane's committed picks end with its pending seed.
         let mut generated = ran.to_vec();
         generated.push(seed);
-        let position = prompt.len() + ran.len();
-        if self.state.position != position {
-            return Err(format!(
-                "park: the resident state sits at {}, not after its {position} tokens",
-                self.state.position
-            ));
+        self.promote(device(gpus)?, tag, prompt, generated, remaining, None)
+    }
+
+    fn windows(&self) -> bool {
+        self.lanes().is_some_and(|store| store.spec().is_some())
+    }
+
+    fn park_window(
+        &mut self,
+        gpus: &mut Gpus,
+        tag: u64,
+        prompt: &[u32],
+        emitted: &[u32],
+        drafter: &mut dyn hipfire_runtime::spec::Speculator,
+        remaining: usize,
+    ) -> Result<()> {
+        let drafter = drafter
+            .drafter_any_mut()
+            .and_then(|any| any.downcast_mut::<crate::mtp_spec::Qwen4MtpDrafter>())
+            .ok_or("an MTP lane takes a native Qwen4 MTP drafter")?;
+        let parts = drafter.promotion_parts()?;
+        self.promote(
+            device(gpus)?,
+            tag,
+            prompt,
+            emitted.to_vec(),
+            remaining,
+            Some(parts),
+        )
+    }
+
+    /// The legacy fn-lanes window ([`crate::lane_exec::Qwen4LaneExecutor`]):
+    /// the root routes and drafts every lane, then one verify step over all
+    /// of them commits each lane's greedy accept.
+    fn step_windows(&mut self, gpus: &mut Gpus, rows: &[(u64, usize)]) -> Result<Vec<LaneWindow>> {
+        let gpu = device(gpus)?;
+        let requests: Vec<(RequestEpoch, usize)> = rows
+            .iter()
+            .map(|&(tag, drafts)| (lane_epoch(tag), drafts))
+            .collect();
+        let drafted = self
+            .lane_executor()
+            .map_err(text)?
+            .draft_step(gpu, &requests)?;
+        let store = self.lanes().ok_or("Qwen4 lanes are not staged")?;
+        let mut slotted = Vec::with_capacity(rows.len());
+        for (epoch, _) in &requests {
+            let slot = store
+                .slot_of(epoch)
+                .ok_or_else(|| format!("engine lane {} is not admitted", epoch.request_tag))?;
+            let window = drafted
+                .iter()
+                .find(|window| window.epoch == *epoch)
+                .ok_or("the draft step omitted a lane")?;
+            if matches!(window.route, crate::lane_exec::LaneRoute::Batched { .. })
+                && window.drafts.is_empty()
+            {
+                return Err("a batched lane window drafted no tokens".into());
+            }
+            slotted.push((slot, *epoch, window.drafts.as_slice()));
         }
-        self.prepare_promotion(gpu, epoch, prompt.to_vec(), generated, seed, position, None)
-            .map_err(text)?;
-        // The prompt's boundary snapshots stay published: the reset that
-        // follows the swap drops the resident turn.
-        self.session_publish_captures();
-        if let Err(error) = self.commit_promotion(gpu, &epoch) {
-            let _ = self.release_lane(&epoch);
-            return Err(format!("lane promotion: {error}"));
+        slotted.sort_unstable_by_key(|&(slot, ..)| slot);
+        let mut plan = BatchStepPlan::default();
+        plan.batch.m_per_slot = vec![0; store.max_lanes()];
+        for &(slot, epoch, drafts) in &slotted {
+            let lane = store
+                .lane(&epoch)
+                .ok_or_else(|| format!("engine lane {} disappeared", epoch.request_tag))?;
+            let seed = store
+                .root_seed(&epoch)
+                .or(lane.host.pending_seed)
+                .ok_or("a decoding lane has no pending seed")?;
+            let begin = plan.batch.tokens.len();
+            let len = 1 + drafts.len();
+            plan.batch.tokens.push(seed);
+            plan.batch.tokens.extend_from_slice(drafts);
+            for j in 0..len {
+                plan.batch
+                    .positions
+                    .push(i32::try_from(lane.state.position + j).map_err(text)?);
+                plan.batch.row_slot.push(i32::try_from(slot).map_err(text)?);
+            }
+            plan.batch.m_per_slot[slot] = len;
+            plan.requests.push(RequestRows {
+                epoch,
+                rows: RowRange { begin, len },
+                kind: if drafts.is_empty() {
+                    RequestStepKind::Ar
+                } else {
+                    RequestStepKind::Verify {
+                        draft_len: drafts.len(),
+                    }
+                },
+            });
+            plan.decode_rows += len;
         }
-        if remaining > 0 {
-            self.lane_executor()
-                .map_err(text)?
-                .map_ahead_decode(gpu, &epoch, remaining);
-        }
-        Ok(())
+        let advances = {
+            let mut executor = self.lane_executor().map_err(text)?;
+            let out = executor
+                .provision_step(gpu, &plan)
+                .and_then(|()| executor.forward_step(gpu, &plan))
+                .and_then(|stepped| executor.commit_step(gpu, &plan, stepped));
+            if out.is_err() {
+                executor.abort_step(&plan);
+            }
+            out?
+        };
+        requests
+            .iter()
+            .map(|(epoch, _)| {
+                advances
+                    .iter()
+                    .find(|advance| advance.epoch == *epoch && !advance.committed_ids.is_empty())
+                    .map(|advance| LaneWindow {
+                        committed: advance.committed_ids.clone(),
+                        drafted: advance.verified_rows.saturating_sub(1),
+                        accepted: advance.accepted_drafts,
+                    })
+                    .ok_or_else(|| format!("lane {} committed nothing", epoch.request_tag))
+            })
+            .collect()
     }
 
     /// The reverse of the promotion's swap: the lane's request states move
@@ -300,6 +444,9 @@ impl MeshLanes for Qwen4Bundle {
     fn step_lanes(&mut self, gpus: &mut Gpus, rows: &[(u64, u32, bool)]) -> Result<Vec<DecodeOut>> {
         let gpu = device(gpus)?;
         let store = self.lanes().ok_or("Qwen4 lanes are not staged")?;
+        if store.spec().is_some() {
+            return Err("MTP lanes step in windows".into());
+        }
         // The executor takes a plan's requests in stable slot order.
         let mut slotted = Vec::with_capacity(rows.len());
         for &(tag, token, _) in rows {
@@ -414,5 +561,11 @@ impl MeshLanes for Qwen4Bundle {
         if let Err(error) = self.release_lane(&lane_epoch(tag)) {
             eprintln!("[engine] lane {tag} release: {error}");
         }
+    }
+
+    /// An MTP lane's state runs ahead of a window that stopped inside it: no
+    /// record continues it.
+    fn keeps_records(&self) -> bool {
+        !self.windows()
     }
 }

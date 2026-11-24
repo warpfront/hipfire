@@ -740,9 +740,10 @@ fn stage_qwen4_lanes(
         other => other.to_string(),
     };
     // PP stages AR lanes only: a spec config is never forwarded there. EP
-    // stages native-MTP lanes. A single card on the engine loop stages AR
-    // lanes: its scheduler verifies speculative requests on the resident
-    // state.
+    // stages native-MTP lanes. A single card on the engine loop stages
+    // native-MTP lanes only under the native MTP drafter (its scheduler runs
+    // their windows); any other drafter's requests verify on the resident
+    // state beside AR lanes.
     let spec_off_reason: Option<String> = match (natural_spec_off, topology) {
         (None, "pp") => {
             eprintln!(
@@ -750,7 +751,10 @@ fn stage_qwen4_lanes(
             );
             Some("native-MTP unsupported under topology.pp".to_string())
         }
-        (None, "single") if hipfire_runtime::config::get().engine_loop => {
+        (None, "single")
+            if hipfire_runtime::config::get().engine_loop
+                && !m.speculator.as_ref().is_some_and(|s| s.name() == "mtp") =>
+        {
             Some("engine loop: speculative requests verify on the resident state".to_string())
         }
         (reason, _) => reason.map(str::to_string),

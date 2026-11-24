@@ -2971,15 +2971,15 @@ fn qwen4_lone_request_takes_lane_for(msg: &serde_json::Value, m: &LoadedModel) -
 }
 
 /// The engine's N-request scheduler serves this load's staged lanes (G12):
-/// the engine loop runs Qwen4 AR and the load staged single-card AR lanes.
-/// A lone request enters it too: it decodes on the resident state, as the
-/// singleton does, until a peer arrives. A drafter's requests (native MTP,
-/// DFlash2) verify on the resident state beside the lanes.
+/// the engine loop runs Qwen4 AR and the load staged single-card lanes. A
+/// lone request enters it too: it decodes on the resident state, as the
+/// singleton does, until a peer arrives. Native-MTP lanes run the native MTP
+/// drafter's windows; other drafters' requests (DFlash2) verify on the
+/// resident state beside AR lanes.
 pub(crate) fn engine_serves_lanes(m: &LoadedModel) -> bool {
     crate::engine::runs_on_engine(GenerationRoute::Qwen4Ar)
-        && m.qwen4().is_some_and(|b| {
-            b.lane_topology() == "single" && b.lanes().is_some_and(|store| store.spec().is_none())
-        })
+        && m.qwen4()
+            .is_some_and(|b| b.lane_topology() == "single" && b.lanes().is_some())
 }
 
 /// The route whose staged lanes the engine's N-request scheduler serves on
