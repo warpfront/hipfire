@@ -1556,6 +1556,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-archcaps"
+version = "0.4.6"
+
+[[package]]
 name = "hipfire-atlas"
 version = "0.4.6"
 dependencies = [

@@ -1,0 +1,8 @@
+[package]
+name = "hipfire-archcaps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GfxArch: the single GPU architecture identity (name, parse, ALL); data-only, no dependencies"
+
+[dependencies]

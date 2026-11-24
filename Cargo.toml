@@ -44,6 +44,7 @@ members = [
     "crates/saddle-quant",
     "crates/hipfire-detect",
     "crates/hipfire-atlas",
+    "crates/hipfire-archcaps",
     "crates/redline",
     "crates/redline-rocr",
     "crates/redline-dispatch",
