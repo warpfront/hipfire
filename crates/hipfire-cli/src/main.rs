@@ -816,8 +816,8 @@ pub(crate) struct BenchArgs {
     /// unchanged.
     #[arg(long = "min-tokens")]
     min_tokens: Option<usize>,
-    /// Send this wire `seed` on every standard-bench generate request
-    /// (warmups and measured runs). Absent sends no seed.
+    /// Send this wire `seed` on every generate request (warmups and measured
+    /// runs, the `--concurrency` sweep included). Absent sends no seed.
     #[arg(long, value_name = "U64")]
     seed: Option<u64>,
     /// Sweep closed-loop concurrency levels, e.g. `1,2,4,8`: at each level K,
@@ -7249,6 +7249,11 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
     };
     if let Some(t) = args.temperature {
         workload.sampling.temperature = t;
+    }
+    // `--seed` reaches the concurrency sweep too: a seeded sampled sweep is
+    // reproducible per request (C1 == CN is checkable at temperature > 0).
+    if args.seed.is_some() {
+        workload.sampling.seed = args.seed;
     }
     // The load-time knobs `hipfire serve` reads from the same configuration:
     // its default system prompt and the VMM batch route parameters.
