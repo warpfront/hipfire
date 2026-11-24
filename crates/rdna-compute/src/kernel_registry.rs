@@ -9041,7 +9041,6 @@ const WALKED_ROUTE_PLAN_FILES: &[&str] = &[
     include_str!("route_plans/qwen3.8-flash-next-base.mq3-xts.gfx1100.tsv"),
     include_str!("route_plans/qwen3.5-4b.mq4.gfx1030.tsv"),
     include_str!("route_plans/qwen3.5-9b.mq4.gfx1030.tsv"),
-    include_str!("route_plans/qwen3.8-27b.mq4-xts.gfx1100.tsv"),
 ];
 
 /// One parsed `route_plans/*.tsv`.
