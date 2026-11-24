@@ -3234,11 +3234,22 @@
      "symbols": [
       "gemm_hfq4g256_rows_pm"
      ]
+    },
+    {
+     "module": "argmax_f32_batched_regrid_pm_gfx1201",
+     "kind": "embedded",
+     "sha256": "a19652ee624858c090b66432d0e8cebf3a217095d1859ca596355805750ee3ac",
+     "flags": null,
+     "scheduler_profile": null,
+     "symbols": [
+      "argmax_f32_batched_regrid_pm_gfx1201"
+     ]
     }
    ],
-   "symbol_count": 153,
+   "symbol_count": 154,
    "mtp_only_modules": [
     "add_inplace",
+    "argmax_f32_batched_regrid_pm_gfx1201",
     "argmax_token_chain",
     "attention_flash_q8_0_reduce",
     "attention_flash_q8_0_tile",
