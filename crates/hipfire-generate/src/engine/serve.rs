@@ -53,6 +53,8 @@ pub fn drive(
     inbox: &mut DaemonInbox,
 ) -> Result<(), BatchDriveError> {
     let _serving = m.ple_serving_guard();
+    // Every RequestRun samples with its own config and RNG: no cohort gate.
+    sched.per_lane_sampling = true;
     let n_layers = m
         .state
         .as_deref_mut()

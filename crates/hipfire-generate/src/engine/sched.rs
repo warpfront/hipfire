@@ -347,6 +347,10 @@ impl Scheduler {
         let mut rows = Vec::with_capacity(take);
         for j in 0..take {
             let idx = lanes[(self.cursor + j) % lanes.len()];
+            if b.aborted(idx) {
+                ended.push(self.end(idx, Exit::Aborted));
+                continue;
+            }
             let run = self.run_mut(idx);
             match run.next_work() {
                 Work::Decode { token: Some(token) } => rows.push((idx, token, !run.greedy())),
@@ -908,7 +912,7 @@ mod tests {
         let prompts = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
         let mut b = fake(&prompts, 4, 4);
         b.eos = u32::MAX;
-        // 1 is aborted while 0 prefills; 2 is aborted while 1 would prefill.
+        // 1 is aborted while 0 prefills, before it took the resident state.
         b.abort_during_prefill = Some((0, 1));
         let mut s = Scheduler::default();
         for idx in 0..3 {
@@ -924,6 +928,29 @@ mod tests {
         assert_eq!((&one.exit, one.place), (&Exit::Aborted, Place::Queued));
         // The resident state went on to the next request in the same tick.
         assert!(b.calls.contains(&Call::Prefill(2)), "{:?}", b.calls);
+    }
+
+    #[test]
+    fn a_request_parked_this_tick_and_aborted_later_in_it_streams_nothing() {
+        let prompts = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
+        let mut b = fake(&prompts, 4, 4);
+        b.eos = u32::MAX;
+        // 0 parks after its prompt; it is aborted while 2 prefills, before
+        // the tick's lane epoch would stream its first token.
+        b.abort_during_prefill = Some((2, 0));
+        let mut s = Scheduler::default();
+        for idx in 0..3 {
+            s.admit(idx);
+        }
+        let ended = s.tick(&mut b);
+        assert!(b.calls.contains(&Call::Park(0)), "{:?}", b.calls);
+        assert!(!b.emitted.contains_key(&0), "{:?}", b.emitted);
+        let zero = ended
+            .iter()
+            .find(|e| e.idx == 0)
+            .expect("0 ended this tick");
+        assert_eq!((&zero.exit, zero.place), (&Exit::Aborted, Place::Lane));
+        assert!(b.emitted.contains_key(&1) && b.emitted.contains_key(&2));
     }
 
     #[test]
