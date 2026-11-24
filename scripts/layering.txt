@@ -17,6 +17,7 @@
 # Format: <layer> <crate>
 
  0 hipfire-atlas
+ 0 hipfire-archcaps
  0 hipfire-config
  0 hipfire-detect
  0 hipfire-kernel-abi
