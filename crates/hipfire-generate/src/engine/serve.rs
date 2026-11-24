@@ -167,7 +167,7 @@ impl Driver {
                     let _scope =
                         BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
                     emit_generation_start(ROUTE, stdout, &key.id, false);
-                    emit_generation_cancel(ROUTE, stdout, &key.id, 0);
+                    emit_engine_cancel(ROUTE, stdout, &key.id, 0);
                     sched.abort_queued(&key, admission);
                 }
             }
@@ -416,7 +416,7 @@ impl Driver {
                     }
                 }
                 let generated = done.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                emit_generation_cancel(ROUTE, stdout, &key.id, generated);
+                emit_engine_cancel(ROUTE, stdout, &key.id, generated);
                 let _ = sched.abort_lane(idx, &key, admission);
                 continue;
             }
@@ -708,7 +708,7 @@ impl<'a> Ctx<'a> {
         };
         match exit {
             Exit::Aborted => {
-                emit_generation_cancel(ROUTE, self.stdout, &key.id, generated);
+                emit_engine_cancel(ROUTE, self.stdout, &key.id, generated);
             }
             Exit::Failed(error) => {
                 let rolled_back = released.is_ok();

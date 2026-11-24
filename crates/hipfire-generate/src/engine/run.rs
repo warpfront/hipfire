@@ -10,7 +10,9 @@
 use super::chatml::{Host, ProtocolEmit, WireProtocol};
 use super::mesh::MeshForwards;
 use super::{admit_budget, drive, DoneMetrics, Exit, Finish, RequestRun};
-use crate::ar::{emit_active_route_done_value, emit_generation_start, GenerationRoute};
+use crate::ar::{
+    emit_active_route_done_value, emit_engine_cancel, emit_generation_start, GenerationRoute,
+};
 use crate::common::{emit_fail_closed_error, emit_spec_cancel_after_rollback, RollbackEpilogue};
 use hipfire_engine::emit::{emit_active_attempt_error, stage_terminal_tool_calls};
 use hipfire_engine::terminal::{await_client_terminal_commit, ClientTerminalDecision};
@@ -218,6 +220,9 @@ impl Job<'_> {
                 },
             };
             match error {
+                None if epilogue.rolled_back => {
+                    emit_engine_cancel(route, emitter.out(), id, generated);
+                }
                 None => emit_spec_cancel_after_rollback(emitter.out(), id, generated, &epilogue),
                 Some(message) => emit_fail_closed_error(
                     emitter.out(),

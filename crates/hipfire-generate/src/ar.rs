@@ -1133,6 +1133,8 @@ pub enum RouteTerminalEvent<'a> {
     },
     Cancel {
         completion_tokens: usize,
+        /// The G12 engine loop served the request (a declined one ran legacy).
+        engine: bool,
     },
 }
 
@@ -1256,6 +1258,7 @@ impl GenerationRouteAdapter {
             },
             RouteTerminal::Cancel => RouteTerminalEvent::Cancel {
                 completion_tokens: 0,
+                engine: false,
             },
         };
         self.emit_terminal_event(output, id, attempt, event)
@@ -1308,12 +1311,16 @@ impl GenerationRouteAdapter {
         id: &str,
         attempt: u64,
         completion_tokens: usize,
+        engine: bool,
     ) -> bool {
         self.emit_terminal_event(
             output,
             id,
             attempt,
-            RouteTerminalEvent::Cancel { completion_tokens },
+            RouteTerminalEvent::Cancel {
+                completion_tokens,
+                engine,
+            },
         )
     }
 
@@ -1377,12 +1384,11 @@ fn emit_route_terminal(
                 rolled_back,
             )
         }
-        RouteTerminalEvent::Cancel { completion_tokens } => {
-            let loop_name = if crate::engine::runs_on_engine(route) {
-                "engine"
-            } else {
-                "legacy"
-            };
+        RouteTerminalEvent::Cancel {
+            completion_tokens,
+            engine,
+        } => {
+            let loop_name = if engine { "engine" } else { "legacy" };
             emit_qwen_ar_cancelled_outcome(&mut buffer, id, completion_tokens, loop_name)
         }
     };
@@ -1711,11 +1717,33 @@ pub fn emit_generation_cancel(
     id: &str,
     completion_tokens: usize,
 ) -> bool {
+    emit_route_cancel(route, output, id, completion_tokens, false)
+}
+
+/// [`emit_generation_cancel`] for a request the G12 engine loop served: its
+/// aborted `done` says `loop: engine`.
+pub fn emit_engine_cancel(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    id: &str,
+    completion_tokens: usize,
+) -> bool {
+    emit_route_cancel(route, output, id, completion_tokens, true)
+}
+
+fn emit_route_cancel(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    id: &str,
+    completion_tokens: usize,
+    engine: bool,
+) -> bool {
     let delivered = production_route_adapter(route).emit_cancel(
         output,
         id,
         active_attempt_id(),
         completion_tokens,
+        engine,
     );
     clear_generation_route();
     delivered
