@@ -1,0 +1,80 @@
+# Invariant class table: V2-PLAN.md section 6.4 as data (slice B0).
+#
+# Exact is the default. Every invariant lists what is `always_exact`. An entry
+# may carry `bounded_difference`: the NAMED arithmetic difference whose effect
+# a row may bound instead of matching exactly. A row asking for a bounded class
+# on an entry without `bounded_difference` is refused; a bounded row whose
+# named difference has no budget (for that card) is `unqualified`.
+# No budgets live here (they are calibrated per card by B3.b).
+
+[[invariant]]
+id = "I1"
+name = "Chunked == one-shot"
+always_exact = "Each chunker against its own same-partition restore. For a family that declares a canonical tile stream: exact at canonical boundaries and on continuation, tested at B-1, B, B+1 and a split inside a tile."
+not_compared = "A family whose snapshot scope includes the chunk width (Gemma4) has different cache scopes per width: not compared."
+bounded_difference = "family-declared chunk-width difference"
+bounded_requires_family_declaration = true
+
+[[invariant]]
+id = "I2"
+name = "Restored == fresh"
+always_exact = "Always. Fresh means the same input, recipe and partition. Includes overwrite of a poisoned tail and no leak into other lanes."
+
+[[invariant]]
+id = "I3"
+name = "Engine == legacy"
+always_exact = "Everything except the three intended differences whitelisted in #1185."
+transitional = true
+
+[[invariant]]
+id = "I4k"
+name = "Kept or aborted speculative window == the verifier's own prefix"
+always_exact = "Always."
+
+[[invariant]]
+id = "I4a"
+name = "Speculative == AR"
+always_exact = "Greedy tokens, logits and target state where the verifier is AR-identical."
+bounded_difference = "verifier arithmetic (batched GEMM against one-token GEMV)"
+bounded_form = "teacher-forced, bounded, with the flip rule; sampled: the target law on small explicit distributions, not seeded text"
+
+[[invariant]]
+id = "I5i"
+name = "Lane isolation"
+always_exact = "At a fixed configured width a lane's output and state do not depend on which peers are live, their order, their content, or slot reuse."
+
+[[invariant]]
+id = "I5w"
+name = "Width 1 == batched"
+always_exact = "Where the kernel is row-equivalent or a certified twin."
+bounded_difference = "declared width-dependent selector"
+bounded_form = "bounded (Kaden's 2026-11-11 rule)"
+
+[[invariant]]
+id = "I6"
+name = "Sealed == open"
+always_exact = "Normalized launch sequence, logits, state, tokens; zero off-plan loads; zero compiler use."
+
+[[invariant]]
+id = "I7"
+name = "Abort, then the same request == fresh"
+always_exact = "Always."
+
+[[invariant]]
+id = "I8"
+name = "Reported capability and route == what ran"
+always_exact = "Always."
+
+[[invariant]]
+id = "I9"
+name = "Capability-masked == full capabilities"
+always_exact = "Structure: shapes, masks, positions, row counts."
+bounded_difference = "capability-masked kernels differ by definition (logits, per card)"
+bounded_form = "logits bounded per card"
+
+[[invariant]]
+id = "I10"
+name = "Absolute anchor, one per family"
+always_exact = "Integer, index and pack semantics against the CPU reference."
+bounded_difference = "logits against the CPU reference (dense attention) or teacher KLD on a real pinned artefact (other families)"
+bounded_form = "bounded against the reference"

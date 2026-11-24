@@ -60,6 +60,7 @@ members = [
     "crates/hipfire-cli",
     "crates/hipfire-client",
     "crates/hipfire-daemon",
+    "crates/hipfire-conformance",
     "crates/saddle-lab",
     "crates/hipfire-xdna",
     "crates/peacemaker-npu",
