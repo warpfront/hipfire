@@ -15485,7 +15485,10 @@ impl Qwen4GpuForward {
                 // The model bundle is not the sole owner: VMM registrations,
                 // pinned words and retained tapes also live on Gpu.
                 gpu.quarantine_retained_replay_owners(reason.clone());
-                return Err(hip_bridge::HipError::new(999, &reason));
+                return Err(hip_bridge::HipError::new(
+                    999,
+                    &format!("{reason}; process restart required"),
+                ));
             }
         }
         if let Some(routes) = self.cache_routes.as_mut() {
@@ -17165,7 +17168,7 @@ impl Qwen4GpuForward {
                     if let Err(wait) = gpu.hip.device_synchronize() {
                         let reason = format!("{error}; cache cancellation HIP wait failed: {wait}");
                         gpu.quarantine_retained_replay_owners(reason.clone());
-                        return Err(invalid(reason));
+                        return Err(invalid(format!("{reason}; process restart required")));
                     }
                     // SAFETY: the typed retained proof and successful HIP wait
                     // cover all readers. Unknown submission drops and quarantines.
@@ -17179,9 +17182,10 @@ impl Qwen4GpuForward {
                             })?;
                     }
                 } else {
-                    gpu.quarantine_retained_replay_owners(format!(
-                        "{error}; exact-cache retained queue has unknown quiescence"
-                    ));
+                    let reason =
+                        format!("{error}; exact-cache retained queue has unknown quiescence");
+                    gpu.quarantine_retained_replay_owners(reason.clone());
+                    return Err(invalid(format!("{reason}; process restart required")));
                 }
             }
             return Err(error);
@@ -17238,7 +17242,7 @@ impl Qwen4GpuForward {
                 result.as_ref().err().map(context).unwrap_or_default()
             );
             gpu.quarantine_retained_replay_owners(reason.clone());
-            return Err(invalid(reason));
+            return Err(invalid(format!("{reason}; process restart required")));
         }
         if let Err(wait) = gpu.hip.device_synchronize() {
             let reason = format!(
@@ -17246,7 +17250,7 @@ impl Qwen4GpuForward {
                 result.as_ref().err().map(context).unwrap_or_default()
             );
             gpu.quarantine_retained_replay_owners(reason.clone());
-            return Err(invalid(reason));
+            return Err(invalid(format!("{reason}; process restart required")));
         }
         // SAFETY: no retained queue submitted (quiescence proven above) and the HIP wait
         // retired every reader of the tile.
