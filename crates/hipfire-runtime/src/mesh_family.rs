@@ -248,7 +248,9 @@ impl MeshRunner {
             return Err("the request's devices carry a different mesh than the runner".into());
         }
         if let Some(reason) = &self.quarantined {
-            return Err(format!("engine mesh quarantined until restart: {reason}"));
+            return Err(format!(
+                "engine mesh quarantined; process restart required: {reason}"
+            ));
         }
         family.admit(gpus)?;
         if gpus.mesh_output_owner().is_none() {
@@ -318,7 +320,9 @@ impl MeshRunner {
         }
         // A quarantined device was never proven idle: the outputs stay leaked.
         if let Some(reason) = &self.quarantined {
-            return Err(format!("engine mesh quarantined until restart: {reason}"));
+            return Err(format!(
+                "engine mesh quarantined; process restart required: {reason}"
+            ));
         }
         if self.outstanding.is_empty() {
             return Ok(());

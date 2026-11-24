@@ -87,7 +87,7 @@ impl RetainedReplayQuarantine {
     pub(crate) fn check(&self) -> Result<(), String> {
         if let Some(reason) = self.reason.as_ref() {
             return Err(format!(
-                "device {} quarantined; GPU owners retained and reuse refused until process restart: {reason}",
+                "device {} quarantined; GPU owners retained, process restart required: {reason}",
                 self.device
             ));
         }

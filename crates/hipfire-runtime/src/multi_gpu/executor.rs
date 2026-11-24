@@ -1128,7 +1128,9 @@ fn drain(backend: &mut impl DrainBackend) -> Result<()> {
     if let Some(error) = failure {
         backend.poison();
         backend.quarantine(&error);
-        return Err(format!("mesh drain failed; resources quarantined: {error}"));
+        return Err(format!(
+            "mesh drain failed; resources quarantined, process restart required: {error}"
+        ));
     }
     Ok(())
 }
@@ -2136,7 +2138,7 @@ fn reset_all<B: OwnerOps>(backend: &mut B, epoch: &ForwardEpoch) -> Result<()> {
     }
     fail_closed(backend);
     Err(format!(
-        "mesh reset failed; mesh poisoned and quarantined: {}",
+        "mesh reset failed; mesh poisoned and quarantined, process restart required: {}",
         failures.join("; ")
     ))
 }

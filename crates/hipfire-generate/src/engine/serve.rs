@@ -156,7 +156,9 @@ impl Driver {
     ) -> Result<(), String> {
         loop {
             if let Some(reason) = runner.quarantined() {
-                return Err(format!("engine mesh quarantined until restart: {reason}"));
+                return Err(format!(
+                    "engine mesh quarantined; process restart required: {reason}"
+                ));
             }
             self.settle_terminals(sched, m, runner, gpus, stdout)?;
             for key in sched.inbox.iter().cloned().collect::<Vec<_>>() {

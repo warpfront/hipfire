@@ -153,7 +153,7 @@ impl Job<'_> {
             return Outcome::Declined("a speculator is attached".into());
         }
         if let Some(reason) = runner.quarantined() {
-            let message = format!("engine mesh quarantined until restart: {reason}");
+            let message = format!("engine mesh quarantined; process restart required: {reason}");
             emit_active_attempt_error(stdout, Some(id), &message, "gpu", false, false);
             return Outcome::Served;
         }
