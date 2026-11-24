@@ -1205,15 +1205,27 @@ impl KernelCompiler {
         // Ship the Radiowave certification the compile wrote beside the cache
         // object: packs have no `.hip` source, so the runtime cannot certify
         // them itself and VMEM-classified acquires would otherwise never fire.
+        // Only a sidecar that certifies these bytes ships (a stale one would be
+        // ignored at load), with the host-specific fields the runtime never
+        // reads zeroed so packs stay byte-reproducible.
         let certified = object.with_extension("radiowave.json");
-        if certified.is_file() {
-            let temp = dir.join(format!(".{module}.{}.radiowave.tmp", unique_token()));
-            std::fs::copy(&certified, &temp)
-                .and_then(|_| std::fs::rename(&temp, &sidecar))
-                .map_err(|e| {
-                    let _ = std::fs::remove_file(&temp);
-                    format!("{module}: radiowave sidecar: {e}")
-                })?;
+        if let Ok(json) = std::fs::read_to_string(&certified) {
+            let bytes = std::fs::read(object).map_err(|e| format!("{module}: {e}"))?;
+            if CodeObjectCertification::from_json(&bytes, &json).is_ok() {
+                let mut manifest: radiowave::CompileManifest = serde_json::from_str(&json)
+                    .map_err(|e| format!("{module}: radiowave sidecar: {e}"))?;
+                manifest.generated_unix_seconds = 0;
+                manifest.source = format!("{module}.hip").into();
+                manifest.output = format!("{module}.hsaco").into();
+                let encoded = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
+                let temp = dir.join(format!(".{module}.{}.radiowave.tmp", unique_token()));
+                std::fs::write(&temp, encoded)
+                    .and_then(|_| std::fs::rename(&temp, &sidecar))
+                    .map_err(|e| {
+                        let _ = std::fs::remove_file(&temp);
+                        format!("{module}: radiowave sidecar: {e}")
+                    })?;
+            }
         }
         Ok(dir.join(format!("{module}.hsaco")))
     }
@@ -3849,6 +3861,56 @@ mod tests {
         let sidecar = pack.join("alpha.radiowave.json");
         std::fs::write(&sidecar, "{}").unwrap();
         assert!(verify(None).unwrap_err().contains("alpha.radiowave.json"));
+        std::fs::remove_file(&sidecar).unwrap();
+        // A cache sidecar that certifies the object ships, normalized so packs
+        // stay byte-reproducible.
+        let cached = root.join("alpha.cache.hsaco");
+        std::fs::copy(pack.join("alpha.hsaco"), &cached).unwrap();
+        let digest = sha2::Sha256::digest(std::fs::read(&cached).unwrap());
+        let manifest = radiowave::CompileManifest {
+            schema_version: 5,
+            compiler: "radiowave".to_owned(),
+            generated_unix_seconds: 1_795_000_000,
+            source: "/tmp/build-xyz/alpha.0123.hip".into(),
+            output: "/tmp/build-xyz/alpha.0123.hsaco".into(),
+            arch: "gfx1201".to_owned(),
+            wavefront: radiowave::Wavefront::Wave32,
+            scheduler_profile: SchedulerProfile::Default,
+            hipcc: "hipcc".into(),
+            hipcc_version: "test".to_owned(),
+            command: Vec::new(),
+            source_sha256: "source".to_owned(),
+            support_header_sha256: "header".to_owned(),
+            peacemaker: None,
+            output_sha256: digest.iter().map(|b| format!("{b:02x}")).collect(),
+            inspection: Some(radiowave::CodeObjectInspection {
+                bundle_target: "hipv4-amdgcn-amd-amdhsa--gfx1201".to_owned(),
+                identity: None,
+                kernels: vec![radiowave::KernelReport {
+                    name: "alpha_f32".to_owned(),
+                    ..Default::default()
+                }],
+            }),
+        };
+        std::fs::write(
+            cached.with_extension("radiowave.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        producer
+            .publish_package(
+                "alpha",
+                entries[0].source(),
+                &["alpha_f32".to_owned()],
+                &cached,
+                &pack,
+            )
+            .unwrap();
+        assert_eq!(verify(None).unwrap().radiowave_certified, 1);
+        let shipped: radiowave::CompileManifest =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(shipped.generated_unix_seconds, 0);
+        assert_eq!(shipped.output, Path::new("alpha.hsaco"));
         std::fs::remove_file(&sidecar).unwrap();
         assert!(verify(Some("hipcc 7.2")).is_ok());
         // A different local compiler would reject every object at load time.
