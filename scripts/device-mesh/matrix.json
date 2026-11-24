@@ -36,6 +36,21 @@
    "size_bytes": 698641072,
    "source": "https://huggingface.co/hipfire-models/LFM2.5-1.2B/resolve/925450193fe1cc66b9130ee1939b5f97651fb1fc/lfm2.5-1.2b.mq4"
   },
+  "MiniMax-M2.7.mq2": {
+   "sha256": "deb83795df6fdb31c72c4821eb5173b1c57968926871d27e77ebb761539aaa5f",
+   "size_bytes": 79169220197,
+   "source": "https://huggingface.co/hipfire-models/MiniMax-M2.7/resolve/483e7bdc45b43d3534afebc56f0956df0b468d79/MiniMax-M2.7.mq2"
+  },
+  "muse-glimmer-30b-dflash.mq4": {
+   "sha256": "6fc0988e51689abf24c2e43d5b1f44794be3409484f99a115d36484ea0e23d2d",
+   "size_bytes": 1357990400,
+   "source": "https://huggingface.co/hipfire-models/muse-glimmer-30b/resolve/060933b95869c8502a7b012b498678b7cdabfe4f/muse-glimmer-30b-dflash.mq4"
+  },
+  "muse-glimmer-30b.mq4": {
+   "sha256": "87bc776a36e0c4b55edfd1f0da1104c966eb43f59aa6fdd0ee33a14ecc0fc052",
+   "size_bytes": 18614785024,
+   "source": "https://huggingface.co/hipfire-models/muse-glimmer-30b/resolve/060933b95869c8502a7b012b498678b7cdabfe4f/muse-glimmer-30b.mq4"
+  },
   "ornith-1.5-35b-a3b.mq4r": {
    "sha256": "84103fcc8ade42aa2ac8ec01176df7a4ead5e94810597c9fae2f6763152a3ac6",
    "size_bytes": 18700570368,
@@ -1867,6 +1882,71 @@
    "fixture_files": [
     "$MODELS_DIR/lfm2.5-1.2b.mq4"
    ]
+  },
+  {
+   "commands": {
+    "positive": [
+     "HIPFIRE_DENSE_FIXTURE=$MODEL_DIR cargo test -p hipfire-generate --locked --test dense_rollback_gpu -- glimmer_dflash_request_that_fits_max_seq_completes --exact --ignored --test-threads=1 --nocapture"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DENSE_FIXTURE": "$MODEL_DIR"
+   },
+   "fixtures": [
+    "muse-glimmer",
+    "muse-glimmer:draft"
+   ],
+   "hosts": [
+    "gfx1151",
+    "gfx1201",
+    "gfx1100"
+   ],
+   "id": "g11-glimmer-dflash-max-seq",
+   "milestone": "G11",
+   "note": "HIPF-86 regression: a greedy DFlash request that fits max_seq completes on DFlash. Own row so hosts without the 20 GB Glimmer pair keep g4-dense-rollback current (an absent fixture blocks the whole row).",
+   "predicate": {
+    "forbid": [
+     "skip: dense fixture",
+     "skip: no GPU"
+    ],
+    "kind": "cargo",
+    "min_passed": 1
+   },
+   "probe": "existing",
+   "route": "single/glimmer-dflash-max-seq"
+  },
+  {
+   "commands": {
+    "positive": [
+     "HIPFIRE_DENSE_FIXTURE=$MODEL_DIR cargo test -p hipfire-generate --locked --test dense_rollback_gpu -- dense_minimax_fault_rolls_back_and_retry_matches_fresh minimax_eight_cycle_unload_drift --exact --ignored --test-threads=1 --nocapture"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DENSE_FIXTURE": "$MODEL_DIR"
+   },
+   "fixtures": [
+    "minimax-m2.7"
+   ],
+   "hosts": [
+    "gfx1151"
+   ],
+   "id": "g7-minimax-dense-rollback",
+   "milestone": "G7",
+   "note": "G7 MiniMax dense rollback + COR-007 eight-cycle unload drift (#884). gfx1151 only: the fixture is 79 GB. Own row so the G4.10 row is not blocked on hosts without it. Timeout: about 2x the measured halo row time (562 s, 550 s; HIPF-232).",
+   "predicate": {
+    "forbid": [
+     "skip: dense fixture",
+     "skip: no GPU"
+    ],
+    "kind": "cargo",
+    "min_passed": 2,
+    "require": [
+     "cor007: steady free"
+    ]
+   },
+   "probe": "existing",
+   "route": "single/minimax-dense-rollback",
+   "timeout": 1200
   },
   {
    "commands": {
