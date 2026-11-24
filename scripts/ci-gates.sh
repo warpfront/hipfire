@@ -33,7 +33,8 @@ run python3 scripts/check-conflict-markers.py
 run python3 scripts/check-selector-receipts.py
 run python3 scripts/check-env-docs.py
 # Developer env-flag call sites must match tests/golden/flags-defaults/developer-callsites.tsv
-# (the GPU-free CI shard's flags_defaults_golden). Regenerate with scripts/flags-golden.sh --regen.
+# (the GPU-free CI shard's flags_defaults_golden). Regenerate with scripts/regen-generated.sh;
+# it also rebuilds the crate maps and the lifecycle/env-inventory tables checked here.
 run python3 scripts/flags-golden-extract.py
 # POSIX-only libc externs (mmap, dlopen, clock_gettime, ...) that Windows
 # compiles: `cargo xwin check` never links, so they break only at an MSVC link.
