@@ -175,14 +175,17 @@ jobs:
             # golden (tests/golden/flags-defaults): a default, ArchCaps accessor or
             # config key change needs its golden row in the same commit
             # (scripts/flags-golden.sh --regen).
+            # Every gate runs even when an earlier one fails: one cargo invocation
+            # with --no-fail-fast for the rdna-compute targets, and the shard's exit
+            # status collected at the end. Before, a failing target stopped the step
+            # (bash -e), so the targets after it went unreported (flagship_pack_coverage
+            # stayed hidden behind kernel_registry_coverage).
             run: |
-              cargo test --profile ci --locked -p rdna-compute --test dflash_accept_emu
-              cargo test --profile ci --locked -p rdna-compute --test all_launcher_abi
-              cargo test --profile ci --locked -p rdna-compute --test kernel_registry_coverage
-              cargo test --profile ci --locked -p rdna-compute --test flagship_pack_coverage
-              cargo test --profile ci --locked -p rdna-compute --test fn_route_plan
-              cargo test --profile ci --locked -p hipfire-runtime --test flags_defaults_golden
-              python3 scripts/flags-golden-extract.py
+              rc=0
+              cargo test --profile ci --locked --no-fail-fast -p rdna-compute --test dflash_accept_emu --test all_launcher_abi --test kernel_registry_coverage --test flagship_pack_coverage --test fn_route_plan || rc=1
+              cargo test --profile ci --locked -p hipfire-runtime --test flags_defaults_golden || rc=1
+              python3 scripts/flags-golden-extract.py || rc=1
+              exit $rc
           - name: int-e
             run: cargo test --profile ci --locked $INTEG_PKGS --test '[e]*'
           - name: int-l
