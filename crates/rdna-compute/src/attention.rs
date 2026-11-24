@@ -131,6 +131,46 @@ pub fn q8_flash_tile_size(
     q8_flash_reduce_safe_tile_size(preferred, head_dim, max_seq)
 }
 
+/// The `max_seq` band of the Q8 decode attention selectors: the flash tile
+/// [`q8_flash_tile_size`] resolves for this load (gfx1100: tile32 at
+/// `max_seq <= 8192`, which binds the plain `attention_flash_q8_0_tile`;
+/// tile128 above, which admits the GQA tile) and whether the tile count passes
+/// the gfx1100 GQA reduce's LDS bound. Two loads in one band dispatch the same
+/// decode attention kernels. A walked route plan seals only a load whose band
+/// one of its walked contexts shares (`kernel_registry`).
+pub fn q8_decode_attn_band(
+    arch: &str,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+) -> String {
+    let tile = q8_flash_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq);
+    q8_decode_attn_band_of(tile, max_seq)
+}
+
+/// [`q8_decode_attn_band`] at the product tile, without the developer
+/// `HIPFIRE_Q8_FLASH_TILE` override: the band a route walk at `max_seq` ran.
+pub fn q8_decode_attn_walked_band(
+    arch: &str,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+) -> String {
+    let tile = q8_flash_reduce_safe_tile_size(
+        q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq),
+        head_dim,
+        max_seq,
+    );
+    q8_decode_attn_band_of(tile, max_seq)
+}
+
+fn q8_decode_attn_band_of(tile: usize, max_seq: usize) -> String {
+    let wide = max_seq.div_ceil(tile) > Q8_DECODE_GQA_REDUCE_MAX_TILES;
+    format!("tile{tile}{}", if wide { "-wide" } else { "" })
+}
+
 /// Dynamic LDS of the gfx1201 Q-resident v2 attention bodies: two KT48
 /// buffers (K8 12 KiB + V8 12 KiB + f32 K/V scales 2 x 192 B each) and the
 /// 8-byte position-bounds pair at 49,920 (`attention_q8_0_fa2_gqa.gfx1201.hip`).

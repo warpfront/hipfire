@@ -319,7 +319,10 @@ class Gfx1100FlashNext(unittest.TestCase):
                              "--union-max-seq")
             lines = text.splitlines()
             self.assertIn("#! max_seq 262144", lines)
+            self.assertIn("#! walked_max_seq 32768 262144", lines, "the loader seals only the walked bands")
             self.assertIn("# max_seq union of walks at [32768, 262144]", lines)
+            single = run_build(root / "q.tsv", "--model", str(model), "--walk", f"ar={high}").splitlines()
+            self.assertFalse([l for l in single if l.startswith("#! walked_max_seq")], "one context: max_seq alone")
             self.assertIn("ar\thip\ts1\tk_s1\t" + HIP_SHA, lines, "the lower walk's kernels join the closure")
 
     def test_plan_axes_open_seal_and_trace_rows(self):

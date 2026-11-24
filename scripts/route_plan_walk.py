@@ -204,7 +204,8 @@ def walk_plan(route, prompt_dir, max_seq):
                      "_fit": {"lo": FIT_LO, "hi": FIT_HI, "head": "Summarize this ledger.\n\n"}})
     if route == "ar":
         for rows in prefill_rows():
-            if rows < max_seq:
+            # The daemon keeps 32 rows of headroom past a bench prefill.
+            if rows + 32 <= max_seq:
                 plan.append({"type": "bench_prefill", "tokens": rows})
         for ctx in (1, 2, 127, 128, 1000, 2047, 2048, 4095, 4096, 8192, 9000, 16400, 33000, 65536, 120000,
                     125000, 131000):
@@ -221,7 +222,11 @@ def walk_plan(route, prompt_dir, max_seq):
             text = " ".join((words * (n // len(words) + 1))[:n])
             plan.append({"type": "generate", "prompt": text, "max_tokens": 12, "temperature": 0.8,
                          "top_k": 40, "seed": n, "_words": n})
-    return plan
+    # A walk at a short context (a placement chosen by the context ceiling, e.g. gfx1100's tile32 Q8 decode
+    # attention at max_seq <= 8192) keeps only the generates whose prompt and decode fit it: a conservative
+    # 1.5 tokens per word plus the chat template (FILLER measures ~1.25, the code prompts ~1.4).
+    return [p for p in plan
+            if "prompt" not in p or int(1.5 * len(p["prompt"].split())) + 32 + p["max_tokens"] < max_seq]
 
 
 def main():

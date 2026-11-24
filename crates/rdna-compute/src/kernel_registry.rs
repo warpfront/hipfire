@@ -7645,11 +7645,17 @@ impl PlannedKernel {
 /// names the spec route in `#! sealed`, which `scripts/route_plan_build.py`
 /// writes only from a sealed replay of the checked-in plan; the hand-closed
 /// Qwen3.6-27B gfx1201 route is [`RouteSeal::Sealed`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouteSeal {
     Sealed,
     /// The walked family of the open plan, for the loader's log label.
     Open(&'static str),
+    /// A sealed route whose load resolves a context-dependent selector band
+    /// no walk ran (e.g. gfx1100 Q8 decode attention at `max_seq <= 8192`
+    /// under a plan walked only above it): the loader keeps it open, so a
+    /// kernel outside the walks binds lazily instead of failing the request.
+    /// The family, and why.
+    Unwalked(&'static str, String),
 }
 
 #[derive(Debug)]
@@ -9064,6 +9070,11 @@ pub struct WalkedRoutePlan {
     pub heads: Option<(usize, usize, usize)>,
     /// Largest admitted `max_seq`: the walks' context ceiling.
     pub max_seq: usize,
+    /// `#! walked_max_seq`: every context a walk of this plan ran at (a
+    /// `--union-max-seq` plan walks several). Absent: the walks all ran at
+    /// [`Self::max_seq`]. The loader seals only a load whose context-dependent
+    /// selector band (`attention::q8_decode_attn_band`) one of them shares.
+    pub walked_max_seq: Vec<usize>,
     /// Policy axis name and every value the walks covered.
     pub axes: Vec<(&'static str, Vec<&'static str>)>,
     /// `#! sealed`: spec routes (`ar`, `native_mtp`) whose whole walked
@@ -9092,11 +9103,21 @@ fn parse_walked_route_plan(text: &'static str) -> Result<WalkedRoutePlan, String
     let mut axes = Vec::new();
     let mut sealed = Vec::new();
     let mut rows = Vec::new();
+    let mut walked_max_seq = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("#! ") {
             let mut words = rest.split(' ');
             match (words.next(), words.next()) {
                 (Some("axis"), Some(name)) => axes.push((name, words.collect::<Vec<_>>())),
+                (Some("walked_max_seq"), Some(first)) => {
+                    for value in std::iter::once(first).chain(words) {
+                        walked_max_seq.push(
+                            value
+                                .parse::<usize>()
+                                .map_err(|e| format!("walked_max_seq: {e}"))?,
+                        );
+                    }
+                }
                 (Some("sealed"), Some(first)) => {
                     for route in std::iter::once(first).chain(words) {
                         if !matches!(route, "ar" | "native_mtp") {
@@ -9155,6 +9176,16 @@ fn parse_walked_route_plan(text: &'static str) -> Result<WalkedRoutePlan, String
             Ok((heads, kv_heads, head_dim))
         })
         .transpose()?;
+    let max_seq: usize = get("max_seq")?
+        .parse()
+        .map_err(|e| format!("max_seq: {e}"))?;
+    if walked_max_seq.is_empty() {
+        walked_max_seq.push(max_seq);
+    } else if walked_max_seq.iter().max() != Some(&max_seq) {
+        return Err(format!(
+            "walked_max_seq {walked_max_seq:?} does not top out at max_seq {max_seq}"
+        ));
+    }
     Ok(WalkedRoutePlan {
         family: get("family")?,
         model_arch: get("model_arch")?
@@ -9164,9 +9195,8 @@ fn parse_walked_route_plan(text: &'static str) -> Result<WalkedRoutePlan, String
         layout: get("layout")?,
         mtp_layout: directive.get("mtp_layout").copied(),
         heads,
-        max_seq: get("max_seq")?
-            .parse()
-            .map_err(|e| format!("max_seq: {e}"))?,
+        max_seq,
+        walked_max_seq,
         axes,
         sealed,
         rows,
@@ -9606,13 +9636,41 @@ fn walked_route_entries_in(
     }
     add_wide_twin_entries(input.arch, &mut planned);
     add_hc8_entries(input, &mut planned);
-    let seal = if plan
+    if !plan
         .sealed
         .contains(&if native_mtp { "native_mtp" } else { "ar" })
     {
-        RouteSeal::Sealed
+        return Ok(Some((
+            RouteKernelPlan { entries: planned },
+            RouteSeal::Open(family),
+        )));
+    }
+    // The qwen35 carrier's decode attention picks its kernels by the Q8 flash
+    // tile, a function of `max_seq` (gfx1100: tile32 and the plain tile at
+    // `max_seq <= 8192`, the GQA tile above). A walk proves the closure of
+    // its own band only, so a load in a band no walked context shares stays
+    // open: an unwalked kernel then binds lazily instead of failing.
+    let seal = if matches!(plan.model_arch, 5 | 6) {
+        let (h, kv, d) = (input.n_heads, input.n_kv_heads, input.head_dim);
+        let band = crate::attention::q8_decode_attn_band(input.arch, h, kv, d, input.max_seq);
+        let walked: Vec<String> = plan
+            .walked_max_seq
+            .iter()
+            .map(|&m| crate::attention::q8_decode_attn_walked_band(input.arch, h, kv, d, m))
+            .collect();
+        if walked.contains(&band) {
+            RouteSeal::Sealed
+        } else {
+            RouteSeal::Unwalked(
+                family,
+                format!(
+                    "max_seq {} resolves Q8 decode attention {band}; the walks at max_seq {:?} ran {walked:?}",
+                    input.max_seq, plan.walked_max_seq
+                ),
+            )
+        }
     } else {
-        RouteSeal::Open(family)
+        RouteSeal::Sealed
     };
     Ok(Some((RouteKernelPlan { entries: planned }, seal)))
 }
@@ -15834,6 +15892,73 @@ extern "C" __global__ void NAMED(int* p) {}
             &axes,
         );
         assert!(walked_route_entries_in(plans, &other).unwrap().is_none());
+    }
+
+    /// gfx1100 Q8 decode attention takes tile32 (the plain tile) at
+    /// `max_seq <= 8192` and tile128 (the GQA tile) above: a plan walked only
+    /// at the default context leaves a short-context load open instead of
+    /// sealing it without the plain tile; a plan that also walked a short
+    /// context seals both bands. An `ar`-sealed plan stays open for
+    /// native MTP whatever the band.
+    #[test]
+    fn sealed_plan_seals_only_the_max_seq_bands_its_walks_ran() {
+        let long_plans =
+            walked_fixture!(main_plan_text().replace("#! max_seq 8192\n", "#! max_seq 262144\n"));
+        let both_plans = walked_fixture!(main_plan_text().replace(
+            "#! max_seq 8192\n",
+            "#! max_seq 262144\n#! walked_max_seq 4096 262144\n",
+        ));
+        assert_eq!(long_plans[0].walked_max_seq, [262144]);
+        assert_eq!(both_plans[0].walked_max_seq, [4096, 262144]);
+        let flags = default_feature_flags("gfx1100").unwrap();
+        let axes = synthetic_axes();
+        let trunk = synthetic_trunk();
+        let trunk_metas = synthetic_metas(&trunk);
+        let seal = |plans: &'static [WalkedRoutePlan], max_seq: usize| {
+            let mut input =
+                synthetic_input("gfx1100", &trunk_metas, KernelSpecRoute::Ar, &flags, &axes);
+            input.max_seq = max_seq;
+            walked_route_entries_in(plans, &input).unwrap().unwrap().1
+        };
+        for max_seq in [8193, 16384, 188897, 262144] {
+            assert_eq!(seal(long_plans, max_seq), RouteSeal::Sealed, "{max_seq}");
+            assert_eq!(seal(both_plans, max_seq), RouteSeal::Sealed, "{max_seq}");
+        }
+        for max_seq in [512, 4096, 8192] {
+            assert!(
+                matches!(
+                    seal(long_plans, max_seq),
+                    RouteSeal::Unwalked("synthetic-qwen35", ref why) if why.contains("tile32")
+                ),
+                "{max_seq}"
+            );
+            assert_eq!(seal(both_plans, max_seq), RouteSeal::Sealed, "{max_seq}");
+        }
+        let with_head = synthetic_with_head();
+        let head_metas = synthetic_metas(&with_head);
+        let mut mtp = synthetic_input(
+            "gfx1100",
+            &head_metas,
+            KernelSpecRoute::NativeMtp,
+            &flags,
+            &axes,
+        );
+        mtp.max_seq = 4096;
+        assert_eq!(
+            walked_route_entries_in(long_plans, &mtp)
+                .unwrap()
+                .unwrap()
+                .1,
+            RouteSeal::Open("synthetic-qwen35")
+        );
+        // The walked contexts must top out at the plan's ceiling.
+        static BAD: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            main_plan_text().replace(
+                "#! max_seq 8192\n",
+                "#! max_seq 8192\n#! walked_max_seq 4096\n",
+            )
+        });
+        assert!(parse_walked_route_plan(BAD.as_str()).is_err());
     }
 
     #[test]

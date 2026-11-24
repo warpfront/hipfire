@@ -3650,7 +3650,9 @@ fn resolve_route_plan(
     String,
 > {
     use hipfire_arch_qwen35::qwen35::StateQuant;
-    use rdna_compute::kernel_registry::{KernelSpecRoute, KernelTensorMeta, RouteKernelInput};
+    use rdna_compute::kernel_registry::{
+        KernelSpecRoute, KernelTensorMeta, RouteKernelInput, RouteSeal,
+    };
     let ModelSource::Hfq(hfq) = req.source else {
         return Err("safetensors directory source".into());
     };
@@ -3870,6 +3872,24 @@ fn resolve_route_plan(
         hc8_sidecar: false,
     })
     .map_err(|e| format!("{e:?}"))?;
+    // Every walk, and the hand-closed gfx1201 route, ran the product
+    // `attention.flash` (auto); another mode dispatches other attention
+    // kernels, so such a load keeps the plan but never seals it.
+    let arch = gpu.arch.as_str();
+    let flash = hipfire_runtime::llama::attention_flash_mode(arch);
+    let seal = if seal == RouteSeal::Sealed
+        && flash != hipfire_runtime::llama::attention_flash_mode_for("auto", arch)
+    {
+        RouteSeal::Unwalked(
+            "qwen35",
+            format!(
+                "attention.flash = {} resolves flash mode {flash}; the walks ran auto",
+                hipfire_runtime::config::get().attention_flash_mode
+            ),
+        )
+    } else {
+        seal
+    };
     Ok((plan, spec, seal))
 }
 
@@ -4074,6 +4094,18 @@ fn begin_route_kernels(
             Some(format!("{family} {} {spec:?}", gpu.arch)),
             None,
         ),
+        Ok((plan, spec, RouteSeal::Unwalked(family, why))) => {
+            eprintln!(
+                "  kernels: {family} {} {spec:?} route left open, outside its walks: {why}",
+                gpu.arch
+            );
+            (
+                plan,
+                Some(spec),
+                Some(format!("{family} {} {spec:?} (unwalked band)", gpu.arch)),
+                None,
+            )
+        }
         Err(reason) if sealed_replay => {
             eprintln!(
                 "  kernels: {LAZY_KERNELS_NOTE} [HIPFIRE_ROUTE_PLAN_SEAL=1: no closed route plan: {reason}]"

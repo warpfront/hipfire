@@ -349,10 +349,13 @@ def main():
         receipts.append(f"# walk {route} {walk.name} daemon_sha256={command['daemon_sha256'][:16]} "
                         f"model={command['load']['model']} requests={command['requests']} env={json.dumps(env, sort_keys=True)}"
                         f" direct_loads={len(direct)}")
+    # Every walked context: the loader seals only a load whose context-dependent kernel selection (the Q8 decode
+    # attention tile band) one of them shares. One context is implied by `#! max_seq` alone.
+    walked_max_seq = sorted(max_seq)
     if len(max_seq) != 1:
         if not a.union_max_seq:
             raise SystemExit(f"walks disagree on max_seq: {max_seq} (--union-max-seq takes the largest)")
-        receipts.append(f"# max_seq union of walks at {sorted(max_seq)}")
+        receipts.append(f"# max_seq union of walks at {walked_max_seq}")
         max_seq = {max(max_seq)}
     if qwen35_walks and len(heads) != 1:
         raise SystemExit(f"walks disagree on heads/kv heads/head dim: {heads}")
@@ -392,6 +395,7 @@ def main():
         *([f"#! mtp_layout {mtp_layout}"] if mtp_layout else []),
         *([f"#! heads {next(iter(heads))}"] if heads else []),
         f"#! max_seq {max_seq.pop()}",
+        *([f"#! walked_max_seq {' '.join(map(str, walked_max_seq))}"] if len(walked_max_seq) > 1 else []),
         *(f"#! axis {name} {' '.join(sorted(values))}" for name, values in sorted(axes.items())),
         *([f"#! sealed {' '.join(r for r in ('ar', 'native_mtp') if r in sealed)}"] if sealed else []),
         *receipts,
