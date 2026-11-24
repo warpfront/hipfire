@@ -244,8 +244,17 @@ mod tests {
         let cfg = LoopConfig::mini();
         // every visit slot of all three passes maps to its own pass's layer
         for (v, want) in [
-            (0, 0), (5, 5), (6, 6), (17, 17), (18, 6), (23, 11), (29, 17),
-            (30, 6), (41, 17), (42, 18), (47, 23),
+            (0, 0),
+            (5, 5),
+            (6, 6),
+            (17, 17),
+            (18, 6),
+            (23, 11),
+            (29, 17),
+            (30, 6),
+            (41, 17),
+            (42, 18),
+            (47, 23),
         ] {
             assert_eq!(cfg.layer_phys(v), want, "visit {v}");
         }
