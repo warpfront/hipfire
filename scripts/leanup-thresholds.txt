@@ -212,3 +212,12 @@ topology_arch_arms_caps          == 0
 topology_arch_arms_generate_qwen == 0
 topology_arch_arms_generate_bench == 0
 topology_arch_arms_total         <= 43
+
+# --- direction ratchets (check-direction-ratchets.py) ---
+# Shrink-only. Pinned at the 2026-11-24 counts on origin/beta-candidate
+# (non-test code). A failure prints what to do instead: a carrier feature trait
+# instead of a bundle downcast, an ArchCaps capability instead of a "gfx…"
+# string match, a typed hipfire-config key instead of a raw HIPFIRE_* read.
+direction_bundle_downcasts    <= 163
+direction_gfx_string_matches  <= 865
+direction_raw_hipfire_env     <= 32
