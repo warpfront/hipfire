@@ -4,7 +4,10 @@
 #   ==  must equal exactly
 #   <=  ceiling; may only decrease
 #
-# A metric with no line here is informational and never fails the run.
+# A metric with no line here is informational and never fails the run (the
+# `gauge_*` metrics of check-direction-ratchets.py are printed, never asserted).
+# `scripts/check-direction-ratchets.py --lower` rewrites direction_* ceilings
+# that sit above their measured value down to it; it never raises one.
 #
 # Lowering a ceiling after an improvement is expected and encouraged. RAISING
 # one requires a sentence in the commit message saying what was traded for it --
