@@ -1,5 +1,5 @@
 # Flags migration gate GB, static half: call-site defaults. Do not edit by hand.
-# regenerate: scripts/flags-golden.sh --regen
+# regenerate: scripts/regen-generated.sh
 # extractor: scripts/flags-golden-extract.py (production crates/*/src, comments and cfg(test) mods removed)
 # columns: section<TAB>arch<TAB>NAME#fn=default (sorted, deduplicated)
 developer_callsite	*	?family.env_var()#developer_bool=false

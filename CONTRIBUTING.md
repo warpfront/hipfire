@@ -80,6 +80,15 @@ first load. See
 `core.hooksPath=.githooks` and makes the local pre-commit hook
 executable.
 
+Generated files (crate `map.md` blocks, the developer call-site flags
+golden, the `docs/CONFIG.md` lifecycle table and the `docs/env-vars.md`
+inventory) are never hand-edited: `scripts/regen-generated.sh` rebuilds
+them from the tree, and the pre-commit hook runs it and stages the result
+(`--all` also rebuilds the cargo-built flags goldens and TUI snapshots).
+A drift failure in `scripts/ci-gates.sh` names that command. Ratchet
+ceilings, pins, lifecycle labels and the census allowlists stay human
+decisions; the script does not touch them.
+
 ### No-GPU CI subset
 
 The default CI path intentionally avoids AMD GPU access and model

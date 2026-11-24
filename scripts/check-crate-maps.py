@@ -330,7 +330,7 @@ def check_crate(crate: Path) -> list[str]:
     if not problems:
         problems.append(
             f"{crate.name}: generated block is stale — "
-            f"run scripts/check-crate-maps.py {crate.name}"
+            f"run scripts/regen-generated.sh (or scripts/check-crate-maps.py {crate.name})"
         )
     return problems + link_problems
 

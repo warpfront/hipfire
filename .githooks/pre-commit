@@ -46,6 +46,28 @@ if [[ -z "${SKIP_FMT_CHECK:-}" ]]; then
     fi
 fi
 
+# ── regenerate generated files (commits touching their inputs, GPU-free, ~15s) ──
+# Crate maps, the developer call-site golden, the CONFIG.md lifecycle table and
+# the env-vars.md inventory are derived from the tree: regenerate them and stage
+# what changed, so their drift gates below and in CI pass without hand edits.
+# Cargo-built goldens (flags defaults, TUI snapshots) regenerate only when the
+# staged diff touches their inputs. Note: a regenerated file is staged whole.
+# Bypass with SKIP_REGEN=1.
+if [[ -z "${SKIP_REGEN:-}" ]] && echo "$CHANGED" | grep -qE '\.(rs|py|sh|toml)$|map\.md$|^docs/(CONFIG|env-vars)\.md$'; then
+    echo "=== Regenerate generated files ===" >&2
+    if ! regen_out=$(scripts/regen-generated.sh --staged); then
+        echo "" >&2
+        echo "✗ scripts/regen-generated.sh failed — see output above (bypass: SKIP_REGEN=1)" >&2
+        exit 1
+    fi
+    if [[ -n "$regen_out" ]]; then
+        echo "$regen_out" | xargs git add --
+        echo "regen-generated: staged regenerated file(s):" >&2
+        echo "$regen_out" | sed 's/^/  /' >&2
+        CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
+    fi
+fi
+
 # ── crate-map + ratchets (every commit touching crates/ or kernels/, GPU-free, <1s) ──
 # Mirrors CI `gates` job (ci.yml:89-98) which fails PRs on stale maps or
 # ratchet regressions. Bypass with SKIP_GATES_CHECK=1 if mid-rebase.
@@ -54,7 +76,7 @@ if [[ -z "${SKIP_GATES_CHECK:-}" ]]; then
         echo "=== Crate maps ===" >&2
         if ! python3 scripts/check-crate-maps.py --check; then
             echo "" >&2
-            echo "✗ crate maps stale — run scripts/check-crate-maps.py <crate> and git add the map.md" >&2
+            echo "✗ crate maps stale — run scripts/regen-generated.sh and git add the map.md" >&2
             exit 1
         fi
         echo "=== Leanup ratchets ===" >&2

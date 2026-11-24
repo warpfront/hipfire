@@ -414,7 +414,7 @@ def main() -> int:
             print(f"  {error}")
         if len(errors) > 200:
             print(f"  … {len(errors) - 200} more")
-        print("Regenerate generated tables with: python3 scripts/check-lifecycle.py --write")
+        print("Regenerate the (b) tables with: scripts/regen-generated.sh (an (a) finding or unknown status needs a source fix)")
         return 1
     deprecated = sum(1 for f in fields if f["deprecated"])
     dep_env = sum(1 for s in env_statuses.values() if s.startswith("deprecated"))

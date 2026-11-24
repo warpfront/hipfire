@@ -29,7 +29,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 GOLDEN = ROOT / "tests/golden/flags-defaults/developer-callsites.tsv"
-REGEN = "scripts/flags-golden.sh --regen"
+REGEN = "scripts/regen-generated.sh"
 
 CALL = re.compile(r"\b(developer_bool|developer_typed_bool|developer_var_os|developer_var)\s*\(")
 CONST = re.compile(r'\b(?:pub(?:\([a-z]+\))?\s+)?(?:const|static)\s+([A-Z][A-Z0-9_]*)\s*:\s*&(?:\'static\s+)?str\s*=\s*"([^"\\]*)"\s*;')
