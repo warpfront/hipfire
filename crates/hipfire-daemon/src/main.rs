@@ -3945,7 +3945,10 @@ fn main() {
                     // Qwen4 batches only through its staged fn-lanes route.
                     let qwen4_batch = hipfire_loader::continuous_batch_route(m.arch_id)
                         == Some(hipfire_loader::ContinuousBatchRoute::Qwen4);
-                    let qwen4_lanes = qwen4_batch && vmm_route;
+                    // The engine's scheduler, or Qwen4 fn-lanes: the driver
+                    // renders each request and announces its own start.
+                    let engine_route = hipfire_generate::batch::engine_lanes_route(m);
+                    let qwen4_lanes = (qwen4_batch && vmm_route) || engine_route.is_some();
                     // Fixed-lane families on the shared lane driver.
                     let (lane_family, lane_route) =
                         match hipfire_generate::lanes::lane_family_route(m) {
@@ -3982,7 +3985,8 @@ fn main() {
                             );
                             hipfire_generate::ar::emit_generation_start(
                                 if qwen4_lanes {
-                                    hipfire_generate::ar::GenerationRoute::Qwen4Ar
+                                    engine_route
+                                        .unwrap_or(hipfire_generate::ar::GenerationRoute::Qwen4Ar)
                                 } else if lane_family {
                                     lane_route
                                 } else {

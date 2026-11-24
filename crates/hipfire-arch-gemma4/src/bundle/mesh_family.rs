@@ -20,7 +20,7 @@ use crate::gemma4::GEMMA4_FORWARD_BATCH_MAX;
 use hipfire_dispatch::pipeline::step_graph::{
     OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, SplitRule, StateClass, StepGraph,
 };
-use hipfire_runtime::mesh_family::{EpochHead, EpochInput, MeshFamily};
+use hipfire_runtime::mesh_family::{EpochHead, EpochInput, MeshFamily, MeshLanes};
 use hipfire_runtime::mesh_split::PlannedCollective;
 use hipfire_runtime::multi_gpu::executor::{
     BoundaryIo, ForwardEpoch, MeshCheckpointId, MeshCheckpointKey, MeshRoute, MeshStepBindings,
@@ -32,7 +32,7 @@ use hipfire_runtime::weight_manifest::{StateEntry, StateKind, WeightEntry};
 use rdna_compute::Gpu;
 
 /// The one band of a one-owner mesh: device 0.
-fn device(gpus: &mut Gpus) -> Result<&mut Gpu> {
+pub(super) fn device(gpus: &mut Gpus) -> Result<&mut Gpu> {
     match gpus.devices.as_mut_slice() {
         [gpu] => Ok(gpu),
         _ => Err("a Gemma 4 load runs on a one-owner mesh".into()),
@@ -232,6 +232,11 @@ impl MeshFamily for Gemma4Bundle {
             prepared: None,
             ran: false,
         })
+    }
+
+    /// The staged engine lanes (`serve.vmm_batch` on the engine loop).
+    fn mesh_lanes(&mut self) -> Option<&mut dyn MeshLanes> {
+        self.lanes.is_some().then_some(self as &mut dyn MeshLanes)
     }
 }
 

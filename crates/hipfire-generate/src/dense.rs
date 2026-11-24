@@ -2281,129 +2281,35 @@ pub fn generate_gemma4(
         id,
         false,
     );
-    let Some(bundle) = m
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Gemma4Bundle>())
-    else {
+    let Some(cfg_eos_tok) = m.gemma4().map(|bundle| bundle.config.eos_token) else {
         emit_error_with_id(stdout, id, "gemma4 bundle missing on arch_id=13 generate");
         return;
     };
-
-    let bos_tok = bundle.config.bos_token;
-    let cfg_eos_tok = bundle.config.eos_token;
-
-    // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
-    let prompt_ids: Vec<u32> = {
-        let tokenizer = m.tokenizer.as_ref().unwrap();
-        let try_jinja = m.chat_template.is_some();
-        let mut ids: Vec<u32> = if try_jinja {
-            let template = m.chat_template.as_ref().unwrap();
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-                tokenizer,
-                template,
-                system: system_prompt,
-                user: prompt,
-                enable_thinking,
-                bos_token: Some("<bos>"),
-                reasoning_strength: None,
-                reasoning_effort: None,
-            };
-            let render_result = if tools.is_some() || messages_history.is_some() {
-                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
-                    match messages_history {
-                        Some(h) => h,
-                        None => {
-                            let mut v = Vec::new();
-                            if let Some(sys) = system_prompt {
-                                v.push(hipfire_runtime::prompt_frame::Message {
-                                    role: hipfire_runtime::prompt_frame::Role::System,
-                                    content: sys.to_string(),
-                                    reasoning_content: None,
-                                    name: None,
-                                    rendered_name: None,
-                                    tool_calls: Vec::new(),
-                                    tool_call_id: None,
-                                    tool_plan: String::new(),
-                                });
-                            }
-                            v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::User,
-                                content: prompt.to_string(),
-                                reasoning_content: None,
-                                name: None,
-                                rendered_name: None,
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                tool_plan: String::new(),
-                            });
-                            synthesized = v;
-                            &synthesized
-                        }
-                    };
-                gemma4_template_messages(messages_slice)
-                    .and_then(|values| frame.render_message_values(values, tools, None))
-            } else {
-                frame.render()
-            };
-            match render_result {
-                Ok(rendered) => tokenizer.encode(&rendered),
-                // A raw-prompt fallback would silently drop the tool
-                // declarations and history the client sent.
-                Err(e) if tools_nonempty => {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("gemma4 chat template render failed for a tools request: {e}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[daemon] jinja render failed in gemma4 path ({e}) —                          falling back to BOS + raw prompt"
-                    );
-                    tokenizer.encode(prompt)
-                }
-            }
-        } else {
-            tokenizer.encode(prompt)
-        };
-        if ids.first() != Some(&bos_tok) {
-            ids.insert(0, bos_tok);
+    let prompt_ids = match gemma4_prompt_ids(
+        m,
+        prompt,
+        system_prompt,
+        enable_thinking,
+        tools,
+        messages_history,
+    ) {
+        Ok(ids) => ids,
+        Err(message) => {
+            emit_active_attempt_error(stdout, Some(id), &message, "validation", false, false);
+            let _ = stdout.flush();
+            return;
         }
-        ids
     };
-
     if prompt_ids.is_empty() {
         emit_error_with_id(stdout, id, "empty prompt after tokenize");
         return;
     }
-
-    // Stop set (see doc comment item 4). `bundle.eos_tok` already resolved
-    // `<end_of_turn>` / `<turn|>` at load; union with config.eos_token
-    // (`<eos>`, id 1), the documented 106, and `<|tool_response>`, which
-    // ends a tool-call turn (the client sends the response).
-    let stop_set: Vec<u32> = {
-        let mut s = vec![cfg_eos_tok, bundle.eos_tok];
-        if !s.contains(&106) {
-            s.push(106);
-        }
-        if let Some(tool_response) = m
-            .tokenizer
-            .as_ref()
-            .and_then(|t| t.special_token_id("<|tool_response>"))
-        {
-            s.push(tool_response);
-        }
-        s.sort_unstable();
-        s.dedup();
-        s
-    };
+    let stop_set = gemma4_stop_set(m);
+    let bundle = m
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Gemma4Bundle>())
+        .expect("the gemma4 bundle was resolved above");
 
     // Hard refusal: the prompt alone must fit (KV writes at pos >= max_seq
     // would be out of bounds).
@@ -2611,6 +2517,116 @@ pub fn generate_gemma4(
     if gemma4_commit_terminal(stdout, id, pending_done, turn_text.calls(), generated_count) {
         hipfire_runtime::arch_model::ArchModel::session_commit(bundle);
     }
+}
+
+/// The Gemma 4 prompt ids of a request (same two-path branch as the lfm2moe
+/// AR path): the chat template rendered with an explicit `<bos>`, or the raw
+/// prompt when the template fails (a tools request fails instead: a raw
+/// fallback would drop its tool declarations and history), BOS-prefixed.
+pub(crate) fn gemma4_prompt_ids(
+    m: &LoadedModel,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    enable_thinking: bool,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) -> Result<Vec<u32>, String> {
+    let bos_tok = m.gemma4().ok_or("gemma4 bundle missing")?.config.bos_token;
+    let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer not loaded")?;
+    let tools_nonempty = tools.is_some_and(|t| !t.is_empty());
+    let mut ids: Vec<u32> = if let Some(template) = m.chat_template.as_ref() {
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking,
+            bos_token: Some("<bos>"),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let render_result = if tools.is_some() || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(h) => h,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        reasoning_content: None,
+                        name: None,
+                        rendered_name: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        tool_plan: String::new(),
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            gemma4_template_messages(messages_slice)
+                .and_then(|values| frame.render_message_values(values, tools, None))
+        } else {
+            frame.render()
+        };
+        match render_result {
+            Ok(rendered) => tokenizer.encode(&rendered),
+            Err(e) if tools_nonempty => {
+                return Err(format!(
+                    "gemma4 chat template render failed for a tools request: {e}"
+                ))
+            }
+            Err(e) => {
+                eprintln!(
+                    "[daemon] jinja render failed in gemma4 path ({e}) —                          falling back to BOS + raw prompt"
+                );
+                tokenizer.encode(prompt)
+            }
+        }
+    } else {
+        tokenizer.encode(prompt)
+    };
+    if ids.first() != Some(&bos_tok) {
+        ids.insert(0, bos_tok);
+    }
+    Ok(ids)
+}
+
+/// The ids that end a Gemma 4 turn (see `generate_gemma4` item 4):
+/// `bundle.eos_tok` (`<end_of_turn>` / `<turn|>`, resolved at load), the
+/// config's `<eos>` (id 1), the documented 106, and `<|tool_response>`,
+/// which ends a tool-call turn (the client sends the response).
+pub(crate) fn gemma4_stop_set(m: &LoadedModel) -> Vec<u32> {
+    let Some(bundle) = m.gemma4() else {
+        return Vec::new();
+    };
+    let mut s = vec![bundle.config.eos_token, bundle.eos_tok];
+    if !s.contains(&106) {
+        s.push(106);
+    }
+    if let Some(tool_response) = m
+        .tokenizer
+        .as_ref()
+        .and_then(|t| t.special_token_id("<|tool_response>"))
+    {
+        s.push(tool_response);
+    }
+    s.sort_unstable();
+    s.dedup();
+    s
 }
 
 /// Why a Gemma 4 load cannot serve `tools`, or `None` when it can. Tools need

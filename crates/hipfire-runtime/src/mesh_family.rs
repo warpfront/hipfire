@@ -152,6 +152,12 @@ pub trait MeshLanes {
     fn step_lanes(&mut self, gpus: &mut Gpus, rows: &[(u64, u32, bool)]) -> Result<Vec<DecodeOut>>;
     /// Free `tag`'s lane (host only; the next park reuses its state).
     fn free_lane(&mut self, tag: u64);
+    /// Whether a finished conversation's lane is kept as its record
+    /// ([`LaneRecord`]): a family whose decoded rows a cold turn would not
+    /// reproduce frees the lane instead.
+    fn keeps_records(&self) -> bool {
+        true
+    }
 }
 
 /// A committed conversation whose state stays in lane `tag`, holding exactly

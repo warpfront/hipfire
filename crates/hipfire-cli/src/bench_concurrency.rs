@@ -379,9 +379,10 @@ fn last_user_text(messages: &Value) -> Option<&str> {
         .as_str()
 }
 
-/// The continuous-batching routes the batch sweep may measure.
+/// The continuous-batching routes the batch sweep may measure (`engine-lanes`:
+/// Gemma 4 on the engine loop's N-request scheduler).
 pub fn is_batch_route(route: Option<&str>) -> bool {
-    matches!(route, Some("vmm" | "fn-lanes"))
+    matches!(route, Some("vmm" | "fn-lanes" | "engine-lanes"))
 }
 
 // ── Drivers ─────────────────────────────────────────────────────────────────

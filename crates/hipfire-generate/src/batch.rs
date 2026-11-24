@@ -599,10 +599,12 @@ pub(crate) fn drain_qwen_batch_inbox(
                     let thinking_enabled = json.get("thinking_enabled").and_then(|v| v.as_bool());
                     let (batch_enable_thinking, batch_reasoning_effort) =
                         qwen_jinja_reasoning(thinking_enabled, raw_effort, max_think);
-                    // Qwen4Ar: the lane driver renders the exact qwen4 prompt
-                    // at assignment (its own template/think handling), so the
-                    // shared qwen35 render must neither run nor reject here.
-                    let rendered = if route == GenerationRoute::Qwen4Ar {
+                    // Qwen4Ar / Gemma4Ar: the engine driver renders the exact
+                    // prompt at assignment (its own template/think handling),
+                    // so the shared qwen35 render must neither run nor reject.
+                    let renders_at_assignment =
+                        matches!(route, GenerationRoute::Qwen4Ar | GenerationRoute::Gemma4Ar);
+                    let rendered = if renders_at_assignment {
                         Ok((Vec::new(), false))
                     } else {
                         batch_render_prompt_tokens(
@@ -647,9 +649,9 @@ pub(crate) fn drain_qwen_batch_inbox(
                         barrier = Some(handoff);
                         break;
                     }
-                    // Qwen4Ar defers rendering to the lane driver, so the
-                    // prompt-length gate runs there (before store admit).
-                    if route != GenerationRoute::Qwen4Ar
+                    // The driver that renders at assignment also runs the
+                    // prompt-length gate (before store admit).
+                    if !renders_at_assignment
                         && (prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity)
                     {
                         emit_batch_admission_error(
@@ -2827,6 +2829,7 @@ pub fn is_vmm_batch_request_eligible(
     serve_continuous_batch: bool,
 ) -> bool {
     let staged = qwen4_lanes_staged(m)
+        || gemma4_engine_lanes_staged(m)
         || m.state.as_ref().is_some_and(|s| {
             (s.as_ref() as &dyn Any)
                 .downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()
@@ -2872,6 +2875,12 @@ pub fn is_vmm_batch_request_eligible(
         return false;
     }
     let sampling = resolve_batch_sampling(msg, m);
+    // Gemma 4 lanes sample on the host with the request's own sampler; the
+    // singleton route refuses stop sequences and min_tokens, so do they.
+    if gemma4_engine_lanes_staged(m) {
+        return hipfire_runtime::stop_sequence::parse_stop_field(msg.get("stop"))
+            .is_ok_and(|stop| stop.is_empty());
+    }
     if m.qwen4().is_some() {
         let store_sampled = m
             .qwen4()
@@ -2886,7 +2895,14 @@ pub fn is_vmm_batch_request_eligible(
 /// `vmm_store` staged).
 pub fn vmm_route_active(vmm_batch: Option<VmmBatchParams>, m: &LoadedModel) -> bool {
     vmm_batch.is_some()
-        && (m.qwen35().is_some_and(|b| b.vmm_store.is_some()) || qwen4_lanes_staged(m))
+        && (m.qwen35().is_some_and(|b| b.vmm_store.is_some())
+            || qwen4_lanes_staged(m)
+            || gemma4_engine_lanes_staged(m))
+}
+
+/// A Gemma 4 model whose engine lanes are staged (engine loop only).
+fn gemma4_engine_lanes_staged(m: &LoadedModel) -> bool {
+    m.gemma4().is_some_and(|b| b.engine_lanes_staged())
 }
 
 /// A Qwen4 model whose AR lane store is staged (`Qwen4Bundle::stage_lanes`).
@@ -2942,9 +2958,9 @@ pub(crate) fn qwen4_lone_lane_for_request(
 
 /// [`qwen4_lone_lane_for_request`] for the loaded model and message
 /// (requires a staged lane store); every request the engine's scheduler
-/// serves ([`engine_serves_lanes`]).
+/// serves ([`engine_lanes_route`]).
 fn qwen4_lone_request_takes_lane_for(msg: &serde_json::Value, m: &LoadedModel) -> bool {
-    engine_serves_lanes(m)
+    engine_lanes_route(m).is_some()
         || m.qwen4().is_some_and(|b| {
             b.lanes().is_some()
                 && qwen4_lone_lane_for_request(
@@ -2965,6 +2981,19 @@ pub(crate) fn engine_serves_lanes(m: &LoadedModel) -> bool {
         && m.qwen4().is_some_and(|b| {
             b.lane_topology() == "single" && b.lanes().is_some_and(|store| store.spec().is_none())
         })
+}
+
+/// The route whose staged lanes the engine's N-request scheduler serves on
+/// this load: Qwen4 AR ([`engine_serves_lanes`]) or Gemma 4 AR (its engine
+/// lanes, staged only on the engine loop, with no drafter attached).
+pub fn engine_lanes_route(m: &LoadedModel) -> Option<GenerationRoute> {
+    if engine_serves_lanes(m) {
+        return Some(GenerationRoute::Qwen4Ar);
+    }
+    (crate::engine::runs_on_engine(GenerationRoute::Gemma4Ar)
+        && m.speculator.is_none()
+        && gemma4_engine_lanes_staged(m))
+    .then_some(GenerationRoute::Gemma4Ar)
 }
 
 /// Qwen4 lane admission: greedy requests, or sampled ones when the store is
@@ -3138,6 +3167,20 @@ pub fn vmm_loaded_ack(
     let Some(p) = vmm_batch else {
         return ack;
     };
+    if gemma4_engine_lanes_staged(m) {
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&ack) else {
+            return ack;
+        };
+        v["continuous_batch_route"] = serde_json::json!("engine-lanes");
+        v["continuous_batch_history_capable"] = serde_json::json!(true);
+        v["continuous_batch_slots"] = serde_json::json!(slots);
+        v["continuous_batch_row_budget"] = serde_json::json!(row_budget);
+        v["continuous_batch_row_budget_requested"] = serde_json::json!(p.max_batch_tokens);
+        v["continuous_batch_exact"] = serde_json::json!(true);
+        v["continuous_batch_spec"] = serde_json::json!(false);
+        v["continuous_batch_spec_mode"] = serde_json::json!("off");
+        return v.to_string();
+    }
     if m.qwen4().is_some() {
         if !qwen4_lanes_staged(m) {
             return ack;
@@ -3292,11 +3335,11 @@ pub fn drive_staged_continuous_batch(
     stdout: &mut std::io::Stdout,
     inbox: &mut DaemonInbox,
 ) -> Result<(), BatchDriveError> {
+    if let (Some(params), Some(route)) = (vmm_batch, engine_lanes_route(m)) {
+        return crate::engine::serve::drive(sched, gpu, m, params, route, stdout, inbox);
+    }
     if m.qwen4().is_some() {
         return match vmm_batch {
-            Some(params) if engine_serves_lanes(m) => {
-                crate::engine::serve::drive(sched, gpu, m, params, stdout, inbox)
-            }
             Some(params) => {
                 crate::fn_batch::drive_qwen4_lane_batch(sched, gpu, m, params, stdout, inbox, None)
             }

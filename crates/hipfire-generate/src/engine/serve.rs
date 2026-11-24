@@ -17,7 +17,8 @@
 //! request that finished in a lane keeps that lane as its conversation's
 //! record once committed ([`LaneRecord`]); a cancel frees it.
 
-use super::chatml::{ChatMl, ChatMlStream, Host};
+use super::chatml::{ChatMl, ChatMlStream, Host, WireProtocol};
+use super::gemma::{Gemma4Stream, Gemma4Wire};
 use super::sched::{Batch, Ended, Place, Scheduler};
 use super::{admit_budget, DoneMetrics, Exit, Finish, Next, RequestRun, Verdict};
 use crate::ar::*;
@@ -42,16 +43,15 @@ use std::io::{Stdout, Write};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-const ROUTE: GenerationRoute = GenerationRoute::Qwen4Ar;
-
-/// Serve the staged continuous batch on the engine loop until no request is
-/// queued or live. `Err`: a driver-level failure; every request it held got
-/// its terminal.
+/// Serve the staged continuous batch of `route` (Qwen4 AR or Gemma 4 AR) on
+/// the engine loop until no request is queued or live. `Err`: a
+/// driver-level failure; every request it held got its terminal.
 pub fn drive(
     sched: &mut ContinuousBatchScheduler,
     gpu: &mut rdna_compute::Gpu,
     m: &mut LoadedModel,
     params: VmmBatchParams,
+    route: GenerationRoute,
     stdout: &mut Stdout,
     inbox: &mut DaemonInbox,
 ) -> Result<(), BatchDriveError> {
@@ -69,6 +69,7 @@ pub fn drive(
         lives: (0..sched.max_batch).map(|_| None).collect(),
         core: Scheduler::default(),
         max_batch_tokens: params.max_batch_tokens,
+        route,
     };
     let result = super::run::on_one_owner(m, gpu, n_layers, |m, runner, gpus| {
         let result = driver.serve(sched, m, runner, gpus, stdout, inbox);
@@ -89,12 +90,7 @@ struct Live {
     budget: usize,
     sampler: SamplerConfig,
     seed: u32,
-    started_in_think: bool,
-    stop: Vec<String>,
-    min_tokens: usize,
-    max_think_tokens: usize,
-    eos: u32,
-    stream: ChatMlStream,
+    wire: Wire,
     /// Lane identity (unique per request).
     tag: u64,
     t0: Instant,
@@ -110,15 +106,123 @@ struct Live {
     streamed: Vec<u32>,
 }
 
-impl Live {
-    fn protocol(&self) -> ChatMl<'_> {
-        ChatMl {
-            started_in_think: self.started_in_think,
-            tools: false,
-            stop: &self.stop,
-            min_tokens: self.min_tokens,
-            max_think_tokens: self.max_think_tokens,
-            eos: std::slice::from_ref(&self.eos),
+/// A request's wire protocol and its stream state, as its route declares it.
+enum Wire {
+    /// Qwen4 AR.
+    ChatMl {
+        started_in_think: bool,
+        stop: Vec<String>,
+        min_tokens: usize,
+        max_think_tokens: usize,
+        eos: u32,
+        stream: Box<ChatMlStream>,
+    },
+    /// Gemma 4 AR.
+    Gemma {
+        enable_thinking: bool,
+        max_think_tokens: usize,
+        stop: Vec<u32>,
+        stream: Gemma4Stream,
+    },
+}
+
+impl Wire {
+    fn emit(
+        &mut self,
+        host: &mut Host<'_>,
+        streamed: &mut Vec<u32>,
+        token: u32,
+    ) -> Result<(Verdict, Vec<u32>), String> {
+        match self {
+            Wire::ChatMl {
+                started_in_think,
+                stop,
+                min_tokens,
+                max_think_tokens,
+                eos,
+                stream,
+            } => {
+                let spec = ChatMl {
+                    started_in_think: *started_in_think,
+                    tools: false,
+                    stop,
+                    min_tokens: *min_tokens,
+                    max_think_tokens: *max_think_tokens,
+                    eos: std::slice::from_ref(eos),
+                };
+                stream.emit(&spec, host, streamed, token)
+            }
+            Wire::Gemma {
+                enable_thinking,
+                max_think_tokens,
+                stop,
+                stream,
+            } => {
+                let spec = Gemma4Wire {
+                    enable_thinking: *enable_thinking,
+                    max_think_tokens: *max_think_tokens,
+                    tools: false,
+                    stop,
+                };
+                let out = stream.emit(&spec, host, token)?;
+                if out.0 != Verdict::Eos {
+                    streamed.push(token);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    fn finish(
+        &mut self,
+        out: &mut Stdout,
+        id: &str,
+        length: bool,
+    ) -> Result<(&'static str, Vec<hipfire_runtime::prompt_frame::ToolCall>), String> {
+        match self {
+            Wire::ChatMl { stream, .. } => stream.finish(out, length),
+            Wire::Gemma { stream, .. } => stream.finish(out, id, length),
+        }
+    }
+
+    /// After the client committed: store the turn for reuse (ChatML only).
+    fn commit_turn(&self, tokenizer: &Tokenizer, streamed: &[u32], cache: &mut AsstTurnCache) {
+        if let Wire::ChatMl {
+            started_in_think,
+            stop,
+            min_tokens,
+            max_think_tokens,
+            eos,
+            stream,
+        } = self
+        {
+            let spec = ChatMl {
+                started_in_think: *started_in_think,
+                tools: false,
+                stop,
+                min_tokens: *min_tokens,
+                max_think_tokens: *max_think_tokens,
+                eos: std::slice::from_ref(eos),
+            };
+            stream.commit_turn(&spec, tokenizer, streamed, cache);
+        }
+    }
+
+    fn stamp_done(&self, done: &mut serde_json::Value, metrics: &DoneMetrics) {
+        if let Wire::Gemma {
+            enable_thinking,
+            max_think_tokens,
+            stop,
+            ..
+        } = self
+        {
+            Gemma4Wire {
+                enable_thinking: *enable_thinking,
+                max_think_tokens: *max_think_tokens,
+                tools: false,
+                stop,
+            }
+            .stamp_done(done, metrics);
         }
     }
 }
@@ -127,6 +231,7 @@ struct Driver {
     lives: Vec<Option<Live>>,
     core: Scheduler,
     max_batch_tokens: usize,
+    route: GenerationRoute,
 }
 
 /// One tick's view of the model, the devices and the requests.
@@ -143,6 +248,7 @@ struct Ctx<'a> {
     asst_turn_cache: &'a mut AsstTurnCache,
     spec_deferred_seed: &'a mut Option<hipfire_loader::DeferredSpecSeed>,
     max_batch_tokens: usize,
+    route: GenerationRoute,
 }
 
 static NEXT_TAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -171,9 +277,9 @@ impl Driver {
                 if batch_check_abort(&key.id, key.attempt_id, admission) {
                     let _scope =
                         BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
-                    emit_generation_start(ROUTE, stdout, &key.id, false);
+                    emit_generation_start(self.route, stdout, &key.id, false);
                     // Never admitted: a pre-admission cancel is legacy, as at the inbox drain.
-                    emit_generation_cancel(ROUTE, stdout, &key.id, 0);
+                    emit_generation_cancel(self.route, stdout, &key.id, 0);
                     sched.abort_queued(&key, admission);
                 }
             }
@@ -186,7 +292,7 @@ impl Driver {
                 is_vmm_batch_request_eligible,
                 tokenizer,
                 m.chat_template.as_ref(),
-                ROUTE,
+                self.route,
                 stdout,
                 inbox,
                 true,
@@ -208,6 +314,7 @@ impl Driver {
             let mut ctx = Ctx::of(
                 &mut self.lives,
                 self.max_batch_tokens,
+                self.route,
                 sched,
                 m,
                 runner,
@@ -241,14 +348,21 @@ impl Driver {
             .ok_or("assigned request missing")?;
         let _scope =
             BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, ticket.admission);
+        let route = self.route;
         let refuse = |sched: &mut ContinuousBatchScheduler,
                       stdout: &mut Stdout,
                       message: &str,
                       class: &str| {
-            emit_generation_error(ROUTE, stdout, Some(&key.id), message, class, false, true);
+            emit_generation_error(route, stdout, Some(&key.id), message, class, false, true);
             let _ = sched.abort_lane(idx, &key, ticket.admission);
         };
-        let (prompt, started_in_think) = match crate::fn_batch::render_request(m, &req) {
+        let rendered = match route {
+            GenerationRoute::Gemma4Ar => {
+                super::gemma::render_request(m, &req).map(|ids| (ids, false))
+            }
+            _ => crate::fn_batch::render_request(m, &req),
+        };
+        let (prompt, started_in_think) = match rendered {
             Ok(rendered) => rendered,
             Err((message, class)) => {
                 refuse(sched, stdout, &message, class);
@@ -256,12 +370,8 @@ impl Driver {
             }
         };
         if prompt.is_empty() {
-            refuse(
-                sched,
-                stdout,
-                "qwen4 AR prompt rendered to zero tokens",
-                "validation",
-            );
+            let message = format!("{} prompt rendered to zero tokens", route.name());
+            refuse(sched, stdout, &message, "validation");
             return Ok(());
         }
         let fit = req
@@ -283,23 +393,58 @@ impl Driver {
                 return Ok(());
             }
         };
-        let min_tokens = hipfire_runtime::stop_sequence::parse_min_tokens_field(
-            req.original_msg.get("min_tokens"),
-            req.max_tokens,
-        );
-        let stop = hipfire_runtime::stop_sequence::parse_stop_field(req.original_msg.get("stop"))
-            .map_err(|e| e.to_string());
-        let (min_tokens, stop) = match (min_tokens, stop) {
-            (Ok(min_tokens), Ok(stop)) => (min_tokens, stop),
-            (Err(message), _) | (_, Err(message)) => {
-                refuse(sched, stdout, &message, "validation");
-                return Ok(());
+        let wire = if route == GenerationRoute::Gemma4Ar {
+            let spec = Gemma4Wire {
+                enable_thinking: super::gemma::enable_thinking(&req),
+                max_think_tokens: req.max_think_tokens,
+                tools: false,
+                stop: &[],
+            };
+            Wire::Gemma {
+                stream: Gemma4Stream::new(&spec),
+                enable_thinking: spec.enable_thinking,
+                max_think_tokens: spec.max_think_tokens,
+                stop: crate::dense::gemma4_stop_set(m),
+            }
+        } else {
+            let min_tokens = hipfire_runtime::stop_sequence::parse_min_tokens_field(
+                req.original_msg.get("min_tokens"),
+                req.max_tokens,
+            );
+            let stop =
+                hipfire_runtime::stop_sequence::parse_stop_field(req.original_msg.get("stop"))
+                    .map_err(|e| e.to_string());
+            let (min_tokens, stop) = match (min_tokens, stop) {
+                (Ok(min_tokens), Ok(stop)) => (min_tokens, stop),
+                (Err(message), _) | (_, Err(message)) => {
+                    refuse(sched, stdout, &message, "validation");
+                    return Ok(());
+                }
+            };
+            let eos = m
+                .qwen4()
+                .map(|bundle| bundle.config.eos_token_id)
+                .ok_or("engine lanes need a Qwen4 bundle")?;
+            let stream = ChatMlStream::new(
+                &ChatMl {
+                    started_in_think,
+                    tools: false,
+                    stop: &stop,
+                    min_tokens,
+                    max_think_tokens: req.max_think_tokens,
+                    eos: &[eos],
+                },
+                &key.id,
+            );
+            Wire::ChatMl {
+                started_in_think,
+                stop,
+                min_tokens,
+                max_think_tokens: req.max_think_tokens,
+                eos,
+                stream: Box::new(stream),
             }
         };
-        let eos = m
-            .qwen4()
-            .map(|bundle| bundle.config.eos_token_id)
-            .ok_or("engine lanes need a Qwen4 bundle")?;
         let s = &req.sampling;
         let sampler = SamplerConfig {
             temperature: s.temp,
@@ -319,21 +464,10 @@ impl Driver {
                 |n| n.checked_add(1),
             )
             .map_err(|_| "engine lane tags are exhausted")?;
-        emit_generation_start(ROUTE, stdout, &key.id, started_in_think);
+        emit_generation_start(route, stdout, &key.id, started_in_think);
         if let BatchLane::Running(lane) = &mut sched.lanes[idx] {
             lane.prompt_len = prompt.len();
         }
-        let stream = ChatMlStream::new(
-            &ChatMl {
-                started_in_think,
-                tools: false,
-                stop: &stop,
-                min_tokens,
-                max_think_tokens: req.max_think_tokens,
-                eos: &[eos],
-            },
-            &key.id,
-        );
         let live = Live {
             seed: request_seed_for(&key, req.client_seed),
             key,
@@ -341,12 +475,7 @@ impl Driver {
             prompt,
             budget,
             sampler,
-            started_in_think,
-            stop,
-            min_tokens,
-            max_think_tokens: req.max_think_tokens,
-            eos,
-            stream,
+            wire,
             tag,
             t0: Instant::now(),
             reused: 0,
@@ -414,7 +543,7 @@ impl Driver {
                         );
                         let generated =
                             done.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        let cancelled = cancel(stdout, &key.id, generated, released);
+                        let cancelled = cancel(self.route, stdout, &key.id, generated, released);
                         let _ = sched.abort_lane(idx, &key, admission);
                         // An unattested state is never handed to the next request.
                         cancelled?;
@@ -428,13 +557,13 @@ impl Driver {
                     }
                 }
                 let generated = done.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                emit_engine_cancel(ROUTE, stdout, &key.id, generated);
+                emit_engine_cancel(self.route, stdout, &key.id, generated);
                 let _ = sched.abort_lane(idx, &key, admission);
                 continue;
             }
             if !sched.commit_lane_retain_terminal(idx, &key, admission) {
                 emit_generation_error(
-                    ROUTE,
+                    self.route,
                     stdout,
                     Some(&key.id),
                     "engine commit_lane failed",
@@ -446,32 +575,34 @@ impl Driver {
                 continue;
             }
             let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
-            live.stream.commit_turn(
-                &live.protocol(),
-                tokenizer,
-                &live.streamed,
-                &mut m.asst_turn_cache,
-            );
+            live.wire
+                .commit_turn(tokenizer, &live.streamed, &mut m.asst_turn_cache);
+            let keeps_records = lanes_of(m).is_some_and(|lanes| lanes.keeps_records());
             match live.held {
                 Some(Place::Resident) => {
                     // The singleton's commit, then the conversation moves into
                     // a lane record so another conversation's turn on the
                     // resident state does not drop it.
                     let state = m.state.as_deref_mut().ok_or("the model has no state")?;
-                    if state.spec_session_reuse() {
-                        state.session_commit_live_mesh(gpus, &live.history);
+                    state.session_commit_live_mesh(gpus, &live.history);
+                    if keeps_records {
                         if let Some(lanes) = lanes_of(m) {
                             keep_record(lanes, runner, gpus, live.tag, &live.history);
                         }
                     }
                     self.core.release_resident();
                 }
-                _ => runner.records.push(LaneRecord {
+                _ if keeps_records => runner.records.push(LaneRecord {
                     tag: live.tag,
                     tokens: live.history,
                 }),
+                _ => {
+                    if let Some(lanes) = lanes_of(m) {
+                        lanes.free_lane(live.tag);
+                    }
+                }
             }
-            emit_generation_done_value(ROUTE, stdout, &done);
+            emit_generation_done_value(self.route, stdout, &done);
             batch_clear_terminal_at_generation(&key.id, key.attempt_id, admission);
         }
         Ok(())
@@ -508,7 +639,7 @@ impl Driver {
                 live.admission,
             );
             emit_generation_error(
-                ROUTE,
+                self.route,
                 stdout,
                 Some(&live.key.id),
                 error,
@@ -520,7 +651,15 @@ impl Driver {
         for (key, req) in &sched.pending {
             let _scope =
                 BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, req.admission);
-            emit_generation_error(ROUTE, stdout, Some(&key.id), error, "gpu", false, false);
+            emit_generation_error(
+                self.route,
+                stdout,
+                Some(&key.id),
+                error,
+                "gpu",
+                false,
+                false,
+            );
         }
         sched.fail_all_active();
     }
@@ -601,6 +740,7 @@ fn keep_record(
 /// (`rolled_back: false`, no `done`) and `Err` so the driver stops serving
 /// the unattested state.
 fn cancel(
+    route: GenerationRoute,
     stdout: &mut impl Write,
     id: &str,
     generated: usize,
@@ -608,7 +748,7 @@ fn cancel(
 ) -> Result<(), String> {
     match released {
         Ok(()) => {
-            emit_engine_cancel(ROUTE, stdout, id, generated);
+            emit_engine_cancel(route, stdout, id, generated);
             Ok(())
         }
         Err(error) => {
@@ -617,7 +757,7 @@ fn cancel(
                 context: Some(error.clone()),
             };
             emit_fail_closed_error_for_route(
-                ROUTE,
+                route,
                 stdout,
                 Some(id),
                 UNATTESTED_CANCEL_MESSAGE,
@@ -661,6 +801,7 @@ impl<'a> Ctx<'a> {
     fn of(
         lives: &'a mut [Option<Live>],
         max_batch_tokens: usize,
+        route: GenerationRoute,
         sched: &'a mut ContinuousBatchScheduler,
         m: &'a mut LoadedModel,
         runner: &'a mut MeshRunner,
@@ -689,6 +830,7 @@ impl<'a> Ctx<'a> {
             asst_turn_cache,
             spec_deferred_seed,
             max_batch_tokens,
+            route,
         })
     }
 
@@ -758,13 +900,13 @@ impl<'a> Ctx<'a> {
             Place::Queued => Ok(()),
         };
         let settled = match exit {
-            Exit::Aborted => cancel(self.stdout, &key.id, generated, released),
+            Exit::Aborted => cancel(self.route, self.stdout, &key.id, generated, released),
             Exit::Failed(error) => {
                 emit_generation_error(
-                    ROUTE,
+                    self.route,
                     self.stdout,
                     Some(&key.id),
-                    &format!("{} engine: {error}", ROUTE.name()),
+                    &format!("{} engine: {error}", self.route.name()),
                     "gpu",
                     false,
                     released.is_ok(),
@@ -792,7 +934,9 @@ impl<'a> Ctx<'a> {
         let (slots, lane_capacity) = (self.sched.lanes.len(), self.sched.lane_capacity);
         let stdout = &mut *self.stdout;
         let live = self.lives[idx].as_mut().ok_or("finished request missing")?;
-        let (finish_reason, tool_calls) = live.stream.finish(stdout, finish == Finish::Length)?;
+        let (finish_reason, tool_calls) =
+            live.wire
+                .finish(stdout, &live.key.id, finish == Finish::Length)?;
         let BatchLane::Running(lane) = &mut self.sched.lanes[idx] else {
             return Err("a finished request's lane is not running".into());
         };
@@ -808,6 +952,7 @@ impl<'a> Ctx<'a> {
             total_ms: millis(end - live.t0),
         };
         let mut done = metrics.done_value(&live.key.id, finish_reason);
+        live.wire.stamp_done(&mut done, &metrics);
         stage_terminal_tool_calls(&mut done, finish_reason, &tool_calls);
         attach_continuous_batch_route_evidence(
             &mut done,
@@ -1085,15 +1230,7 @@ impl Batch for Ctx<'_> {
             prompt: &live.prompt,
             t0: live.t0,
         };
-        let spec = ChatMl {
-            started_in_think: live.started_in_think,
-            tools: false,
-            stop: &live.stop,
-            min_tokens: live.min_tokens,
-            max_think_tokens: live.max_think_tokens,
-            eos: std::slice::from_ref(&live.eos),
-        };
-        live.stream.emit(&spec, &mut host, streamed_tokens, token)
+        live.wire.emit(&mut host, streamed_tokens, token)
     }
 
     fn history(&self, idx: usize) -> &[u32] {
@@ -1131,9 +1268,9 @@ mod tests {
         let admission = batch_announce_terminal(id, attempt).expect("batch admission");
         let _scope = BatchAttemptScope::enter_for_generation(id, attempt, admission);
         let mut out = Vec::new();
-        emit_generation_start(ROUTE, &mut out, id, false);
+        emit_generation_start(GenerationRoute::Qwen4Ar, &mut out, id, false);
         let started = out.len();
-        let result = cancel(&mut out, id, 3, released);
+        let result = cancel(GenerationRoute::Qwen4Ar, &mut out, id, 3, released);
         (result, lines(&out[started..]))
     }
 

@@ -18,6 +18,7 @@
 //! prompt and the decoded reply. Decode and batched prefill write different
 //! KV bits, so the decoded rows are never reused.
 
+mod lanes;
 mod mesh_family;
 
 use crate::config::Gemma4Config;
@@ -79,6 +80,8 @@ pub struct Gemma4Bundle {
     session: Option<SessionDriver>,
     /// The KV state the engine loop's step program declares.
     mesh_state: Vec<hipfire_runtime::weight_manifest::StateEntry>,
+    /// The engine loop's lanes, when the load staged a continuous batch.
+    lanes: Option<lanes::Gemma4Lanes>,
 }
 
 /// Bytes of one position of one Q8_0 cache slot (K or V): 34-byte blocks of
@@ -112,6 +115,7 @@ impl Gemma4Bundle {
             state,
             prefill_rows,
             session: None,
+            lanes: None,
         }
     }
 
@@ -403,6 +407,9 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
             session.clear(gpu);
         }
         b.state.free_gpu(gpu);
+        if let Some(lanes) = b.lanes {
+            lanes.free_gpu(gpu);
+        }
         b.weights.free_gpu(gpu);
     }
     fn mesh_family(&mut self) -> Option<&mut dyn hipfire_runtime::mesh_family::MeshFamily> {

@@ -14,6 +14,50 @@ use hipfire_runtime::prompt_frame::ToolCall;
 use hipfire_runtime::tokenizer::TokenTextStream;
 use std::io::Stdout;
 
+/// The request's Jinja `enable_thinking`, as the daemon derives it for the
+/// singleton (`qwen_jinja_reasoning`; Gemma 4 thinking is a plain boolean).
+pub fn enable_thinking(req: &hipfire_engine::scheduler::BatchPendingRequest) -> bool {
+    let msg = &req.original_msg;
+    let raw_effort = msg
+        .get("reasoning_effort")
+        .or_else(|| msg.get("thinking_mode"))
+        .and_then(|v| v.as_str());
+    hipfire_engine::prompt::qwen_jinja_reasoning(
+        msg.get("thinking_enabled").and_then(|v| v.as_bool()),
+        raw_effort,
+        req.max_think_tokens,
+    )
+    .0
+}
+
+/// A batched request's prompt ids, rendered as the singleton renders them
+/// (`generate_gemma4`): tool-free text chat (batch admission excludes tools).
+pub fn render_request(
+    m: &hipfire_loader::LoadedModel,
+    req: &hipfire_engine::scheduler::BatchPendingRequest,
+) -> Result<Vec<u32>, (String, &'static str)> {
+    if req.max_tokens == 0 {
+        return Err(("max_tokens must be > 0".to_string(), "validation"));
+    }
+    let msg = &req.original_msg;
+    let prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(
+        msg.get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Hello"),
+    );
+    let history = hipfire_engine::prompt::parse_generate_messages(msg)
+        .map_err(|e| (format!("invalid messages field: {e}"), "validation"))?;
+    crate::dense::gemma4_prompt_ids(
+        m,
+        &prompt,
+        msg.get("system").and_then(|v| v.as_str()),
+        enable_thinking(req),
+        None,
+        history.as_deref(),
+    )
+    .map_err(|message| (message, "validation"))
+}
+
 /// Gemma 4 as `generate_gemma4` speaks it, for one request.
 pub struct Gemma4Wire<'a> {
     pub enable_thinking: bool,

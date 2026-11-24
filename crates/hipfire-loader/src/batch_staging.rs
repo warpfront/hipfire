@@ -104,6 +104,32 @@ pub fn stage_continuous_batch(
     let mut out = BatchStaging::default();
     if let Some(req) = vmm {
         if requested > 1 {
+            // Gemma 4 batches only on the engine loop: its N-request
+            // scheduler over whole-step lanes (no legacy batch driver).
+            if hipfire_runtime::config::get().engine_loop {
+                let max_seq = m.max_seq;
+                if let Some(bundle) = m.gemma4_mut() {
+                    return Ok(match bundle.stage_engine_lanes(gpu, requested) {
+                        Ok(()) => {
+                            eprintln!("[daemon] gemma4 engine lanes staged: lanes={requested}");
+                            BatchStaging {
+                                capable: true,
+                                slots: requested,
+                                lane_capacity: max_seq,
+                                vmm: true,
+                                row_budget: req.row_budget,
+                                ..BatchStaging::default()
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[daemon] gemma4 engine lanes refused: {error} — fallback to sequential"
+                            );
+                            BatchStaging::default()
+                        }
+                    });
+                }
+            }
             match crate::continuous_batch_route(m.arch_id) {
                 // Qwen35's VMM route stays single-device only.
                 Some(crate::ContinuousBatchRoute::Qwen35) if m.pp == 1 && m.ep.is_none() => {
