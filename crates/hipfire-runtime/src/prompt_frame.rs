@@ -518,8 +518,8 @@ fn render_tool_call_qwen_xml(tc: &ToolCall) -> String {
 /// for a Qwen3.5/3.6-family model, given the `HIPFIRE_QWEN35_GRAMMAR` env value
 /// (`None` if unset) and the loaded model path. Lives in the lib — not only in
 /// the CLI's `resolveToolGrammar` — so the DAEMON defaults correctly when
-/// launched DIRECTLY: the GPU behavior gate and `coherence-gate.sh` /
-/// `agentic-gate.sh` spawn `target/release/daemon` (hipfire-daemon) without the CLI's `applyConfigEnv`,
+/// launched DIRECTLY: the GPU behavior gate and `agentic-gate.sh` spawn
+/// `target/release/daemon` (hipfire-daemon) without the CLI's `applyConfigEnv`,
 /// so without this they fall back to Hermes and never exercise the native-XML
 /// path. Precedence: explicit env wins (`"0"` = off kill-switch, any other set
 /// value = on); otherwise carnice (Hermes-native) => ON, plain Qwen3.5/3.6

@@ -12,7 +12,7 @@
 //! attractor lives in the IDs, not in the visible chunks (which may
 //! aggregate or drop tokens via `EosFilter`).
 //!
-//! Source: `scripts/coherence-gate-dflash.sh:191-243` + CLAUDE.md:236-244.
+//! Source: the retired `coherence-gate-dflash.sh` attractor check + CLAUDE.md:236-244.
 //! The Path-A failure shape is single-token loops (e.g. "numbers(numbers(...")
 //! that produce `unique_ratio ≈ 0.05, max_freq ≈ 0.60` in the first 128.
 

@@ -1223,7 +1223,7 @@ impl DType {
     /// **Forward-path-ready candidates not currently in the allow-list**
     /// (forward kernels exist but no `.hfq` file in tree ships sidecars
     /// for them — widen only after the quantizer side is verified to
-    /// emit sidecars and at least one coherence-gate row exercises the
+    /// emit sidecars and at least one conformance row exercises the
     /// combination):
     /// - `MQ6G256`
     /// - `MQ2G256`, `MQ2G256Lloyd`

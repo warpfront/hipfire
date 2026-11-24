@@ -5,7 +5,7 @@
 //! EOS-immediate detector — hard-fails when generation produced zero
 //! visible bytes before stopping.
 //!
-//! Cousin of the coherence-gate's "zero tokens emitted" hard-error
+//! Cousin of the retired coherence gate's "zero tokens emitted" hard-error
 //! (`CLAUDE.md:219-221`). The runtime-side gate fires on no token
 //! events at all; this detector additionally fires when there were
 //! token events but every one was empty/synthetic.
