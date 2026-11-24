@@ -167,7 +167,8 @@ impl Driver {
                     let _scope =
                         BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
                     emit_generation_start(ROUTE, stdout, &key.id, false);
-                    emit_engine_cancel(ROUTE, stdout, &key.id, 0);
+                    // Never admitted: a pre-admission cancel is legacy, as at the inbox drain.
+                    emit_generation_cancel(ROUTE, stdout, &key.id, 0);
                     sched.abort_queued(&key, admission);
                 }
             }

@@ -6998,6 +6998,33 @@ mod route_scope_tests {
         clear_terminal_control();
         set_active_attempt_id(0);
     }
+
+    #[test]
+    fn cancel_stamps_the_loop_that_served() {
+        let _guard = route_lock();
+        let route = GenerationRoute::Qwen4Ar;
+        for (engine, expected) in [(true, "engine"), (false, "legacy")] {
+            let id = "loop-stamp";
+            let mut sink = Vec::new();
+            clear_generation_route();
+            set_active_attempt_id(91_303);
+            clear_terminal_control();
+            activate_terminal_control(id, 91_303);
+            let _scope = GenerationRouteScope::enter(route, id);
+            emit_generation_start(route, &mut sink, id, false);
+            if engine {
+                emit_engine_cancel(route, &mut sink, id, 1);
+            } else {
+                emit_generation_cancel(route, &mut sink, id, 1);
+            }
+            let events = parse_events(&sink);
+            let done = events.iter().find(|e| e["type"] == "done").expect("done");
+            assert_eq!(done["loop"], expected);
+        }
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
 }
 
 #[cfg(test)]
