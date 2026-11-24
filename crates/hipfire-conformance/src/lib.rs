@@ -41,13 +41,22 @@ pub mod selftest {
 
     impl FakeArm {
         pub fn good() -> Self {
-            FakeArm { fault: Fault::None, kernels: GOOD_KERNELS.to_vec() }
+            FakeArm {
+                fault: Fault::None,
+                kernels: GOOD_KERNELS.to_vec(),
+            }
         }
         pub fn faulty(fault: Fault) -> Self {
-            FakeArm { fault, kernels: GOOD_KERNELS.to_vec() }
+            FakeArm {
+                fault,
+                kernels: GOOD_KERNELS.to_vec(),
+            }
         }
         pub fn fallback() -> Self {
-            FakeArm { fault: Fault::None, kernels: FALLBACK_KERNELS.to_vec() }
+            FakeArm {
+                fault: Fault::None,
+                kernels: FALLBACK_KERNELS.to_vec(),
+            }
         }
     }
 
@@ -65,7 +74,11 @@ pub mod selftest {
 
     impl Arm for FakeArm {
         fn run(&mut self, _recipe: &Recipe, s: &InputSchedule) -> Result<ArmRun, String> {
-            let seed = if self.fault == Fault::WrongSeed { s.seed ^ 0xdead } else { s.seed };
+            let seed = if self.fault == Fault::WrongSeed {
+                s.seed ^ 0xdead
+            } else {
+                s.seed
+            };
             let mut kv: Vec<Vec<u8>> = vec![Vec::new(); LANES];
             let mut recurrent = [0u8; 8];
             let mut steps = Vec::new();
@@ -74,7 +87,9 @@ pub mod selftest {
                     rows.extend_from_slice(&row_bytes(seed, lane, step));
                 }
                 let kvh = kv.iter().fold(0u64, |h, k| h.rotate_left(3) ^ h64(k));
-                recurrent = (u64::from_le_bytes(recurrent) ^ kvh).wrapping_mul(31).to_le_bytes();
+                recurrent = (u64::from_le_bytes(recurrent) ^ kvh)
+                    .wrapping_mul(31)
+                    .to_le_bytes();
                 if self.fault == Fault::SwappedKvRow && step >= 2 {
                     let (a, b) = kv.split_at_mut(1);
                     let (r0, r1) = (&mut a[0], &mut b[0]);
@@ -94,8 +109,14 @@ pub mod selftest {
                 steps.push(HostState {
                     meta: (step as u64 + 1).to_le_bytes().to_vec(),
                     fixed: vec![
-                        HostPart { name: "sampler".into(), bytes: seed.to_le_bytes().to_vec() },
-                        HostPart { name: "recurrent".into(), bytes: recurrent.to_vec() },
+                        HostPart {
+                            name: "sampler".into(),
+                            bytes: seed.to_le_bytes().to_vec(),
+                        },
+                        HostPart {
+                            name: "recurrent".into(),
+                            bytes: recurrent.to_vec(),
+                        },
                     ],
                     rows: kv
                         .iter()
@@ -126,7 +147,10 @@ pub mod selftest {
             name: n.into(),
             required_kernels: GOOD_KERNELS.iter().map(|s| s.to_string()).collect(),
         };
-        RecipePair { reference: r("fake-ref"), candidate: r("fake-cand") }
+        RecipePair {
+            reference: r("fake-ref"),
+            candidate: r("fake-cand"),
+        }
     }
 
     pub fn row(invariant: &str, class: ComparisonClass) -> RowSpec {
@@ -134,7 +158,10 @@ pub mod selftest {
             fixture: "host-fake".into(),
             invariant: invariant.into(),
             recipe_pair: recipe_pair(),
-            input_schedule: InputSchedule { seed: 0x5eed, steps: 5 },
+            input_schedule: InputSchedule {
+                seed: 0x5eed,
+                steps: 5,
+            },
             comparison_class: class,
             bounded_difference: None,
             budgets: Budgets::new(),
@@ -148,7 +175,12 @@ pub mod selftest {
         pub detail: String,
     }
 
-    fn run(table: &ClassTable, row: &RowSpec, cand: FakeArm, refr: FakeArm) -> Result<RowReport, Refusal> {
+    fn run(
+        table: &ClassTable,
+        row: &RowSpec,
+        cand: FakeArm,
+        refr: FakeArm,
+    ) -> Result<RowReport, Refusal> {
         let (mut a, mut b) = (refr, cand);
         run_row(table, row, &mut a, &mut b)
     }
@@ -160,18 +192,39 @@ pub mod selftest {
         let base = row("I2", ComparisonClass::Exact);
 
         let r = run(&table, &base, FakeArm::good(), FakeArm::good()).unwrap();
-        add("unmodified run is pass", r.verdict == Verdict::Pass, r.verdict.name().into());
+        add(
+            "unmodified run is pass",
+            r.verdict == Verdict::Pass,
+            r.verdict.name().into(),
+        );
 
         for (name, fault, comp, rowi, owner) in [
-            ("kv row swapped between lanes", Fault::SwappedKvRow, "kv.lane0", Some(2), "lane0"),
-            ("stale row after restore", Fault::StaleRestore, "kv.lane1", Some(1), "lane1"),
+            (
+                "kv row swapped between lanes",
+                Fault::SwappedKvRow,
+                "kv.lane0",
+                Some(2),
+                "lane0",
+            ),
+            (
+                "stale row after restore",
+                Fault::StaleRestore,
+                "kv.lane1",
+                Some(1),
+                "lane1",
+            ),
             ("wrong seed", Fault::WrongSeed, "sampler", None, "sampler"),
         ] {
             let r = run(&table, &base, FakeArm::faulty(fault), FakeArm::good()).unwrap();
             let (ok, detail) = match &r.verdict {
-                Verdict::Fail { first_difference: d } => (
+                Verdict::Fail {
+                    first_difference: d,
+                } => (
                     d.component == comp && d.row == rowi && d.owner == owner,
-                    format!("fail at step {} {} row {:?} owner {}", d.step, d.component, d.row, d.owner),
+                    format!(
+                        "fail at step {} {} row {:?} owner {}",
+                        d.step, d.component, d.row, d.owner
+                    ),
                 ),
                 v => (false, v.name().to_string()),
             };
@@ -186,7 +239,11 @@ pub mod selftest {
         );
 
         let mut b = row("I5w", ComparisonClass::Bounded);
-        b.bounded_difference = ClassTable::embedded().get("I5w").unwrap().bounded_difference.clone();
+        b.bounded_difference = ClassTable::embedded()
+            .get("I5w")
+            .unwrap()
+            .bounded_difference
+            .clone();
         let r = run(&table, &b, FakeArm::good(), FakeArm::good()).unwrap();
         add(
             "bounded row without budget is unqualified",
@@ -194,8 +251,17 @@ pub mod selftest {
             r.verdict.name().into(),
         );
 
-        let e = run(&table, &row("I99", ComparisonClass::Exact), FakeArm::good(), FakeArm::good());
-        add("row with no class is refused", matches!(e, Err(Refusal::NoClass(_))), "refused".into());
+        let e = run(
+            &table,
+            &row("I99", ComparisonClass::Exact),
+            FakeArm::good(),
+            FakeArm::good(),
+        );
+        add(
+            "row with no class is refused",
+            matches!(e, Err(Refusal::NoClass(_))),
+            "refused".into(),
+        );
         cases
     }
 }
@@ -232,11 +298,16 @@ mod tests {
     #[test]
     fn every_invariant_of_the_plan_is_in_the_table() {
         let t = ClassTable::embedded();
-        for id in ["I1", "I2", "I3", "I4k", "I4a", "I5i", "I5w", "I6", "I7", "I8", "I9", "I10"] {
+        for id in [
+            "I1", "I2", "I3", "I4k", "I4a", "I5i", "I5w", "I6", "I7", "I8", "I9", "I10",
+        ] {
             assert!(t.get(id).is_some(), "{id}");
         }
         for id in ["I2", "I3", "I4k", "I5i", "I6", "I7", "I8"] {
-            assert!(t.get(id).unwrap().bounded_difference.is_none(), "{id} must never be bounded");
+            assert!(
+                t.get(id).unwrap().bounded_difference.is_none(),
+                "{id} must never be bounded"
+            );
         }
     }
 }

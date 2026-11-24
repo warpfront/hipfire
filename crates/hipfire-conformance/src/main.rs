@@ -14,7 +14,12 @@ fn main() -> ExitCode {
             let cases = selftest::run_all();
             let mut bad = 0;
             for c in &cases {
-                println!("{} {}: {}", if c.ok { "ok  " } else { "FAIL" }, c.name, c.detail);
+                println!(
+                    "{} {}: {}",
+                    if c.ok { "ok  " } else { "FAIL" },
+                    c.name,
+                    c.detail
+                );
                 bad += usize::from(!c.ok);
             }
             println!(
@@ -32,7 +37,12 @@ fn main() -> ExitCode {
         }
         Some("--classes") => {
             for i in ClassTable::embedded().invariant {
-                println!("{}\t{}\t{}", i.id, i.bounded_difference.as_deref().unwrap_or("exact only"), i.name);
+                println!(
+                    "{}\t{}\t{}",
+                    i.id,
+                    i.bounded_difference.as_deref().unwrap_or("exact only"),
+                    i.name
+                );
             }
             ExitCode::SUCCESS
         }

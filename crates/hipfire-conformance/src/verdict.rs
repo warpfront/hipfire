@@ -42,7 +42,10 @@ impl ClassTable {
                 return Err(format!("classes.toml: duplicate invariant {}", i.id));
             }
             if i.bounded_difference.as_deref() == Some("") {
-                return Err(format!("classes.toml: {} has an unnamed bounded difference", i.id));
+                return Err(format!(
+                    "classes.toml: {} has an unnamed bounded difference",
+                    i.id
+                ));
             }
         }
         Ok(t)
@@ -118,11 +121,17 @@ pub trait Arm {
 #[serde(tag = "verdict", rename_all = "snake_case")]
 pub enum Verdict {
     Pass,
-    Fail { first_difference: FirstDifference },
+    Fail {
+        first_difference: FirstDifference,
+    },
     /// The intended recipe did not run on at least one arm.
-    NotCovered { missing: Vec<String> },
+    NotCovered {
+        missing: Vec<String>,
+    },
     /// Bounded class and no budget for the named difference.
-    Unqualified { difference: String },
+    Unqualified {
+        difference: String,
+    },
 }
 
 impl Verdict {
@@ -160,8 +169,14 @@ pub struct RowReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
     NoClass(String),
-    BoundedNotAllowed { invariant: String },
-    DifferenceMismatch { invariant: String, got: Option<String>, table: String },
+    BoundedNotAllowed {
+        invariant: String,
+    },
+    DifferenceMismatch {
+        invariant: String,
+        got: Option<String>,
+        table: String,
+    },
     Arm(String),
 }
 
@@ -191,12 +206,16 @@ pub fn peak_rss_kib() -> Option<u64> {
 /// Decide a row's class standing before anything runs. `Ok(Some(d))` = bounded
 /// with named difference `d`; `Ok(None)` = exact.
 fn admit(table: &ClassTable, row: &RowSpec) -> Result<Option<String>, Refusal> {
-    let inv = table.get(&row.invariant).ok_or_else(|| Refusal::NoClass(row.invariant.clone()))?;
+    let inv = table
+        .get(&row.invariant)
+        .ok_or_else(|| Refusal::NoClass(row.invariant.clone()))?;
     match row.comparison_class {
         ComparisonClass::Exact => Ok(None),
         ComparisonClass::Bounded => {
             let Some(tbl) = &inv.bounded_difference else {
-                return Err(Refusal::BoundedNotAllowed { invariant: inv.id.clone() });
+                return Err(Refusal::BoundedNotAllowed {
+                    invariant: inv.id.clone(),
+                });
             };
             if row.bounded_difference.as_deref() != Some(tbl.as_str()) {
                 return Err(Refusal::DifferenceMismatch {
@@ -221,8 +240,12 @@ pub fn run_row(
 ) -> Result<RowReport, Refusal> {
     let bounded = admit(table, row)?;
     let t0 = Instant::now();
-    let a = reference.run(&row.recipe_pair.reference, &row.input_schedule).map_err(Refusal::Arm)?;
-    let b = candidate.run(&row.recipe_pair.candidate, &row.input_schedule).map_err(Refusal::Arm)?;
+    let a = reference
+        .run(&row.recipe_pair.reference, &row.input_schedule)
+        .map_err(Refusal::Arm)?;
+    let b = candidate
+        .run(&row.recipe_pair.candidate, &row.input_schedule)
+        .map_err(Refusal::Arm)?;
     let ra = Receipt::parse(&a.audit_log).map_err(Refusal::Arm)?;
     let rb = Receipt::parse(&b.audit_log).map_err(Refusal::Arm)?;
 
@@ -250,7 +273,10 @@ pub fn run_row(
     } else if bounded.is_some() {
         // A budgeted bounded row needs logit-level metrics from the card half.
         report.verdict = Verdict::Unqualified {
-            difference: format!("{}: bounded comparison needs the card runner", row.invariant),
+            difference: format!(
+                "{}: bounded comparison needs the card runner",
+                row.invariant
+            ),
         };
     } else {
         let da: Vec<StateDigest> = a.steps.iter().map(HostState::digest).collect();
@@ -266,12 +292,17 @@ pub fn run_row(
                     detail: format!("arm step counts differ: {} vs {}", da.len(), db.len()),
                 }),
             };
-            report.per_row_metrics.push(RowMetric { step, state_equal: diff.is_none() });
+            report.per_row_metrics.push(RowMetric {
+                step,
+                state_equal: diff.is_none(),
+            });
             if let Some(mut d) = diff {
                 d.step = step;
                 if report.first_difference.is_none() {
                     report.first_difference = Some(d.clone());
-                    report.verdict = Verdict::Fail { first_difference: d };
+                    report.verdict = Verdict::Fail {
+                        first_difference: d,
+                    };
                 }
             }
         }

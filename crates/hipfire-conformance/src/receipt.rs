@@ -42,12 +42,18 @@ impl Receipt {
             match kind {
                 "load" => {
                     let path = f.next().ok_or_else(bad)?;
-                    r.images.push(LoadedImage { handle, image: path.to_string() });
+                    r.images.push(LoadedImage {
+                        handle,
+                        image: path.to_string(),
+                    });
                 }
                 "load_data" => {
                     let len = f.next().ok_or_else(bad)?;
                     let fnv = f.next().ok_or_else(bad)?;
-                    r.images.push(LoadedImage { handle, image: format!("data:{len}:{fnv}") });
+                    r.images.push(LoadedImage {
+                        handle,
+                        image: format!("data:{len}:{fnv}"),
+                    });
                 }
                 "get_function" => {
                     let name = f.next().ok_or_else(bad)?;
@@ -67,7 +73,11 @@ impl Receipt {
     /// recipe ran.
     pub fn missing(&self, required: &[String]) -> Vec<String> {
         let have = self.function_names();
-        required.iter().filter(|k| !have.contains(k.as_str())).cloned().collect()
+        required
+            .iter()
+            .filter(|k| !have.contains(k.as_str()))
+            .cloned()
+            .collect()
     }
 }
 
@@ -83,8 +93,14 @@ HIPFIRE_MODULE_LOAD_AUDIT\tget_function\t0x2\tgemv_q8\n";
         let r = Receipt::parse(log).unwrap();
         assert_eq!(r.images.len(), 2);
         assert_eq!(r.images[1].image, "data:128:00000000deadbeef");
-        assert_eq!(r.functions, vec![("0x2".to_string(), "gemv_q8".to_string())]);
-        assert_eq!(r.missing(&["gemv_q8".into(), "gemm".into()]), vec!["gemm".to_string()]);
+        assert_eq!(
+            r.functions,
+            vec![("0x2".to_string(), "gemv_q8".to_string())]
+        );
+        assert_eq!(
+            r.missing(&["gemv_q8".into(), "gemm".into()]),
+            vec!["gemm".to_string()]
+        );
     }
 
     #[test]

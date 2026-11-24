@@ -102,7 +102,11 @@ impl HostState {
     pub fn digest(&self) -> StateDigest {
         StateDigest {
             meta: h64(&self.meta),
-            fixed: self.fixed.iter().map(|p| (p.name.clone(), h64(&p.bytes))).collect(),
+            fixed: self
+                .fixed
+                .iter()
+                .map(|p| (p.name.clone(), h64(&p.bytes)))
+                .collect(),
             streams: self
                 .rows
                 .iter()
@@ -134,22 +138,42 @@ pub fn first_difference(a: &StateDigest, b: &StateDigest) -> Option<FirstDiffere
         return Some(mk("meta", None, "meta", "host metadata differs".into()));
     }
     if a.fixed.len() != b.fixed.len() {
-        return Some(mk("layout", None, "layout", "fixed part count differs".into()));
+        return Some(mk(
+            "layout",
+            None,
+            "layout",
+            "fixed part count differs".into(),
+        ));
     }
     for (x, y) in a.fixed.iter().zip(&b.fixed) {
         if x.0 != y.0 {
-            return Some(mk(&x.0, None, &x.0, format!("fixed part order: {} vs {}", x.0, y.0)));
+            return Some(mk(
+                &x.0,
+                None,
+                &x.0,
+                format!("fixed part order: {} vs {}", x.0, y.0),
+            ));
         }
         if x.1 != y.1 {
             return Some(mk(&x.0, None, &x.0, "fixed part bytes differ".into()));
         }
     }
     if a.streams.len() != b.streams.len() {
-        return Some(mk("layout", None, "layout", "row stream count differs".into()));
+        return Some(mk(
+            "layout",
+            None,
+            "layout",
+            "row stream count differs".into(),
+        ));
     }
     for (x, y) in a.streams.iter().zip(&b.streams) {
         if x.name != y.name {
-            return Some(mk(&x.name, None, &x.owner, format!("stream order: {} vs {}", x.name, y.name)));
+            return Some(mk(
+                &x.name,
+                None,
+                &x.owner,
+                format!("stream order: {} vs {}", x.name, y.name),
+            ));
         }
         let n = x.rows.len().min(y.rows.len());
         for r in 0..n {
@@ -176,7 +200,10 @@ mod tests {
     fn state(v: u8) -> HostState {
         HostState {
             meta: vec![1],
-            fixed: vec![HostPart { name: "rec".into(), bytes: vec![v; 4] }],
+            fixed: vec![HostPart {
+                name: "rec".into(),
+                bytes: vec![v; 4],
+            }],
             rows: vec![HostRows {
                 name: "kv.lane0".into(),
                 owner: "lane0".into(),
@@ -196,7 +223,10 @@ mod tests {
         let mut b = state(7);
         b.rows[0].bytes[4] ^= 1;
         let d = first_difference(&state(7).digest(), &b.digest()).unwrap();
-        assert_eq!((d.component.as_str(), d.row, d.owner.as_str()), ("kv.lane0", Some(2), "lane0"));
+        assert_eq!(
+            (d.component.as_str(), d.row, d.owner.as_str()),
+            ("kv.lane0", Some(2), "lane0")
+        );
     }
 
     #[test]
