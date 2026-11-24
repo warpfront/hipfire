@@ -84,3 +84,5 @@
 10 hipfire-generate
 10 saddle-lab
 11 hipfire-daemon
+# Conformance runner (V2 B1a): host-only digests/receipts, no workspace deps yet.
+11 hipfire-conformance
