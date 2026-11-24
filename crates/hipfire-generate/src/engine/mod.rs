@@ -358,8 +358,9 @@ impl RequestRun {
     }
 
     /// A speculative request at a window boundary leaves its drafting for a
-    /// lane that runs its windows: its next row is its seed (already
-    /// emitted). `None`: not at a window boundary, nothing changed.
+    /// lane that runs its windows: its next row is its seed (emitted, or a
+    /// held first token, [`Emit::holds_first`]). `None`: not at a window
+    /// boundary, nothing changed.
     fn take_window_drafting(&mut self) -> Option<spec::Drafting> {
         let d = self.draft.as_ref()?;
         if self.finish.is_some() || d.owed.len() != 1 || !self.forced.is_empty() {
@@ -370,9 +371,9 @@ impl RequestRun {
         Some(d)
     }
 
-    /// A lane window committed `token` and the driver emitted it as
-    /// `verdict`; while the request continues it is the next row's seed.
-    /// Whether it continues.
+    /// A lane window committed `token` (or a held first token streams) and
+    /// the driver emitted it as `verdict`; while the request continues it is
+    /// the next row's seed. Whether it continues.
     fn apply_window_token(&mut self, token: u32, verdict: Verdict) -> bool {
         self.pending = None;
         if verdict != Verdict::Eos {
@@ -576,6 +577,13 @@ pub trait Emit {
     fn window_cap(&self) -> Option<usize> {
         None
     }
+
+    /// A speculative request's first token is held, not emitted: it moves
+    /// into a window lane at this boundary and its caller streams the token
+    /// with the burst it prefilled in ([`sched`]).
+    fn holds_first(&self) -> bool {
+        false
+    }
 }
 
 /// How [`drive`] left a request: finished (still uncommitted), or an exit
@@ -672,6 +680,13 @@ fn spec_step(run: &mut RequestRun, io: &mut (impl Forwards + Emit + ?Sized)) -> 
             };
             io.commit_prompt();
             run.position = run.prompt_len;
+            let d = run.draft.as_mut().expect("a speculative request");
+            // Held only where the next work is a window boundary (the park).
+            if io.holds_first() && !d.retire.is_retired() {
+                d.owed.push(first);
+                d.emitted.push(first);
+                return io.finish_prefill(&mut *d.drafter);
+            }
             let (verdict, close) = io.emit(first)?;
             run.spec_commit(first, verdict, &close);
             let d = run.draft.as_mut().expect("a speculative request");
@@ -823,6 +838,10 @@ impl<F, E: Emit + ?Sized> Emit for Both<'_, F, E> {
 
     fn window_cap(&self) -> Option<usize> {
         self.1.window_cap()
+    }
+
+    fn holds_first(&self) -> bool {
+        self.1.holds_first()
     }
 }
 

@@ -38,6 +38,9 @@
 //!   into a lane at a window boundary like a decoding AR request, its
 //!   drafter's state with it, and the drafter goes back to the load for the
 //!   next one; every tick then runs one window epoch over the window lanes.
+//!   One that moves right after its prompt holds its first token
+//!   ([`Emit::holds_first`]) and streams it with the tick's burst, as an AR
+//!   request streams its first lane token.
 //!   Otherwise it stays resident until it finishes and the next queued
 //!   request takes the resident state after it. [`Ended`] hands a resident
 //!   one's drafter back.
@@ -331,6 +334,7 @@ impl Scheduler {
             )
         };
         let run = self.run_mut(idx);
+        let prompt = matches!(run.next_work(), Work::Prefill { .. });
         // A parking request at its boundary moves without an epoch; every
         // other resident request runs one.
         if !(parks && boundary(&run.next_work())) {
@@ -370,8 +374,9 @@ impl Scheduler {
         self.resident = None;
         let req = self.reqs[idx].as_mut().expect("parked request is live");
         req.place = Place::Lane;
-        // A window lane's seed was streamed on the resident state.
-        req.fresh = !window;
+        // A window lane's seed was streamed on the resident state, unless
+        // this tick's prompt held it.
+        req.fresh = !window || prompt;
         req.window = window;
         true
     }
@@ -392,10 +397,15 @@ impl Scheduler {
             }
             let req = self.reqs[idx].as_mut().expect("a lane request is live");
             req.fresh = false;
+            let window = req.window;
             let run = req.run.as_mut().expect("a lane request has its run");
             let Work::Decode { token: Some(seed) } = run.next_work() else {
                 continue;
             };
+            if window {
+                self.window_token(b, idx, seed, ended);
+                continue;
+            }
             let remaining = run.remaining();
             match b.emit(idx, seed) {
                 Ok((verdict, close)) if verdict == Verdict::Continue && remaining > 1 => {
@@ -509,28 +519,43 @@ impl Scheduler {
             }
         };
         for (&(idx, _), committed) in rows.iter().zip(windows) {
-            let mut failed = None;
             for token in committed {
-                let continues = match b.emit(idx, token) {
-                    // Template tokens are never forced on a window lane
-                    // ([`Batch::lane_takes`]).
-                    Ok((_, close)) if !close.is_empty() => {
-                        Err("a window lane was forced template tokens".to_string())
-                    }
-                    Ok((verdict, _)) => Ok(self.run_mut(idx).apply_window_token(token, verdict)),
-                    Err(error) => Err(error),
-                };
-                match continues {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(error) => failed = Some(error),
+                if !self.window_token(b, idx, token, ended) {
+                    break;
                 }
-                break;
             }
-            if let Some(error) = failed {
+        }
+    }
+
+    /// Emit a window lane's committed `token`; a request it ends or fails
+    /// leaves. Whether the request continues.
+    fn window_token(
+        &mut self,
+        b: &mut impl Batch,
+        idx: usize,
+        token: u32,
+        ended: &mut Vec<Ended>,
+    ) -> bool {
+        let continues = match b.emit(idx, token) {
+            // Template tokens are never forced on a window lane
+            // ([`Batch::lane_takes`]).
+            Ok((_, close)) if !close.is_empty() => {
+                Err("a window lane was forced template tokens".to_string())
+            }
+            Ok((verdict, _)) => Ok(self.run_mut(idx).apply_window_token(token, verdict)),
+            Err(error) => Err(error),
+        };
+        match continues {
+            Ok(true) => true,
+            Ok(false) => {
+                if let Work::Done(finish) = self.run_mut(idx).next_work() {
+                    ended.push(self.end(idx, Exit::Finished(finish)));
+                }
+                false
+            }
+            Err(error) => {
                 ended.push(self.end(idx, Exit::Failed(error)));
-            } else if let Work::Done(finish) = self.run_mut(idx).next_work() {
-                ended.push(self.end(idx, Exit::Finished(finish)));
+                false
             }
         }
     }
@@ -626,6 +651,12 @@ impl<B: Batch> Emit for One<'_, B> {
 
     fn window_cap(&self) -> Option<usize> {
         self.b.window_cap(self.idx)
+    }
+
+    /// A speculative request that moves into its lane at this boundary
+    /// streams its first token with the tick's burst.
+    fn holds_first(&self) -> bool {
+        !self.keep
     }
 }
 
@@ -1229,6 +1260,48 @@ mod tests {
                 Call::Emit(1),
                 Call::Emit(2),
                 Call::Lanes(vec![0, 1, 2])
+            ]
+        );
+    }
+
+    #[test]
+    fn a_burst_of_speculative_prompts_streams_first_tokens_before_its_window_epoch() {
+        let prompts = vec![vec![1, 2], vec![3, 4, 5], vec![6]];
+        let mut b = fake(&prompts, 4, 4);
+        b.eos = u32::MAX;
+        b.sampled = Vec::new();
+        b.spec = vec![0, 1, 2];
+        b.windows = true;
+        let mut s = Scheduler::default();
+        for idx in 0..3 {
+            s.admit(idx);
+        }
+        s.tick(&mut b);
+        // Each prompt prefills and moves into its window lane holding its
+        // first token; the burst's first tokens stream together, then one
+        // window epoch runs them.
+        assert_eq!(
+            b.calls,
+            vec![
+                Call::Prefill(0),
+                Call::Park(0),
+                Call::Prefill(1),
+                Call::Park(1),
+                Call::Prefill(2),
+                Call::Park(2),
+                Call::Emit(0),
+                Call::Emit(1),
+                Call::Emit(2),
+                Call::Windows(vec![0, 1, 2]),
+                Call::Emit(0),
+                Call::Emit(0),
+                Call::Emit(0),
+                Call::Emit(1),
+                Call::Emit(1),
+                Call::Emit(1),
+                Call::Emit(2),
+                Call::Emit(2),
+                Call::Emit(2),
             ]
         );
     }
