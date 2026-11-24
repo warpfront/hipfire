@@ -1431,6 +1431,10 @@ impl Batch for Ctx<'_> {
     /// drafter, reset, goes back to the load for the next request (the
     /// legacy promotion's release: the resident graphs are re-captured).
     fn park_window(&mut self, idx: usize, run: &mut RequestRun) -> Result<(), String> {
+        // Checked before the swap: a refused boundary leaves `run` unchanged.
+        if !matches!(run.next_work(), super::Work::Verify { ar: false, .. }) {
+            return Err("a parked speculative request was not at a window boundary".into());
+        }
         let remaining = run.remaining();
         let live = self.lives[idx]
             .as_mut()
