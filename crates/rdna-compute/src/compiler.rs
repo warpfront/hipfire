@@ -1211,20 +1211,39 @@ impl KernelCompiler {
         let certified = object.with_extension("radiowave.json");
         if let Ok(json) = std::fs::read_to_string(&certified) {
             let bytes = std::fs::read(object).map_err(|e| format!("{module}: {e}"))?;
-            if CodeObjectCertification::from_json(&bytes, &json).is_ok() {
-                let mut manifest: radiowave::CompileManifest = serde_json::from_str(&json)
-                    .map_err(|e| format!("{module}: radiowave sidecar: {e}"))?;
-                manifest.generated_unix_seconds = 0;
-                manifest.source = format!("{module}.hip").into();
-                manifest.output = format!("{module}.hsaco").into();
-                let encoded = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
-                let temp = dir.join(format!(".{module}.{}.radiowave.tmp", unique_token()));
-                std::fs::write(&temp, encoded)
-                    .and_then(|_| std::fs::rename(&temp, &sidecar))
-                    .map_err(|e| {
-                        let _ = std::fs::remove_file(&temp);
-                        format!("{module}: radiowave sidecar: {e}")
-                    })?;
+            match CodeObjectCertification::from_json(&bytes, &json) {
+                Err(e) => eprintln!("  {module}: cache radiowave sidecar not shipped: {e}"),
+                Ok(_) => {
+                    let mut manifest: radiowave::CompileManifest = serde_json::from_str(&json)
+                        .map_err(|e| format!("{module}: radiowave sidecar: {e}"))?;
+                    manifest.generated_unix_seconds = 0;
+                    manifest.source = format!("{module}.hip").into();
+                    manifest.output = format!("{module}.hsaco").into();
+                    // Toolchain prefix is host-specific; keep only the binary name and version line.
+                    if let Some(name) = manifest.hipcc.file_name().map(PathBuf::from) {
+                        manifest.hipcc = name;
+                    }
+                    if let Some(first) = manifest.command.first_mut() {
+                        if let Some(name) = Path::new(first.as_str()).file_name() {
+                            *first = name.to_string_lossy().into_owned();
+                        }
+                    }
+                    manifest.hipcc_version = manifest
+                        .hipcc_version
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_owned();
+                    let encoded =
+                        serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
+                    let temp = dir.join(format!(".{module}.{}.radiowave.tmp", unique_token()));
+                    std::fs::write(&temp, encoded)
+                        .and_then(|_| std::fs::rename(&temp, &sidecar))
+                        .map_err(|e| {
+                            let _ = std::fs::remove_file(&temp);
+                            format!("{module}: radiowave sidecar: {e}")
+                        })?;
+                }
             }
         }
         Ok(dir.join(format!("{module}.hsaco")))
@@ -3911,6 +3930,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
         assert_eq!(shipped.generated_unix_seconds, 0);
         assert_eq!(shipped.output, Path::new("alpha.hsaco"));
+        assert_eq!(shipped.source, Path::new("alpha.hip"));
         std::fs::remove_file(&sidecar).unwrap();
         assert!(verify(Some("hipcc 7.2")).is_ok());
         // A different local compiler would reject every object at load time.
