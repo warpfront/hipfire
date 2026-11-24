@@ -191,8 +191,8 @@ pub struct MeshRunner {
     /// ticket covers: nothing counts as drained until a successful reset.
     unsettled: bool,
     /// A failed device synchronization quarantined the mesh. Persistent for
-    /// this runner (the load): every later engine request is refused. Routes
-    /// that do not run on the engine are not gated by it.
+    /// this runner (the load); the device itself carries the quarantine too,
+    /// so every route, load and unload on it refuses until restart.
     quarantined: Option<String>,
     /// Committed conversations kept in the family's lanes, oldest first.
     pub records: Vec<LaneRecord>,

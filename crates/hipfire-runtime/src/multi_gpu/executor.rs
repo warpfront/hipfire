@@ -575,8 +575,9 @@ pub(super) struct MeshExecutionState {
     poisoned: bool,
     quarantined: bool,
     /// The devices are lent by their owner (`Gpus::lend_single`): a quarantine
-    /// marks the state but leaves them in place, so the lender takes them back
-    /// and keeps its own refusal; a quarantine never leaks a lent device.
+    /// leaves them in place, so the lender takes them back, but marks each
+    /// device itself quarantined (`quarantine_lent`); a quarantine never leaks
+    /// a lent device.
     pub(super) lent: bool,
 }
 
@@ -1220,7 +1221,9 @@ impl DrainBackend for HipBackend<'_> {
         // Reached only after a failed device synchronization (see `drain` and
         // `reset_all`): like `HipDrain`, keep device ownership until teardown
         // because in-flight work may still reference registered VMM/host state.
-        if !self.gpus.mesh_execution.lent {
+        if self.gpus.mesh_execution.lent {
+            quarantine_lent(&mut self.gpus.devices);
+        } else {
             std::mem::forget(std::mem::take(&mut self.gpus.devices));
         }
     }
@@ -2241,11 +2244,21 @@ impl DrainBackend for HipDrain<'_> {
     fn quarantine(&mut self) {
         self.state.quarantined = true;
         // Gpu::drop frees registered VMM/host-mapped state; a failed drain keeps
-        // device ownership until process teardown (a lent device goes back to
-        // its owner, which never drops it here).
-        if !self.state.lent {
+        // device ownership until process teardown.
+        if self.state.lent {
+            quarantine_lent(self.devices);
+        } else {
             std::mem::forget(std::mem::take(self.devices));
         }
+    }
+}
+
+/// A lent device goes back to its owner (the daemon), which outlives this
+/// mesh: mark the device itself, so every later route, load and unload on it
+/// refuses GPU work and its frees until process restart.
+fn quarantine_lent(devices: &mut [Gpu]) {
+    for gpu in devices {
+        gpu.quarantine_retained_replay_owners("engine mesh device synchronization failed");
     }
 }
 
@@ -5404,5 +5417,31 @@ mod lifecycle_tests {
         assert_eq!(toy.count(|e| matches!(e, Ev::Reset(_))), 3);
         assert_eq!(toy.count(|e| matches!(e, Ev::Sync(_))), 6);
         assert!(toy.fail_closed() && toy.quarantined);
+    }
+
+    /// HIPF-519: a failed sync on a lent device (the engine's one-owner mesh)
+    /// must quarantine the daemon's `Gpu` itself, so non-engine routes, a
+    /// reload and an unload's frees all refuse. Marks the device quarantined
+    /// for the whole process: run alone.
+    ///   cargo test -p hipfire-runtime --lib lent_drain_quarantine -- --ignored
+    #[test]
+    #[ignore = "needs a GPU; quarantines it for the rest of the process"]
+    fn lent_drain_quarantine_marks_the_lenders_device() {
+        let mut gpu = Gpu::init().expect("gpu");
+        let held = gpu.zeros(&[16], DType::F32).expect("alloc");
+        let mesh = DeviceMesh::single().expect("mesh");
+        Gpus::lend_single(&mut gpu, &mesh, 1, |gpus| {
+            let state = &mut gpus.mesh_execution;
+            HipDrain {
+                devices: &mut gpus.devices,
+                state,
+            }
+            .quarantine();
+            assert!(gpus.mesh_quarantined());
+        });
+        assert!(gpu.bind_thread().is_err(), "any route binds first");
+        assert!(gpu.zeros(&[16], DType::F32).is_err(), "a reload allocates");
+        assert!(gpu.free_tensor(held).is_err(), "an unload frees nothing");
+        assert!(Gpu::init().is_err(), "a new device handle is refused too");
     }
 }
