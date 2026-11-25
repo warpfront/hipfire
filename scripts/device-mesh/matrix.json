@@ -1886,7 +1886,8 @@
   {
    "commands": {
     "positive": [
-     "HIPFIRE_DENSE_FIXTURE=$MODEL_DIR cargo test -p hipfire-generate --locked --test dense_rollback_gpu -- glimmer_dflash_request_that_fits_max_seq_completes glimmer_client_abort_stops_decode --exact --ignored --test-threads=1 --nocapture"
+     "HIPFIRE_DENSE_FIXTURE=$MODEL_DIR cargo test -p hipfire-generate --locked --test dense_rollback_gpu -- glimmer_dflash_request_that_fits_max_seq_completes glimmer_client_abort_stops_decode --exact --ignored --test-threads=1 --nocapture",
+     "HIPFIRE_DENSE_FIXTURE=$MODEL_DIR cargo test -p hipfire-arch-muse-glimmer --locked --test kv_cap_gpu -- rows_past_max_seq_are_an_error --exact --ignored --test-threads=1 --nocapture"
     ]
    },
    "env": {
@@ -1903,14 +1904,15 @@
    ],
    "id": "g11-glimmer-dflash-max-seq",
    "milestone": "G11",
-   "note": "HIPF-86 regression (a greedy DFlash request that fits max_seq completes on DFlash) plus the Glimmer client-abort test (HIPF-276). Own row so hosts without the 20 GB Glimmer pair keep g4-dense-rollback current (an absent fixture blocks the whole row).",
+   "note": "HIPF-86 regression (a greedy DFlash request that fits max_seq completes on DFlash) plus the Glimmer client-abort test (HIPF-276). Own row so hosts without the 20 GB Glimmer pair keep g4-dense-rollback current (an absent fixture blocks the whole row). Also runs kv_cap_gpu rows_past_max_seq_are_an_error (#666 G11): a verify/prefill row ending past max_seq returns an error.",
    "predicate": {
     "forbid": [
      "skip: dense fixture",
-     "skip: no GPU"
+     "skip: no GPU",
+     "skip: muse-glimmer-30b.mq4 not found"
     ],
     "kind": "cargo",
-    "min_passed": 2
+    "min_passed": 3
    },
    "probe": "existing",
    "route": "single/glimmer-dflash-max-seq"
