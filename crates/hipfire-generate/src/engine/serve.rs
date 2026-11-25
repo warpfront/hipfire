@@ -936,6 +936,20 @@ fn reset_drafting(
     drafter.reset(gpu)
 }
 
+/// Test-only (`serve-fault-inject`): the next [`rollback`] fails before any
+/// owner reset. Process-global and one-shot: the daemon's stdin reader arms
+/// it from an `abort` carrying `test_fault_engine_reset: true`.
+#[cfg(feature = "serve-fault-inject")]
+static ENGINE_RESET_FAULT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arm the one-shot engine reset fault (see [`ENGINE_RESET_FAULT`]).
+#[cfg(feature = "serve-fault-inject")]
+#[doc(hidden)]
+pub fn arm_engine_reset_fault() {
+    ENGINE_RESET_FAULT.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// The attested rollback of the resident state (the singleton's): the
 /// request's outputs drained and freed, the turn cache and deferred seed
 /// dropped, every owner reset.
@@ -955,6 +969,10 @@ fn rollback(
     let family = state
         .mesh_family()
         .ok_or("the model declares no engine family")?;
+    #[cfg(feature = "serve-fault-inject")]
+    if ENGINE_RESET_FAULT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err("injected engine reset fault".into());
+    }
     runner.reset(family, gpus)
 }
 

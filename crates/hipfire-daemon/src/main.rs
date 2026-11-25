@@ -1284,6 +1284,13 @@ fn main() {
                                 command = kind,
                                 "daemon control command received"
                             );
+                            // Test-only: this cancel's engine rollback fails (armed before the abort lands).
+                            #[cfg(feature = "serve-fault-inject")]
+                            if msg.get("test_fault_engine_reset").and_then(|v| v.as_bool())
+                                == Some(true)
+                            {
+                                hipfire_generate::engine::serve::arm_engine_reset_fault();
+                            }
                             apply_terminal_control(kind, id, attempt_id);
                             batch_apply_terminal_control(kind, id, attempt_id);
                         }
