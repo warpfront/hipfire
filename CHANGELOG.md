@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.4.8 — 2026-11-24
+## v0.4.8 — 2026-11-25
 
 0.4.8 is a bug-fix patch release on top of 0.4.7. It backports fixes from beta for bugs that 0.4.7 users can hit; it removes nothing and changes no default numerics. Every entry names its beta commit.
 
