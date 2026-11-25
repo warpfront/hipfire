@@ -50,7 +50,8 @@ impl Qwen4Bundle {
 
     /// Move the resident request into lane `tag` ([`Self::prepare_promotion`]
     /// with `generated` ending in its pending seed, then the swap); its
-    /// context is mapped for `remaining` decode rows.
+    /// context is mapped for `remaining` decode rows. A `sampling` lane
+    /// draws from that sampler's stream.
     fn promote(
         &mut self,
         gpu: &mut Gpu,
@@ -59,6 +60,7 @@ impl Qwen4Bundle {
         generated: Vec<u32>,
         remaining: usize,
         parts: Option<crate::mtp_spec::Qwen4PromotionParts<'_>>,
+        sampling: Option<crate::lane::LaneSampling>,
     ) -> Result<()> {
         let epoch = lane_epoch(tag);
         let seed = *generated.last().ok_or("park: no pending seed")?;
@@ -79,6 +81,14 @@ impl Qwen4Bundle {
             parts,
         )
         .map_err(text)?;
+        if let Some(sampling) = sampling {
+            if let Err(error) =
+                self.with_lanes(|store, _| store.set_promoted_sampling(&epoch, sampling))
+            {
+                let _ = self.abort_promotion(&epoch);
+                return Err(text(error));
+            }
+        }
         // The prompt's boundary snapshots stay published: the reset that
         // follows the swap drops the resident turn.
         self.session_publish_captures();
@@ -279,7 +289,7 @@ impl MeshLanes for Qwen4Bundle {
         // The lane's committed picks end with its pending seed.
         let mut generated = ran.to_vec();
         generated.push(seed);
-        self.promote(device(gpus)?, tag, prompt, generated, remaining, None)
+        self.promote(device(gpus)?, tag, prompt, generated, remaining, None, None)
     }
 
     fn windows(&self) -> bool {
@@ -299,6 +309,7 @@ impl MeshLanes for Qwen4Bundle {
             .drafter_any_mut()
             .and_then(|any| any.downcast_mut::<crate::mtp_spec::Qwen4MtpDrafter>())
             .ok_or("an MTP lane takes a native Qwen4 MTP drafter")?;
+        let sampling = drafter.naive_lane_sampling()?;
         let parts = drafter.promotion_parts()?;
         self.promote(
             device(gpus)?,
@@ -307,7 +318,12 @@ impl MeshLanes for Qwen4Bundle {
             emitted.to_vec(),
             remaining,
             Some(parts),
+            sampling,
         )
+    }
+
+    fn sampled_windows(&self) -> bool {
+        self.windows() && self.lanes().is_some_and(|store| store.sampled())
     }
 
     /// The legacy fn-lanes window ([`crate::lane_exec::Qwen4LaneExecutor`]):

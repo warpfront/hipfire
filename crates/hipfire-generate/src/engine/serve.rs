@@ -1488,18 +1488,21 @@ impl Batch for Ctx<'_> {
         Ok(())
     }
 
-    /// Greedy speculative requests on lanes that run windows (their windows
-    /// are the singleton's greedy accept), AR ones on AR lanes. A minimum
-    /// token count or a think budget keeps a speculative request resident:
-    /// the lane's windows stop at EOS and are never forced.
+    /// Speculative requests on lanes that run windows (their windows are the
+    /// singleton's greedy or naive sampled accept; sampled only on lanes that
+    /// continue the seeded stream), AR ones on AR lanes. A minimum token count
+    /// or a think budget keeps a speculative request resident: the lane's
+    /// windows stop at EOS and are never forced.
     fn lane_takes(&mut self, idx: usize) -> bool {
-        let windows = self.lanes().is_ok_and(|lanes| lanes.windows());
+        let (windows, sampled) = self.lanes().map_or((false, false), |lanes| {
+            (lanes.windows(), lanes.sampled_windows())
+        });
         let live = self.live(idx);
         match &live.spec {
             None => !windows,
             Some(_) => {
                 windows
-                    && live.sampler.temperature <= 0.0
+                    && (live.sampler.temperature <= 0.0 || sampled)
                     && hipfire_runtime::sampler::PenaltyTable::flags_for(&live.sampler) == 0
                     && matches!(
                         live.wire,

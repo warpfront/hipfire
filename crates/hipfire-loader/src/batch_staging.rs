@@ -888,6 +888,23 @@ fn stage_qwen4_lanes(
         Some(bundle) => bundle.set_lanes_sampled(req.sampled),
         None => return refuse("model state not Qwen4"),
     }
+    // Engine window lanes draw sampled windows naive; the resident windows of
+    // the same requests verify naive too, so a parked request continues the
+    // singleton's seeded stream.
+    if topology == "single"
+        && hipfire_runtime::config::get().engine_loop
+        && spec_on_k.is_some()
+        && req.sampled
+    {
+        if let Some(drafter) = m
+            .speculator
+            .as_mut()
+            .and_then(|s| s.drafter_any_mut())
+            .and_then(|any| any.downcast_mut::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>())
+        {
+            drafter.force_sampled_naive();
+        }
+    }
     let Some(store) = m.qwen4().and_then(|bundle| bundle.lanes()) else {
         return refuse("lane store missing after staging");
     };

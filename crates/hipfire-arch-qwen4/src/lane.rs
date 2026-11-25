@@ -3254,6 +3254,32 @@ impl Qwen4LaneStore {
         Ok(())
     }
 
+    /// [`Self::set_lane_sampling`] for a lane just promoted mid-turn
+    /// (`admit_promoted`): its RNG continues the singleton's stream at
+    /// [`LaneSampling::initial_rng`]. Refused unless the store is staged
+    /// sampled and no step is in flight.
+    pub(crate) fn set_promoted_sampling(
+        &mut self,
+        epoch: &RequestEpoch,
+        sampling: LaneSampling,
+    ) -> Result<(), String> {
+        if !self.sampled {
+            return Err("a sampled lane needs serve.batch_sampled".to_string());
+        }
+        if self.phase != LanePhase::Idle {
+            return Err("set_promoted_sampling: a step is in flight".to_string());
+        }
+        sampling.validate()?;
+        let host = &mut self
+            .table
+            .get_mut(epoch)
+            .ok_or_else(|| format!("set_promoted_sampling: unknown epoch {epoch:?}"))?
+            .host;
+        host.rng = sampling.initial_rng();
+        host.sampling = Some(sampling);
+        Ok(())
+    }
+
     /// Make `epoch`'s lane a `min_tokens` lane (host only): its windows never
     /// stop at EOS (see [`LaneHost::ignore_eos`]). After admission and before
     /// the lane's first step; refused while a step is in flight or once the lane

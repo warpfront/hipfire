@@ -5616,6 +5616,36 @@ impl Qwen4MtpDrafter {
         matches!(self.sampled_mode, Ok(SampledMode::Naive))
     }
 
+    /// Verify sampled requests with [`SampledMode::Naive`], whatever
+    /// `HIPFIRE_MTP_SAMPLED_MODE` says: an engine load whose window lanes
+    /// draw naive (`lane_exec`) runs its resident windows on the same rule, so
+    /// a request parked mid-turn continues the singleton's seeded stream.
+    pub fn force_sampled_naive(&mut self) {
+        self.sampled_mode = Ok(SampledMode::Naive);
+    }
+
+    /// The configured sampled request as a naive lane sampler whose `seed` is
+    /// the AR sampler RNG state its next draw takes (the process-wide stream
+    /// the naive verify draws from). `None`: greedy. `Err`: a Leviathan
+    /// request, whose stream no lane continues.
+    pub fn naive_lane_sampling(&self) -> Result<Option<crate::lane::LaneSampling>, String> {
+        let Some(state) = self.sampled.as_ref() else {
+            return Ok(None);
+        };
+        if !state.naive {
+            return Err("a sampled window lane needs the naive sampled verify".into());
+        }
+        let cfg = &self.request;
+        Ok(Some(crate::lane::LaneSampling {
+            temperature: cfg.temp,
+            top_p: cfg.top_p,
+            top_k: cfg.top_k,
+            min_p: (cfg.min_p > 0.0).then_some(cfg.min_p),
+            seed: hipfire_runtime::llama::sampler_rng_snapshot(),
+            seeded: true,
+        }))
+    }
+
     /// The configured request carries a non-neutral repeat / presence /
     /// frequency penalty (the router's definition: the window is not
     /// consulted).

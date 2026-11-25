@@ -164,6 +164,11 @@ pub trait MeshLanes {
     fn windows(&self) -> bool {
         false
     }
+    /// Whether a sampled speculative request may park into a window lane
+    /// (the lane continues its seeded stream).
+    fn sampled_windows(&self) -> bool {
+        false
+    }
     /// [`Self::park`] of a speculative request at a window boundary: it ran
     /// `prompt` and every `emitted` token but the last, its next window's
     /// seed; `drafter` holds its draft state, which moves into the lane (the
