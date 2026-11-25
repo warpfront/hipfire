@@ -2026,10 +2026,8 @@ pub fn generate_lfm3_omni(
         let seed = omni_seed();
         // Prefill once.
         let prefill = {
-            let bundle = match m.state.as_mut() {
-                Some(s) => (s.as_mut() as &mut dyn std::any::Any)
-                    .downcast_mut::<hipfire_loader::Lfm3Bundle>()
-                    .expect("not lfm3"),
+            let bundle = match m.lfm3_mut() {
+                Some(b) => b,
                 _ => {
                     write_error(stdout, id, "lfm3-omni: not an lfm3 model");
                     return;
@@ -2125,10 +2123,8 @@ pub fn generate_lfm3_omni(
             let this_chunk = chunk_steps.min(steps_left);
             steps_left -= this_chunk;
             let step_out = {
-                let bundle = match m.state.as_mut() {
-                    Some(s) => (s.as_mut() as &mut dyn std::any::Any)
-                        .downcast_mut::<hipfire_loader::Lfm3Bundle>()
-                        .expect("not lfm3"),
+                let bundle = match m.lfm3_mut() {
+                    Some(b) => b,
                     _ => {
                         // LEAK-1: free the codec GPU buffers on the error path.
                         codec_cache.free_gpu(gpu);
@@ -2268,10 +2264,8 @@ pub fn generate_lfm3_omni(
     // Omni generate loop (AUDIO or INTERLEAVED, inferred from the prompt marker).
     let t0 = std::time::Instant::now();
     let generated = {
-        let bundle = match m.state.as_mut() {
-            Some(s) => (s.as_mut() as &mut dyn std::any::Any)
-                .downcast_mut::<hipfire_loader::Lfm3Bundle>()
-                .expect("not lfm3"),
+        let bundle = match m.lfm3_mut() {
+            Some(b) => b,
             _ => {
                 write_error(stdout, id, "lfm3-omni: not an lfm3 model");
                 return;
