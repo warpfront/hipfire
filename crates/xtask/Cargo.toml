@@ -1,0 +1,12 @@
+# Repository tooling reached as `cargo xtask <cmd>` (alias in .cargo/config.toml).
+# It orchestrates and never links product code: no dependency on any workspace
+# crate and no third-party dependency, so it builds in seconds from any
+# checkout. Not part of the product binary or the release archive.
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]

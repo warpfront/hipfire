@@ -82,12 +82,12 @@ executable.
 
 Generated files (crate `map.md` blocks, the developer call-site flags
 golden, the `docs/CONFIG.md` lifecycle table and the `docs/env-vars.md`
-inventory) are never hand-edited: `scripts/regen-generated.sh` rebuilds
-them from the tree, and the pre-commit hook runs it and stages the result
-(`--all` also rebuilds the cargo-built flags goldens and TUI snapshots).
-A drift failure in `scripts/ci-gates.sh` names that command. Ratchet
-ceilings, pins, lifecycle labels and the census allowlists stay human
-decisions; the script does not touch them.
+inventory) are never hand-edited: `cargo xtask regen` rebuilds them from
+the tree, and the pre-commit hook runs it and stages the result
+(`cargo xtask regen --all` also rebuilds the cargo-built flags goldens and
+TUI snapshots). A drift failure in `scripts/ci-gates.sh` names that
+command. Ratchet ceilings, pins, lifecycle labels and the census
+allowlists stay human decisions; the command does not touch them.
 
 ### No-GPU CI subset
 

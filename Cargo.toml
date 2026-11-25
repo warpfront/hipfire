@@ -67,6 +67,7 @@ members = [
     "crates/peacemaker-npu",
     "crates/peacemaker-cdna",
     "crates/npu-tools",
+    "crates/xtask",
 ]
 
 [workspace.package]

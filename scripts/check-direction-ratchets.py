@@ -101,7 +101,7 @@ GUIDANCE = {
         "Do not read HIPFIRE_* from the environment directly. Add a typed key to the\n"
         "    hipfire-config schema (crates/hipfire-config/src/lib.rs) and read it from ProcessConfig /\n"
         "    FeatureFlags; a developer-only knob uses hipfire_config::developer_var/developer_bool.\n"
-        "    Then run scripts/regen-generated.sh to refresh the golden and the env-vars inventory.",
+        "    Then run cargo xtask regen to refresh the golden and the env-vars inventory.",
     ),
     "scripts_top_level_files": (
         "a file was added directly under scripts/",
