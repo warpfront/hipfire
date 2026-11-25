@@ -157,14 +157,6 @@ impl CodeObjectArtifact {
             }),
         }
     }
-
-    /// Whether `image` is byte-for-byte this artifact's image; pointer
-    /// equality short-circuits the hash for repeated static loads.
-    fn holds(&self, image: &[u8]) -> bool {
-        let own = self.image.as_bytes();
-        (own.as_ptr() == image.as_ptr() && own.len() == image.len())
-            || CodeObjectId::of(image) == self.id
-    }
 }
 
 /// Artifacts are equal exactly when their images are (same digest).
@@ -194,6 +186,12 @@ impl fmt::Display for CodeObjectArtifact {
 pub struct CodeObjectRegistry {
     modules: HashMap<String, RecordedArtifact>,
     functions: HashMap<String, RecordedArtifact>,
+    /// Digests of `'static` images [`Self::check_function_image`] hashed, by
+    /// address and length. Each use of a `const` image may materialise its
+    /// own copy, so a launcher's copy can sit at another address than the one
+    /// a route preload admitted; a `'static` slice is never freed or written,
+    /// so each copy is hashed once instead of on every launch.
+    static_digests: HashMap<(usize, usize), CodeObjectId>,
 }
 
 impl CodeObjectRegistry {
@@ -235,14 +233,34 @@ impl CodeObjectRegistry {
     }
 
     /// Identity check for an already-loaded function against the image a
-    /// caller asks for, without hashing when the bytes are the bound ones.
-    pub fn check_function_image(&self, func: &str, image: &[u8]) -> Result<(), String> {
-        match self.functions.get(func) {
-            Some(bound) if !bound.holds(image) => Err(format!(
-                "function {func:?} is bound to image {} and a different image was requested",
-                bound.id
-            )),
-            _ => Ok(()),
+    /// caller asks for: no hash when the bytes are the bound ones, and at
+    /// most one per `'static` copy (`static_digests`).
+    pub fn check_function_image(
+        &mut self,
+        func: &str,
+        image: &CodeObjectBytes,
+    ) -> Result<(), String> {
+        let Some(bound) = self.functions.get(func) else {
+            return Ok(());
+        };
+        let (own, bytes) = (bound.image.as_bytes(), image.as_bytes());
+        if own.as_ptr() == bytes.as_ptr() && own.len() == bytes.len() {
+            return Ok(());
+        }
+        let bound_id = bound.id;
+        let id = match image.static_bytes() {
+            Some(bytes) => *self
+                .static_digests
+                .entry((bytes.as_ptr() as usize, bytes.len()))
+                .or_insert_with(|| CodeObjectId::of(bytes)),
+            None => CodeObjectId::of(bytes),
+        };
+        if id == bound_id {
+            Ok(())
+        } else {
+            Err(format!(
+                "function {func:?} is bound to image {bound_id} and a different image was requested"
+            ))
         }
     }
 
@@ -296,12 +314,50 @@ mod tests {
             .unwrap();
         let err = registry.bind_function("k", &b).unwrap_err();
         assert!(err.contains("cannot rebind"), "{err}");
-        assert!(registry.check_function_image("k", IMAGE_A).is_ok());
-        assert!(registry
-            .check_function_image("k", IMAGE_A.to_vec().as_slice())
-            .is_ok());
-        assert!(registry.check_function_image("k", IMAGE_B).is_err());
+        let check = |registry: &mut CodeObjectRegistry, image: CodeObjectBytes| {
+            registry.check_function_image("k", &image)
+        };
+        assert!(check(&mut registry, IMAGE_A.into()).is_ok());
+        let owned: Arc<[u8]> = IMAGE_A.into();
+        assert!(check(&mut registry, owned.into()).is_ok());
+        assert!(
+            registry.static_digests.is_empty(),
+            "neither the bound copy nor an owned image is cached"
+        );
+        assert!(check(&mut registry, IMAGE_B.into()).is_err());
         assert_eq!(registry.function("k").unwrap().id(), a.id());
+    }
+
+    /// A route preload and a launcher can hold different `'static` copies of
+    /// one `const` image: the launcher's copy is hashed once, then remembered.
+    #[test]
+    fn another_static_copy_is_hashed_once() {
+        // Two distinct `static` items are distinct allocations; a byte-string
+        // literal (`IMAGE_A`) may be merged with an identical static by the
+        // optimizer, so the bound image is a static of its own.
+        static BOUND: [u8; 12] = *b"\x7fELF image a";
+        static COPY_A: [u8; 12] = *b"\x7fELF image a";
+        static COPY_B: [u8; 12] = *b"\x7fELF image b";
+        assert_ne!(COPY_A.as_ptr(), BOUND.as_ptr());
+        let mut registry = CodeObjectRegistry::default();
+        let a = registry.admit_module("m", native("m", &BOUND)).unwrap();
+        registry.bind_function("k", &a).unwrap();
+        for _ in 0..3 {
+            assert!(registry
+                .check_function_image("k", &COPY_A.as_slice().into())
+                .is_ok());
+        }
+        assert_eq!(
+            registry.static_digests,
+            HashMap::from([((COPY_A.as_ptr() as usize, 12), a.id())])
+        );
+        assert!(registry
+            .check_function_image("k", &COPY_B.as_slice().into())
+            .is_err());
+        assert!(registry
+            .check_function_image("k", &COPY_B.as_slice().into())
+            .is_err());
+        assert_eq!(registry.static_digests.len(), 2);
     }
 
     #[test]

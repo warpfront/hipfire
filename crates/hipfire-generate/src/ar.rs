@@ -5657,6 +5657,12 @@ pub fn generate(
             // advance and call maybe_evict immediately so the next write
             // never overruns physical_cap. compact_offset bookkeeping on
             // the cache itself keeps RoPE phase correct across evictions.
+            // Past the warm-up this step is steady state: no legacy null-stream submission
+            // until the iteration ends (`HIPFIRE_NULL_STREAM_LEDGER`).
+            let _step = hip_bridge::null_stream::steady_step_after_warmup(
+                generated,
+                gpu.active_stream.is_some(),
+            );
             if let Err(e) = qwen35::forward_scratch(
                 gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch,
             ) {

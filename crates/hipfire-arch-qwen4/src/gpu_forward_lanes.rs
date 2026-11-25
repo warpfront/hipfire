@@ -2352,6 +2352,22 @@ fn with_ple_project(program: &mut Vec<(LaneOp, StageName)>) {
     }
 }
 
+/// Whether the lane-batched PLE op ([`GroupedDepthwiseOp::lane_states`]) may run at its chunk's
+/// first lane's [`LaneOp::PleConv`]: the op reads and adds into every chunk lane's HC streams, so
+/// each of them must already have run the program up to the PLE layer. A run of per-lane
+/// operations is emitted segment-major (lane 0's whole run, then lane 1's, ...), so that holds
+/// only when `PleConv` opens its run: it is the program's first operation (the embedding has
+/// filled every lane's streams before the program) or a once-over-all-rows operation precedes it.
+/// Inside a longer per-lane run (every stage per lane: a card with no row-twin proof, e.g.
+/// single-card gfx1201) the later lanes have not reached the PLE layer yet.
+fn ple_batch_inputs_ready(program: &[(LaneOp, StageName)], policy: &LaneStagePolicy) -> bool {
+    match program.iter().position(|&(op, _)| op == LaneOp::PleConv) {
+        Some(0) => true,
+        Some(at) => !policy.share(program[at - 1].1).per_lane(),
+        None => false,
+    }
+}
+
 /// QSA lengths a lane's state commits after the step (the singleton's
 /// post-forward commit): `(lane, qsa slot, full, raw, pooled, selected, position)`.
 type QsaCommit = (usize, usize, usize, usize, usize, usize, usize);
@@ -3503,15 +3519,18 @@ fn forward_lanes_scoped(
         // `PLE_LANES_MAX` consecutive lanes as ONE op (key / value projections
         // over the chunk's rows + one batched tail) instead of the whole chain
         // per lane. A chunk needs 2+ lanes, every row tensor the chain touches
-        // laid out contiguously lane after lane, and each lane's own PLE conv
-        // state; anything else keeps the per-lane chain. Declared before the
-        // steps: they borrow the chunks.
+        // laid out contiguously lane after lane, each lane's own PLE conv
+        // state, and every lane's streams already at the PLE layer when the
+        // chunk's first lane emits the op ([`ple_batch_inputs_ready`]);
+        // anything else keeps the per-lane chain. Declared before the steps:
+        // they borrow the chunks.
         let ple_chunks: Vec<(usize, Vec<&GpuTensor>)> = match &ple_w {
             Some(ple_w)
                 if band_scope.input
                     && !prefill
                     && !bf16_state
-                    && lane_segs.iter().all(|seg| seg.rows == 1) =>
+                    && lane_segs.iter().all(|seg| seg.rows == 1)
+                    && ple_batch_inputs_ready(&program, policy) =>
             {
                 let width = |tensor: &GpuTensor| tensor.buf.as_ptr() as usize;
                 let lane_ids: Vec<usize> = (0..lane_segs.len()).collect();
@@ -6954,6 +6973,61 @@ mod tests {
             with_ple_project(&mut same);
             assert_eq!(same, band);
         }
+    }
+
+    /// The lane-batched PLE op runs at its chunk's first lane, so it is admitted only where
+    /// every lane has reached the PLE layer by then: `PleConv` opens its per-lane run. Under
+    /// the every-stage-per-lane policy (single-card gfx1201, no row-twin proof) the whole
+    /// program is ONE per-lane run emitted lane after lane: batching there ran every later
+    /// lane's PLE chain on its streams before that lane's layers below the PLE layer, and
+    /// those lanes decoded garbage from their third token (the single-card fn-lanes early stop).
+    #[test]
+    fn the_lane_ple_batch_needs_every_lane_at_the_ple_layer() {
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let layers = single.band.clone();
+        assert!(layers.len() >= 2);
+        let per_lane = LaneStagePolicy::all_per_lane();
+        for ple_layer in layers.clone().skip(1) {
+            let program = lane_program(
+                band_kinds(&config, layers.clone()),
+                &per_lane,
+                Some(ple_layer),
+            );
+            assert!(
+                !ple_batch_inputs_ready(&program, &per_lane),
+                "PLE layer {ple_layer}"
+            );
+        }
+        // PLE at layer 0: `PleConv` is the program's first op (the embedding ran for every lane).
+        let first = lane_program(band_kinds(&config, layers.clone()), &per_lane, Some(0));
+        assert!(ple_batch_inputs_ready(&first, &per_lane));
+        // A shared HC write ahead of the PLE layer (the EP / G0 policies) closes the run.
+        let shared = per_lane
+            .with(StageName::HcWrite, StageShare::OnceAllRows)
+            .unwrap();
+        for ple_layer in layers.clone() {
+            let program = lane_program(
+                band_kinds(&config, layers.clone()),
+                &shared,
+                Some(ple_layer),
+            );
+            assert!(
+                ple_batch_inputs_ready(&program, &shared),
+                "PLE layer {ple_layer}"
+            );
+        }
+        // The G0 production table (every row-local stage shared) batches at the model's PLE layer.
+        let production = LaneStagePolicy::production();
+        let program = lane_program(
+            band_kinds(&config, layers.clone()),
+            &production,
+            Some(ple_layer_of(&config)),
+        );
+        assert!(ple_batch_inputs_ready(&program, &production));
+        // No PLE layer in the band: nothing to batch.
+        let band = lane_program(band_kinds(&config, layers), &per_lane, None);
+        assert!(!ple_batch_inputs_ready(&band, &per_lane));
     }
 
     /// The PLE project piece is ONE item on its own segment (every row of the step) right

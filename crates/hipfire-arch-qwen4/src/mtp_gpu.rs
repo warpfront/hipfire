@@ -4139,8 +4139,9 @@ impl Qwen4MtpGpu {
     /// The backing allocation must remain live and any later writes must be
     /// ordered after the enqueued embedding gather; returning from this call
     /// does not imply device completion. With `device_ids` this call never
-    /// blocks the host; without it the scratch upload is a blocking
-    /// `hipMemcpy` that waits for all previously queued device work.
+    /// blocks the host; without it the scratch upload is
+    /// `Gpu::htod_stream_ordered`: enqueued on the active stream and waited
+    /// on there (a blocking `hipMemcpy` only when no stream is active).
     pub(crate) fn append_rows(
         &mut self,
         gpu: &mut Gpu,
@@ -4241,15 +4242,17 @@ impl Qwen4MtpGpu {
         }
         // Given device ids (the trunk's already uploaded rows or the prompt
         // chunk's one upload, same bytes as `tokens`) skip the host fill and
-        // copy; otherwise the scratch uploads.
+        // copy; otherwise the scratch uploads, ordered on the active stream
+        // (a decode fill runs inside the steady step: no legacy null-stream copy).
         let token_ids = match device_ids {
             Some(ids) => ids,
             None => {
                 for (bytes, &token) in scratch.host_token_bytes.chunks_exact_mut(4).zip(tokens) {
                     bytes.copy_from_slice(&(token as i32).to_ne_bytes());
                 }
-                gpu.memcpy_htod_auto(
+                gpu.htod_stream_ordered(
                     &scratch.token_ids.buf,
+                    0,
                     &scratch.host_token_bytes[..rows * std::mem::size_of::<i32>()],
                 )?;
                 &scratch.token_ids

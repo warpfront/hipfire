@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.4.8 — 2026-11-25
+
+0.4.8 is a bug-fix patch release on top of 0.4.7. It backports fixes from beta for bugs that 0.4.7 users can hit; it removes nothing and changes no default numerics. Every entry names its beta commit.
+
+### Fixes: decode speed on R9700 (gfx1201)
+
+- **Fixed: single-card Flash-Next with native MTP, the default on one R9700, is no longer up to 2.7x slower than it should be (beta e91e9ce63e, 86b5ba54fc).** Each kernel launch on the default planned route SHA-256-hashed its whole embedded image, about 0.6 ms per launch of the `.hc8` sidecar's 1.4 MB `hc8_wmma_pm_gfx1201`, with hundreds of launches per token. The route preload had bound a different copy of the same `const` image, so the identity check missed on the address every time. Each `'static` copy is now hashed once. Owned images are still hashed on every call, and a different image is still refused. Setting a developer flag such as `HIPFIRE_QWEN4_DECODE_SHARE=off` only looked like a workaround because it takes the load off the planned route. The hc8 single-static-address workaround is removed. Measured on one R9700, 0.4.8 against the v0.4.7 release archive, 4 fresh loads each (symtrunk + `.hc8`, `--spec mtp`, C1, T=1, 512 tokens): story 19.7 -> 52.3 tok/s (2.66x, 95% CI [2.59, 2.72]), code 45.4 -> 78.5 tok/s (1.73x [1.70, 1.76]). Greedy output is byte-identical.
+- **Fixed: on R9700, single-card processes no longer fall into a sticky slow mode in which every step runs about 2x slower (beta 0b6ba5c04d, d2601315be).** A blocking copy on the legacy null stream puts a packet on that stream's own hardware queue. When the queue mapper places that queue on the decode queue's pipe, every dispatch pays a time slice for the rest of the process. The per-step readbacks, uploads and embedding launches now run on the decode stream:
+  - Qwen3.5/3.6: the sampler readback, repeat-window upload, HIP-graph position copy, batched-forward uploads, DFlash and MTP uploads and readbacks, and the replay-table uploads;
+  - Gemma 4 and DeepSeek V4: the graph-path logits readback;
+  - Qwen4: the host argmax, spec AR-token and draft-head readbacks, and the native-MTP decode-fill token upload;
+  - `embedding_q8` and `embedding_lookup_q4k`.
+
+  The same bytes are computed. In the 0.4.8 release smoke (one process per binary, greedy, byte-identical transcripts), a v0.4.7 A3B process decoded at 56.2 tok/s and the 0.4.8 one at 114.5. New developer guard: `HIPFIRE_NULL_STREAM_LEDGER=deny` panics on a null-stream submission inside a steady decode step or verify window.
+- **Fixed: two-card Flash-Next EP2 lanes read their per-step decode top-1 and draft tokens on the decode stream, not with a blocking null-stream copy, closing the same slow-mode path (beta ed1082999e).** Output is byte-identical. In the 0.4.8 measurement (2x R9700, 4 fresh loads per binary, C1) none of the v0.4.7 processes fell into the slow mode, and C1 speed was unchanged (story 134.2 vs 134.4 tok/s, code 217.1 vs 215.4).
+
+### Fixes: loading
+
+- **Fixed: explicit `--spec mtp` on Qwen3.6/3.8-27B dense on gfx1201 works again instead of failing every request with `argmax_f32_batched_regrid_pm_gfx1201 ... outside this load's planned kernel route` (beta 1ba511f871).** It hit loads that take the sealed native-MTP route plan: a models directory without the `.vl` vision sidecar. With the sidecar the load stays on the open route and was not affected. The closed route planned the hipcc `argmax_f32_batched_regrid`, but on exact gfx1201 the verify launches its sealed PeaceMaker twin. The twin is now planned and bound before ready, and the post-ready refusal is unchanged.
+
+### Fixes: serving
+
+- **Fixed: with `serve.vmm_batch` on one GPU (Flash-Next, one R9700), concurrent requests no longer emit blank lines and stop after 15-23 tokens (#1180, beta 41d1224b99).** The lane-batched PLE op ran every lane's PLE chain at the first lane's PLE step. On one card, where every lane stage runs per lane, lanes 1..n had not reached the PLE layer at that point. The batch now runs only where every lane has reached the PLE layer (`ple_batch_inputs_ready`), and the single-card step runs the per-lane chain. EP2 lanes are unchanged. `docs/SERVE.md` states the single-GPU contract: the singleton-prefilled lane is byte-identical to the request run alone, and a lane prefilled as a lane tile decodes correctly but not byte-identically. `serve.vmm_batch` stays off by default on one GPU.
+
 ## v0.4.7 — 2026-11-15
 
 0.4.7 is a bug-fix patch release on top of 0.4.6. It backports fixes from beta for bugs that 0.4.6 users can hit; it removes nothing and changes no default numerics. Every entry names its beta commit.

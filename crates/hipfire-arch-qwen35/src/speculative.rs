@@ -511,7 +511,7 @@ pub(crate) fn dflash_download_verify_argmax(
     {
         let bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, b * 4) };
-        gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf)?;
+        gpu.dtoh_stream_ordered(bytes, &argmax_buf.buf)?;
     }
     Ok(host_idx.into_iter().map(|idx| idx as u32).collect())
 }
@@ -2453,11 +2453,13 @@ impl GdnTape {
                 gpu.hip.device_synchronize()?;
             }
             let (pre, gdn) = self.replay_ml_rows(ml, weights, config, dn_state);
-            gpu.hip.memcpy_htod(
+            // Stream-ordered (not the null stream): a blocking null-stream copy here parks a
+            // packet beside the decode queue (see `Gpu::upload_stream_ordered`).
+            gpu.upload_stream_ordered(
                 &ml.pre_table,
                 rdna_compute::dflash_gdn_replay::table_bytes(&pre),
             )?;
-            gpu.hip.memcpy_htod(
+            gpu.upload_stream_ordered(
                 &ml.gdn_table,
                 rdna_compute::dflash_gdn_replay::table_bytes(&gdn),
             )?;
@@ -2609,11 +2611,11 @@ impl GdnTape {
                 // Unkeyed while its tables are rewritten: a failed upload never
                 // leaves a fingerprint over half-written tables.
                 from.slots.take(victim);
-                gpu.hip.memcpy_htod(
+                gpu.upload_stream_ordered(
                     &from.pre_tables[victim],
                     rdna_compute::dflash_gdn_replay::table_bytes(&pre),
                 )?;
-                gpu.hip.memcpy_htod(
+                gpu.upload_stream_ordered(
                     &from.gdn_tables[victim],
                     rdna_compute::dflash_gdn_replay::table_bytes(&gdn),
                 )?;
@@ -7485,7 +7487,7 @@ pub fn build_dflash_noise_embeddings_weights(
     let id_view = draft_scratch.noise_tokens.sub_offset(0, b);
     let id_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u8, ids.len() * 4) };
-    gpu.hip.memcpy_htod(&id_view.buf, id_bytes)?;
+    gpu.upload_stream_ordered(&id_view.buf, id_bytes)?;
     let out_view = draft_scratch.x.sub_offset(0, b * h);
     gpu.embedding_lookup_q8_batched(&target_weights.token_embd, &out_view, &id_view, b, h)?;
     Ok(true)

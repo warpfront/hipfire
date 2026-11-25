@@ -188,7 +188,7 @@ pub fn sample(
     let scope = &history[scope_start..];
     if !scope.is_empty() {
         let bytes: Vec<u8> = scope.iter().flat_map(|t| t.to_ne_bytes()).collect();
-        let _ = gpu.hip.memcpy_htod(&repeat_buf.buf, &bytes);
+        let _ = gpu.upload_stream_ordered(&repeat_buf.buf, &bytes);
     }
 
     // Step 2: apply unconditional blocked tokens. One 4-byte H2D per

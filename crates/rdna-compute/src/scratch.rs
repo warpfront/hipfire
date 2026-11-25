@@ -342,7 +342,7 @@ pub struct ScratchState {
     /// f32 RMS value, and three u32 epoch counters, padded to 64 bytes; the
     /// split path uses its first f32 as the RMS handoff.
     pub mq_rmsnorm_wavegrid_scratch: Option<DeviceBuffer>,
-    /// Four-byte result of `tensor_ops::argmax_f32_host`.
+    /// Four-byte result of `tensor_ops::argmax_f32_host_stream_ordered`.
     pub argmax_host: Option<GpuTensor>,
     /// `(x, x_rot, k)` pointers of an `mq_rotate_x` output a fused kernel
     /// already wrote (`Gpu::hyper_read_projected_rotate`); the next matching
