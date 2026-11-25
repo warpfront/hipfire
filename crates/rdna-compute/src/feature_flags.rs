@@ -3356,6 +3356,36 @@ mod tests {
         }
     }
 
+    /// The four-row MoE down defaults on for exact gfx1100 / gfx1151 / gfx1201; `0` turns it off.
+    #[test]
+    fn qwen4_moe_down_r4_flag_defaults_on_exact_gfx1100_gfx1151_gfx1201() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_MOE_DOWN_R4" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let exact = matches!(arch, "gfx1100" | "gfx1151" | "gfx1201");
+            assert_eq!(
+                FeatureFlags::from_lookup(arch, |_| Err(())).qwen4_moe_down_r4_enabled(),
+                exact,
+                "{arch}"
+            );
+            assert!(!FeatureFlags::from_lookup(arch, with("0")).qwen4_moe_down_r4_enabled());
+            assert_eq!(
+                FeatureFlags::from_lookup(arch, with("1")).qwen4_moe_down_r4_enabled(),
+                exact,
+                "{arch}"
+            );
+        }
+    }
+
     /// The EP partial-mask implicit zeros default on for exact gfx1201 only (`0` kills, `1`
     /// enables nothing elsewhere); the poison control is off unless `1`.
     #[test]
