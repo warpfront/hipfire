@@ -36,6 +36,11 @@
    "size_bytes": 698641072,
    "source": "https://huggingface.co/hipfire-models/LFM2.5-1.2B/resolve/925450193fe1cc66b9130ee1939b5f97651fb1fc/lfm2.5-1.2b.mq4"
   },
+  "lfm2.5-vl-3b.mq4v2.hfq": {
+   "sha256": "ce009cd0170171dd041b00c2a50f40c7103ee2e3c938f81562319ede501bd5d2",
+   "size_bytes": 2307116928,
+   "source": "TODO: no download URL yet (no registry card). Halo copy: /mnt/models/hipfire-models/lfm2.5-vl-3b.mq4v2.hfq"
+  },
   "MiniMax-M2.7.mq2": {
    "sha256": "deb83795df6fdb31c72c4821eb5173b1c57968926871d27e77ebb761539aaa5f",
    "size_bytes": 79169220197,
@@ -1951,7 +1956,7 @@
   {
    "commands": {
     "positive": [
-     "HIPFIRE_VISION_FIXTURE=\"$MODELS_DIR/qwen3.8-27b.mq4-xts,$MODELS_DIR/qwen3.8-27b-vision.hfq\" HIPFIRE_DOTS_OCR_FIXTURE=$MODELS_DIR/dots-ocr.q8.hfq cargo test -p hipfire-generate --locked --test vision_lifecycle_tests -- --ignored --test-threads=1"
+     "HIPFIRE_VISION_FIXTURE=\"$MODELS_DIR/qwen3.8-27b.mq4-xts,$MODELS_DIR/qwen3.8-27b-vision.hfq\" HIPFIRE_DOTS_OCR_FIXTURE=$MODELS_DIR/dots-ocr.q8.hfq HIPFIRE_LFM2_VL_FIXTURE=$MODELS_DIR/lfm2.5-vl-3b.mq4v2.hfq cargo test -p hipfire-generate --locked --test vision_lifecycle_tests -- --ignored --test-threads=1"
     ],
     "negative": [
      "cargo test -p hipfire-generate --locked --test vision_lifecycle_tests vision_fixture_pair_rejects -- --test-threads=1"
@@ -1959,7 +1964,8 @@
    },
    "env": {
     "HIPFIRE_VISION_FIXTURE": "$MODELS_DIR/qwen3.8-27b.mq4-xts,$MODELS_DIR/qwen3.8-27b-vision.hfq",
-    "HIPFIRE_DOTS_OCR_FIXTURE": "$MODELS_DIR/dots-ocr.q8.hfq"
+    "HIPFIRE_DOTS_OCR_FIXTURE": "$MODELS_DIR/dots-ocr.q8.hfq",
+    "HIPFIRE_LFM2_VL_FIXTURE": "$MODELS_DIR/lfm2.5-vl-3b.mq4v2.hfq"
    },
    "fixtures": [
     "qwen3.8:27b-mq4-xts"
@@ -1977,13 +1983,14 @@
    },
    "predicate": {
     "kind": "cargo",
-    "min_passed": 2
+    "min_passed": 3
    },
    "probe": "existing",
    "route": "single/vision-ocr-lifecycle",
    "fixture_files": [
     "$MODELS_DIR/qwen3.8-27b-vision.hfq",
-    "$MODELS_DIR/dots-ocr.q8.hfq"
+    "$MODELS_DIR/dots-ocr.q8.hfq",
+    "$MODELS_DIR/lfm2.5-vl-3b.mq4v2.hfq"
    ],
    "timeout": 6000
   },
