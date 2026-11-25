@@ -174,7 +174,7 @@ while read -r metric op want; do
     "==") [ "$got" = "$want" ] || { echo "leanup-ratchets: FAIL $metric = $got, must be $want"; fails=$((fails+1)); } ;;
     "<=") if [ "$got" -gt "$want" ] 2>/dev/null; then
             echo "leanup-ratchets: FAIL $metric = $got, ceiling $want"; fails=$((fails+1))
-            case "$metric" in direction_*) failed_direction+=("$metric") ;; esac
+            case "$metric" in direction_*|scripts_top_level_files) failed_direction+=("$metric") ;; esac
           fi ;;
     *) echo "leanup-ratchets: FAIL — unknown operator '$op' for $metric"; fails=$((fails+1)) ;;
   esac
