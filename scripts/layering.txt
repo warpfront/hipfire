@@ -28,6 +28,8 @@
  0 radiowave
  0 redline
  0 railgun-corpus
+# xtask is repository tooling and links no workspace crate; layer 0 enforces that.
+ 0 xtask
  1 hip-bridge
  1 hipfire-client
  2 peacemaker-isa
