@@ -105,6 +105,7 @@ fn main() {
             &prompt_tokens,
             max_frames,
             &mut rng,
+            &|| false,
         )
         .unwrap_or_else(|e| panic!("omni_generate_audio: {e}"))
     };

@@ -19,7 +19,7 @@ use hipfire_engine::emit::{
     emit_error_with_id, emit_gen_start, emit_visible_token, render_tail_opens_think, write_error,
 };
 use hipfire_engine::terminal::{
-    active_attempt_id, await_client_terminal_commit, emit_staged_terminal_done,
+    active_attempt_id, await_client_terminal_commit, check_abort, emit_staged_terminal_done,
     ClientTerminalDecision,
 };
 use hipfire_loader::LoadedModel;
@@ -181,6 +181,47 @@ pub(crate) fn emit_lfm3_tool_terminal(
 ) {
     hipfire_engine::emit::stage_terminal_tool_calls(pending_done, finish_reason, calls);
     hipfire_engine::emit::emit_tool_calls_event(stdout, id, calls);
+}
+
+/// Client cancel on an LFM3 route: the attested fail-closed rollback and
+/// cancel terminal `generate_lfm2moe` uses, so the serve's abort_and_drain
+/// ends at once instead of waiting out the whole turn.
+fn emit_lfm3_cancel(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl Write,
+    id: &str,
+    generated: usize,
+) {
+    let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+    crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+}
+
+/// Omni terminal through the two-phase commit handshake the text routes use,
+/// instead of a raw `done`: a latched abort gets the rollback + cancel
+/// terminal, otherwise `commit_ready` is staged and `done` follows only on
+/// the client's commit.
+fn finish_lfm3_omni(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    pending_done: &serde_json::Value,
+    completion_tokens: usize,
+) {
+    if check_abort(id) {
+        emit_lfm3_cancel(m, gpu, stdout, id, completion_tokens);
+        return;
+    }
+    let _ = stdout.flush();
+    match await_client_terminal_commit(stdout, id, pending_done) {
+        ClientTerminalDecision::Commit => {
+            let _ = emit_staged_terminal_done(stdout, pending_done);
+        }
+        ClientTerminalDecision::Abort => {
+            crate::ar::emit_active_route_cancel(stdout, id, completion_tokens)
+        }
+    }
 }
 
 pub fn generate_lfm3(
@@ -402,6 +443,7 @@ pub fn generate_lfm3(
     // ── Prefill: decode_step per prompt token. The LAST decode_step's logits
     // are the predictions for the first generated token. ──
     let mut last_logits: Vec<f32> = Vec::new();
+    let mut prefill_aborted = false;
     {
         let b = m.lfm3_mut().unwrap();
         let cfg = &b.config;
@@ -409,6 +451,12 @@ pub fn generate_lfm3(
         let state = &mut b.state;
         let mut position = state.n_tokens as u32;
         for &tok in &prompt_ids {
+            // Per-token abort poll: a cancel during a long prompt must not run
+            // the whole prefill first.
+            if check_abort(id) {
+                prefill_aborted = true;
+                break;
+            }
             match hipfire_arch_lfm3::forward::decode_step(cfg, weights, state, gpu, tok, position) {
                 Ok(logits) => last_logits = logits,
                 Err(e) => {
@@ -418,6 +466,10 @@ pub fn generate_lfm3(
             }
             position += 1;
         }
+    }
+    if prefill_aborted || check_abort(id) {
+        emit_lfm3_cancel(m, gpu, stdout, id, 0);
+        return;
     }
     for &tok in &prompt_ids {
         m.conversation_tokens.push(tok);
@@ -440,6 +492,10 @@ pub fn generate_lfm3(
 
     let decode_t0 = Instant::now();
     loop {
+        if check_abort(id) {
+            emit_lfm3_cancel(m, gpu, stdout, id, generated_count);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
@@ -531,6 +587,13 @@ pub fn generate_lfm3(
         if !tail.is_empty() {
             emit_visible_token(stdout, id, &tail);
         }
+    }
+
+    // An abort latched between loop exit and commit must not reach the
+    // two-phase commit handshake.
+    if check_abort(id) {
+        emit_lfm3_cancel(m, gpu, stdout, id, generated_count);
+        return;
     }
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
@@ -730,6 +793,12 @@ pub fn generate_lfm3_vl(
         vision_config.spatial_merge_size,
     );
 
+    // The tower is one uninterruptible GPU call; a cancel that arrived during
+    // preprocessing must not start it.
+    if check_abort(id) {
+        emit_lfm3_cancel(m, gpu, stdout, id, 0);
+        return;
+    }
     // ── Vision tower + projector → projected visual tokens ──
     let visual_tokens = {
         let vw = m.lfm3_vision_weights().unwrap();
@@ -964,6 +1033,7 @@ pub fn generate_lfm3_vl(
     //    image_pad positions via decode_step_with_embed. ──
     let mut last_logits: Vec<f32> = Vec::new();
     let mut visual_idx = 0usize;
+    let mut prefill_aborted = false;
     {
         let b = m.lfm3_mut().unwrap();
         let cfg = &b.config;
@@ -971,6 +1041,10 @@ pub fn generate_lfm3_vl(
         let state = &mut b.state;
         let mut position = state.n_tokens as u32;
         for &tok in &prompt_tokens {
+            if check_abort(id) {
+                prefill_aborted = true;
+                break;
+            }
             let res = if tok == image_pad_id && visual_idx < n_visual_tokens {
                 let emb = &visual_tokens[visual_idx * text_hidden..(visual_idx + 1) * text_hidden];
                 visual_idx += 1;
@@ -990,6 +1064,10 @@ pub fn generate_lfm3_vl(
             position += 1;
         }
     }
+    if prefill_aborted || check_abort(id) {
+        emit_lfm3_cancel(m, gpu, stdout, id, 0);
+        return;
+    }
     for &tok in &prompt_tokens {
         m.conversation_tokens.push(tok);
     }
@@ -1005,6 +1083,10 @@ pub fn generate_lfm3_vl(
     let mut tools_route = Lfm3ToolRoute::new(tools.map(|t| !t.is_empty()).unwrap_or(false));
     let decode_t0 = Instant::now();
     loop {
+        if check_abort(id) {
+            emit_lfm3_cancel(m, gpu, stdout, id, generated_count);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
@@ -1061,6 +1143,10 @@ pub fn generate_lfm3_vl(
     // unclosed span.
     for part in tools_route.finish() {
         emit_visible_token(stdout, id, &part);
+    }
+    if check_abort(id) {
+        emit_lfm3_cancel(m, gpu, stdout, id, generated_count);
+        return;
     }
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -1238,6 +1324,10 @@ pub fn generate_lfm3_audio(
         return;
     }
 
+    if check_abort(id) {
+        emit_lfm3_cancel(m, gpu, stdout, id, 0);
+        return;
+    }
     // ── Mel + encoder + projector → projected audio tokens ──
     let mel = lfm3_mel::log_mel_from_waveform(&waveform.samples, &audio_config.mel);
     let num_frames = mel.len() / audio_config.mel.n_mels;
@@ -1527,6 +1617,7 @@ pub fn generate_lfm3_audio(
     //    audio_pad positions via decode_step_with_embed. ──
     let mut last_logits: Vec<f32> = Vec::new();
     let mut audio_idx = 0usize;
+    let mut prefill_aborted = false;
     {
         let b = m.lfm3_mut().unwrap();
         let cfg = &b.config;
@@ -1534,6 +1625,10 @@ pub fn generate_lfm3_audio(
         let state = &mut b.state;
         let mut position = state.n_tokens as u32;
         for &tok in &prompt_tokens {
+            if check_abort(id) {
+                prefill_aborted = true;
+                break;
+            }
             let res = if tok == audio_pad_id && audio_idx < n_audio_tokens {
                 let emb = &audio_tokens[audio_idx * text_hidden..(audio_idx + 1) * text_hidden];
                 audio_idx += 1;
@@ -1553,6 +1648,10 @@ pub fn generate_lfm3_audio(
             position += 1;
         }
     }
+    if prefill_aborted || check_abort(id) {
+        emit_lfm3_cancel(m, gpu, stdout, id, 0);
+        return;
+    }
     for &tok in &prompt_tokens {
         m.conversation_tokens.push(tok);
     }
@@ -1569,6 +1668,10 @@ pub fn generate_lfm3_audio(
     let mut tools_route = Lfm3ToolRoute::new(tools.map(|t| !t.is_empty()).unwrap_or(false));
     let decode_t0 = Instant::now();
     loop {
+        if check_abort(id) {
+            emit_lfm3_cancel(m, gpu, stdout, id, generated_count);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
@@ -1614,6 +1717,10 @@ pub fn generate_lfm3_audio(
     m.seq_pos = m.lfm3().unwrap().state.n_tokens;
     for part in tools_route.finish() {
         emit_visible_token(stdout, id, &part);
+    }
+    if check_abort(id) {
+        emit_lfm3_cancel(m, gpu, stdout, id, generated_count);
+        return;
     }
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -1832,7 +1939,7 @@ pub fn generate_lfm3_omni(
         let t0 = std::time::Instant::now();
         let seed = omni_seed();
         // Prefill once.
-        let mut stream_state = {
+        let prefill = {
             let bundle = match m.state.as_mut() {
                 Some(s) => (s.as_mut() as &mut dyn std::any::Any)
                     .downcast_mut::<hipfire_loader::Lfm3Bundle>()
@@ -1842,18 +1949,24 @@ pub fn generate_lfm3_omni(
                     return;
                 }
             };
-            match omni::omni_stream_prefill(
+            omni::omni_stream_prefill(
                 &bundle.config,
                 &bundle.weights,
                 &mut bundle.state,
                 gpu,
                 &prompt_tokens,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    write_error(stdout, id, &format!("lfm3-omni: stream prefill: {e}"));
-                    return;
-                }
+                &|| check_abort(id),
+            )
+        };
+        let mut stream_state = match prefill {
+            Ok(s) => s,
+            Err(_) if check_abort(id) => {
+                emit_lfm3_cancel(m, gpu, stdout, id, 0);
+                return;
+            }
+            Err(e) => {
+                write_error(stdout, id, &format!("lfm3-omni: stream prefill: {e}"));
+                return;
             }
         };
         // Load the codec + create the streaming cache.
@@ -1910,6 +2023,12 @@ pub fn generate_lfm3_omni(
         let mut steps_left = max_steps;
         let mut hit_step_budget = false;
         while !stream_state.finished {
+            if check_abort(id) {
+                codec_cache.free_gpu(gpu);
+                codec_weights.free_gpu(gpu);
+                emit_lfm3_cancel(m, gpu, stdout, id, total_frames);
+                return;
+            }
             if steps_left == 0 {
                 hit_step_budget = true;
                 break;
@@ -2044,18 +2163,14 @@ pub fn generate_lfm3_omni(
         // FINISH-1: distinguish budget-capped streams (length) from a natural
         // eos/im_end finish (stop) — same contract as the text routes.
         let finish_reason = if hit_step_budget { "length" } else { "stop" };
-        let _ = writeln!(
-            stdout,
-            "{}",
-            serde_json::json!({"type":"done","id":id,"tokens":total_frames,"total_ms":gen_ms,"streamed":true,"finish_reason":finish_reason,"attempt_id":active_attempt_id()})
-        );
-        let _ = stdout.flush();
+        let pending_done = serde_json::json!({"type":"done","id":id,"tokens":total_frames,"total_ms":gen_ms,"streamed":true,"finish_reason":finish_reason,"attempt_id":active_attempt_id()});
+        finish_lfm3_omni(m, gpu, stdout, id, &pending_done, total_frames);
         return;
     }
 
     // Omni generate loop (AUDIO or INTERLEAVED, inferred from the prompt marker).
     let t0 = std::time::Instant::now();
-    let out = {
+    let generated = {
         let bundle = match m.state.as_mut() {
             Some(s) => (s.as_mut() as &mut dyn std::any::Any)
                 .downcast_mut::<hipfire_loader::Lfm3Bundle>()
@@ -2067,7 +2182,7 @@ pub fn generate_lfm3_omni(
         };
         let seed = omni_seed();
         let mut rng = omni::DepthRng::new(seed);
-        match omni::omni_generate(
+        omni::omni_generate(
             &bundle.config,
             &bundle.weights,
             &mut bundle.state,
@@ -2077,12 +2192,18 @@ pub fn generate_lfm3_omni(
             &prompt_tokens,
             max_steps,
             &mut rng,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                write_error(stdout, id, &format!("lfm3-omni: generate failed: {e}"));
-                return;
-            }
+            &|| check_abort(id),
+        )
+    };
+    let out = match generated {
+        Ok(v) => v,
+        Err(_) if check_abort(id) => {
+            emit_lfm3_cancel(m, gpu, stdout, id, 0);
+            return;
+        }
+        Err(e) => {
+            write_error(stdout, id, &format!("lfm3-omni: generate failed: {e}"));
+            return;
         }
     };
     let gen_ms = t0.elapsed().as_millis();
@@ -2120,12 +2241,8 @@ pub fn generate_lfm3_omni(
             "{}",
             serde_json::json!({"type":"token","id":id,"text":text_out,"attempt_id":active_attempt_id()})
         );
-        let _ = writeln!(
-            stdout,
-            "{}",
-            serde_json::json!({"type":"done","id":id,"tokens":out.text_tokens.len(),"total_ms":gen_ms,"finish_reason":finish_reason,"attempt_id":active_attempt_id()})
-        );
-        let _ = stdout.flush();
+        let pending_done = serde_json::json!({"type":"done","id":id,"tokens":out.text_tokens.len(),"total_ms":gen_ms,"finish_reason":finish_reason,"attempt_id":active_attempt_id()});
+        finish_lfm3_omni(m, gpu, stdout, id, &pending_done, out.text_tokens.len());
         return;
     }
 
@@ -2193,12 +2310,8 @@ pub fn generate_lfm3_omni(
             "attempt_id": active_attempt_id(),
         })
     );
-    let _ = writeln!(
-        stdout,
-        "{}",
-        serde_json::json!({"type":"done","id":id,"tokens":out.text_tokens.len(),"total_ms":gen_ms,"finish_reason":finish_reason,"attempt_id":active_attempt_id()})
-    );
-    let _ = stdout.flush();
+    let pending_done = serde_json::json!({"type":"done","id":id,"tokens":out.text_tokens.len(),"total_ms":gen_ms,"finish_reason":finish_reason,"attempt_id":active_attempt_id()});
+    finish_lfm3_omni(m, gpu, stdout, id, &pending_done, out.text_tokens.len());
 }
 
 #[cfg(test)]

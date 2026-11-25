@@ -71,6 +71,7 @@ fn main() {
             &prompt_tokens,
             40,
             &mut rng,
+            &|| false,
         )
         .expect("batch omni_generate");
         (
@@ -120,6 +121,7 @@ fn main() {
             &prompt_tokens,
             40,
             &mut rng,
+            &|| false,
         )
         .expect("batch omni_generate run2");
         (out.text_tokens.clone(), out.audio_codes.clone())
@@ -192,6 +194,7 @@ fn main() {
             &mut bundle.state,
             &mut gpu,
             &prompt_tokens_s,
+            &|| false,
         )
         .expect("stream prefill");
         eprintln!("  prefill done (position={})", stream.position);

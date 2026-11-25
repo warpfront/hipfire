@@ -103,6 +103,11 @@ pub struct OmniOutput {
 
 /// Run the omni generate loop. The mode is inferred from the prompt's last
 /// token: `<|audio_start|>` → AUDIO, `<|mixed_start|>` → INTERLEAVED.
+///
+/// `should_abort` is polled before every prefill token and every generate
+/// step; when it returns true the loop stops with an `Err` (the caller owns
+/// the cancel terminal and the state reset).
+#[allow(clippy::too_many_arguments)]
 pub fn omni_generate(
     cfg: &Lfm3Config,
     weights: &Lfm3Weights,
@@ -113,6 +118,7 @@ pub fn omni_generate(
     prompt_tokens: &[u32],
     max_steps: usize,
     rng: &mut DepthRng,
+    should_abort: &dyn Fn() -> bool,
 ) -> Result<OmniOutput, String> {
     let last = *prompt_tokens.last().unwrap_or(&0);
     if last == AUDIO_START_TOKEN {
@@ -126,6 +132,7 @@ pub fn omni_generate(
             prompt_tokens,
             max_steps,
             rng,
+            should_abort,
         )?;
         Ok(OmniOutput {
             text_tokens: vec![AUDIO_OUT_TOKEN; n],
@@ -145,6 +152,7 @@ pub fn omni_generate(
             prompt_tokens,
             max_steps,
             rng,
+            should_abort,
         )
     } else {
         Err(format!(
@@ -163,6 +171,7 @@ pub fn omni_generate(
 /// its open-ended chat surface. hipfire's AUDIO route is TTS-shaped (the
 /// daemon decodes the codes to WAV and finishes), so audio-eos is the stop
 /// signal here. The INTERLEAVED loop keeps the HF behavior.
+#[allow(clippy::too_many_arguments)]
 pub fn omni_generate_audio(
     cfg: &Lfm3Config,
     weights: &Lfm3Weights,
@@ -173,11 +182,15 @@ pub fn omni_generate_audio(
     prompt_tokens: &[u32],
     max_frames: usize,
     rng: &mut DepthRng,
+    should_abort: &dyn Fn() -> bool,
 ) -> Result<(Vec<u32>, usize, bool), String> {
     let eos_code = depth_cfg.audio_eos_code;
 
     // ── Prefill ──
     for (i, &t) in prompt_tokens.iter().enumerate() {
+        if should_abort() {
+            return Err(format!("omni: aborted during prefill @ {i}"));
+        }
         decode_step(cfg, weights, state, gpu, t, i as u32)
             .map_err(|e| format!("omni: prefill decode_step @ {i}: {e}"))?;
     }
@@ -192,6 +205,9 @@ pub fn omni_generate_audio(
     let mut n_emitted = 0usize;
     let mut hit_eos = false;
     for step in 0..max_frames {
+        if should_abort() {
+            return Err(format!("omni: aborted @ step {step}"));
+        }
         let codes = sample_audio_frame(depth_cfg, depth_weights, gpu, &hidden, &history, rng)
             .map_err(|e| format!("omni: sample_audio_frame @ {step}: {e}"))?;
         let is_eos = codes.iter().any(|&c| c == eos_code);
@@ -218,6 +234,7 @@ pub fn omni_generate_audio(
 /// Run the omni INTERLEAVED-mode generate loop. `prompt_tokens` must end with
 /// `<|mixed_start|>` (125015). Alternates text blocks (greedy argmax, 6 tokens)
 /// and audio blocks (MaskGIT, 12 frames). `<|text_end|>` starts the audio tail.
+#[allow(clippy::too_many_arguments)]
 fn omni_generate_interleaved(
     cfg: &Lfm3Config,
     weights: &Lfm3Weights,
@@ -228,6 +245,7 @@ fn omni_generate_interleaved(
     prompt_tokens: &[u32],
     max_steps: usize,
     rng: &mut DepthRng,
+    should_abort: &dyn Fn() -> bool,
 ) -> Result<OmniOutput, String> {
     let eos_code = depth_cfg.audio_eos_code;
     let n_text = INTERLEAVED_N_TEXT;
@@ -236,6 +254,9 @@ fn omni_generate_interleaved(
     // ── Prefill ──
     let mut prev_logits: Option<Vec<f32>> = None;
     for (i, &t) in prompt_tokens.iter().enumerate() {
+        if should_abort() {
+            return Err(format!("omni: aborted during prefill @ {i}"));
+        }
         prev_logits = Some(
             decode_step(cfg, weights, state, gpu, t, i as u32)
                 .map_err(|e| format!("omni: prefill decode_step @ {i}: {e}"))?,
@@ -267,6 +288,9 @@ fn omni_generate_interleaved(
     let mut in_interleave = true;
 
     for step in 0..max_steps {
+        if should_abort() {
+            return Err(format!("omni: aborted @ step {step}"));
+        }
         if speaking {
             // Audio slot: MaskGIT-sample one frame.
             let codes = sample_audio_frame(depth_cfg, depth_weights, gpu, &hidden, &history, rng)
@@ -426,12 +450,15 @@ pub struct OmniStepOutput {
 /// from the prompt's last token (`<|audio_start|>` → AUDIO, `<|mixed_start|>`
 /// → INTERLEAVED). The caller's `Lfm3State` is advanced (KV cache + conv state
 /// filled); `state.final_norm_buf` holds the hidden at the last prompt token.
+/// `should_abort` is polled before every prompt token, as in
+/// [`omni_generate`].
 pub fn omni_stream_prefill(
     cfg: &Lfm3Config,
     weights: &Lfm3Weights,
     state: &mut Lfm3State,
     gpu: &mut Gpu,
     prompt_tokens: &[u32],
+    should_abort: &dyn Fn() -> bool,
 ) -> Result<OmniStreamState, String> {
     let last = *prompt_tokens.last().unwrap_or(&0);
     // Mode inference matches omni_generate: unknown markers error instead of
@@ -448,6 +475,9 @@ pub fn omni_stream_prefill(
     };
     let mut prev_logits: Option<Vec<f32>> = None;
     for (i, &t) in prompt_tokens.iter().enumerate() {
+        if should_abort() {
+            return Err(format!("omni stream: aborted during prefill @ {i}"));
+        }
         prev_logits = Some(
             decode_step(cfg, weights, state, gpu, t, i as u32)
                 .map_err(|e| format!("omni stream: prefill @ {i}: {e}"))?,

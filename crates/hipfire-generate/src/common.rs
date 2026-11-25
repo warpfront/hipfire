@@ -1698,6 +1698,14 @@ pub fn fail_closed_reset_target_and_spec(
                 push_reset_err(&mut first_err, "lfm2moe.reset", e);
             }
         }
+        if let Some(b) = m.lfm3_mut() {
+            // Zeroes the conv history and rewinds the token cursor, so a
+            // cancel never leaves a half-prefilled turn behind (the LFM3
+            // routes also cold-rebuild from position 0 on the next turn).
+            if let Err(e) = b.state.reset(gpu) {
+                push_reset_err(&mut first_err, "lfm3.reset", e);
+            }
+        }
         if let Some(b) = m.minimax_mut() {
             b.state.reset();
         }
