@@ -4341,7 +4341,9 @@ mod tests {
         gpu.drain_pool();
         let mut hfq = HfqFile::open(std::path::Path::new(&path))
             .unwrap_or_else(|e| panic!("open {DSPARK_FIXTURE_ENV}={path}: {e:?}"));
-        let cfg = DeepseekV4::config_from_hfq(&hfq).expect("DSpark fixture model config");
+        DeepseekV4::validate_mq2r_dspark_sidecar(&hfq).expect("DSpark fixture sidecar identity");
+        let cfg =
+            DeepseekV4Config::from_mq2r_dspark_sidecar(&hfq).expect("DSpark fixture model config");
         hfq.drop_mmap();
         Some((hfq, cfg, gpu))
     }
