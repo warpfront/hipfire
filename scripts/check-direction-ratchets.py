@@ -23,20 +23,25 @@ scripts/ratchet-diff.sh):
                                  CENTRAL_CONFIG_READERS of scripts/check-env-docs.py).
                                  Add a typed key to hipfire-config instead.
 
-Also emits five informational gauges (`gauge_*`, no ceiling line, never fail; they
+Emits a fourth shrink-only metric, `scripts_top_level_files` (files directly in `scripts/`,
+not directories): a new script goes into `cargo xtask` as a subcommand, or under a
+subdirectory that is archived, never into the top level. Its ceiling is in the same file.
+
+Also emits six informational gauges (`gauge_*`, no ceiling line, never fail; they
 feed the Monday digest): `gauge_generate_entry_fns` (`pub fn generate_*` in
 hipfire-generate/src), `gauge_generation_routes` (variants of `GenerationRoute`),
 `gauge_engine_routes` (entries of `ENGINE_ROUTES`), `gauge_map_md_files` (committed
 `crates/**/map.md`), `gauge_typed_arch_compares` (`== GfxArch::X`, `matches!(.., GfxArch::..)`,
 `.is_gfx*()` lines outside the arch-capability owners: arch coupling that the string
-ratchet stops seeing once strings become typed)  and `gauge_ci_gate_steps` (`run` lines in scripts/ci-gates.sh).
+ratchet stops seeing once strings become typed), `gauge_ci_gate_steps` (`run` lines in scripts/ci-gates.sh)
+and `gauge_scripts_total` (every file under `scripts/`, so that moving files into subdirectories is visible).
 
 Only non-test code counts: `crates/*/src/**/*.rs`, excluding build.rs, comments,
 `#[cfg(test)]` items and out-of-line `#[cfg(test)] mod x;` files.
 
 Usage:
     scripts/check-direction-ratchets.py --metrics       `name value` lines (leanup-ratchets.sh)
-    scripts/check-direction-ratchets.py --lower         rewrite each direction_* ceiling in
+    scripts/check-direction-ratchets.py --lower         rewrite each direction_* / scripts_top_level_files ceiling in
                                                         scripts/leanup-thresholds.txt that sits above
                                                         its measured value down to that value; never raises
     scripts/check-direction-ratchets.py --list METRIC   every counted site, file:line
@@ -97,6 +102,13 @@ GUIDANCE = {
         "    hipfire-config schema (crates/hipfire-config/src/lib.rs) and read it from ProcessConfig /\n"
         "    FeatureFlags; a developer-only knob uses hipfire_config::developer_var/developer_bool.\n"
         "    Then run scripts/regen-generated.sh to refresh the golden and the env-vars inventory.",
+    ),
+    "scripts_top_level_files": (
+        "a file was added directly under scripts/",
+        "Do not add a new top-level script. Add a `cargo xtask` subcommand instead (xtask/), or put a\n"
+        "    one-off under a subdirectory that is archived (scripts/analysis/, scripts/lab/). Moving\n"
+        "    files out of the top level is the goal: the ceiling only goes down, and\n"
+        "    gauge_scripts_total shows whether files merely moved into subdirectories.",
     ),
 }
 
@@ -160,6 +172,9 @@ def line_of(text: str, idx: int) -> int:
 
 def sites(texts: list[tuple[str, str]] | None = None) -> dict[str, list[str]]:
     found = {name: [] for name in GUIDANCE}
+    found["scripts_top_level_files"] = sorted(
+        f"scripts/{p.name}:1" for p in (ROOT / "scripts").iterdir() if p.is_file()
+    )
     for rel, text in (texts if texts is not None else sources()):
         crate = rel.split("/")[1]
         if crate in SHARED_CRATES:
@@ -217,15 +232,16 @@ def gauges(texts: list[tuple[str, str]]) -> dict[str, int]:
         "gauge_map_md_files": sum(1 for p in ROOT.glob("crates/**/map.md") if "target" not in p.relative_to(ROOT).parts),
         "gauge_typed_arch_compares": typed,
         "gauge_ci_gate_steps": len(re.findall(r"^\s*run\s", ci, re.M)),
+        "gauge_scripts_total": sum(1 for p in (ROOT / "scripts").rglob("*") if p.is_file() and "__pycache__" not in p.parts),
     }
 
 
 def lower(found: dict[str, list[str]]) -> int:
-    """Rewrite `direction_* <= N` ceilings above the measured count down to it. Never raises."""
+    """Rewrite `direction_* / scripts_top_level_files <= N` ceilings above the measured count down to it. Never raises."""
     path = ROOT / "scripts/leanup-thresholds.txt"
     out, changed = [], 0
     for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
-        m = re.match(r"(direction_\w+)(\s+<=\s+)(\d+)(\s*)$", line.rstrip("\n"))
+        m = re.match(r"((?:direction_\w+|scripts_top_level_files))(\s+<=\s+)(\d+)(\s*)$", line.rstrip("\n"))
         if m and m.group(1) in found and len(found[m.group(1)]) < int(m.group(3)):
             now = len(found[m.group(1)])
             print(f"{m.group(1)}: {m.group(3)} -> {now}")

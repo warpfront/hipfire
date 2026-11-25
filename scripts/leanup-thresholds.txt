@@ -224,3 +224,9 @@ topology_arch_arms_total         <= 43
 direction_bundle_downcasts    <= 163
 direction_gfx_string_matches  <= 865
 direction_raw_hipfire_env     <= 32
+
+# --- scripts/ top level (check-direction-ratchets.py) ---
+# Shrink-only count of files directly in scripts/ (directories not counted). New
+# tooling is a `cargo xtask` subcommand, not a script; one-offs go in an archived
+# subdirectory. `gauge_scripts_total` (informational) shows whether files only moved.
+scripts_top_level_files       <= 308
