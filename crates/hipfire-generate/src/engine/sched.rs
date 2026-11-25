@@ -26,7 +26,10 @@
 //!   the same tick, so a burst of short prompts all prefill before the lane
 //!   epoch that runs their first tokens. The requests that moved this tick
 //!   stream their first lane token together right before that epoch, not
-//!   after it ran them; one that this token ends never runs it.
+//!   after it ran them; one that this token ends never runs it. A prompt
+//!   epoch that takes the tick past its row budget ([`Batch::row_budget`])
+//!   streams the tokens held so far first: a held token never waits for
+//!   more prompt rows than one tick runs.
 //! - A request that samples (temperature, penalties) parks like a greedy one:
 //!   its lane row comes back as logits and it draws with its own RNG, so its
 //!   tokens are the singleton's for the same seed.
@@ -67,6 +70,9 @@ pub trait Batch {
     fn lane_capacity(&mut self) -> usize;
     /// Lanes one lane epoch runs at most.
     fn lane_rows(&mut self) -> usize;
+    /// Rows one tick runs at most (`serve.max_batch_tokens`): first tokens
+    /// held for a burst never wait for prompt rows past it.
+    fn row_budget(&mut self) -> usize;
     /// Begin `idx` on the resident state (session restore or reset).
     fn begin(&mut self, idx: usize) -> Result<RequestRun, String>;
     /// [`Forwards::prefill`] of the resident `idx`.
@@ -264,7 +270,8 @@ impl Scheduler {
         // one epoch all reach this tick's lane epoch (their first tokens
         // share it), a longer prompt takes one epoch per tick. Aborts are
         // polled again before every epoch inside the tick, as `drive` does.
-        while self.start(b, &mut ended) && self.resident_epoch(b, &mut ended) {}
+        let mut prompt_rows = 0;
+        while self.start(b, &mut ended) && self.resident_epoch(b, &mut prompt_rows, &mut ended) {}
         self.lane_epoch(b, &mut ended);
         ended
     }
@@ -312,15 +319,33 @@ impl Scheduler {
     /// The resident request's next epoch; a request that decodes while
     /// others are live moves into a lane (after one drained decode when its
     /// next token is still on the device; a speculative one at its next
-    /// window boundary). Whether the resident state is free for the next
-    /// request (it moved or was aborted).
-    fn resident_epoch(&mut self, b: &mut impl Batch, ended: &mut Vec<Ended>) -> bool {
+    /// window boundary). `prompt_rows` counts this tick's prompt rows.
+    /// Whether the resident state is free for the next request (it moved or
+    /// was aborted).
+    fn resident_epoch(
+        &mut self,
+        b: &mut impl Batch,
+        prompt_rows: &mut usize,
+        ended: &mut Vec<Ended>,
+    ) -> bool {
         let Some(idx) = self.resident else {
             return false;
         };
         if b.aborted(idx) {
             ended.push(self.end(idx, Exit::Aborted));
             return true;
+        }
+        let prompt = match self.run_mut(idx).next_work() {
+            Work::Prefill { rows } => Some(rows.len()),
+            _ => None,
+        };
+        if let Some(rows) = prompt {
+            // First tokens held for this tick's burst go out before a prompt
+            // epoch that takes the tick past its row budget.
+            *prompt_rows += rows;
+            if *prompt_rows > b.row_budget() {
+                self.stream_fresh(b, ended);
+            }
         }
         let lanes = self.lanes().count();
         let others = lanes > 0 || !self.queue.is_empty();
@@ -334,7 +359,6 @@ impl Scheduler {
             )
         };
         let run = self.run_mut(idx);
-        let prompt = matches!(run.next_work(), Work::Prefill { .. });
         // A parking request at its boundary moves without an epoch; every
         // other resident request runs one.
         if !(parks && boundary(&run.next_work())) {
@@ -376,7 +400,7 @@ impl Scheduler {
         req.place = Place::Lane;
         // A window lane's seed was streamed on the resident state, unless
         // this tick's prompt held it.
-        req.fresh = !window || prompt;
+        req.fresh = !window || prompt.is_some();
         req.window = window;
         true
     }
@@ -696,6 +720,8 @@ mod tests {
         eos: u32,
         capacity: usize,
         rows: usize,
+        /// [`Batch::row_budget`].
+        row_budget: usize,
         /// Each request's model state: the tokens it ran.
         state: HashMap<usize, Vec<u32>>,
         /// The device argmax a keep-mode decode left.
@@ -714,6 +740,8 @@ mod tests {
         windows: bool,
         /// A window lane's pending seed.
         seeds: HashMap<usize, u32>,
+        /// Requests whose every emit fails.
+        emit_fails: Vec<usize>,
         calls: Vec<Call>,
     }
 
@@ -831,6 +859,10 @@ mod tests {
             self.rows
         }
 
+        fn row_budget(&mut self) -> usize {
+            self.row_budget
+        }
+
         fn begin(&mut self, idx: usize) -> Result<RequestRun, String> {
             self.state.insert(idx, Vec::new());
             let len = self.prompts[&idx].len();
@@ -921,6 +953,11 @@ mod tests {
 
         fn park_window(&mut self, idx: usize, run: &mut RequestRun) -> Result<(), String> {
             self.calls.push(Call::Park(idx));
+            let d = run.drafting().ok_or("a window lane needs a drafter")?;
+            // The lane's committed tokens end in its seed, streamed or held.
+            let streamed = self.emitted.get(&idx).map_or(&[][..], Vec::as_slice);
+            assert_eq!(d.emitted.last(), d.owed.last());
+            assert!(d.emitted.starts_with(streamed) && d.emitted.len() <= streamed.len() + 1);
             run.take_window_drafting()
                 .ok_or("not at a window boundary")?;
             let Work::Decode { token: Some(seed) } = run.next_work() else {
@@ -980,6 +1017,9 @@ mod tests {
 
         fn emit(&mut self, idx: usize, token: u32) -> Result<(Verdict, Vec<u32>), String> {
             self.calls.push(Call::Emit(idx));
+            if self.emit_fails.contains(&idx) {
+                return Err(format!("emit of {idx} failed"));
+            }
             self.emitted.entry(idx).or_default().push(token);
             self.history.get_mut(&idx).unwrap().push(token);
             let verdict = if token == self.eos {
@@ -1005,6 +1045,10 @@ mod tests {
         type Draft<'a> = FakeDraft<'a>;
 
         fn draft(&mut self, idx: usize) -> Result<FakeDraft<'_>, String> {
+            // The client aborts the other request while this prompt runs.
+            if let Some((_, other)) = self.abort_during_prefill.filter(|&(a, _)| a == idx) {
+                self.aborted.insert(other, true);
+            }
             Ok(FakeDraft {
                 idx,
                 prompt: &self.prompts[&idx],
@@ -1021,6 +1065,7 @@ mod tests {
             eos: 0,
             capacity,
             rows,
+            row_budget: 100,
             // Request 1 samples in every scenario.
             sampled: vec![1],
             ..Fake::default()
@@ -1304,6 +1349,81 @@ mod tests {
                 Call::Emit(2),
             ]
         );
+    }
+
+    #[test]
+    fn held_first_tokens_stream_before_a_prompt_past_the_row_budget() {
+        let prompts = vec![vec![1, 2], vec![3; 150], vec![6]];
+        let mut b = fake(&prompts, 4, 4);
+        b.eos = u32::MAX;
+        b.sampled = Vec::new();
+        b.spec = vec![0, 1, 2];
+        b.windows = true;
+        let mut s = Scheduler::default();
+        for idx in 0..3 {
+            s.admit(idx);
+        }
+        s.tick(&mut b);
+        // The long prompt takes the tick past its 100-row budget: the first
+        // token held before it goes out first, and so does its own before
+        // the next prompt.
+        assert_eq!(
+            b.calls[..10],
+            [
+                Call::Prefill(0),
+                Call::Park(0),
+                Call::Emit(0),
+                Call::Prefill(1),
+                Call::Park(1),
+                Call::Emit(1),
+                Call::Prefill(2),
+                Call::Park(2),
+                Call::Emit(2),
+                Call::Windows(vec![0, 1, 2]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_held_first_token_that_ends_its_request_never_runs_in_its_window_lane() {
+        let prompts = vec![vec![1, 2], vec![3, 4, 5], vec![6], vec![7, 8]];
+        let setup = |b: &mut Fake| {
+            b.eos = pick(&[1, 2]);
+            b.sampled = Vec::new();
+            b.spec = vec![0, 1, 2, 3];
+            b.windows = true;
+        };
+        let mut b = fake(&prompts, 4, 4);
+        setup(&mut b);
+        // 0's first token is EOS, 1 is aborted after its park, 2's emit fails.
+        b.abort_during_prefill = Some((2, 1));
+        b.emit_fails = vec![2];
+        let mut s = Scheduler::default();
+        for idx in 0..4 {
+            s.admit(idx);
+        }
+        let ended = run_all(&mut s, &mut b);
+        let exit = |idx| &ended.iter().find(|e| e.idx == idx).unwrap().exit;
+        assert_eq!(exit(0), &Exit::Finished(super::super::Finish::Stop));
+        assert_eq!(exit(1), &Exit::Aborted);
+        assert!(matches!(exit(2), Exit::Failed(_)));
+        assert!(matches!(exit(3), Exit::Finished(_)));
+        assert!(ended
+            .iter()
+            .all(|e| e.place == Place::Lane && e.drafting.is_none()));
+        assert_eq!(b.emitted[&0], vec![b.eos]);
+        assert!(!b.emitted.contains_key(&1) && !b.emitted.contains_key(&2));
+        assert!(b
+            .calls
+            .iter()
+            .all(|c| !matches!(c, Call::Windows(lanes) if lanes != &[3])));
+        // The survivor's tokens are its own alone.
+        let mut alone = fake(&prompts, 4, 4);
+        setup(&mut alone);
+        let mut s = Scheduler::default();
+        s.admit(3);
+        run_all(&mut s, &mut alone);
+        assert_eq!(b.emitted[&3], alone.emitted[&3]);
     }
 
     #[test]

@@ -17,6 +17,7 @@ DIR/EVIDENCE.md.
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -628,6 +629,27 @@ def host_state(own_pid=None):
     return {"loadavg": os.getloadavg(), "kfd": kfd, "gfxclk": sclk}
 
 
+def wait_gpu_released(timeout_s=120):
+    """Wait until no hipfire GPU reservation lock is held: the previous arm's daemon can still
+    hold it after its bench returned (`FATAL ... already reserved`, Loki HIPF-557 N3)."""
+    deadline = time.time() + timeout_s
+    for path in [*Path("/run/lock/hipfire").glob("gpu-*.lock"), *Path("/tmp/hipfire-locks").glob("gpu-*.lock")]:
+        try:
+            f = open(path)
+        except OSError:
+            continue
+        with f:
+            while True:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(f, fcntl.LOCK_UN)
+                    break
+                except BlockingIOError:
+                    if time.time() > deadline:
+                        return
+                    time.sleep(0.5)
+
+
 def perf_ok(m):
     """G-perf: both median tok/s deltas within +-2 %."""
     return all(m.get(k) is not None and abs(m[k]) <= 2.0
@@ -768,6 +790,7 @@ def run_conc(args, route, out):
         cmd = [args.hipfire, "bench", route["model"], "--concurrency", ",".join(map(str, points)),
                "--backend", backend, "--workload", workloads[0] if len(workloads) == 1 else "both",
                "--runs", str(runs), "-j", *c.get("args", [])]
+        wait_gpu_released()
         host = host_state()
         with open(f"{base}.json", "w") as fo, open(f"{base}.log", "w") as fe:
             rc = subprocess.run(cmd, env=env, stdout=fo, stderr=fe).returncode

@@ -179,7 +179,9 @@ A run passes when all of these hold:
 The route's `conc` block runs `hipfire bench --concurrency` once per arm, the
 daemon behind a wire tap (`daemon-tap.sh`, `HIPFIRE_DAEMON_BIN`): the bench
 JSON gives each request's wire times, the tapped stdout its tokens, ids and
-done envelope.
+done envelope. Before each arm the harness waits (at most 120 s) until no
+hipfire GPU reservation lock is held, because the previous arm's daemon can
+still hold it after its bench returned.
 
 ```json
 "conc": {

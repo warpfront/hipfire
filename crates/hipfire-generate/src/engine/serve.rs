@@ -1220,6 +1220,10 @@ impl Batch for Ctx<'_> {
         self.lanes().map_or(0, |lanes| lanes.lane_rows().min(cap))
     }
 
+    fn row_budget(&mut self) -> usize {
+        self.max_batch_tokens
+    }
+
     /// The singleton's request start on the resident state: the session plan
     /// picks the reused prefix (restore, live continuation or reset).
     fn begin(&mut self, idx: usize) -> Result<RequestRun, String> {
