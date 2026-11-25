@@ -24,6 +24,7 @@ use hipfire_engine::terminal::{
 };
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::{ToolOutputRouter, ToolRouteEvent};
+use hipfire_runtime::tokenizer::TokenTextStream;
 use std::path::Path;
 
 /// Emit an active-attempt error (thin alias to the dense-route helper).
@@ -166,6 +167,21 @@ impl Lfm3ToolRoute {
         };
         Ok((finish_reason, self.calls))
     }
+}
+
+/// Turn-close guard of the VL and audio routes, on one token's own bytes.
+fn is_turn_close(raw: &[u8]) -> bool {
+    std::str::from_utf8(raw).is_ok_and(|s| matches!(s.trim(), "</s>" | "<|im_end|>"))
+}
+
+/// End of stream: the held bytes of a character the cap cut off mid-way,
+/// decoded lossily and routed like any other fragment.
+fn flush_text_stream(stream: &mut TokenTextStream, route: &mut Lfm3ToolRoute) -> Vec<String> {
+    let tail = stream.flush();
+    if tail.is_empty() || route.error().is_some() {
+        return Vec::new();
+    }
+    route.push(&tail).unwrap_or_default()
 }
 
 /// Stage and emit the legacy tool-call surfaces for a finished LFM3 turn.
@@ -489,6 +505,9 @@ pub fn generate_lfm3(
     // ── Tool-call routing (see `Lfm3ToolRoute` for why this router and why
     // the legacy terminal shape). ──
     let mut tools_route = Lfm3ToolRoute::new(tools.map(|t| !t.is_empty()).unwrap_or(false));
+    // Holds the bytes of a character split across tokens until it completes,
+    // so the stream never carries U+FFFD for valid output.
+    let mut text_stream = TokenTextStream::new();
 
     let decode_t0 = Instant::now();
     loop {
@@ -504,9 +523,9 @@ pub fn generate_lfm3(
             break;
         }
 
-        let frag = {
+        let raw = {
             let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
+            tokenizer.decode_bytes(&[next_tok])
         };
         // String-level EOS-class guard: exact EOS-class strings only. A
         // whitespace-only fragment (" ", "\n") is LEGITIMATE model output —
@@ -515,10 +534,12 @@ pub fn generate_lfm3(
         // generation on the first whitespace token (surfaced through serve as
         // truncated/"zero content" answers). Exact "" is kept: an EOS variant
         // that decodes to the empty string doesn't id-round-trip into
-        // stop_toks, so the string form is the only catch.
-        if matches!(frag.as_str(), "" | "</s>" | "<|im_end|>") {
+        // stop_toks, so the string form is the only catch. Matched on the
+        // token's own bytes, before UTF-8 reassembly.
+        if matches!(raw.as_slice(), b"" | b"</s>" | b"<|im_end|>") {
             break;
         }
+        let frag = text_stream.push_bytes(&raw);
         // Route the fragment. Tool-call spans are withheld from the client
         // stream and parsed into structured calls; only the router's visible
         // prose reaches the stop matcher (so tool-span text can never trip a
@@ -564,6 +585,18 @@ pub fn generate_lfm3(
     }
 
     m.seq_pos = m.lfm3().unwrap().state.n_tokens;
+
+    // A character the cap cut off mid-way: release its held bytes (lossily)
+    // like any other visible text.
+    for part in flush_text_stream(&mut text_stream, &mut tools_route) {
+        if stop_matcher.matched() {
+            break;
+        }
+        let visible = stop_matcher.push(&part);
+        if !visible.is_empty() {
+            emit_visible_token(stdout, id, visible.as_ref());
+        }
+    }
 
     // End-of-stream router drain: flushes prose held back as a possible
     // `<tool_call>` marker prefix, or fails closed on an unclosed span (the
@@ -1081,6 +1114,7 @@ pub fn generate_lfm3_vl(
     let mut rng = sampling::Xorshift::new(seed);
     let mut generated_count: usize = 0;
     let mut tools_route = Lfm3ToolRoute::new(tools.map(|t| !t.is_empty()).unwrap_or(false));
+    let mut text_stream = TokenTextStream::new();
     let decode_t0 = Instant::now();
     loop {
         if check_abort(id) {
@@ -1094,18 +1128,19 @@ pub fn generate_lfm3_vl(
         if stop_toks.contains(&next_tok) {
             break;
         }
-        let frag = {
+        let raw = {
             let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
+            tokenizer.decode_bytes(&[next_tok])
         };
         // Only break on a real EOS / turn-close token. The bare `""` frag case
         // (whitespace / the LFM3 think-close marker) is intentionally NOT a stop
         // here — the model thinks (<think>…</think>) then emits the visible
         // answer, and breaking on whitespace would truncate mid-think before the
         // answer. stop_toks (eos / <|im_end|>) handles the real turn end.
-        if matches!(frag.trim(), "</s>" | "<|im_end|>") {
+        if is_turn_close(&raw) {
             break;
         }
+        let frag = text_stream.push_bytes(&raw);
         // Tool-call routing: an LFM3-VL turn can end in a call (the same
         // `<tool_call><function=…>` shape the text route emits), so the
         // visible prose is routed and the span withheld exactly as in
@@ -1141,6 +1176,9 @@ pub fn generate_lfm3_vl(
     m.seq_pos = m.lfm3().unwrap().state.n_tokens;
     // Flush prose held back as a possible marker prefix / fail closed on an
     // unclosed span.
+    for part in flush_text_stream(&mut text_stream, &mut tools_route) {
+        emit_visible_token(stdout, id, &part);
+    }
     for part in tools_route.finish() {
         emit_visible_token(stdout, id, &part);
     }
@@ -1666,6 +1704,7 @@ pub fn generate_lfm3_audio(
     let mut rng = sampling::Xorshift::new(seed);
     let mut generated_count: usize = 0;
     let mut tools_route = Lfm3ToolRoute::new(tools.map(|t| !t.is_empty()).unwrap_or(false));
+    let mut text_stream = TokenTextStream::new();
     let decode_t0 = Instant::now();
     loop {
         if check_abort(id) {
@@ -1679,13 +1718,14 @@ pub fn generate_lfm3_audio(
         if stop_toks.contains(&next_tok) {
             break;
         }
-        let frag = {
+        let raw = {
             let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
+            tokenizer.decode_bytes(&[next_tok])
         };
-        if matches!(frag.trim(), "</s>" | "<|im_end|>") {
+        if is_turn_close(&raw) {
             break;
         }
+        let frag = text_stream.push_bytes(&raw);
         match tools_route.push(&frag) {
             Ok(parts) => {
                 for part in parts {
@@ -1715,6 +1755,9 @@ pub fn generate_lfm3_audio(
     }
 
     m.seq_pos = m.lfm3().unwrap().state.n_tokens;
+    for part in flush_text_stream(&mut text_stream, &mut tools_route) {
+        emit_visible_token(stdout, id, &part);
+    }
     for part in tools_route.finish() {
         emit_visible_token(stdout, id, &part);
     }
@@ -2004,6 +2047,9 @@ pub fn generate_lfm3_omni(
             }
         };
         let mut rng = omni::DepthRng::new(seed);
+        // Chunks end at arbitrary tokens: hold a split character's bytes until
+        // the next chunk completes it.
+        let mut text_stream = TokenTextStream::new();
         let chunk_steps = 12usize; // generate ~12 frames/steps per chunk
         let mut total_frames = 0usize;
         let mut n_chunks = 0usize;
@@ -2078,7 +2124,7 @@ pub fn generate_lfm3_omni(
                     .filter(|&&t| t != omni::AUDIO_OUT_TOKEN)
                     .copied()
                     .collect();
-                let text = tok.decode(&text_ids);
+                let text = text_stream.push_bytes(&tok.decode_bytes(&text_ids));
                 if !text.is_empty() {
                     let _ = writeln!(
                         stdout,
@@ -2122,6 +2168,14 @@ pub fn generate_lfm3_omni(
                 }
                 total_frames += step_out.n_audio_frames;
             }
+        }
+        let tail = text_stream.flush();
+        if !tail.is_empty() {
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::json!({"type":"token","id":id,"text":tail,"attempt_id":active_attempt_id()})
+            );
         }
         // Flush the codec's held-back tail if not already finalized.
         // LEAK-1 was also here: a failed tail flush used to be swallowed
@@ -2433,5 +2487,45 @@ mod tests {
         let (finish_reason, calls) = route.terminal(false).expect("clean terminal");
         assert_eq!(finish_reason, "stop");
         assert!(calls.is_empty());
+    }
+
+    /// fivetide's #1066 review, blocking item 4: per-token `decode` turned a
+    /// character split across tokens into U+FFFD ("Z��o shàng h��o"). Fed one
+    /// byte at a time, the worst split a byte-level BPE can produce, the
+    /// route's stream reassembles every character.
+    #[test]
+    fn split_multibyte_characters_reach_the_wire_whole() {
+        use super::flush_text_stream;
+        use hipfire_runtime::tokenizer::TokenTextStream;
+        let text = "Zǎo shàng hǎo 🌅";
+        for tools in [false, true] {
+            let mut stream = TokenTextStream::new();
+            let mut route = Lfm3ToolRoute::new(tools);
+            let mut out = String::new();
+            for b in text.as_bytes() {
+                for part in route.push(&stream.push_bytes(&[*b])).unwrap() {
+                    out.push_str(&part);
+                }
+            }
+            for part in flush_text_stream(&mut stream, &mut route) {
+                out.push_str(&part);
+            }
+            for part in route.finish() {
+                out.push_str(&part);
+            }
+            assert_eq!(out, text, "tools={tools}");
+        }
+    }
+
+    /// The VL/audio turn-close guard now sees one token's raw bytes; a lone
+    /// lead byte must not read as a close (nor panic).
+    #[test]
+    fn turn_close_guard_reads_raw_token_bytes() {
+        use super::is_turn_close;
+        assert!(is_turn_close(b"<|im_end|>"));
+        assert!(is_turn_close(b" </s>\n"));
+        assert!(!is_turn_close(b""));
+        assert!(!is_turn_close(&[0xE5]));
+        assert!(!is_turn_close(b"im_end"));
     }
 }
