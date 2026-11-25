@@ -7,7 +7,7 @@
 //! Run with `--features serve-fault-inject -- --ignored`.
 //!
 //! The daemon binary is driven over its JSONL protocol; an `abort` carrying
-//! `test_fault_engine_reset: true` makes that cancel's engine rollback fail.
+//! `test_fault_engine_reset: true` makes the next engine rollback fail.
 //! - x: abort a resident request at a token (tick settle site);
 //! - xc: abort at `commit_ready` (`settle_terminals` site).
 //! Both must give the cancelled request one fail-closed `error`
@@ -65,6 +65,16 @@ impl Daemon {
                 _ => {}
             }
         }
+        // Precondition: the fixture serves on the engine loop (else every
+        // assertion below would read as a product defect).
+        d.generate("W1", YES, 8);
+        let w = d.run(&["W1"], None, None, None);
+        let w = &w[0].1[0];
+        assert!(
+            w["type"] == "done" && w["loop"] == "engine",
+            "fixture {model} does not serve on the engine loop (needs a Qwen4 \
+             Flash-Next file + HIPFIRE_ENGINE_LOOP=engine): {w}"
+        );
         d
     }
 
@@ -158,9 +168,11 @@ impl Drop for Daemon {
     }
 }
 
+/// `HIPFIRE_ENGINE_FIXTURE`, else the `qwen3.8:flash-next` file in the model store.
 fn fixture() -> String {
     std::env::var("HIPFIRE_ENGINE_FIXTURE").unwrap_or_else(|_| {
-        "/home/bjoern/mesh-validation/HIPF-522/fixtures/qwen3.8-flash-next-base.mq4-xts".into()
+        let home = std::env::var("HOME").expect("HOME");
+        format!("{home}/.hipfire/models/qwen3.8-flash-next-base.mq4-xts")
     })
 }
 

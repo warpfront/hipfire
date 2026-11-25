@@ -76,6 +76,16 @@
    "size_bytes": 125288544792,
    "source": "no download: the Flash-Next XTS monolithic GPTQ3 file. The registry tag qwen3.8:flash-next-gptq3 now names qwen3.8-flash-next-base.mq4-xts, so never hipfire pull it; verify a local copy against this lock."
   },
+  "qwen3.8-flash-next-base.mq4-xts": {
+   "sha256": "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45",
+   "size_bytes": 70888270360,
+   "source": "https://huggingface.co/hipfire-models/qwen3.8-flash-next/resolve/21381aa3f159cf8567aa180126d71b9349ae8b1b/qwen3.8-flash-next-base.mq4-xts"
+  },
+  "qwen3.8-flash-next.ple-q4": {
+   "sha256": "fc78d30b9d2376db2b713732e80de2069f1cd1d6e1e40b50c716927dcc18ee1e",
+   "size_bytes": 29120146432,
+   "source": "https://huggingface.co/hipfire-models/qwen3.8-flash-next/resolve/21381aa3f159cf8567aa180126d71b9349ae8b1b/qwen3.8-flash-next.ple-q4"
+  },
   "qwen3.5-9b.mq4": {
    "sha256": "ba83acf5bfd5d4e334b0afc26d779734e31623bb7f74e807c3581dfecb3128ad",
    "size_bytes": 5313750016,
@@ -3417,6 +3427,35 @@
    "route": "single/flashnext-cold-archive-one-shot",
    "fixture_files": [
     "$MODELS_DIR/qwen3.8-flash-next-gptq3.mq4"
+   ]
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "HIPFIRE_ENGINE_FIXTURE=$MODEL cargo test --release -p hipfire-daemon --locked --features serve-fault-inject --test engine_reset_fault_gpu -- --ignored --test-threads=1"
+    ]
+   },
+   "env": {
+    "HIPFIRE_ENGINE_FIXTURE": "$MODEL"
+   },
+   "fixtures": [
+    "qwen3.8:flash-next"
+   ],
+   "hosts": [
+    "gfx1151"
+   ],
+   "id": "g12-engine-reset-fault",
+   "milestone": "G12",
+   "note": "HIPF-563: the engine batch driver fails closed when a cancel's rollback is not attested (tick and settle_terminals sites: one error rolled_back=false, no done, batch poisoned) and a core-queued abort stamps loop legacy. Needs the q4 PLE sidecar linked as <model>.ple-q4 (hipfire pull does this).",
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 1
+   },
+   "probe": "existing",
+   "route": "batch/engine-unattested-rollback-poisons",
+   "fixture_files": [
+    "$MODELS_DIR/qwen3.8-flash-next.ple-q4"
    ]
   }
  ],

@@ -1284,7 +1284,8 @@ fn main() {
                                 command = kind,
                                 "daemon control command received"
                             );
-                            // Test-only: this cancel's engine rollback fails (armed before the abort lands).
+                            // Test-only: arms the next engine rollback in the process to fail; a
+                            // cancel that never rolls back (MTP keep-fed) leaves it armed.
                             #[cfg(feature = "serve-fault-inject")]
                             if msg.get("test_fault_engine_reset").and_then(|v| v.as_bool())
                                 == Some(true)
