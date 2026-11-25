@@ -912,7 +912,10 @@ mod tests {
 
     /// Feed `bytes` to `ws_read_text` with a `max_bytes` budget; return its
     /// result and the bytes the server wrote back.
-    async fn read_with(bytes: &[u8], max_bytes: usize) -> (anyhow::Result<Option<String>>, Vec<u8>) {
+    async fn read_with(
+        bytes: &[u8],
+        max_bytes: usize,
+    ) -> (anyhow::Result<Option<String>>, Vec<u8>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (mut client, server) = tokio::io::duplex(1024);
         let mut server = hyper_util::rt::TokioIo::new(server);

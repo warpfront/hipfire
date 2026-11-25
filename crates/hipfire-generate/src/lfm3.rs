@@ -941,8 +941,8 @@ pub fn generate_lfm3_vl(
             // The gateway marks each image's position with `IMAGE_SLOT`; this
             // route renders one image and splices it before the live user text
             // (anchored below), so the markers are dropped from the history.
-            let unslotted: Option<Vec<hipfire_runtime::prompt_frame::Message>> =
-                messages_history.map(|h| {
+            let unslotted: Option<Vec<hipfire_runtime::prompt_frame::Message>> = messages_history
+                .map(|h| {
                     h.iter()
                         .map(|msg| {
                             let mut msg = msg.clone();

@@ -19255,13 +19255,8 @@ impl Carrier for Lfm3Carrier {
         let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<|im_end|>", "</s>", ""]);
         // Phase 1 is AR-only: LFM3 does not yet impl `SpecTarget`, so
         // `build_speculator` returns None unless HIPFIRE_NGRAM_DRAFT is set.
-        let speculator = crate::spec_build::build_speculator(
-            meta.arch_id,
-            None,
-            None,
-            ctx.max_seq,
-            ctx.spec,
-        );
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, None, ctx.max_seq, ctx.spec);
         // LFM3's chat_template.jinja uses transformers' `{% generation %}` block,
         // which minijinja cannot parse (the daemon would fall back to a bare
         // Plain prompt and the model echoes the prompt tail). Strip the markers
