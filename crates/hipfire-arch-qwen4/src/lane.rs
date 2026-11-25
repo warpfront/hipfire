@@ -2391,6 +2391,9 @@ pub struct Qwen4LaneStore {
     spec: Option<SpecStore>,
     /// `serve.batch_sampled`: lanes may carry a [`LaneSampling`].
     sampled: bool,
+    /// Sampled requests may be promoted mid-turn (host naive draws continue
+    /// the singleton's stream); `false` where lanes draw on the device.
+    promote_sampled: bool,
     /// Host scratch the sampled lanes' downloaded logits rows reuse (empty
     /// unless staged `sampled` on a band with step outputs). Pinned host memory
     /// when [`rdna_compute::feature_flags::FeatureFlags::qwen4_lane_pinned_logits_enabled`];
@@ -2626,6 +2629,7 @@ impl Qwen4LaneStore {
             },
             spec: spec_store,
             sampled: false,
+            promote_sampled: true,
             sample_host: SampleScratch::new(),
             sample_arena: None,
             scope,
@@ -3183,6 +3187,17 @@ impl Qwen4LaneStore {
     /// (`serve.batch_sampled`).
     pub fn sampled(&self) -> bool {
         self.sampled
+    }
+
+    /// Whether a sampled request may be promoted into a lane mid-turn.
+    pub fn promotes_sampled(&self) -> bool {
+        self.sampled && self.promote_sampled
+    }
+
+    /// Keep sampled requests out of mid-turn promotion (device lane draws
+    /// do not continue the singleton's naive stream).
+    pub fn set_promote_sampled(&mut self, on: bool) {
+        self.promote_sampled = on;
     }
 
     /// Record `serve.batch_sampled`. Turning it on pre-sizes the host logits

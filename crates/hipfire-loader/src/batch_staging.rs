@@ -901,8 +901,8 @@ fn stage_qwen4_lanes(
             eprintln!(
                 "[daemon] qwen4 engine lanes: device lane draws; sampled speculative requests stay resident"
             );
-            if let Some(bundle) = m.qwen4_mut() {
-                bundle.set_lanes_sampled(false);
+            if let Some(store) = m.qwen4_mut().and_then(|bundle| bundle.lanes_mut()) {
+                store.set_promote_sampled(false);
             }
         } else if let Some(drafter) = m
             .speculator

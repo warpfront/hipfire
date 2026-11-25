@@ -323,7 +323,7 @@ impl MeshLanes for Qwen4Bundle {
     }
 
     fn sampled_windows(&self) -> bool {
-        self.windows() && self.lanes().is_some_and(|store| store.sampled())
+        self.windows() && self.lanes().is_some_and(|store| store.promotes_sampled())
     }
 
     /// The legacy fn-lanes window ([`crate::lane_exec::Qwen4LaneExecutor`]):
