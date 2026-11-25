@@ -84,6 +84,9 @@ pub enum Trim {
     Reset,
     /// A continuing request re-prefilled its committed history.
     Realigned,
+    /// A client abort stopped the realign part way: the live state holds
+    /// none of the request, which rolls back.
+    Aborted,
 }
 
 /// A speculative route's request: the drafter's configuration and the
@@ -314,19 +317,18 @@ impl Forwards for DraftForwards<'_> {
         d: &mut dyn Speculator,
         tokens: &[u32],
         position: usize,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let id = self.id;
         let abort = || check_abort(id);
         if spec_forced_advance(None, self.gpu, d, self.target, tokens, position, &abort)? {
-            return Ok(());
+            return Ok(true);
         }
-        // An abort here ends the request at the next poll; its rollback
-        // resets the partly advanced state.
         match self
             .target
             .spec_advance(self.gpu, tokens, position, false, &abort, None)?
         {
-            SpecAdvance::Ready { .. } | SpecAdvance::Aborted => Ok(()),
+            SpecAdvance::Ready { .. } => Ok(true),
+            SpecAdvance::Aborted => Ok(false),
         }
     }
 
@@ -356,9 +358,8 @@ impl Forwards for DraftForwards<'_> {
         history.extend_from_slice(self.prompt);
         history.extend_from_slice(tail);
         let id = self.id;
-        // The prefill's pick is not history; an abort ends the request at the
-        // next poll.
-        spec_prefill(
+        // The prefill's pick is not history.
+        let outcome = spec_prefill(
             None,
             self.gpu,
             d,
@@ -372,7 +373,10 @@ impl Forwards for DraftForwards<'_> {
             &|| check_abort(id),
         )
         .map_err(|error| format!("spec_prefix_realign: {error}"))?;
-        Ok(Trim::Realigned)
+        Ok(match outcome {
+            PrefillOutcome::Ready { .. } => Trim::Realigned,
+            PrefillOutcome::Aborted => Trim::Aborted,
+        })
     }
 }
 
@@ -470,6 +474,12 @@ mod tests {
         trims: Vec<(usize, Vec<u32>, Option<Vec<u32>>)>,
         /// Where each drafter prompt fill started.
         prefills: Vec<usize>,
+        /// AR steps (`verify` with `ar`) the request ran.
+        ar_steps: usize,
+        /// The next advance or realign stops part way on a client abort,
+        /// which the wire then reports.
+        abort: std::rc::Rc<std::cell::Cell<bool>>,
+        abort_in_forward: bool,
     }
 
     impl Forwards for Model {
@@ -502,7 +512,7 @@ mod tests {
             seed: u32,
             _: &[u32],
             max_emit: usize,
-            _: bool,
+            ar: bool,
         ) -> Result<SpecStep, String> {
             assert_eq!(
                 self.ran.len(),
@@ -510,7 +520,12 @@ mod tests {
                 "a window starts where the target is"
             );
             self.ran.push(seed);
-            let n = self.width.min(max_emit);
+            let n = if ar {
+                self.ar_steps += 1;
+                1
+            } else {
+                self.width.min(max_emit)
+            };
             let mut emit = Vec::new();
             for i in 0..n {
                 let t = truth(&self.ran);
@@ -527,10 +542,15 @@ mod tests {
             _: &mut dyn Speculator,
             tokens: &[u32],
             position: usize,
-        ) -> Result<(), String> {
+        ) -> Result<bool, String> {
+            if self.abort_in_forward {
+                self.abort.set(true);
+                self.ran.extend_from_slice(&tokens[..tokens.len() / 2]);
+                return Ok(false);
+            }
             assert_eq!(self.ran.len(), position);
             self.ran.extend_from_slice(tokens);
-            Ok(())
+            Ok(true)
         }
         fn trim(
             &mut self,
@@ -554,6 +574,11 @@ mod tests {
                     self.ran.clear();
                     Trim::Reset
                 }
+                Some(_) if self.abort_in_forward => {
+                    self.abort.set(true);
+                    self.ran.clear();
+                    Trim::Aborted
+                }
                 Some(tail) => {
                     self.ran = [&self.prompt[..], tail].concat();
                     Trim::Realigned
@@ -571,6 +596,7 @@ mod tests {
         eos_at: Option<usize>,
         close_at: Option<usize>,
         cap: Option<usize>,
+        abort: std::rc::Rc<std::cell::Cell<bool>>,
     }
 
     impl Emit for Wire {
@@ -595,7 +621,7 @@ mod tests {
             &self.history
         }
         fn aborted(&self) -> bool {
-            false
+            self.abort.get()
         }
         fn window_cap(&self) -> Option<usize> {
             self.cap
@@ -624,6 +650,9 @@ mod tests {
             repairs,
             trims: Vec::new(),
             prefills: Vec::new(),
+            ar_steps: 0,
+            abort: Default::default(),
+            abort_in_forward: false,
         }
     }
 
@@ -764,5 +793,63 @@ mod tests {
         assert_eq!(exit, Exit::Finished(Finish::Length));
         assert!(m.trims.is_empty(), "windows of 2 end exactly on the close");
         assert_eq!(wire.emitted, ar_reference(&m.prompt, &wire.emitted));
+    }
+
+    #[test]
+    fn a_request_below_the_retire_line_retires_to_ar_steps() {
+        let mut m = model(4, true);
+        let mut wire = Wire::default();
+        // Each window costs 100 tokens against 4 committed: the early check
+        // retires after its 8 windows.
+        let line = BreakEven {
+            base: 100.0,
+            per_1k_ctx: 0.0,
+            per_row: 0.0,
+        };
+        let mut run = RequestRun::new(m.prompt.len(), 0, 50, greedy(), 1)
+            .with_drafting(Drafting::new(Box::new(NoDrafter), Some(line)));
+        assert_eq!(
+            drive(&mut run, &mut m, &mut wire),
+            Exit::Finished(Finish::Length)
+        );
+        let d = SpecDone::of(run.drafting().unwrap());
+        // The first token, 8 windows of 4, then one token per AR step.
+        assert_eq!(d.tally.windows, 8);
+        assert_eq!(d.tally.retired_at, Some(5 + 8 * 4));
+        assert_eq!(d.tally.ar_steps, 50 - 1 - 8 * 4);
+        assert_eq!(m.ar_steps, d.tally.ar_steps);
+        assert_eq!(wire.emitted, ar_reference(&m.prompt, &wire.emitted));
+        assert_eq!(m.ran, [&m.prompt[..], &wire.emitted[..]].concat());
+    }
+
+    #[test]
+    fn an_advance_stopped_by_an_abort_keeps_nothing_live() {
+        let mut m = model(4, true);
+        let mut wire = Wire {
+            close_at: Some(5),
+            abort: m.abort.clone(),
+            ..Wire::default()
+        };
+        m.abort_in_forward = true;
+        let (exit, run) = run(&mut m, &mut wire, 12);
+        assert_eq!(exit, Exit::Aborted);
+        assert_eq!(&wire.emitted[5..7], &CLOSE, "the close was forced");
+        // `keep_fed` refuses a position under the prompt: the abort rolls back.
+        assert_eq!(run.position, 0);
+    }
+
+    #[test]
+    fn a_realign_stopped_by_an_abort_keeps_nothing_live() {
+        let mut m = model(4, false);
+        let mut wire = Wire {
+            close_at: Some(3),
+            abort: m.abort.clone(),
+            ..Wire::default()
+        };
+        m.abort_in_forward = true;
+        let (exit, run) = run(&mut m, &mut wire, 12);
+        assert_eq!(exit, Exit::Aborted);
+        assert_eq!(m.trims.len(), 1);
+        assert_eq!(run.position, 0);
     }
 }

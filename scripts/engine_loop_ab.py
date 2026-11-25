@@ -236,7 +236,7 @@ def toks(r):
     return [t for t, _ in r.get("ids", [])]
 
 
-def compare(sc, a, b, spec_noise=False):
+def compare(sc, a, b, spec_noise=False, positions=False):
     """Diff two result lists (a = legacy, b = engine). Returns (status, notes);
     notes are [kind, text]; status is diff|unexercised|intended|equal."""
     notes = []
@@ -293,10 +293,10 @@ def compare(sc, a, b, spec_noise=False):
         if toks(x) != toks(y):
             note(DIFF, f"[{i}] token ids differ")
         elif x.get("ids", []) != y.get("ids", []):
-            # Intended diff 4: an engine route stamps every committed token with
-            # its conversation position; legacy Gemma 4 EAGLE counts from the
-            # first generated token.
-            note(INTENDED, f"[{i}] committed positions differ, token ids equal")
+            # Intended diff 6 (`positions`, Gemma 4 EAGLE only): the engine
+            # stamps every committed token with its conversation position;
+            # legacy Gemma 4 EAGLE counts from the first generated token.
+            note(INTENDED if positions else DIFF, f"[{i}] committed positions differ, token ids equal")
         for key in sorted(set(dx) | set(dy)):
             vx, vy = dx.get(key), dy.get(key)
             if vx == vy:
@@ -364,7 +364,8 @@ def judge(res, route, tvd_max, perf=None):
     for sc in res["legacy"]:
         if sc == "daemon_rc":
             continue
-        status, notes = compare(sc, res["legacy"][sc], res["engine"][sc], route.get("spec_noise", False))
+        status, notes = compare(sc, res["legacy"][sc], res["engine"][sc], route.get("spec_noise", False),
+                                "drafter" in route.get("load", {}))
         scenarios[sc] = {"status": status, "notes": notes}
     sampled = sampled_checks(res)
     sampled["ok"] = (sampled["legacy_reproducible"] and sampled["engine_reproducible"]
@@ -464,7 +465,9 @@ def self_test():
     # token ids: exact, aborts on the common prefix
     ids = lambda x, i: {**x, "ids": i}
     assert st("cold", [ids(r("ab"), [[1, 0]])], [ids(r("ab"), [[2, 0]])]) == "diff"
-    assert st("cold", [ids(r("ab"), [[1, 0]])], [ids(r("ab"), [[1, 5]])]) == "intended"
+    # positions: intended only on a Gemma 4 EAGLE route
+    assert st("cold", [ids(r("ab"), [[1, 0]])], [ids(r("ab"), [[1, 5]])]) == "diff"
+    assert st("cold", [ids(r("ab"), [[1, 0]])], [ids(r("ab"), [[1, 5]])], positions=True) == "intended"
     assert st("abort_decode", [ids(ab[0], [[1, 0], [2, 1]]), r("x", cached_tokens=3)],
               [ids(ab[0], [[1, 0]]), r("x", cached_tokens=3)]) == "equal"
     assert st("abort_decode", [ids(ab[0], [[1, 0], [2, 1]]), r("x", cached_tokens=3)],

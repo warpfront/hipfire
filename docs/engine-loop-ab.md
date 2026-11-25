@@ -140,8 +140,9 @@ These are reported as `intended` and do not fail the run:
    of legacy's. A prompt of `max_seq - 1` tokens is refused on the engine.
 6. **Committed positions.** Every engine route stamps a `committed` token with
    its conversation position; legacy Gemma 4 EAGLE counts from the first
-   generated token. Equal token ids at different positions are `intended`
-   (HIPF-471).
+   generated token. On a Gemma 4 EAGLE route (`load` names a `drafter`), equal
+   token ids at different positions are `intended` (HIPF-471); on every other
+   route a position difference is a diff (HIPF-552).
 
 Every other difference is a diff.
 

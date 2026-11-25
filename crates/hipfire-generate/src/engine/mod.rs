@@ -418,6 +418,11 @@ impl RequestRun {
                 self.position = prompt_len + d.emitted.len() - 1;
                 d.owed.drain(..d.owed.len() - 1);
             }
+            // Its abort (the next poll) rolls back from nothing kept.
+            Some(spec::Trim::Aborted) => {
+                self.position = 0;
+                d.owed.clear();
+            }
         }
         if ar {
             d.tally.ar_steps += 1;
@@ -534,13 +539,14 @@ pub trait Forwards {
     ) -> Result<SpecStep, String> {
         Err(NO_DRAFTER.into())
     }
-    /// Speculative: run committed `tokens` from `position` ([`Work::Advance`]).
+    /// Speculative: run committed `tokens` from `position` ([`Work::Advance`]);
+    /// `false`: a client abort stopped it part way.
     fn advance(
         &mut self,
         _d: &mut dyn Speculator,
         _tokens: &[u32],
         _position: usize,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         Err(NO_DRAFTER.into())
     }
     /// Speculative: the window from `start` on `seed` committed past `kept`:
@@ -734,7 +740,12 @@ fn spec_step(run: &mut RequestRun, io: &mut (impl Forwards + Emit + ?Sized)) -> 
         }
         Work::Advance { tokens } => {
             let d = run.draft.as_mut().expect("a speculative request");
-            io.advance(&mut *d.drafter, &tokens, run.position)?;
+            if !io.advance(&mut *d.drafter, &tokens, run.position)? {
+                // A part-run advance: nothing of the request is kept live,
+                // its abort (the next poll) rolls back.
+                run.position = 0;
+                return Ok(());
+            }
             run.position += tokens.len();
             d.owed.drain(..tokens.len());
             Ok(())
@@ -802,7 +813,7 @@ impl<F: Forwards, E: ?Sized> Forwards for Both<'_, F, E> {
         d: &mut dyn Speculator,
         tokens: &[u32],
         position: usize,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         self.0.advance(d, tokens, position)
     }
 

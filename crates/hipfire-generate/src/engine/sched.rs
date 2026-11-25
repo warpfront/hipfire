@@ -613,7 +613,7 @@ impl<B: Batch> Forwards for One<'_, B> {
         d: &mut dyn Speculator,
         tokens: &[u32],
         position: usize,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         self.b.draft(self.idx)?.advance(d, tokens, position)
     }
 
@@ -772,10 +772,10 @@ mod tests {
             _: &mut dyn Speculator,
             tokens: &[u32],
             position: usize,
-        ) -> Result<(), String> {
+        ) -> Result<bool, String> {
             assert_eq!(self.state.len(), position);
             self.state.extend_from_slice(tokens);
-            Ok(())
+            Ok(true)
         }
         fn trim(
             &mut self,
@@ -1404,9 +1404,11 @@ mod tests {
         let mut s = Scheduler::default();
         s.admit(2);
         s.admit(3);
+        assert!(s.drafter().is_none(), "no request runs yet");
         while !b.calls.contains(&Call::Window(2)) {
             assert!(s.tick(&mut b).is_empty());
         }
+        assert!(s.drafter().is_some(), "the live request holds the drafter");
         b.aborted.insert(2, true);
         b.calls.clear();
         let ended = s.tick(&mut b);
@@ -1416,6 +1418,7 @@ mod tests {
             (&Exit::Aborted, Place::Resident)
         );
         assert!(ended[0].drafting.is_some());
+        assert!(s.drafter().is_none(), "the drafter left with the request");
         assert!(
             !b.calls.contains(&Call::Prefill(3)),
             "nothing begins on the resident state before its rollback"
