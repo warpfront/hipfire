@@ -45,12 +45,13 @@
 //! Other restores or resets invalidate residents whose rows are rewritten
 //! (external owners report resets through [`SessionCache::live_state_reset`]).
 //!
-//! A short side request that diverges early from a long committed live
-//! conversation would overwrite its rows. [`SessionDriver`] then *parks* the
-//! conversation first: the fixed parts and only the leading rows the side
-//! request can write ([`SessionState::side_request_rows`]) are copied aside,
-//! together with the residents, and a later request that extends the whole
-//! parked history restores them byte-exact and continues in place.
+//! A side request that diverges early from the committed live conversation
+//! would overwrite its rows. [`SessionDriver`] then *parks* the conversation
+//! first: the fixed parts and only the leading rows the side request can
+//! write ([`SessionState::side_request_rows`]; the whole history when it is
+//! no longer than that) are copied aside, together with the residents, and a
+//! later request that extends the whole parked history restores them
+//! byte-exact and continues in place.
 //!
 //! An optional disk tier ([`SessionCache::with_disk`]) keeps snapshots the
 //! device tier evicts (and every published snapshot at [`SessionCache::clear`])
@@ -507,9 +508,14 @@ fn capture_domain(domain: &CacheDomain, cold_exact: bool) -> CacheDomain {
     }
 }
 
-/// Largest `through` (prompt plus every row decode may write) of a side
-/// request the cache parks the live conversation for.
-const SIDE_PARK_MAX_THROUGH: usize = 8192;
+/// Most rows of each stream a park copies: the rows the parked history and a
+/// side request both occupy, `min(main_len, through)` (`through`: prompt plus
+/// every row decode may write).
+const SIDE_PARK_ROW_LIMIT: usize = 8192;
+/// `HIPFIRE_SESSION_PARK_SHORT` (developer, default on): `0` parks only a
+/// history longer than the side request's `through`, itself at most
+/// [`SIDE_PARK_ROW_LIMIT`] (the rule before 0.5.0).
+const SESSION_PARK_SHORT_ENV: &str = "HIPFIRE_SESSION_PARK_SHORT";
 /// Longest common prefix a side request may share with the parked history.
 const SIDE_PARK_EARLY_LCP: usize = 1024;
 
@@ -3795,9 +3801,20 @@ fn common_prefix(a: &[u32], b: &[u32]) -> usize {
 
 /// Whether the committed live history of `main_len` tokens is parked for a
 /// side request that shares `lcp` tokens with it and writes `through` rows:
-/// short, diverging early, and the parked history longer than the side's rows.
-fn side_park_eligible(main_len: usize, lcp: usize, through: usize) -> bool {
-    through <= SIDE_PARK_MAX_THROUGH && lcp <= SIDE_PARK_EARLY_LCP && main_len > through
+/// it diverges early and the park copies at most [`SIDE_PARK_ROW_LIMIT`] rows
+/// per stream (`min(main_len, through)`; a history no longer than the side's
+/// rows parks whole). `short = false` ([`SESSION_PARK_SHORT_ENV`] `0`) keeps
+/// the old rule: `through` bounded and the history strictly longer than it.
+fn side_park_eligible(main_len: usize, lcp: usize, through: usize, short: bool) -> bool {
+    let rows = if short {
+        main_len.min(through)
+    } else {
+        through
+    };
+    main_len > 0
+        && lcp <= SIDE_PARK_EARLY_LCP
+        && rows <= SIDE_PARK_ROW_LIMIT
+        && (short || main_len > through)
 }
 
 /// Whether an existing park (covering `parked_through` tokens) stays usable
@@ -3862,6 +3879,9 @@ pub struct SessionDriver {
     parked: Option<LiveRecord>,
     /// One-shot `through` bound for the next [`Self::begin`].
     write_limit: Option<usize>,
+    /// [`SESSION_PARK_SHORT_ENV`], read once: park a history no longer than
+    /// the side request's rows too ([`side_park_eligible`]).
+    park_short: bool,
 }
 
 impl SessionDriver {
@@ -3872,6 +3892,7 @@ impl SessionDriver {
             turn: None,
             parked: None,
             write_limit: None,
+            park_short: hipfire_config::developer_bool(SESSION_PARK_SHORT_ENV, true),
         }
     }
 
@@ -4005,10 +4026,11 @@ impl SessionDriver {
     /// - snapshot: restore the `reused`-token snapshot;
     /// - `reused == 0`: cold start.
     ///
-    /// A request bounded by [`Self::set_request_write_limit`] that is short
-    /// and diverges early from a longer committed live state parks that state
-    /// first (unless the memory guard or the state refuses). Returns whether
-    /// the prefill continues the live state.
+    /// A request bounded by [`Self::set_request_write_limit`] that diverges
+    /// early from the committed live state parks that state first when the
+    /// park copies at most [`SIDE_PARK_ROW_LIMIT`] rows per stream
+    /// ([`side_park_eligible`]), unless the memory guard or the state
+    /// refuses. Returns whether the prefill continues the live state.
     pub fn begin(
         &mut self,
         gpu: &mut Gpu,
@@ -4044,6 +4066,7 @@ impl SessionDriver {
                             record.tokens.len(),
                             common_prefix(prompt, &record.tokens),
                             through,
+                            self.park_short,
                         ) =>
                 {
                     Some((record.tokens.len(), through))
@@ -6271,7 +6294,8 @@ mod tests {
         assert!(side_park_eligible(
             consumed.len(),
             common_prefix(&side, &consumed),
-            SIDE_THROUGH
+            SIDE_THROUGH,
+            true
         ));
 
         // Park: fixed parts whole, rows [0, ceil bound) of every stream.
@@ -6412,22 +6436,48 @@ mod tests {
     }
 
     #[test]
-    fn long_unknown_or_overflowing_side_requests_are_not_parked() {
-        assert_eq!(SIDE_PARK_MAX_THROUGH, 8192);
+    fn park_eligibility_bounds_the_copied_rows() {
+        assert_eq!(SIDE_PARK_ROW_LIMIT, 8192);
         assert_eq!(SIDE_PARK_EARLY_LCP, 1024);
         let main = 9000;
-        assert!(side_park_eligible(main, SHARED_LCP, 8192));
-        assert!(!side_park_eligible(main, SHARED_LCP, 8193));
-        assert!(!side_park_eligible(main, 0, usize::MAX));
-        assert!(!side_park_eligible(usize::MAX, 0, usize::MAX));
-        // Early divergence only.
-        assert!(side_park_eligible(main, SIDE_PARK_EARLY_LCP, 100));
-        assert!(!side_park_eligible(main, SIDE_PARK_EARLY_LCP + 1, 100));
-        assert!(!side_park_eligible(main, usize::MAX, 100));
-        // The parked history must be longer than the rows the side may write.
-        assert!(!side_park_eligible(500, 0, 500));
-        assert!(side_park_eligible(501, 0, 500));
-        assert!(!side_park_eligible(0, 0, 0));
+        for short in [true, false] {
+            assert!(side_park_eligible(main, SHARED_LCP, 8192, short));
+            assert!(!side_park_eligible(main, SHARED_LCP, 8193, short));
+            assert!(!side_park_eligible(main, 0, usize::MAX, short));
+            assert!(!side_park_eligible(usize::MAX, 0, usize::MAX, short));
+            // Early divergence only.
+            assert!(side_park_eligible(main, SIDE_PARK_EARLY_LCP, 100, short));
+            assert!(!side_park_eligible(
+                main,
+                SIDE_PARK_EARLY_LCP + 1,
+                100,
+                short
+            ));
+            assert!(!side_park_eligible(main, usize::MAX, 100, short));
+            assert!(side_park_eligible(501, 0, 500, short));
+            assert!(!side_park_eligible(0, 0, 0, short));
+        }
+        // A history no longer than the side's rows parks whole, up to the row
+        // bound, whatever the side's own bound...
+        assert!(side_park_eligible(500, 0, 500, true));
+        assert!(side_park_eligible(33, 3, 45, true));
+        assert!(side_park_eligible(SIDE_PARK_ROW_LIMIT, 0, usize::MAX, true));
+        assert!(!side_park_eligible(
+            SIDE_PARK_ROW_LIMIT + 1,
+            0,
+            usize::MAX,
+            true
+        ));
+        // ...unless HIPFIRE_SESSION_PARK_SHORT=0: then it must be longer than
+        // a bounded side request.
+        assert!(!side_park_eligible(500, 0, 500, false));
+        assert!(!side_park_eligible(33, 3, 45, false));
+        assert!(!side_park_eligible(
+            SIDE_PARK_ROW_LIMIT,
+            0,
+            usize::MAX,
+            false
+        ));
 
         // A state that does not implement the hook never parks.
         assert_eq!(PlainState.side_request_rows(AR, 100), None);

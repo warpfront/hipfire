@@ -581,6 +581,7 @@ developer_callsite	*	HIPFIRE_ROUTED_GL#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_ROUTE_PLAN_SEAL#developer_bool=false
 developer_callsite	*	HIPFIRE_SCHED_PROFILE#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_SCHED_PROFILE#developer_var=ok.and_then.unwrap_or_else
+developer_callsite	*	HIPFIRE_SESSION_PARK_SHORT#developer_bool=true
 developer_callsite	*	HIPFIRE_SKIP_LLAMA_COMMIT_CHECK#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_SLOTS_GFX1100_ROUTES#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_SLOTS_PAGED#developer_var=ok.and_then
