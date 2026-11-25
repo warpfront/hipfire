@@ -141,17 +141,43 @@ async fn ws_write_text<S: HyperWrite + Unpin>(s: &mut S, text: &str) -> Result<(
     ws_write_frame(s, 0x1, text.as_bytes()).await
 }
 
+/// RFC6455 close codes the reader sends before giving up on a connection.
+const WS_CLOSE_PROTOCOL_ERROR: u16 = 1002;
+const WS_CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
+
+/// Send a close frame carrying `code`, then fail the read with `reason`.
+async fn ws_fail<S: HyperWrite + Unpin>(s: &mut S, code: u16, reason: &str) -> anyhow::Error {
+    let _ = ws_write_frame(s, 0x8, &code.to_be_bytes()).await;
+    anyhow!("websocket closed with {code}: {reason}")
+}
+
 /// Read one complete text message (reassembling fragments); `None` on close.
-async fn ws_read_text<S: HyperRead + HyperWrite + Unpin>(s: &mut S) -> Result<Option<String>> {
+///
+/// The declared payload length is untrusted: a frame, or a fragmented message
+/// as a whole, larger than `max_bytes` closes the connection with 1009 before
+/// anything is allocated. Unmasked client frames and malformed control frames
+/// close it with 1002 (RFC6455 §5.1, §5.5).
+async fn ws_read_text<S: HyperRead + HyperWrite + Unpin>(
+    s: &mut S,
+    max_bytes: usize,
+) -> Result<Option<String>> {
     let mut message = Vec::new();
     loop {
         let mut head = [0u8; 2];
         if read_exact_rt(s, &mut head).await.is_err() {
             return Ok(None);
         }
+        let fin = head[0] & 0x80 != 0;
         let opcode = head[0] & 0x0f;
         let masked = head[1] & 0x80 != 0;
         let len0 = (head[1] & 0x7f) as u64;
+        let is_control = opcode & 0x8 != 0;
+        if !masked {
+            return Err(ws_fail(s, WS_CLOSE_PROTOCOL_ERROR, "unmasked client frame").await);
+        }
+        if is_control && (!fin || len0 > 125) {
+            return Err(ws_fail(s, WS_CLOSE_PROTOCOL_ERROR, "malformed control frame").await);
+        }
         let len = match len0 {
             126 => {
                 let mut b = [0u8; 2];
@@ -165,21 +191,29 @@ async fn ws_read_text<S: HyperRead + HyperWrite + Unpin>(s: &mut S) -> Result<Op
             }
             n => n,
         };
-        let mut mask = [0u8; 4];
-        if masked {
-            read_exact_rt(s, &mut mask).await?;
-        }
-        let mut payload = vec![0u8; len as usize];
-        read_exact_rt(s, &mut payload).await?;
-        if masked {
-            for (i, byte) in payload.iter_mut().enumerate() {
-                *byte ^= mask[i % 4];
+        let budget = max_bytes.saturating_sub(if is_control { 0 } else { message.len() });
+        let len = match usize::try_from(len) {
+            Ok(len) if len <= budget => len,
+            _ => {
+                return Err(ws_fail(
+                    s,
+                    WS_CLOSE_MESSAGE_TOO_BIG,
+                    &format!("frame of {len} bytes exceeds the {max_bytes}-byte limit"),
+                )
+                .await)
             }
+        };
+        let mut mask = [0u8; 4];
+        read_exact_rt(s, &mut mask).await?;
+        let mut payload = vec![0u8; len];
+        read_exact_rt(s, &mut payload).await?;
+        for (i, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[i % 4];
         }
         match opcode {
             0x0 | 0x1 => {
                 message.extend_from_slice(&payload);
-                if head[0] & 0x80 != 0 {
+                if fin {
                     return Ok(Some(String::from_utf8_lossy(&message).into_owned()));
                 }
             }
@@ -604,10 +638,22 @@ fn run_turn(
     }));
 }
 
+/// Most `conversation.item.create` entries (user items or tool results) a
+/// session holds between two `response.create`s.
+const MAX_QUEUED_ITEMS: usize = 64;
+
+/// The `type: "error"` event the session sends for a refused client event.
+fn realtime_error_event(message: &str) -> String {
+    serde_json::json!({ "type": "error", "error": { "message": message } }).to_string()
+}
+
 async fn run_session(upgraded: Upgraded, shared: Arc<ServeShared>) -> Result<()> {
     let mut ws = upgraded;
     let state = Arc::new(std::sync::Mutex::new(RealtimeSessionState::new()));
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    // `serve.max_request_bytes` bounds one WebSocket message and the buffered
+    // input audio, the same budget an HTTP request body gets.
+    let max_bytes = usize::try_from(shared.max_request_bytes).unwrap_or(usize::MAX);
 
     let session_created = serde_json::json!({
         "type": "session.created",
@@ -622,7 +668,7 @@ async fn run_session(upgraded: Upgraded, shared: Arc<ServeShared>) -> Result<()>
 
     loop {
         tokio::select! {
-            inbound = ws_read_text(&mut ws) => {
+            inbound = ws_read_text(&mut ws, max_bytes) => {
                 let text = match inbound? {
                     Some(t) => t,
                     None => break,
@@ -662,7 +708,21 @@ async fn run_session(upgraded: Upgraded, shared: Arc<ServeShared>) -> Result<()>
                     Some("input_audio_buffer.append") => {
                         if let Some(audio) = event.get("audio").and_then(|v| v.as_str()) {
                             match base64::engine::general_purpose::STANDARD.decode(audio) {
-                                Ok(pcm) => state.lock().unwrap_or_else(|e| e.into_inner()).input_pcm.extend_from_slice(&pcm),
+                                Ok(pcm) => {
+                                    let refused = {
+                                        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                                        let fits = st.input_pcm.len().saturating_add(pcm.len()) <= max_bytes;
+                                        if fits {
+                                            st.input_pcm.extend_from_slice(&pcm);
+                                        }
+                                        !fits
+                                    };
+                                    if refused {
+                                        ws_write_text(&mut ws, &realtime_error_event(&format!(
+                                            "input audio buffer is full ({max_bytes} bytes); commit or clear it"
+                                        ))).await?;
+                                    }
+                                }
                                 Err(error) => eprintln!("[realtime] input_audio_buffer.append decode failed: {error}"),
                             }
                         }
@@ -694,14 +754,28 @@ async fn run_session(upgraded: Upgraded, shared: Arc<ServeShared>) -> Result<()>
                         // `role: "tool"` message, NOT into the user queue: the
                         // next `response.create` replays it in order so the
                         // model can answer on top of the call it made.
-                        if let Some(result) = realtime_tool_result_message(&item) {
-                            state
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .pending_tool_results
-                                .push(result);
-                        } else if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
-                            state.lock().unwrap_or_else(|e| e.into_inner()).queued_items.push(content.to_owned());
+                        let refused = {
+                            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(result) = realtime_tool_result_message(&item) {
+                                let full = st.pending_tool_results.len() >= MAX_QUEUED_ITEMS;
+                                if !full {
+                                    st.pending_tool_results.push(result);
+                                }
+                                full
+                            } else if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
+                                let full = st.queued_items.len() >= MAX_QUEUED_ITEMS;
+                                if !full {
+                                    st.queued_items.push(content.to_owned());
+                                }
+                                full
+                            } else {
+                                false
+                            }
+                        };
+                        if refused {
+                            ws_write_text(&mut ws, &realtime_error_event(&format!(
+                                "too many queued items ({MAX_QUEUED_ITEMS}); send response.create first"
+                            ))).await?;
                         }
                     }
                     Some("response.create") => {
@@ -834,5 +908,64 @@ mod tests {
             realtime_websocket_accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
         );
+    }
+
+    /// Feed `bytes` to `ws_read_text` with a `max_bytes` budget; return its
+    /// result and the bytes the server wrote back.
+    async fn read_with(bytes: &[u8], max_bytes: usize) -> (anyhow::Result<Option<String>>, Vec<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, server) = tokio::io::duplex(1024);
+        let mut server = hyper_util::rt::TokioIo::new(server);
+        client.write_all(bytes).await.unwrap();
+        client.shutdown().await.unwrap();
+        let read = super::ws_read_text(&mut server, max_bytes).await;
+        drop(server);
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).await.unwrap();
+        (read, reply)
+    }
+
+    /// A masked client frame carrying `payload` (zero mask key).
+    fn masked(first: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 126);
+        let mut f = vec![first, 0x80 | payload.len() as u8, 0, 0, 0, 0];
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// fivetide's #1066 review, blocking item 1: one 10-byte frame header
+    /// declaring a 2^40-byte payload (`82 7f` + length) aborted the whole serve
+    /// process (`memory allocation of 1099511627776 bytes failed`). Masked,
+    /// the same header now closes with 1009 before anything is allocated.
+    #[tokio::test]
+    async fn declared_frame_length_is_bounded_before_allocation() {
+        let mut frame = vec![0x82, 0xff];
+        frame.extend_from_slice(&(1u64 << 40).to_be_bytes());
+        let (read, reply) = read_with(&frame, 1 << 20).await;
+        assert!(read.is_err());
+        assert_eq!(reply, [0x88, 0x02, 0x03, 0xf1], "close 1009");
+    }
+
+    /// fivetide's exact bytes: the frame is unmasked, which a server must
+    /// refuse (RFC6455 §5.1) — close 1002, no allocation.
+    #[tokio::test]
+    async fn unmasked_client_frame_is_refused() {
+        let mut frame = vec![0x82, 0x7f];
+        frame.extend_from_slice(&(1u64 << 40).to_be_bytes());
+        let (read, reply) = read_with(&frame, 1 << 20).await;
+        assert!(read.is_err());
+        assert_eq!(reply, [0x88, 0x02, 0x03, 0xea], "close 1002");
+    }
+
+    /// Fragments are bounded as a whole message, not frame by frame.
+    #[tokio::test]
+    async fn fragmented_message_over_the_limit_is_refused() {
+        let mut bytes = masked(0x01, b"0123456789");
+        bytes.extend(masked(0x80, b"0123456789"));
+        let (read, reply) = read_with(&bytes, 15).await;
+        assert!(read.is_err());
+        assert_eq!(reply, [0x88, 0x02, 0x03, 0xf1], "close 1009");
+        let (read, _) = read_with(&bytes, 20).await;
+        assert_eq!(read.unwrap().as_deref(), Some("01234567890123456789"));
     }
 }
