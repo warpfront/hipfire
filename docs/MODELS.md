@@ -559,6 +559,7 @@ and `crates/hipfire-arch-gemma4/src/gemma4.rs`):
   [`architecture-ids.md`](architecture-ids.md).
 
 The Gemma4 EAGLE drafter (arch 22) is currently gated off (`HIPFIRE_GEMMA4_EAGLE=1` to enable; see [`architecture-ids.md`](architecture-ids.md)).
+To build a drafter file, run `hipfire-quantize --format q8f16` on the stock HF dir (`google/gemma-4-{E2B,E4B,26B-A4B,31B}-it-assistant`). Its `model_type: gemma4_assistant` / `Gemma4AssistantForCausalLM` maps to arch 22 as shipped; no `config.json` edits are needed.
 
 No Gemma4 rows are registered until a quantized artifact is actually on the Hub and passes `scripts/registry_gen.py` probing: that script checks LFS presence and `size_gb` against the real file and fails the run on a mismatch.
 

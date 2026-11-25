@@ -131,6 +131,15 @@ fn gemma4_variants_route_correctly_and_gemma4_unified_assistant_is_22() {
         derive_arch_id(&json!({ "model_type": "gemma4_unified_assistant" })),
         22
     );
+    // Stock HF drafter config (google/gemma-4-*-it-assistant).
+    assert_eq!(lookup_model_type("gemma4_assistant"), Some(22));
+    assert_eq!(
+        derive_arch_id(&json!({
+            "model_type": "gemma4_assistant",
+            "architectures": ["Gemma4AssistantForCausalLM"]
+        })),
+        22
+    );
     // Bare gemma/gemma2/gemma3 must NOT map to 13 (old GGUF prefix would, new table does not).
     for mt in ["gemma", "gemma2", "gemma3", "gemma4_foobar"] {
         assert_eq!(
