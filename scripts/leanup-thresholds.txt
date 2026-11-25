@@ -221,12 +221,12 @@ topology_arch_arms_total         <= 43
 # (non-test code). A failure prints what to do instead: a carrier feature trait
 # instead of a bundle downcast, an ArchCaps capability instead of a "gfx…"
 # string match, a typed hipfire-config key instead of a raw HIPFIRE_* read.
-direction_bundle_downcasts    <= 165
-direction_gfx_string_matches  <= 865
+direction_bundle_downcasts    <= 163
+direction_gfx_string_matches  <= 857
 direction_raw_hipfire_env     <= 32
 
 # --- scripts/ top level (check-direction-ratchets.py) ---
 # Shrink-only count of files directly in scripts/ (directories not counted). New
 # tooling is a `cargo xtask` subcommand, not a script; one-offs go in an archived
 # subdirectory. `gauge_scripts_total` (informational) shows whether files only moved.
-scripts_top_level_files       <= 308
+scripts_top_level_files       <= 224
