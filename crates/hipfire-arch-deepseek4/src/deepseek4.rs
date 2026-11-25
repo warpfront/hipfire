@@ -417,6 +417,18 @@ struct RawYarnScaling {
 
 impl DeepseekV4Config {
     pub fn from_hfq(hfq: &HfqFile) -> Result<Self, String> {
+        Self::parse(hfq, false)
+    }
+
+    /// Config of an MQ2R DSpark sidecar. The sidecar carries only the draft
+    /// tensors, so the file-identity route check refuses it; the product takes
+    /// the config from the P3 target instead. Verify the sidecar identity
+    /// (`validate_mq2r_dspark_sidecar`) before this call.
+    pub fn from_mq2r_dspark_sidecar(hfq: &HfqFile) -> Result<Self, String> {
+        Self::parse(hfq, true)
+    }
+
+    fn parse(hfq: &HfqFile, mq2r_sidecar: bool) -> Result<Self, String> {
         // The quantizer wraps the DeepSeek V4 config inside an outer
         // `{"architecture":..., "config":{...}, "tokenizer":...,
         // "tokenizer_config":...}` envelope (matches the Qwen3.5
@@ -438,6 +450,7 @@ impl DeepseekV4Config {
         // map in the tensor index (hipfire_runtime::route_sku). A file that
         // carries E8 tensors without the exact recipe fails here.
         let mq2r = mq2rxt
+            || mq2r_sidecar
             || hipfire_runtime::route_sku::header_route(&hfq.metadata_json)?
                 == Some(hipfire_runtime::route_sku::RouteSku::Mq2r)
             || hipfire_runtime::route_sku::structural_route(hfq)?
