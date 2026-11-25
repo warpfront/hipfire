@@ -35,6 +35,8 @@
 //!                    --schedules 25,63,65,513,521 --output DIR   (G2 snapshot/session roundtrip at
 //!                    an Open GDN stream: restore and continue byte-exact vs uninterrupted)
 //!   qwen4_kld pair --base BASE.npy --cand CAND.npy --corpus CORPUS.json --output OUT.json
+//!   qwen4_kld restore --model MODEL.hfq --prompt-file REQUEST.json --output OUT.json
+//!                    (I2 sampled restore twin: cold vs live-restored turn-2 logits and RNG draws)
 //! `pair` (S1 slow-link gate, CPU-only) reads two full-gate `s11ref --decode`
 //! outputs (each with its OUT.npy.json receipt) over the same reference and
 //! corpus: per-corpus-sequence mean KL first, then the paired
@@ -2510,6 +2512,348 @@ const MULTI_TURN_DECODE: usize = 7;
 /// Rows of the second turn's first call in the split arm (off-grid).
 const MULTI_TURN_SPLIT: usize = 37;
 
+/// `restore`: in-process twin of the conformance row `qwen4-ar-sampled-restore`
+/// (I2, restored == fresh, sampled). `--prompt-file` is a JSON request: the row's
+/// turn 1 (`messages`, `temperature`, `top_p`, `max_tokens`, `thinking`), the
+/// daemon's turn-1 reply (`reply`) and ids (`turn1_ids`), the second user
+/// message (`user2`), the daemon's turn-2 ids on the cold and the live daemon
+/// (`turn2_reference_ids`, `turn2_candidate_ids`), `positions` and `seed_u32`
+/// (the request seed `hipfire-engine::scheduler::request_seed_for` derives from
+/// the wire seed). Prompts render like the daemon's AR route (normalized
+/// contents, the artifact's template, `render_messages`); sampling is the
+/// legacy loop's `sample_cpu` with the artifact's recommended `top_k`.
+/// Arms, each followed by `positions` turn-2 decode rows teacher-forced with
+/// the reference ids (row 0 is the prefill's final row):
+///   cold         fresh session cache, `prefill_final` of the whole turn-2 prompt
+///                (the cold daemon's route);
+///   live         fresh cache, turn 1 prefilled and sampled from the seed, committed
+///                live, turn 2 planned and prefilled from the reused prefix (the
+///                daemon's second request on the same conversation);
+///   cold_raw     one `forward_chunk_final` of the whole prompt, no session plan;
+///   chunk_split  two `forward_chunk_final` calls split at the turn-1 boundary;
+///   decode_split turn 1 as a prefill plus `forward_token`s, then the suffix, no
+///                session plan (the live route without the cache).
+/// Every arm resets the CPU sampler RNG to the seed before turn 2 and samples each
+/// row from its own logits, logging the RNG state before and after each draw.
+/// OUT.json holds max|Δ|, full-vocab KL(cold || arm), argmax, sample and RNG
+/// equality of each arm against `cold` per position.
+fn restore(model: &Path, request: &Path, output: &Path, pin: &HotsetPin) -> Result<(), String> {
+    use hipfire_runtime::arch_model::ArchModel;
+    use hipfire_runtime::llama::{argmax, reset_cpu_sampler_rng, sampler_rng_snapshot};
+    use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message};
+    use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
+    use hipfire_runtime::session_cache::{SessionCache, SessionRoute};
+    use hipfire_runtime::tokenizer::maybe_normalize_prompt;
+    use serde_json::{json, Value};
+    use std::borrow::Cow;
+
+    let req: Value = serde_json::from_str(
+        &std::fs::read_to_string(request)
+            .map_err(|e| format!("read {}: {e}", request.display()))?,
+    )
+    .map_err(|e| format!("{}: {e}", request.display()))?;
+    let field = |key: &str| req.get(key).ok_or_else(|| format!("request needs `{key}`"));
+    let num = |key: &str| {
+        field(key)?
+            .as_f64()
+            .ok_or_else(|| format!("`{key}` must be a number"))
+    };
+    let text = |key: &str| {
+        field(key)?
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| format!("`{key}` must be a string"))
+    };
+    let ids = |key: &str| -> Result<Vec<u32>, String> {
+        serde_json::from_value(field(key)?.clone()).map_err(|e| format!("`{key}`: {e}"))
+    };
+    let seed = num("seed_u32")? as u32;
+    let max_tokens = num("max_tokens")? as usize;
+    let positions = num("positions")? as usize;
+    let thinking = req
+        .get("thinking")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let daemon_turn1 = ids("turn1_ids")?;
+    let reference = ids("turn2_reference_ids")?;
+    let candidate = ids("turn2_candidate_ids")?;
+    if positions == 0 || positions > reference.len() {
+        return Err(format!(
+            "`positions` must be 1..={} (the reference ids)",
+            reference.len()
+        ));
+    }
+    let mut messages: Vec<Message> = serde_json::from_value(field("messages")?.clone())
+        .map_err(|e| format!("`messages`: {e}"))?;
+    let turn1_messages = messages.len();
+    for (role, content) in [("assistant", text("reply")?), ("user", text("user2")?)] {
+        messages.push(
+            serde_json::from_value(json!({"role": role, "content": content}))
+                .map_err(|e| format!("{role} message: {e}"))?,
+        );
+    }
+    for message in &mut messages {
+        if !message.content.is_empty() {
+            if let Cow::Owned(normalized) = maybe_normalize_prompt(&message.content) {
+                message.content = normalized;
+            }
+        }
+    }
+
+    let hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
+    let tok =
+        Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| format!("tokenizer: {e}"))?;
+    let template = hfq
+        .chat_template()
+        .ok_or("the artifact has no chat_template")?;
+    // The daemon's fallback: request top_k > the artifact's recommended top_k > none.
+    let top_k = hfq
+        .recommended_sampling()
+        .and_then(|r| r.top_k)
+        .filter(|&k| k > 0);
+    let frame = JinjaChatFrame {
+        tokenizer: &tok,
+        template: &template,
+        system: None,
+        user: "",
+        enable_thinking: thinking,
+        bos_token: None,
+        reasoning_strength: None,
+        reasoning_effort: None,
+    };
+    let render = |msgs: &[Message]| {
+        frame
+            .render_messages(msgs, None, None)
+            .map(|rendered| tok.encode(&rendered))
+            .map_err(|e| format!("render: {e}"))
+    };
+    let p1 = render(&messages[..turn1_messages])?;
+    let p2 = render(&messages)?;
+
+    let mut m = Model::load(model, 4096, 2, None, pin)?;
+    let domain = hipfire_runtime::serve_contract::CacheDomain::for_model(
+        &hfq,
+        &tok,
+        Some(&template),
+        "qwen4",
+        m.gpu.device_id,
+    );
+    drop(hfq);
+    let im_end = tok.special_token_id("<|im_end|>");
+    let budget = hipfire_config::memory::session_cache_bytes();
+    let prefill_row = m.logits.sub_offset(0, m.vocab);
+    let decode_row = m.logits.sub_offset(m.vocab, m.vocab);
+    let cfg = SamplerConfig {
+        temperature: num("temperature")? as f32,
+        top_p: num("top_p")? as f32,
+        repeat_penalty: 1.0,
+        repeat_window: 128,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        blocked_tokens: Vec::new(),
+        top_k,
+        min_p: None,
+    };
+    // The carrier's attach (`hipfire-loader` qwen4 carrier): a cache of the
+    // configured budget and `<|im_end|>` as the turn end; a fresh daemon's state.
+    let fresh_session = |m: &mut Model| -> Result<(), String> {
+        m.bundle.session_clear(&mut m.gpu);
+        m.bundle
+            .attach_session_cache(SessionCache::new(domain.clone(), budget));
+        m.bundle.set_turn_end_token(im_end);
+        m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())
+    };
+    let turn2_rows = |m: &mut Model, prompt_len: usize| -> Result<Vec<Vec<f32>>, String> {
+        m.bundle
+            .map_ahead_for_decode(&mut m.gpu, prompt_len, max_tokens, 0);
+        let mut rows = vec![m
+            .gpu
+            .download_f32(&prefill_row)
+            .map_err(|e| e.to_string())?];
+        for &token in &reference[..positions - 1] {
+            m.bundle
+                .forward_token_or_argmax(&mut m.gpu, Some(token), &decode_row)
+                .map_err(|e| format!("turn-2 decode: {e}"))?;
+            rows.push(m.gpu.download_f32(&decode_row).map_err(|e| e.to_string())?);
+        }
+        Ok(rows)
+    };
+    let chunk = |m: &mut Model, tokens: &[u32]| -> Result<(), String> {
+        m.bundle
+            .forward_chunk_final(&mut m.gpu, tokens, &prefill_row, None)
+            .map_err(|e| format!("forward_chunk_final: {e}"))
+    };
+
+    // cold
+    fresh_session(&mut m)?;
+    ArchModel::session_request_write_limit(&mut m.bundle, p2.len() + max_tokens + 1);
+    let cold_reused = m.bundle.session_plan(&p2, SessionRoute::Ar);
+    m.bundle
+        .prefill_final(&mut m.gpu, &p2, cold_reused, &prefill_row)
+        .map_err(|e| format!("cold prefill: {e}"))?;
+    let cold = turn2_rows(&mut m, p2.len())?;
+
+    // live: turn 1 sampled exactly as the legacy AR loop does, then turn 2.
+    fresh_session(&mut m)?;
+    ArchModel::session_request_write_limit(&mut m.bundle, p1.len() + max_tokens + 1);
+    let turn1_reused = m.bundle.session_plan(&p1, SessionRoute::Ar);
+    m.bundle
+        .prefill_final(&mut m.gpu, &p1, turn1_reused, &prefill_row)
+        .map_err(|e| format!("turn-1 prefill: {e}"))?;
+    m.bundle
+        .map_ahead_for_decode(&mut m.gpu, p1.len(), max_tokens, 0);
+    reset_cpu_sampler_rng(seed);
+    let mut consumed = p1.clone();
+    let mut row = m
+        .gpu
+        .download_f32(&prefill_row)
+        .map_err(|e| e.to_string())?;
+    let mut turn1 = Vec::with_capacity(max_tokens);
+    for i in 0..max_tokens {
+        let token = sample_cpu(&mut row, &consumed, &cfg);
+        turn1.push(token);
+        m.bundle
+            .forward_token_or_argmax(&mut m.gpu, Some(token), &decode_row)
+            .map_err(|e| format!("turn-1 decode: {e}"))?;
+        consumed.push(token);
+        if i + 1 < max_tokens {
+            row = m.gpu.download_f32(&decode_row).map_err(|e| e.to_string())?;
+        }
+    }
+    m.bundle.session_commit_live(&consumed);
+    let boundary = consumed.len();
+    let prefix_matches = p2.get(..boundary) == Some(&consumed[..]);
+    let mut p2_live = consumed.clone();
+    p2_live.extend_from_slice(p2.get(boundary..).unwrap_or(&[]));
+    ArchModel::session_request_write_limit(&mut m.bundle, p2_live.len() + max_tokens + 1);
+    let live_reused = m.bundle.session_plan(&p2_live, SessionRoute::Ar);
+    m.bundle
+        .prefill_final(&mut m.gpu, &p2_live, live_reused, &prefill_row)
+        .map_err(|e| format!("live turn-2 prefill: {e}"))?;
+    let live = turn2_rows(&mut m, p2_live.len())?;
+
+    // cold_raw: one call, no session plan.
+    fresh_session(&mut m)?;
+    chunk(&mut m, &p2_live)?;
+    let cold_raw = turn2_rows(&mut m, p2_live.len())?;
+
+    // chunk_split: two calls at the turn-1 boundary.
+    fresh_session(&mut m)?;
+    chunk(&mut m, &p2_live[..boundary])?;
+    chunk(&mut m, &p2_live[boundary..])?;
+    let chunk_split = turn2_rows(&mut m, p2_live.len())?;
+
+    // decode_split: the live route's forwards without the session cache.
+    fresh_session(&mut m)?;
+    chunk(&mut m, &p1)?;
+    for &token in &turn1 {
+        m.bundle
+            .forward_token_or_argmax(&mut m.gpu, Some(token), &decode_row)
+            .map_err(|e| format!("decode_split turn-1 decode: {e}"))?;
+    }
+    chunk(&mut m, &p2_live[boundary..])?;
+    let decode_split = turn2_rows(&mut m, p2_live.len())?;
+    m.bundle.session_clear(&mut m.gpu);
+
+    // Draws: the RNG reset to the seed, one `sample_cpu` per row in order.
+    let draws = |rows: &[Vec<f32>], prompt: &[u32]| -> Vec<(u32, u32, u32)> {
+        reset_cpu_sampler_rng(seed);
+        let mut history = prompt.to_vec();
+        rows.iter()
+            .enumerate()
+            .map(|(k, row)| {
+                let before = sampler_rng_snapshot();
+                let token = sample_cpu(&mut row.clone(), &history, &cfg);
+                history.push(reference[k]);
+                (token, before, sampler_rng_snapshot())
+            })
+            .collect()
+    };
+    let top = |row: &[f32]| {
+        let mut order: Vec<usize> = (0..row.len()).collect();
+        order.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
+        order[..5]
+            .iter()
+            .map(|&i| json!([i, row[i]]))
+            .collect::<Vec<_>>()
+    };
+    let cold_draws = draws(&cold, &p2);
+    let arms: [(&str, &Vec<Vec<f32>>, &[u32]); 5] = [
+        ("cold", &cold, &p2),
+        ("live", &live, &p2_live),
+        ("cold_raw", &cold_raw, &p2_live),
+        ("chunk_split", &chunk_split, &p2_live),
+        ("decode_split", &decode_split, &p2_live),
+    ];
+    let mut report_arms = Vec::new();
+    for (name, rows, prompt) in arms {
+        let arm_draws = draws(rows, prompt);
+        let mut cells = Vec::new();
+        for k in 0..positions {
+            let (a, b) = (&cold[k], &rows[k]);
+            let max_abs = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            let kl = full_vocab_kl(a, b);
+            let (token, before, after) = arm_draws[k];
+            let (cold_token, cold_before, cold_after) = cold_draws[k];
+            let rng_equal = before == cold_before && after == cold_after;
+            println!(
+                "RESTORE arm={name} pos={k} identical={} max_abs={max_abs:.6e} kl={kl:.6e} argmax={}/{} sample={token}/{cold_token} rng={before:08x}->{after:08x} cold_rng={cold_before:08x}->{cold_after:08x} rng_equal={rng_equal}",
+                a == b,
+                argmax(b),
+                argmax(a),
+            );
+            cells.push(json!({
+                "pos": k, "identical": a == b, "max_abs": max_abs, "kl": kl,
+                "argmax": argmax(b), "cold_argmax": argmax(a),
+                "sample": token, "cold_sample": cold_token,
+                "rng_before": before, "rng_after": after,
+                "cold_rng_before": cold_before, "cold_rng_after": cold_after,
+                "rng_equal": rng_equal, "top5": top(b),
+            }));
+        }
+        report_arms.push(json!({"arm": name, "positions": cells}));
+    }
+    // The daemon's candidate stream is comparable while it agrees with the
+    // reference ids the rows were teacher-forced with.
+    let live_draws = draws(&live, &p2_live);
+    let comparable = 1 + reference
+        .iter()
+        .zip(&candidate)
+        .take(positions - 1)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let candidate_reproduced =
+        (0..comparable.min(positions)).all(|k| live_draws[k].0 == candidate[k]);
+    let reference_reproduced = (0..positions).all(|k| cold_draws[k].0 == reference[k]);
+    println!(
+        "RESTORE p1={} p2={} boundary={boundary} prefix_matches={prefix_matches} turn1_matches_daemon={} reused cold={cold_reused} turn1={turn1_reused} live={live_reused} top_k={top_k:?} seed={seed:08x} reference_reproduced={reference_reproduced} candidate_reproduced={candidate_reproduced} (first {comparable} positions)",
+        p1.len(),
+        p2.len(),
+        turn1 == daemon_turn1,
+    );
+    let receipt = json!({
+        "schema": "hipfire.qwen4.restore_twin.v1", "model": model.display().to_string(),
+        "arch": m.gpu.arch.to_string(), "seed_u32": seed, "top_k": top_k,
+        "temperature": cfg.temperature, "top_p": cfg.top_p,
+        "p1": p1, "p2": p2, "p2_live": p2_live, "boundary": boundary,
+        "prefix_matches": prefix_matches,
+        "turn1": turn1, "turn1_matches_daemon": turn1 == daemon_turn1,
+        "reused": {"cold": cold_reused, "turn1": turn1_reused, "live": live_reused},
+        "reference_reproduced": reference_reproduced,
+        "candidate_reproduced": candidate_reproduced, "candidate_comparable": comparable,
+        "arms": report_arms,
+    });
+    std::fs::write(
+        output,
+        serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())? + "\n",
+    )
+    .map_err(|e| format!("write {}: {e}", output.display()))
+}
+
 /// Little-endian f64 rows of a 1-D `.npy` as `write_kl_npy` writes them.
 fn read_kl_npy(path: &Path) -> Result<Vec<f64>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -2806,6 +3150,10 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                 return Err("chunklogits requires --prompts and --schedules".into());
             }
             chunklogits(&model, &prompts, max_prompt, &schedules, &output, &pin)
+        }
+        ("restore", Some(model), None, None, Some(output)) => {
+            let request = prompt_file.ok_or("restore requires --prompt-file REQUEST.json")?;
+            restore(&model, &request, &output, &pin)
         }
         ("g2", Some(model), None, None, Some(output)) => {
             let max_prompt = max_prompt.ok_or("g2 requires --max-prompt")?;
