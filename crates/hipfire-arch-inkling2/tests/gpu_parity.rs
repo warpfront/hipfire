@@ -599,16 +599,18 @@ fn gate3_token0_logits() {
 /// position 1 on it can. Bars: the same argmax at every position and
 /// r >= `R_MIN` at every position.
 ///
-/// `R_MIN` is empirical, from gfx1151: with the MoE post-conv history at the
-/// wrong offset (`4 * ekv`) this sequence gives r 0.959 / 0.968 / 0.952 at
-/// positions 1..3 and a different argmax at position 3; at the right offset
-/// (`2 * ekv + e`) r is 0.997 / 0.978 / 0.987 / 0.983. Positions >= 1 stay
-/// below position 0, which is not explained yet.
+/// `R_MIN` is empirical, from gfx1151 on this sequence. Correct: r 0.9988 /
+/// 0.9971 / 0.9948 / 0.9940. With the loop-message bank also mixing the
+/// prelude and first core block: 0.997 / 0.978 / 0.987 / 0.983. With, in
+/// addition, the MoE post-conv history at the wrong offset (`4 * ekv`):
+/// 0.997 / 0.959 / 0.968 / 0.952 and a different argmax at position 3. What
+/// remains is mostly the down_proj repack (the CPU reads the original MQ4
+/// down_proj, the GPU a re-quantized MQ4G256V2 copy).
 #[test]
 #[ignore = "needs the 14 GB MQ4 artifact + a HIP GPU; slow CPU reference"]
 fn gate3b_multi_token_logits() {
     const TOKENS: [u32; 4] = [5000, 12345, 777, 31274];
-    const R_MIN: f32 = 0.97;
+    const R_MIN: f32 = 0.99;
     let (cfg, weights) = open_artifact();
     let vocab = cfg.unpadded_vocab_size;
     let e = cfg.n_embd;
