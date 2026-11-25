@@ -244,7 +244,7 @@ pub struct FeatureFlags {
     /// run the unfused reference.
     pub qwen4_gdn_lanes_fuse: bool,
     /// Qwen4 MQ4G128V2 K=640 indexed MoE down with four weight rows per wave
-    /// (`HIPFIRE_QWEN4_MOE_DOWN_R4`), default on for gfx1151.
+    /// (`HIPFIRE_QWEN4_MOE_DOWN_R4`), default on for gfx1100, gfx1151, gfx1201.
     pub qwen4_moe_down_r4: bool,
     /// Single-token Q8 K=640 shared-expert down + BF16 scaled add in one
     /// launch (`HIPFIRE_QWEN4_SHARED_DOWN_FUSE`), default on for gfx1151.
@@ -257,8 +257,8 @@ pub struct FeatureFlags {
     /// default on only for gfx1151.
     pub qwen4_decode_head_fuse: bool,
     /// Fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
-    /// (`HIPFIRE_QWEN4_PLE_FUSE`), default on for gfx1151 and gfx1201, off
-    /// elsewhere.
+    /// (`HIPFIRE_QWEN4_PLE_FUSE`), default on for gfx1100, gfx1151 and gfx1201,
+    /// off elsewhere.
     pub qwen4_ple_fuse: bool,
     /// Split partial-N gfx11 IU4 grids into unchecked full-tile interior and
     /// one guarded tail launch (`kernel.gfx11_iu4_gridspec`, default on).
@@ -1112,7 +1112,7 @@ impl FeatureFlags {
         // for exact gfx1151 only; gfx1201 takes its own subset below.
         let halo_hyper_default = arch == "gfx1151";
         // The exact units that do not need the F16 WMMA route (H8a combine
-        // zero-init, wave-per-token router, fused PLE tail) default on for
+        // zero-init, wave-per-token router) default on for
         // exact gfx1151 and gfx1201.
         let exact_unit_default = matches!(arch, "gfx1151" | "gfx1201");
         // gfx1201 takes the H1 pairing and the retiled HC up+mix on its
@@ -1269,15 +1269,18 @@ impl FeatureFlags {
                 value(hipfire_config::QWEN4_LANE_ROW_EXACT_ENV).ok().as_deref(),
             ) != hipfire_config::LaneRowExact::GreedySeeded,
             qwen4_gdn_lanes_fuse: true,
+            // gfx1100: byte-identical at +0.9 % decode (Kaden, #1130 D2).
             qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4")
-                .unwrap_or(arch == "gfx1151" || is_gfx1201),
+                .unwrap_or(matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")),
             qwen4_shared_down_fuse: parse_bool("HIPFIRE_QWEN4_SHARED_DOWN_FUSE")
                 .unwrap_or(arch == "gfx1151"),
             qwen4_decode_zba_x3: parse_bool("HIPFIRE_QWEN4_DECODE_ZBA_X3")
                 .unwrap_or(arch == "gfx1151"),
             qwen4_decode_head_fuse: parse_bool("HIPFIRE_QWEN4_DECODE_HEAD_FUSE")
                 .unwrap_or(arch == "gfx1151"),
-            qwen4_ple_fuse: parse_bool("HIPFIRE_QWEN4_PLE_FUSE").unwrap_or(exact_unit_default),
+            // gfx1100: byte-identical at +0.8 % decode (Kaden, #1130 D2).
+            qwen4_ple_fuse: parse_bool("HIPFIRE_QWEN4_PLE_FUSE")
+                .unwrap_or(matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
             gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(true),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
@@ -2042,8 +2045,10 @@ impl FeatureFlags {
         self.qwen4_qsa_lanes && matches!(self.arch.as_str(), "gfx1201" | "gfx942")
     }
 
+    /// Exact gfx1100 / gfx1151 / gfx1201. gfx1100 receipt: Kaden on #1130,
+    /// byte-identical output at +0.9 % decode (accepted under the 2 % floor, D2).
     pub fn qwen4_moe_down_r4_enabled(&self) -> bool {
-        self.qwen4_moe_down_r4 && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
+        self.qwen4_moe_down_r4 && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
     }
 
     pub fn qwen4_shared_down_fuse_enabled(&self) -> bool {
@@ -2141,9 +2146,11 @@ impl FeatureFlags {
     }
 
     /// The fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
-    /// (`HIPFIRE_QWEN4_PLE_FUSE`). Exact gfx1151 / gfx1201.
+    /// (`HIPFIRE_QWEN4_PLE_FUSE`). Exact gfx1100 / gfx1151 / gfx1201. gfx1100
+    /// receipt: Kaden on #1130, byte-identical output at +0.8 % decode
+    /// (accepted under the 2 % floor, D2).
     pub fn qwen4_ple_fuse_enabled(&self) -> bool {
-        self.qwen4_ple_fuse && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
+        self.qwen4_ple_fuse && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
     }
     /// Producer-emitted IU4 sidecar route on gfx1100/gfx1151 + IU4 opt-in.
     /// When live (and eager + batch/K admission), RMSNorm/FWHT and
@@ -3319,9 +3326,9 @@ mod tests {
         }
     }
 
-    /// The fused PLE tail defaults on for exact gfx1151 / gfx1201; `0` turns it off.
+    /// The fused PLE tail defaults on for exact gfx1100 / gfx1151 / gfx1201; `0` turns it off.
     #[test]
-    fn qwen4_ple_fuse_flag_defaults_on_exact_gfx1151_gfx1201() {
+    fn qwen4_ple_fuse_flag_defaults_on_exact_gfx1100_gfx1151_gfx1201() {
         let with = |value: &'static str| {
             move |name: &str| -> std::result::Result<String, ()> {
                 if name == "HIPFIRE_QWEN4_PLE_FUSE" {
@@ -3334,7 +3341,7 @@ mod tests {
         for arch in [
             "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
         ] {
-            let exact = matches!(arch, "gfx1151" | "gfx1201");
+            let exact = matches!(arch, "gfx1100" | "gfx1151" | "gfx1201");
             assert_eq!(
                 FeatureFlags::from_lookup(arch, |_| Err(())).qwen4_ple_fuse_enabled(),
                 exact,

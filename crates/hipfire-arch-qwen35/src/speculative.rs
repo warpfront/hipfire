@@ -228,20 +228,55 @@ fn dflash_moe_draft_ffn_graph_eligible(
     num_experts > 0 && !ctx_slice_present && !pld_present && !use_temp_sampling
 }
 
+/// One default-off `HIPFIRE_VERIFY_GRAPH` quarantine: the verify HipGraph stays
+/// off for an exact (arch, target lm_head dtype) pair unless `=1` opts in.
+/// Direct batched HIP/WMMA stays on for the pair.
+struct VerifyGraphQuarantine {
+    arch: &'static str,
+    dtypes: &'static [rdna_compute::DType],
+    /// Measured reason, or `None` while the pair has no receipt. Kaden offered
+    /// a paired DFlash graph on/off A/B on gfx1100 and gfx1201 (#1130); a
+    /// follow-up updates the unreceipted rows from it.
+    #[allow(dead_code)]
+    receipt: Option<&'static str>,
+}
+
+/// HIPF-396 tier C (#1130 D3): the three quarantines, moved here unchanged.
+const VERIFY_GRAPH_QUARANTINES: &[VerifyGraphQuarantine] = &[
+    // `dc105ea64` admitted MQ2/3/4/5/6G256V2 to gfx1100 batched WMMA, and
+    // `verify_graph_ok` shares that eligibility via `prefill_batch_pbs_eligible`.
+    // Graph-off direct and forced-blob direct full-model V2 fixtures pass on
+    // gfx1100, but two graph-on V2 campaigns lost the endpoint.
+    VerifyGraphQuarantine {
+        arch: "gfx1100",
+        dtypes: &[
+            rdna_compute::DType::MQ4G256V2,
+            rdna_compute::DType::MQ6G256V2,
+            rdna_compute::DType::MQ5G256V2,
+            rdna_compute::DType::MQ3G256V2,
+            rdna_compute::DType::MQ2G256V2,
+        ],
+        receipt: None,
+    },
+    // Direct batched HIP is faster for the measured Qwen MQ4 workload.
+    VerifyGraphQuarantine {
+        arch: "gfx1100",
+        dtypes: &[rdna_compute::DType::MQ4G256],
+        receipt: Some("#695"),
+    },
+    // Paired 11.5K DFlash runs on R9700 showed graph replay slower than the
+    // direct tiled-flash path; no receipt is on file.
+    VerifyGraphQuarantine {
+        arch: "gfx1201",
+        dtypes: &[rdna_compute::DType::MQ4G256],
+        receipt: None,
+    },
+];
+
 /// Whether `HIPFIRE_VERIFY_GRAPH` admits the HipGraph verify route for this
-/// (arch, target lm_head dtype) pair.
-///
-/// `dc105ea64` newly admitted MQ2/3/4/5/6G256V2 to gfx1100 batched WMMA, and
-/// `verify_graph_ok` shares that eligibility via `prefill_batch_pbs_eligible`.
-/// Graph-off direct and forced-blob direct full-model V2 fixtures pass on
-/// gfx1100, but two graph-on V2 campaigns lost the endpoint. Default-off graph
-/// quarantines (direct batched HIP/WMMA remains on):
-/// - exact gfx1100 + MQ*V2
-/// - exact gfx1100 + legacy MQ4G256 (measured direct HIP faster)
-/// - exact gfx1201 + legacy MQ4G256 (measured graph replay slower than direct)
-///
-/// `HIPFIRE_VERIFY_GRAPH=1` opts back in diagnostically; `=0` force-offs
-/// everywhere; all other arch/dtype pairs stay default-on.
+/// (arch, target lm_head dtype) pair. `=0` force-offs everywhere; `=1` opts the
+/// `VERIFY_GRAPH_QUARANTINES` pairs back in diagnostically; all other pairs
+/// stay default-on.
 pub(crate) fn dflash_verify_graph_env_eligible(
     arch: &str,
     output_dtype: rdna_compute::DType,
@@ -250,28 +285,10 @@ pub(crate) fn dflash_verify_graph_env_eligible(
     if verify_graph == Some(false) {
         return false;
     }
-    let is_mq_v2 = matches!(
-        output_dtype,
-        rdna_compute::DType::MQ4G256V2
-            | rdna_compute::DType::MQ6G256V2
-            | rdna_compute::DType::MQ5G256V2
-            | rdna_compute::DType::MQ3G256V2
-            | rdna_compute::DType::MQ2G256V2
-    );
-    if arch == "gfx1100" && is_mq_v2 {
-        return verify_graph == Some(true);
-    }
-    if arch == "gfx1100" && output_dtype == rdna_compute::DType::MQ4G256 {
-        // Direct batched HIP is faster for the measured Qwen MQ4 workload;
-        // keep graph available as an explicit diagnostic opt-in.
-        return verify_graph == Some(true);
-    }
-    if arch == "gfx1201" && output_dtype == rdna_compute::DType::MQ4G256 {
-        // Paired 11.5K DFlash runs on R9700 show graph replay slower than the
-        // direct tiled-flash path; keep it available as an explicit diagnostic.
-        return verify_graph == Some(true);
-    }
-    true
+    let quarantined = VERIFY_GRAPH_QUARANTINES
+        .iter()
+        .any(|q| q.arch == arch && q.dtypes.contains(&output_dtype));
+    !quarantined || verify_graph == Some(true)
 }
 
 pub(crate) fn dflash_batched_lm_head_supported(dtype: rdna_compute::DType) -> bool {

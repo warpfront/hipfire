@@ -10,7 +10,7 @@
 //! (`crates/hipfire-arch-qwen4/src/gpu_forward.rs`,
 //! `crates/hipfire-dispatch/src/pipeline/layer_ops.rs`), so on gfx942 it
 //! exercises the variant gfx942 takes: `qwen4_ple_fuse_enabled()` is exact
-//! gfx1151 / gfx1201 and `qwen4_bf16_streams` needs `has_gfx11_plus_simt()`, so
+//! gfx1100 / gfx1151 / gfx1201 and `qwen4_bf16_streams` needs `has_gfx11_plus_simt()`, so
 //! the unfused PLE chain on F32 streams is what runs here.
 //! Census of record: `local://census-io.md`.
 
@@ -260,7 +260,7 @@ fn embedding_q8_batched(gpu: &mut Gpu) -> Result<String, String> {
 // PLE row gather: host-staged BF16 [tokens, 16, 160] widened to F32
 // (`gpu_forward.rs:6293`, lanes `gpu_forward_lanes.rs:1576`). Exact.
 // (`grouped_gather_convert_bf16_f16` is the fused-F16 sibling: unreachable on
-// gfx942, `qwen4_ple_rows_f16` needs `qwen4_ple_fuse_enabled()` = gfx1151/1201.)
+// gfx942, `qwen4_ple_rows_f16` needs `qwen4_ple_fuse_enabled()` = gfx1100/1151/1201.)
 fn grouped_gather_convert_bf16(gpu: &mut Gpu) -> Result<String, String> {
     let mut rng = Rng::new(0xE003);
     let mut results = Vec::new();
