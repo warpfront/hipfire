@@ -1230,7 +1230,9 @@ fn run_visit(
             None,
             &gs.conv[visit],
             &tmp[moe_conv],
-            4 * ekv,
+            // ffn-out segment starts after K, V and attn-out: 2*ekv + e
+            // (was 4 * ekv, which overlapped the last 256 attn-out channels).
+            2 * ekv + e,
             e,
             0,
             hd,
