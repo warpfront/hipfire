@@ -18,8 +18,8 @@ use hipfire_engine::terminal::{
 };
 use hipfire_generate::ar::{emit_generation_start, GenerationRoute, GenerationRouteScope};
 use hipfire_generate::dense::{
-    gemma4_commit_terminal, gemma4_finish_reason, gemma4_pending_done, gemma4_template_messages,
-    gemma4_tools_unsupported_reason, Gemma4TurnStats, Gemma4TurnText,
+    gemma4_commit_terminal, gemma4_finish_reason, gemma4_pending_done,
+    gemma4_tools_unsupported_reason, openai_template_messages, Gemma4TurnStats, Gemma4TurnText,
 };
 use hipfire_runtime::prompt_frame::{Message, Role, ToolCall};
 use serde_json::{json, Value};
@@ -347,7 +347,7 @@ fn smoke_history() -> Vec<Message> {
 
 #[test]
 fn template_messages_carry_openai_function_calls_and_resolved_tool_names() {
-    let values = gemma4_template_messages(&smoke_history()).unwrap();
+    let values = openai_template_messages(&smoke_history()).unwrap();
     assert_eq!(
         values[2]["tool_calls"],
         json!([{
@@ -363,7 +363,7 @@ fn template_messages_carry_openai_function_calls_and_resolved_tool_names() {
 
     let mut bad = smoke_history();
     bad[2].tool_calls[0].arguments = Value::String("not json".to_owned());
-    assert!(gemma4_template_messages(&bad).is_err());
+    assert!(openai_template_messages(&bad).is_err());
 }
 
 /// The Gemma 4 template's tool-call and tool-response walk (verbatim
@@ -412,7 +412,7 @@ fn projected_history_renders_through_the_gemma_tool_walk() {
     };
     let history = smoke_history();
     let rendered = frame
-        .render_message_values(gemma4_template_messages(&history).unwrap(), None, None)
+        .render_message_values(openai_template_messages(&history).unwrap(), None, None)
         .unwrap();
     assert!(
         rendered.contains("<|tool_call>call:get_temperature{city:<|\"|>Oslo<|\"|>}<tool_call|>"),

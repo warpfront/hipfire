@@ -1052,14 +1052,18 @@ pub fn cached_producer_reasoning_text(
     Some(reasoning)
 }
 
-/// JSON formatter matching HuggingFace's `json.dumps(..., ensure_ascii=False)`
-/// default separators — `", "` between elements and `": "` after keys — the
-/// exact form the model's chat_template was trained on. minijinja's builtin
-/// `tojson` is compact (`,`/`:`); registering [`hf_tojson`] on the render env
-/// makes `{{ x | tojson }}` (tool DEFINITIONS and mapping-valued tool-call
+/// JSON formatter matching HuggingFace's `json.dumps(..., ensure_ascii=False)`:
+/// by default its separators — `", "` between elements and `": "` after keys —
+/// the exact form the model's chat_template was trained on, or the
+/// `separators=(item, key)` a template passes. minijinja's builtin `tojson` is
+/// compact (`,`/`:`); registering [`hf_tojson_filter`] on the render env makes
+/// `{{ x | tojson }}` (tool DEFINITIONS and mapping-valued tool-call
 /// arguments) byte-match `transformers.apply_chat_template`.
-struct HfJsonFormatter;
-impl serde_json::ser::Formatter for HfJsonFormatter {
+struct HfJsonFormatter<'a> {
+    item: &'a [u8],
+    key: &'a [u8],
+}
+impl serde_json::ser::Formatter for HfJsonFormatter<'_> {
     fn begin_array_value<W: ?Sized + std::io::Write>(
         &mut self,
         w: &mut W,
@@ -1068,7 +1072,7 @@ impl serde_json::ser::Formatter for HfJsonFormatter {
         if first {
             Ok(())
         } else {
-            w.write_all(b", ")
+            w.write_all(self.item)
         }
     }
     fn begin_object_key<W: ?Sized + std::io::Write>(
@@ -1079,24 +1083,72 @@ impl serde_json::ser::Formatter for HfJsonFormatter {
         if first {
             Ok(())
         } else {
-            w.write_all(b", ")
+            w.write_all(self.item)
         }
     }
     fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
-        w.write_all(b": ")
+        w.write_all(self.key)
     }
 }
 
-/// HF-compatible `tojson` filter (see [`HfJsonFormatter`]). Serializes the
-/// minijinja value DIRECTLY (not through an intermediate `serde_json::Value`),
-/// so map key order is whatever the value carries — preserved end-to-end when
-/// `serde_json` is built with `preserve_order` (without it, the request-parse
-/// `BTreeMap` has already alphabetized object keys before render). Register with
-/// `env.add_filter("tojson", hf_tojson)` to override minijinja's compact builtin.
+/// HF-compatible `tojson` with HF's default separators (see
+/// [`HfJsonFormatter`]). Serializes the minijinja value DIRECTLY (not through
+/// an intermediate `serde_json::Value`), so map key order is whatever the
+/// value carries — preserved end-to-end when `serde_json` is built with
+/// `preserve_order` (without it, the request-parse `BTreeMap` has already
+/// alphabetized object keys before render).
 pub fn hf_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
-    use serde::Serialize;
+    hf_json_string(&value, b", ", b": ")
+}
+
+/// The `tojson` filter registered on the render env: [`hf_tojson`] plus the
+/// keyword arguments of transformers' Jinja `tojson` that change bytes —
+/// `separators=(item, key)` and `sort_keys` (recursive, like `json.dumps`).
+/// Any other keyword argument is an error rather than silently ignored.
+pub fn hf_tojson_filter(
+    value: minijinja::Value,
+    kwargs: minijinja::value::Kwargs,
+) -> Result<String, minijinja::Error> {
+    let invalid = |msg: String| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg);
+    let separators: Option<Vec<String>> = kwargs.get("separators")?;
+    let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
+    kwargs.assert_all_used()?;
+    let (item, key) = match separators.as_deref() {
+        None => (", ", ": "),
+        Some([item, key]) => (item.as_str(), key.as_str()),
+        Some(other) => {
+            return Err(invalid(format!(
+                "tojson: separators must be an (item, key) pair, got {} values",
+                other.len()
+            )))
+        }
+    };
+    if sort_keys != Some(true) {
+        return hf_json_string(&value, item.as_bytes(), key.as_bytes());
+    }
+    let mut json = serde_json::to_value(&value).map_err(|e| invalid(format!("tojson: {e}")))?;
+    sort_json_keys(&mut json);
+    hf_json_string(&json, item.as_bytes(), key.as_bytes())
+}
+
+fn sort_json_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.sort_keys();
+            map.values_mut().for_each(sort_json_keys);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(sort_json_keys),
+        _ => {}
+    }
+}
+
+fn hf_json_string(
+    value: &impl serde::Serialize,
+    item: &[u8],
+    key: &[u8],
+) -> Result<String, minijinja::Error> {
     let mut buf = Vec::new();
-    let mut ser = serde_json::Serializer::with_formatter(&mut buf, HfJsonFormatter);
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, HfJsonFormatter { item, key });
     value.serialize(&mut ser).map_err(|e| {
         minijinja::Error::new(
             minijinja::ErrorKind::InvalidOperation,
@@ -1412,7 +1464,7 @@ impl<'a> JinjaChatFrame<'a> {
         // Override minijinja's compact builtin `tojson` with the HF-spaced form
         // (`", "` / `": "`) the model trained on, so tool-definition and
         // mapping-arg rendering byte-matches transformers' apply_chat_template.
-        env.add_filter("tojson", hf_tojson);
+        env.add_filter("tojson", hf_tojson_filter);
 
         let cleaned_template =
             parenthesize_conditional_kwargs(&strip_generation_tags(self.template));

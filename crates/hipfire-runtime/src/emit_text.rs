@@ -334,6 +334,11 @@ pub struct MessageFrameMarkers {
     /// Every other special token, sorted. Never rendered as text: a role
     /// header or a content kind other than the two above.
     pub protocol: Vec<u32>,
+    /// Content kind of a JSON tool invocation, when the vocabulary has one.
+    pub invoke_json: Option<u32>,
+    /// Content kind of a text tool invocation; no template emits it, so a
+    /// tools turn that produces it fails closed.
+    pub invoke_text: Option<u32>,
 }
 
 impl MessageFrameMarkers {
@@ -341,9 +346,11 @@ impl MessageFrameMarkers {
     pub const MESSAGE_CLOSE: &'static str = "<|end_message|>";
     pub const REASONING: &'static str = "<|content_thinking|>";
     pub const TEXT: &'static str = "<|content_text|>";
+    pub const INVOKE_JSON: &'static str = "<|content_invoke_tool_json|>";
+    pub const INVOKE_TEXT: &'static str = "<|content_invoke_tool_text|>";
 
     /// Resolve the markers from the tokenizer's special tokens; `None` when
-    /// the vocabulary lacks any of the four.
+    /// the vocabulary lacks any of the four frame markers.
     pub fn from_tokenizer(tokenizer: &crate::tokenizer::Tokenizer) -> Option<Self> {
         let message_open = tokenizer.special_token_id(Self::MESSAGE_OPEN)?;
         let message_close = tokenizer.special_token_id(Self::MESSAGE_CLOSE)?;
@@ -364,6 +371,8 @@ impl MessageFrameMarkers {
             reasoning,
             text,
             protocol,
+            invoke_json: tokenizer.special_token_id(Self::INVOKE_JSON),
+            invoke_text: tokenizer.special_token_id(Self::INVOKE_TEXT),
         })
     }
 }
@@ -376,6 +385,9 @@ enum FrameSpan {
     Reasoning,
     /// Between `message_open` and the content kind: the message name.
     Header,
+    /// Body of a JSON tool invocation (tools turns only): buffered, never
+    /// streamed, parsed when the message closes.
+    Invoke,
 }
 
 /// Incremental router for [`MessageFrameMarkers`] protocols: committed token
@@ -387,9 +399,16 @@ enum FrameSpan {
 /// depends only on the token sequence, so streamed and non-streamed turns
 /// concatenate to the same channels. A message closed by `<|end_message|>`
 /// leaves the turn open; only [`Self::finish_into`] (EOS, length, abort) ends
-/// it, keeping whatever the open span held in its channel. A content kind
-/// other than reasoning/text (tool invocation) routes its body to content;
-/// structured tool parsing is not part of this router.
+/// it, keeping whatever the open span held in its channel.
+///
+/// Tool invocations (`<|message_model|>NAME<|content_invoke_tool_json|>
+/// {"name":NAME,"args":{…}}<|end_message|>`) are parsed only on a router
+/// built [`Self::with_tools`]: the body is buffered, validated when its
+/// message closes, and kept in [`Self::tool_calls`]; it never reaches an
+/// event. The first protocol violation latches [`Self::tool_error`], and an
+/// invocation still open at the end of the turn shows in
+/// [`Self::in_tool_call`]; the caller decides the terminal. Without tools any
+/// other content kind routes its body to content.
 ///
 /// `Content` events carry no protocol markers: on this protocol they are the
 /// client-visible answer.
@@ -399,6 +418,12 @@ pub struct MessageFrameRouter {
     span: FrameSpan,
     header: String,
     finished: bool,
+    /// Declared tool names; `None` when the turn carries no tools.
+    tools: Option<Vec<String>>,
+    invoke_name: String,
+    invoke_body: String,
+    calls: Vec<crate::prompt_frame::ToolCall>,
+    tool_error: Option<String>,
 }
 
 impl MessageFrameRouter {
@@ -409,7 +434,35 @@ impl MessageFrameRouter {
             span: FrameSpan::Content,
             header: String::new(),
             finished: false,
+            tools: None,
+            invoke_name: String::new(),
+            invoke_body: String::new(),
+            calls: Vec::new(),
+            tool_error: None,
         }
+    }
+
+    /// A router for a turn that declared `tools` (their function names).
+    pub fn with_tools(markers: MessageFrameMarkers, tools: Vec<String>) -> Self {
+        Self {
+            tools: Some(tools),
+            ..Self::new(markers)
+        }
+    }
+
+    /// Calls completed and validated so far, in generation order.
+    pub fn tool_calls(&self) -> &[crate::prompt_frame::ToolCall] {
+        &self.calls
+    }
+
+    /// The first tool-protocol violation, if any; the turn must fail closed.
+    pub fn tool_error(&self) -> Option<&str> {
+        self.tool_error.as_deref()
+    }
+
+    /// Whether a tool invocation is open (its message not yet closed).
+    pub fn in_tool_call(&self) -> bool {
+        self.span == FrameSpan::Invoke
     }
 
     /// Route one committed token, appending to `out`. Inert after
@@ -424,17 +477,40 @@ impl MessageFrameRouter {
             return;
         }
         let m = &self.markers;
-        if token == m.message_open {
+        let (open, close, reasoning, text) = (m.message_open, m.message_close, m.reasoning, m.text);
+        let protocol = m.protocol.binary_search(&token).is_ok();
+        let tools_on = self.tools.is_some();
+        let invoke_json = tools_on && Some(token) == m.invoke_json;
+        let invoke_text = tools_on && Some(token) == m.invoke_text;
+        let is_marker = token == open || token == reasoning || token == text || protocol;
+        if self.span == FrameSpan::Invoke && token != close && is_marker {
+            self.fail_tool("tool call not closed before the next protocol token");
+        }
+        if token == open {
             self.close_span(out);
             self.span = FrameSpan::Header;
-        } else if token == m.message_close {
+        } else if token == close {
             self.close_span(out);
+            if self.span == FrameSpan::Invoke {
+                self.finish_call();
+            }
             self.span = FrameSpan::Content;
-        } else if token == m.reasoning {
+        } else if token == reasoning {
             self.enter_body(FrameSpan::Reasoning, out);
-        } else if token == m.text {
+        } else if token == text {
             self.enter_body(FrameSpan::Content, out);
-        } else if m.protocol.binary_search(&token).is_ok() {
+        } else if invoke_json || invoke_text {
+            if self.span != FrameSpan::Header {
+                self.fail_tool("tool invocation outside a model message header");
+            } else if invoke_text {
+                self.fail_tool("text tool invocation is not supported");
+            }
+            let tail = self.text.flush();
+            self.route(tail, out);
+            self.invoke_name = std::mem::take(&mut self.header);
+            self.invoke_body.clear();
+            self.span = FrameSpan::Invoke;
+        } else if protocol {
             if self.span == FrameSpan::Header {
                 self.enter_body(FrameSpan::Content, out);
             } else {
@@ -447,8 +523,10 @@ impl MessageFrameRouter {
         }
     }
 
-    /// End of turn: flush held bytes into the open span and release an
-    /// unfinished header as content. Repeated calls are inert.
+    /// End of turn: flush held bytes into the open span and, on a turn
+    /// without tools, release an unfinished header as content. An open tool
+    /// invocation stays open ([`Self::in_tool_call`]) and is never released.
+    /// Repeated calls are inert.
     pub fn finish_into(&mut self, out: &mut Vec<ThinkRouteEvent>) {
         if self.finished {
             return;
@@ -457,13 +535,17 @@ impl MessageFrameRouter {
         self.finished = true;
     }
 
-    /// Flush held bytes into the current span; a header that never named a
-    /// content kind carried text, so it is released as content.
+    /// Flush held bytes into the current span; without tools, a header that
+    /// never named a content kind carried text, so it is released as content.
     fn close_span(&mut self, out: &mut Vec<ThinkRouteEvent>) {
         let tail = self.text.flush();
         self.route(tail, out);
-        if self.span == FrameSpan::Header && !self.header.is_empty() {
-            out.push(ThinkRouteEvent::Content(std::mem::take(&mut self.header)));
+        if self.span == FrameSpan::Header {
+            let header = std::mem::take(&mut self.header);
+            // On a tools turn a header names a tool: protocol, never prose.
+            if self.tools.is_none() && !header.is_empty() {
+                out.push(ThinkRouteEvent::Content(header));
+            }
         }
     }
 
@@ -483,7 +565,50 @@ impl MessageFrameRouter {
             FrameSpan::Content => out.push(ThinkRouteEvent::Content(text)),
             FrameSpan::Reasoning => out.push(ThinkRouteEvent::Reasoning(text)),
             FrameSpan::Header => self.header.push_str(&text),
+            FrameSpan::Invoke => self.invoke_body.push_str(&text),
         }
+    }
+
+    fn fail_tool(&mut self, reason: &str) {
+        if self.tool_error.is_none() {
+            self.tool_error = Some(reason.to_owned());
+        }
+    }
+
+    /// Validate a closed invocation: exactly `{"name": NAME, "args": {…}}`,
+    /// `NAME` equal to the message header and a declared tool.
+    fn finish_call(&mut self) {
+        let name = std::mem::take(&mut self.invoke_name);
+        let body = std::mem::take(&mut self.invoke_body);
+        let parsed = match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(serde_json::Value::Object(map)) => map,
+            Ok(_) => return self.fail_tool("tool call body is not a JSON object"),
+            Err(_) => return self.fail_tool("tool call body is not valid JSON"),
+        };
+        if parsed.len() != 2 {
+            return self.fail_tool("tool call body must hold exactly `name` and `args`");
+        }
+        match parsed.get("name").and_then(serde_json::Value::as_str) {
+            Some(body_name) if body_name == name => {}
+            Some(_) => return self.fail_tool("tool call name differs from its message header"),
+            None => return self.fail_tool("tool call `name` must be a string"),
+        }
+        let Some(args @ serde_json::Value::Object(_)) = parsed.get("args") else {
+            return self.fail_tool("tool call `args` must be an object");
+        };
+        let declared = self
+            .tools
+            .as_deref()
+            .is_some_and(|tools| tools.iter().any(|tool| *tool == name));
+        if !declared {
+            return self.fail_tool("tool call names an undeclared tool");
+        }
+        self.calls.push(crate::prompt_frame::ToolCall {
+            id: None,
+            arguments: args.clone(),
+            name,
+            rendered_body: None,
+        });
     }
 }
 

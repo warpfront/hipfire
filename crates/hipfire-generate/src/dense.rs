@@ -2344,7 +2344,7 @@ pub fn generate_gemma4(
                             &synthesized
                         }
                     };
-                gemma4_template_messages(messages_slice)
+                openai_template_messages(messages_slice)
                     .and_then(|values| frame.render_message_values(values, tools, None))
             } else {
                 frame.render()
@@ -2591,12 +2591,13 @@ pub fn gemma4_tools_unsupported_reason(chat_template: Option<&str>) -> Option<&'
     }
 }
 
-/// The `messages` the Gemma 4 template reads. It walks OpenAI-shaped
-/// `tool_calls[].function.{name,arguments}` (arguments a mapping, else it
-/// raises) and names a tool result by its `tool_call_id`'s call or its
-/// `name`; [`Message`](hipfire_runtime::prompt_frame::Message) serializes
-/// neither shape, so assistant calls and tool results are projected here.
-pub fn gemma4_template_messages(
+/// The `messages` a template reading OpenAI-shaped history expects (Gemma 4,
+/// Inkling-2-Mini). It walks `tool_calls[].function.{name,arguments}`
+/// (arguments a mapping, else it raises) and names a tool result by its
+/// `tool_call_id`'s call or its `name`;
+/// [`Message`](hipfire_runtime::prompt_frame::Message) serializes neither
+/// shape, so assistant calls and tool results are projected here.
+pub fn openai_template_messages(
     messages: &[hipfire_runtime::prompt_frame::Message],
 ) -> Result<Vec<serde_json::Value>, String> {
     use hipfire_runtime::prompt_frame::Role;
@@ -6708,6 +6709,74 @@ mod inkling_context_refusal_tests {
     }
 }
 
+/// History for the Inkling-2-Mini template: [`openai_template_messages`],
+/// refusing a tool result that names no tool. The template would render it
+/// as a bare `<|message_tool|>` header, so the model could not tell which
+/// call it answers.
+pub fn inkling_template_messages(
+    messages: &[hipfire_runtime::prompt_frame::Message],
+) -> Result<Vec<serde_json::Value>, String> {
+    let values = openai_template_messages(messages)?;
+    for value in &values {
+        let is_tool = value.get("role").and_then(serde_json::Value::as_str) == Some("tool");
+        let named = value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| !name.is_empty());
+        if is_tool && !named {
+            return Err(
+                "tool result has no `name` and its `tool_call_id` matches no earlier call"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(values)
+}
+
+/// Function names of a request's tool declarations, read the way the
+/// Inkling-2-Mini template reads them (`tool.function`, else the tool).
+pub fn inkling_tool_names(tools: &[serde_json::Value]) -> Vec<String> {
+    tools
+        .iter()
+        .filter_map(|tool| {
+            tool.get("function")
+                .unwrap_or(tool)
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// Terminal of an Inkling-2-Mini turn from how it ended (`ended_on_eos`:
+/// the sampling-end token, else a length cut) and what its frame router saw.
+/// A tool-protocol violation, or EOS inside an open invocation, fails closed
+/// (`Err`: no `done`, no calls). A length cut releases no call. EOS with
+/// validated calls is `tool_calls`.
+pub fn inkling_terminal(
+    ended_on_eos: bool,
+    frames: &hipfire_runtime::emit_text::MessageFrameRouter,
+) -> Result<(&'static str, Vec<hipfire_runtime::prompt_frame::ToolCall>), String> {
+    if let Some(error) = frames.tool_error() {
+        return Err(error.to_owned());
+    }
+    if !ended_on_eos {
+        return Ok(("length", Vec::new()));
+    }
+    if frames.in_tool_call() {
+        return Err("the turn ended inside a tool call".to_owned());
+    }
+    let calls = frames.tool_calls().to_vec();
+    Ok((
+        if calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        },
+        calls,
+    ))
+}
+
 /// Inkling-2-Mini (arch_id=24) generate path — plain GPU AR.
 ///
 /// Stateless like `generate_maple`: every turn cold-resets the GPU session
@@ -6715,15 +6784,18 @@ mod inkling_context_refusal_tests {
 /// `forward_token_gpu` (one token in, logits out), then decodes token by
 /// token with the request's full sampler contract
 /// (`sampler::sample_cpu`: temp 0 reduces to argmax, matching 04's
-/// `generate_cpu`). No spec, no batch, no tools/stop router on this route
+/// `generate_cpu`). No spec, no batch, no stop router on this route
 /// (refused upstream by the capability gates). The model writes its
-/// thinking and its answer as separate protocol-framed messages;
-/// [`MessageFrameRouter`] splits them by token id into the typed
-/// `reasoning` / `token` events of semantic contract v2, so the framing
-/// never reaches the client and the sampled ids are untouched.
-/// `reasoning_effort` is the template variable (thinking off is `"none"`,
-/// `None` the template default). Prefill loops one token at a time — the GPU
-/// forward only does single-token steps, no prefill kernel exists here.
+/// thinking, its answer and its tool invocations as separate
+/// protocol-framed messages; [`MessageFrameRouter`] splits them by token id
+/// into the typed `reasoning` / `token` events of semantic contract v2 and
+/// buffers invocations as validated calls, released only on a
+/// `tool_calls` terminal ([`inkling_terminal`]). The framing never reaches
+/// the client and the sampled ids are untouched. Tools render through the
+/// template from [`inkling_template_messages`]. `reasoning_effort` is the
+/// template variable (thinking off is `"none"`, `None` the template
+/// default). Prefill loops one token at a time — the GPU forward only does
+/// single-token steps, no prefill kernel exists here.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_inkling(
     m: &mut LoadedModel,
@@ -6787,10 +6859,20 @@ pub fn generate_inkling(
         return;
     };
 
+    // A turn that declares tools or replays tool history must render exactly;
+    // the raw-encode fallback would silently drop the tool protocol.
+    let tool_turn = tools.is_some_and(|t| !t.is_empty())
+        || messages_history.is_some_and(|h| {
+            h.iter().any(|msg| {
+                !msg.tool_calls.is_empty()
+                    || matches!(msg.role, hipfire_runtime::prompt_frame::Role::Tool)
+            })
+        });
+
     // Prompt build (same two-path branch as the lfm2moe AR path): the model
     // carries an embedded chat template (brief 07 serves with it), so render
     // through `JinjaChatFrame`; fall back to raw encode when absent.
-    let prompt_ids: Vec<u32> = {
+    let prompt_ids: Result<Vec<u32>, String> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         let try_jinja = m.chat_template.is_some();
         if try_jinja {
@@ -6839,19 +6921,31 @@ pub fn generate_inkling(
                             &synthesized
                         }
                     };
-                frame.render_messages(messages_slice, tools, None)
+                inkling_template_messages(messages_slice)
+                    .and_then(|values| frame.render_message_values(values, tools, None))
             } else {
                 frame.render()
             };
             match render_result {
-                Ok(rendered) => tokenizer.encode(&rendered),
+                Ok(rendered) => Ok(tokenizer.encode(&rendered)),
+                Err(e) if tool_turn => Err(format!("inkling2 tool prompt render failed: {e}")),
                 Err(e) => {
                     eprintln!("[daemon] jinja render failed in inkling2 path ({e}) — falling back to raw encode");
-                    tokenizer.encode(prompt)
+                    Ok(tokenizer.encode(prompt))
                 }
             }
+        } else if tool_turn {
+            Err("inkling2 tools need the model's chat template".to_owned())
         } else {
-            tokenizer.encode(prompt)
+            Ok(tokenizer.encode(prompt))
+        }
+    };
+    let prompt_ids = match prompt_ids {
+        Ok(ids) => ids,
+        Err(message) => {
+            emit_active_attempt_error(stdout, Some(id), &message, "validation", false, false);
+            let _ = stdout.flush();
+            return;
         }
     };
 
@@ -6975,7 +7069,13 @@ pub fn generate_inkling(
     let mut generated_count: usize = 0;
     let prompt_len = prompt_ids.len();
     let decode_t0 = Instant::now();
-    let mut frames = hipfire_runtime::emit_text::MessageFrameRouter::new(frame_markers);
+    let mut frames = match tools.filter(|t| !t.is_empty()) {
+        Some(t) => hipfire_runtime::emit_text::MessageFrameRouter::with_tools(
+            frame_markers,
+            inkling_tool_names(t),
+        ),
+        None => hipfire_runtime::emit_text::MessageFrameRouter::new(frame_markers),
+    };
     let mut frame_events = Vec::new();
     loop {
         if check_abort(id) {
@@ -7058,7 +7158,21 @@ pub fn generate_inkling(
     };
     let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
     let round1 = |v: f64| (v * 10.0).round() / 10.0;
-    let finish_reason = if hit_eos { "stop" } else { "length" };
+    let (finish_reason, tool_calls) = match inkling_terminal(hit_eos, &frames) {
+        Ok(terminal) => terminal,
+        Err(reason) => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!("malformed Inkling-2-Mini tool call: {reason}"),
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    };
     // Native metric keys. Every turn cold-resets and prefills the whole
     // prompt one row per forward, so nothing is cached and the first token
     // follows the prefill directly.
@@ -7078,9 +7192,8 @@ pub fn generate_inkling(
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
-    // No tool calls on this route; the empty stage keeps the terminal shape
-    // identical to every other legacy-contract producer.
-    let tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+    // Calls are released only on this staged terminal (`tool_calls`), never
+    // mid-stream.
     hipfire_engine::emit::stage_terminal_tool_calls(&mut pending_done, finish_reason, &tool_calls);
     hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
     let _ = stdout.flush();

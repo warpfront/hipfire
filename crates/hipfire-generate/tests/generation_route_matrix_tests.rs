@@ -377,6 +377,10 @@ const SAFE_ROUTES: &[GenerationRoute] = &[
     // Arch 19 with the shared DFlash2 drafter: the same router over committed
     // tokens (`Qwen35Emit` via the Raon carrier, grammar off).
     GenerationRoute::RaonSpec,
+    // Arch 24 (Inkling-2-Mini), semantic v2. Tool invocations are protocol
+    // messages parsed by token id (`MessageFrameRouter`), validated against
+    // the declared tools, and staged only on a `tool_calls` terminal.
+    GenerationRoute::InklingAr,
 ];
 
 /// Pure gate model mirroring generate()'s tools preflight:
@@ -1300,7 +1304,7 @@ fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_
     let mut expected = SAFE_ROUTES.to_vec();
     expected.sort_by_key(|r| r.name());
     assert_eq!(from_all, expected);
-    assert_eq!(from_all.len(), 13);
+    assert_eq!(from_all.len(), 14);
     // Negative: every other ALL member is denied for tools.
     for &r in GenerationRoute::ALL {
         if !SAFE_ROUTES.contains(&r) {

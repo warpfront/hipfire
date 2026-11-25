@@ -921,6 +921,18 @@ then `<|content_text|>`). The daemon splits them by token id into
 never reach the client. A turn that ends inside the thinking message returns it
 as `reasoning_content` with empty `content`.
 
+Tools on Inkling-2-Mini render through the model's own template (declaration,
+assistant `tool_calls` with object arguments, and tool results named by their
+`tool_call_id`'s call or their `name`; a result that names no tool is a 400).
+The model writes each call as its own message
+(`<|message_model|>NAME<|content_invoke_tool_json|>{"name":…,"args":{…}}<|end_message|>`);
+the daemon buffers it, validates it when the message closes (a JSON object with
+exactly `name` and `args`, `name` equal to the header and a declared tool,
+`args` an object) and releases calls only when the turn ends on the model's
+end-of-turn token, with `finish_reason=tool_calls`. A malformed call, or a turn
+that ends inside one, fails the request closed (no calls); a `max_tokens` cut
+returns `length` with no calls.
+
 When `messages` contains no `system` or `developer` role, the serve layer inserts `prompt.system` from a per-model TOML override or the registry card's `recommended_settings.system_prompt`. A client-supplied system/developer message always wins.
 
 `finish_reason` values emitted to clients: `stop`, `length`, `tool_calls`. A

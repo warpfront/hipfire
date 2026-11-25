@@ -967,6 +967,13 @@ impl GenerationRoute {
     /// `finish_reason == "tool_calls"` terminal. A load whose template carries
     /// no tool format refuses tools by name instead. The developer-gated EAGLE
     /// branch never serves a tools request, so tools always decode AR.
+    ///
+    /// `InklingAr` (semantic v2) renders tools through the embedded template
+    /// and parses the model's `<|content_invoke_tool_json|>` messages by
+    /// token id (`MessageFrameRouter`): each call is validated against the
+    /// declared tools when its message closes and released only on a
+    /// `finish_reason == "tool_calls"` terminal; a malformed or truncated
+    /// call fails the turn closed.
     pub const fn supports_tools(self) -> bool {
         matches!(
             self,
@@ -983,6 +990,7 @@ impl GenerationRoute {
                 | Self::RaonAr
                 | Self::RaonSpec
                 | Self::Gemma4Ar
+                | Self::InklingAr
         )
     }
 
@@ -3185,8 +3193,8 @@ pub fn generate(
         }
         GenerationRoute::InklingAr => {
             // Arch 24 (Inkling-2-Mini). Single-GPU AR over the 48-visit GPU
-            // forward. No spec, no batch, no tools/stop/min_tokens on this
-            // route (refused upstream by the capability gates). Thinking is
+            // forward. No spec, no batch, no stop/min_tokens on this route
+            // (refused upstream by the capability gates). Thinking is
             // controlled only through the template's `reasoning_effort`
             // (`MessageFrames` contract): no think-token cap or force-close.
             let _ = (
