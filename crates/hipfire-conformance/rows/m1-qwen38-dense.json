@@ -1,0 +1,473 @@
+{
+ "fixture": "qwen3.8-27b.mq4-xts (qwen3_5 dense, serve VMM batch)",
+ "row": [
+  {
+   "name": "qwen38-ar-greedy-c1-cn",
+   "invariant": "I5i",
+   "kind": "c1_cn",
+   "plant": "none",
+   "expect_fail": false,
+   "daemon": {
+    "daemon": "${CONFORMANCE_DAEMON}",
+    "model": "${QWEN38_MODEL}",
+    "load_params": {
+     "max_seq": 4096,
+     "continuous_batch_size": 4,
+     "mtp_mode": "off",
+     "serve_vmm_batch": {
+      "spec": false,
+      "sampled": true
+     }
+    },
+    "env": {},
+    "timeout_secs": 1200
+   },
+   "requests": [
+    {
+     "type": "generate",
+     "id": "r0",
+     "prompt": "Write one sentence about rivers.",
+     "temperature": 0.0,
+     "top_p": 1.0,
+     "seed": 1000,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    },
+    {
+     "type": "generate",
+     "id": "r1",
+     "prompt": "List three prime numbers and explain why.",
+     "temperature": 0.0,
+     "top_p": 1.0,
+     "seed": 1001,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    },
+    {
+     "type": "generate",
+     "id": "r2",
+     "prompt": "Describe a cat in a short paragraph.",
+     "temperature": 0.0,
+     "top_p": 1.0,
+     "seed": 1002,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    },
+    {
+     "type": "generate",
+     "id": "r3",
+     "prompt": "What is the capital of France? Answer briefly.",
+     "temperature": 0.0,
+     "top_p": 1.0,
+     "seed": 1003,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    }
+   ]
+  },
+  {
+   "name": "qwen38-ar-sampled-c1-cn",
+   "invariant": "I5i",
+   "kind": "c1_cn",
+   "plant": "none",
+   "expect_fail": false,
+   "daemon": {
+    "daemon": "${CONFORMANCE_DAEMON}",
+    "model": "${QWEN38_MODEL}",
+    "load_params": {
+     "max_seq": 4096,
+     "continuous_batch_size": 4,
+     "mtp_mode": "off",
+     "serve_vmm_batch": {
+      "spec": false,
+      "sampled": true
+     }
+    },
+    "env": {},
+    "timeout_secs": 1200
+   },
+   "requests": [
+    {
+     "type": "generate",
+     "id": "r0",
+     "prompt": "Write one sentence about rivers.",
+     "temperature": 0.7,
+     "top_p": 0.95,
+     "seed": 1000,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    },
+    {
+     "type": "generate",
+     "id": "r1",
+     "prompt": "List three prime numbers and explain why.",
+     "temperature": 0.7,
+     "top_p": 0.95,
+     "seed": 1001,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    },
+    {
+     "type": "generate",
+     "id": "r2",
+     "prompt": "Describe a cat in a short paragraph.",
+     "temperature": 0.7,
+     "top_p": 0.95,
+     "seed": 1002,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    },
+    {
+     "type": "generate",
+     "id": "r3",
+     "prompt": "What is the capital of France? Answer briefly.",
+     "temperature": 0.7,
+     "top_p": 0.95,
+     "seed": 1003,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    }
+   ]
+  },
+  {
+   "name": "qwen38-mtp-greedy-c1-cn",
+   "invariant": "I5i",
+   "kind": "c1_cn",
+   "plant": "none",
+   "expect_fail": false,
+   "daemon": {
+    "daemon": "${CONFORMANCE_DAEMON}",
+    "model": "${QWEN38_MODEL}",
+    "load_params": {
+     "max_seq": 4096,
+     "continuous_batch_size": 4,
+     "mtp_mode": "on",
+     "serve_vmm_batch": {
+      "spec": true,
+      "sampled": true
+     }
+    },
+    "env": {},
+    "timeout_secs": 1200
+   },
+   "requests": [
+    {
+     "type": "generate",
+     "id": "r0",
+     "prompt": "Write one sentence about rivers.",
+     "temperature": 0.0,
+     "top_p": 1.0,
+     "seed": 1000,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    },
+    {
+     "type": "generate",
+     "id": "r1",
+     "prompt": "List three prime numbers and explain why.",
+     "temperature": 0.0,
+     "top_p": 1.0,
+     "seed": 1001,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    },
+    {
+     "type": "generate",
+     "id": "r2",
+     "prompt": "Describe a cat in a short paragraph.",
+     "temperature": 0.0,
+     "top_p": 1.0,
+     "seed": 1002,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    },
+    {
+     "type": "generate",
+     "id": "r3",
+     "prompt": "What is the capital of France? Answer briefly.",
+     "temperature": 0.0,
+     "top_p": 1.0,
+     "seed": 1003,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    }
+   ]
+  },
+  {
+   "name": "qwen38-mtp-sampled-c1-cn",
+   "invariant": "I5i",
+   "kind": "c1_cn",
+   "plant": "none",
+   "expect_fail": false,
+   "daemon": {
+    "daemon": "${CONFORMANCE_DAEMON}",
+    "model": "${QWEN38_MODEL}",
+    "load_params": {
+     "max_seq": 4096,
+     "continuous_batch_size": 4,
+     "mtp_mode": "on",
+     "serve_vmm_batch": {
+      "spec": true,
+      "sampled": true
+     }
+    },
+    "env": {},
+    "timeout_secs": 1200
+   },
+   "requests": [
+    {
+     "type": "generate",
+     "id": "r0",
+     "prompt": "Write one sentence about rivers.",
+     "temperature": 0.7,
+     "top_p": 0.95,
+     "seed": 1000,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    },
+    {
+     "type": "generate",
+     "id": "r1",
+     "prompt": "List three prime numbers and explain why.",
+     "temperature": 0.7,
+     "top_p": 0.95,
+     "seed": 1001,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    },
+    {
+     "type": "generate",
+     "id": "r2",
+     "prompt": "Describe a cat in a short paragraph.",
+     "temperature": 0.7,
+     "top_p": 0.95,
+     "seed": 1002,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    },
+    {
+     "type": "generate",
+     "id": "r3",
+     "prompt": "What is the capital of France? Answer briefly.",
+     "temperature": 0.7,
+     "top_p": 0.95,
+     "seed": 1003,
+     "max_tokens": 48,
+     "repeat_penalty": 1.0,
+     "thinking_enabled": false,
+     "serve_continuous_batch": true
+    }
+   ]
+  },
+  {
+   "name": "qwen38-ar-greedy-restore",
+   "invariant": "I2",
+   "kind": "restore",
+   "plant": "none",
+   "expect_fail": false,
+   "daemon": {
+    "daemon": "${CONFORMANCE_DAEMON}",
+    "model": "${QWEN38_MODEL}",
+    "load_params": {
+     "max_seq": 4096,
+     "mtp_mode": "off"
+    },
+    "env": {},
+    "timeout_secs": 1200
+   },
+   "turn1": {
+    "type": "generate",
+    "id": "conv",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Name two colors of the rainbow."
+     }
+    ],
+    "max_tokens": 32,
+    "repeat_penalty": 1.0,
+    "thinking_enabled": false,
+    "seed": 77,
+    "temperature": 0.0,
+    "top_p": 1.0
+   },
+   "user2": "Now name one more, and say why it is your favorite.",
+   "reference": "cold",
+   "candidate": "live"
+  },
+  {
+   "name": "qwen38-ar-sampled-restore",
+   "invariant": "I2",
+   "kind": "restore",
+   "plant": "none",
+   "expect_fail": false,
+   "daemon": {
+    "daemon": "${CONFORMANCE_DAEMON}",
+    "model": "${QWEN38_MODEL}",
+    "load_params": {
+     "max_seq": 4096,
+     "mtp_mode": "off"
+    },
+    "env": {},
+    "timeout_secs": 1200
+   },
+   "turn1": {
+    "type": "generate",
+    "id": "conv",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Name two colors of the rainbow."
+     }
+    ],
+    "max_tokens": 32,
+    "repeat_penalty": 1.0,
+    "thinking_enabled": false,
+    "seed": 77,
+    "temperature": 0.7,
+    "top_p": 0.95
+   },
+   "user2": "Now name one more, and say why it is your favorite.",
+   "reference": "cold",
+   "candidate": "live"
+  },
+  {
+   "name": "qwen38-mtp-greedy-restore",
+   "invariant": "I2",
+   "kind": "restore",
+   "plant": "none",
+   "expect_fail": false,
+   "daemon": {
+    "daemon": "${CONFORMANCE_DAEMON}",
+    "model": "${QWEN38_MODEL}",
+    "load_params": {
+     "max_seq": 4096,
+     "mtp_mode": "on"
+    },
+    "env": {},
+    "timeout_secs": 1200
+   },
+   "turn1": {
+    "type": "generate",
+    "id": "conv",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Name two colors of the rainbow."
+     }
+    ],
+    "max_tokens": 32,
+    "repeat_penalty": 1.0,
+    "thinking_enabled": false,
+    "seed": 77,
+    "temperature": 0.0,
+    "top_p": 1.0
+   },
+   "user2": "Now name one more, and say why it is your favorite.",
+   "reference": "cold",
+   "candidate": "live"
+  },
+  {
+   "name": "qwen38-mtp-sampled-restore",
+   "invariant": "I2",
+   "kind": "restore",
+   "plant": "none",
+   "expect_fail": false,
+   "daemon": {
+    "daemon": "${CONFORMANCE_DAEMON}",
+    "model": "${QWEN38_MODEL}",
+    "load_params": {
+     "max_seq": 4096,
+     "mtp_mode": "on"
+    },
+    "env": {},
+    "timeout_secs": 1200
+   },
+   "turn1": {
+    "type": "generate",
+    "id": "conv",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Name two colors of the rainbow."
+     }
+    ],
+    "max_tokens": 32,
+    "repeat_penalty": 1.0,
+    "thinking_enabled": false,
+    "seed": 77,
+    "temperature": 0.7,
+    "top_p": 0.95
+   },
+   "user2": "Now name one more, and say why it is your favorite.",
+   "reference": "cold",
+   "candidate": "live"
+  },
+  {
+   "name": "qwen38-ar-greedy-restore-plant-stale",
+   "invariant": "I2",
+   "kind": "restore",
+   "plant": "stale_restore",
+   "expect_fail": true,
+   "daemon": {
+    "daemon": "${CONFORMANCE_DAEMON}",
+    "model": "${QWEN38_MODEL}",
+    "load_params": {
+     "max_seq": 4096,
+     "mtp_mode": "off"
+    },
+    "env": {},
+    "timeout_secs": 1200
+   },
+   "turn1": {
+    "type": "generate",
+    "id": "conv",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Name two colors of the rainbow."
+     }
+    ],
+    "max_tokens": 32,
+    "repeat_penalty": 1.0,
+    "thinking_enabled": false,
+    "seed": 77,
+    "temperature": 0.0,
+    "top_p": 1.0
+   },
+   "user2": "Now name one more, and say why it is your favorite.",
+   "reference": "cold",
+   "candidate": "live"
+  }
+ ]
+}

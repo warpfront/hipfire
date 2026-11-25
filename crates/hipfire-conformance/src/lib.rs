@@ -1,10 +1,12 @@
-//! hipfire conformance runner, CPU-only first half (V2-PLAN 6.4, slices B0/B1a).
+//! hipfire conformance runner (V2-PLAN 6.4, slices B0/B1a).
 //!
 //! * [`digest`]: per-component digests of defined live bytes.
 //! * [`receipt`]: executed-recipe receipts from the module-load audit.
 //! * [`verdict`]: class table, row interface, verdicts.
 //! * [`selftest`]: a host fake state with planted faults.
+//! * [`card`]: card rows through the real `daemon` (I5i C1 == CN, I2 restored == fresh).
 
+pub mod card;
 pub mod digest;
 pub mod receipt;
 pub mod verdict;

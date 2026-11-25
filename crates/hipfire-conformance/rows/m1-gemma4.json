@@ -1,0 +1,182 @@
+{
+ "fixture": "gemma4-12b-it.q8.hfq (+ gemma4-12b-it-drafter.q8.hfq for EAGLE)",
+ "row": [
+  {
+   "name": "gemma4-ar-greedy-restore",
+   "invariant": "I2",
+   "kind": "restore",
+   "plant": "none",
+   "expect_fail": false,
+   "daemon": {
+    "daemon": "${CONFORMANCE_DAEMON}",
+    "model": "${GEMMA4_MODEL}",
+    "load_params": {
+     "max_seq": 4096
+    },
+    "env": {},
+    "timeout_secs": 1200
+   },
+   "turn1": {
+    "type": "generate",
+    "id": "conv",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Name two colors of the rainbow."
+     }
+    ],
+    "max_tokens": 32,
+    "repeat_penalty": 1.0,
+    "thinking_enabled": false,
+    "seed": 77,
+    "temperature": 0.0,
+    "top_p": 1.0
+   },
+   "user2": "Now name one more, and say why it is your favorite.",
+   "reference": "cold",
+   "candidate": "live"
+  },
+  {
+   "name": "gemma4-ar-sampled-restore",
+   "invariant": "I2",
+   "kind": "restore",
+   "plant": "none",
+   "expect_fail": false,
+   "daemon": {
+    "daemon": "${CONFORMANCE_DAEMON}",
+    "model": "${GEMMA4_MODEL}",
+    "load_params": {
+     "max_seq": 4096
+    },
+    "env": {},
+    "timeout_secs": 1200
+   },
+   "turn1": {
+    "type": "generate",
+    "id": "conv",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Name two colors of the rainbow."
+     }
+    ],
+    "max_tokens": 32,
+    "repeat_penalty": 1.0,
+    "thinking_enabled": false,
+    "seed": 77,
+    "temperature": 0.7,
+    "top_p": 0.95
+   },
+   "user2": "Now name one more, and say why it is your favorite.",
+   "reference": "cold",
+   "candidate": "live"
+  },
+  {
+   "name": "gemma4-eagle-greedy-restore",
+   "invariant": "I2",
+   "kind": "restore",
+   "plant": "none",
+   "expect_fail": false,
+   "daemon": {
+    "daemon": "${CONFORMANCE_DAEMON}",
+    "model": "${GEMMA4_MODEL}",
+    "load_params": {
+     "max_seq": 4096,
+     "drafter": "${GEMMA4_DRAFTER}"
+    },
+    "env": {},
+    "timeout_secs": 1200
+   },
+   "turn1": {
+    "type": "generate",
+    "id": "conv",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Name two colors of the rainbow."
+     }
+    ],
+    "max_tokens": 32,
+    "repeat_penalty": 1.0,
+    "thinking_enabled": false,
+    "seed": 77,
+    "temperature": 0.0,
+    "top_p": 1.0
+   },
+   "user2": "Now name one more, and say why it is your favorite.",
+   "reference": "cold",
+   "candidate": "live"
+  },
+  {
+   "name": "gemma4-eagle-sampled-restore",
+   "invariant": "I2",
+   "kind": "restore",
+   "plant": "none",
+   "expect_fail": false,
+   "daemon": {
+    "daemon": "${CONFORMANCE_DAEMON}",
+    "model": "${GEMMA4_MODEL}",
+    "load_params": {
+     "max_seq": 4096,
+     "drafter": "${GEMMA4_DRAFTER}"
+    },
+    "env": {},
+    "timeout_secs": 1200
+   },
+   "turn1": {
+    "type": "generate",
+    "id": "conv",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Name two colors of the rainbow."
+     }
+    ],
+    "max_tokens": 32,
+    "repeat_penalty": 1.0,
+    "thinking_enabled": false,
+    "seed": 77,
+    "temperature": 0.7,
+    "top_p": 0.95
+   },
+   "user2": "Now name one more, and say why it is your favorite.",
+   "reference": "cold",
+   "candidate": "live"
+  },
+  {
+   "name": "gemma4-ar-greedy-restore-plant-stale",
+   "invariant": "I2",
+   "kind": "restore",
+   "plant": "stale_restore",
+   "expect_fail": true,
+   "daemon": {
+    "daemon": "${CONFORMANCE_DAEMON}",
+    "model": "${GEMMA4_MODEL}",
+    "load_params": {
+     "max_seq": 4096
+    },
+    "env": {},
+    "timeout_secs": 1200
+   },
+   "turn1": {
+    "type": "generate",
+    "id": "conv",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Name two colors of the rainbow."
+     }
+    ],
+    "max_tokens": 32,
+    "repeat_penalty": 1.0,
+    "thinking_enabled": false,
+    "seed": 77,
+    "temperature": 0.0,
+    "top_p": 1.0
+   },
+   "user2": "Now name one more, and say why it is your favorite.",
+   "reference": "cold",
+   "candidate": "live"
+  }
+ ]
+}

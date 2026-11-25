@@ -106,6 +106,7 @@ pub struct RowSpec {
 }
 
 /// One executed arm: audit log text plus the state after every step.
+#[derive(Clone)]
 pub struct ArmRun {
     pub audit_log: String,
     pub steps: Vec<HostState>,
