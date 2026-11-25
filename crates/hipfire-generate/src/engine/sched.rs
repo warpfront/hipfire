@@ -43,9 +43,11 @@
 //!   into a lane at a window boundary like a decoding AR request, its
 //!   drafter's state with it, and the drafter goes back to the load for the
 //!   next one; every tick then runs one window epoch over the window lanes.
-//!   One that moves right after its prompt holds its first token
-//!   ([`Emit::holds_first`]) and streams it with the tick's burst, as an AR
-//!   request streams its first lane token.
+//!   The tick's first prompt streams its first token at once; one that
+//!   moves into its lane right after a later prompt of the tick holds its
+//!   first token ([`Emit::holds_first`]) and streams it with the tick's
+//!   burst, as an AR request streams its first lane token (so a burst's
+//!   first tokens do not leave one prompt apart, the serial prefill's shape).
 //!   Otherwise it stays resident until it finishes and the next queued
 //!   request takes the resident state after it. [`Ended`] hands a resident
 //!   one's drafter back.
@@ -358,6 +360,9 @@ impl Scheduler {
             Work::Prefill { rows } => Some(rows.len()),
             _ => None,
         };
+        // The tick's first prompt streams its first token at once; later
+        // ones hold theirs for the burst ([`Emit::holds_first`]).
+        let later = self.prompt_rows > 0;
         if let Some(rows) = prompt {
             // First tokens held for this tick's burst go out before a prompt
             // epoch that takes the tick past its row budget.
@@ -385,6 +390,7 @@ impl Scheduler {
                 b,
                 idx,
                 keep: !parks,
+                hold: parks && later,
             };
             if let Err(error) = step(run, &mut one) {
                 ended.push(self.end(idx, Exit::Failed(error)));
@@ -401,6 +407,7 @@ impl Scheduler {
             return false;
         }
         let window = matches!(work, Work::Verify { .. });
+        let held = run.generated() == 0;
         let parked = match work {
             Work::Decode {
                 token: Some(seed), ..
@@ -418,8 +425,8 @@ impl Scheduler {
         let req = self.reqs[idx].as_mut().expect("parked request is live");
         req.place = Place::Lane;
         // A window lane's seed was streamed on the resident state, unless
-        // this tick's prompt held it.
-        req.fresh = !window || prompt.is_some();
+        // its prompt held it (nothing emitted yet).
+        req.fresh = !window || held;
         req.window = window;
         true
     }
@@ -610,6 +617,9 @@ struct One<'a, B> {
     b: &'a mut B,
     idx: usize,
     keep: bool,
+    /// A speculative prompt that moves into its lane after the tick's first
+    /// prompt: its first token streams with the tick's burst.
+    hold: bool,
 }
 
 impl<B: Batch> Forwards for One<'_, B> {
@@ -696,10 +706,8 @@ impl<B: Batch> Emit for One<'_, B> {
         self.b.window_cap(self.idx)
     }
 
-    /// A speculative request that moves into its lane at this boundary
-    /// streams its first token with the tick's burst.
     fn holds_first(&self) -> bool {
-        !self.keep
+        self.hold
     }
 }
 
@@ -1341,19 +1349,19 @@ mod tests {
             s.admit(idx);
         }
         s.tick(&mut b);
-        // Each prompt prefills and moves into its window lane holding its
-        // first token; the burst's first tokens stream together, then one
-        // window epoch runs them.
+        // The tick's first prompt streams its first token at once; the
+        // later ones move into their window lanes holding theirs, which
+        // stream together right before one window epoch runs them all.
         assert_eq!(
             b.calls,
             vec![
                 Call::Prefill(0),
+                Call::Emit(0),
                 Call::Park(0),
                 Call::Prefill(1),
                 Call::Park(1),
                 Call::Prefill(2),
                 Call::Park(2),
-                Call::Emit(0),
                 Call::Emit(1),
                 Call::Emit(2),
                 Call::Windows(vec![0, 1, 2]),
@@ -1384,14 +1392,13 @@ mod tests {
         }
         s.tick(&mut b);
         // The long prompt takes the tick past its 100-row budget: the first
-        // token held before it goes out first, and so does its own before
-        // the next prompt.
+        // token it held goes out before the next prompt.
         assert_eq!(
             b.calls[..10],
             [
                 Call::Prefill(0),
-                Call::Park(0),
                 Call::Emit(0),
+                Call::Park(0),
                 Call::Prefill(1),
                 Call::Park(1),
                 Call::Emit(1),
@@ -1426,6 +1433,7 @@ mod tests {
             b.calls[..13],
             [
                 Call::Prefill(0),
+                Call::Emit(0),
                 Call::Park(0),
                 Call::Prefill(1),
                 Call::Park(1),
@@ -1433,7 +1441,6 @@ mod tests {
                 Call::Park(2),
                 Call::Prefill(3),
                 Call::Park(3),
-                Call::Emit(0),
                 Call::Emit(1),
                 Call::Emit(2),
                 Call::Emit(3),
@@ -1452,44 +1459,44 @@ mod tests {
 
     #[test]
     fn a_held_first_token_that_ends_its_request_never_runs_in_its_window_lane() {
-        let prompts = vec![vec![1, 2], vec![3, 4, 5], vec![6], vec![7, 8]];
+        let prompts = vec![vec![9], vec![1, 2], vec![3, 4, 5], vec![6], vec![7, 8]];
         let setup = |b: &mut Fake| {
             b.eos = pick(&[1, 2]);
             b.sampled = Vec::new();
-            b.spec = vec![0, 1, 2, 3];
+            b.spec = vec![0, 1, 2, 3, 4];
             b.windows = true;
+            b.capacity = 5;
         };
         let mut b = fake(&prompts, 4, 4);
         setup(&mut b);
-        // 0's first token is EOS, 1 is aborted after its park, 2's emit fails.
-        b.abort_during_prefill = Some((2, 1));
-        b.emit_fails = vec![2];
+        // Behind the tick's first prompt: 1's first token is EOS, 2 is
+        // aborted after its park, 3's emit fails.
+        b.abort_during_prefill = Some((3, 2));
+        b.emit_fails = vec![3];
         let mut s = Scheduler::default();
-        for idx in 0..4 {
+        for idx in 0..5 {
             s.admit(idx);
         }
         let ended = run_all(&mut s, &mut b);
-        let exit = |idx| &ended.iter().find(|e| e.idx == idx).unwrap().exit;
-        assert_eq!(exit(0), &Exit::Finished(super::super::Finish::Stop));
-        assert_eq!(exit(1), &Exit::Aborted);
-        assert!(matches!(exit(2), Exit::Failed(_)));
-        assert!(matches!(exit(3), Exit::Finished(_)));
-        assert!(ended
-            .iter()
-            .all(|e| e.place == Place::Lane && e.drafting.is_none()));
-        assert_eq!(b.emitted[&0], vec![b.eos]);
-        assert!(!b.emitted.contains_key(&1) && !b.emitted.contains_key(&2));
-        assert!(b
-            .calls
-            .iter()
-            .all(|c| !matches!(c, Call::Windows(lanes) if lanes != &[3])));
+        let ended_of = |idx| ended.iter().find(|e| e.idx == idx).unwrap();
+        assert_eq!(ended_of(1).exit, Exit::Finished(super::super::Finish::Stop));
+        assert_eq!(ended_of(2).exit, Exit::Aborted);
+        assert!(matches!(ended_of(3).exit, Exit::Failed(_)));
+        assert!(matches!(ended_of(4).exit, Exit::Finished(_)));
+        assert!((1..5)
+            .all(|idx| ended_of(idx).place == Place::Lane && ended_of(idx).drafting.is_none()));
+        assert_eq!(b.emitted[&1], vec![b.eos]);
+        assert!(!b.emitted.contains_key(&2) && !b.emitted.contains_key(&3));
+        assert!(b.calls.iter().all(
+            |c| !matches!(c, Call::Windows(lanes) if lanes.iter().any(|l| (1..4).contains(l)))
+        ));
         // The survivor's tokens are its own alone.
         let mut alone = fake(&prompts, 4, 4);
         setup(&mut alone);
         let mut s = Scheduler::default();
-        s.admit(3);
+        s.admit(4);
         run_all(&mut s, &mut alone);
-        assert_eq!(b.emitted[&3], alone.emitted[&3]);
+        assert_eq!(b.emitted[&4], alone.emitted[&4]);
     }
 
     #[test]
