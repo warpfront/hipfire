@@ -687,6 +687,26 @@ pub fn generate_lfm3(
     }
 }
 
+/// Default LFM3-VL pixel cap: 1 MP (4,096 patches, 1,024 visual tokens).
+/// The vision tower's attention is O(patches^2) and runs as one
+/// uninterruptible call; on gfx1151 fivetide measured 20.4 s for 3,072
+/// patches and 711 s for 14,840, so HF's 16.7 MP `longest_edge` lets one
+/// photo hold the daemon for hours. Images under the cap keep HF's grid.
+const LFM3_VL_DEFAULT_MAX_PIXELS: usize = 1_048_576;
+
+/// The LFM3-VL pixel cap for this request: `HIPFIRE_VL_MAX_PIXELS` (developer
+/// tier, also `developer.vl_max_pixels` in the config file) when set,
+/// otherwise [`LFM3_VL_DEFAULT_MAX_PIXELS`]; kept inside HF's
+/// `[shortest_edge, longest_edge]` budget.
+fn lfm3_vl_max_pixels() -> usize {
+    hipfire_config::developer_var("HIPFIRE_VL_MAX_PIXELS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(LFM3_VL_DEFAULT_MAX_PIXELS)
+        .clamp(image::LFM3_VL_MIN_PIXELS, image::LFM3_VL_MAX_PIXELS)
+}
+
 pub fn generate_lfm3_vl(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -756,7 +776,9 @@ pub fn generate_lfm3_vl(
     // VL-RESIZE-1: LFM3-VL has its own pixel budget (HF `Lfm3VlImageProcessor`
     // size {shortest_edge: 65_536, longest_edge: 16_777_216}); the shared
     // preprocessor's Qwen defaults silently changed the patch grid for
-    // out-of-overlap images.
+    // out-of-overlap images. The upper bound is the operator cap
+    // (`lfm3_vl_max_pixels`), which bounds the tower's cost.
+    let max_pixels = lfm3_vl_max_pixels();
     let (pixels, img_h, img_w) = match image_source {
         ImageSource::Path(path) => {
             eprintln!("[lfm3-vl] preprocessing image: path: {}", path);
@@ -765,7 +787,7 @@ pub fn generate_lfm3_vl(
                 vision_config.patch_size,
                 vision_config.spatial_merge_size,
                 image::LFM3_VL_MIN_PIXELS,
-                image::LFM3_VL_MAX_PIXELS,
+                max_pixels,
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -802,7 +824,7 @@ pub fn generate_lfm3_vl(
                 vision_config.patch_size,
                 vision_config.spatial_merge_size,
                 image::LFM3_VL_MIN_PIXELS,
-                image::LFM3_VL_MAX_PIXELS,
+                max_pixels,
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -815,6 +837,25 @@ pub fn generate_lfm3_vl(
     let grid_h = img_h / vision_config.patch_size;
     let grid_w = img_w / vision_config.patch_size;
     let n_visual_tokens = grid_h * grid_w / (sms * sms);
+
+    // The image's visual tokens alone must fit the context before the tower
+    // runs; the exact prompt check follows once the prompt is built.
+    let cap = m.lfm3().unwrap().state.max_seq;
+    if n_visual_tokens.saturating_add(max_tokens) > cap {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "lfm3-vl: image exceeds context capacity: visual_tokens={} + max_tokens={} > capacity={} (lower HIPFIRE_VL_MAX_PIXELS or raise max_seq)",
+                n_visual_tokens, max_tokens, cap
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
 
     let patches = image::extract_patches(
         &pixels,
