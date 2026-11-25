@@ -15,11 +15,17 @@
 //!
 //! Gate order (stop at the first red): 0 (CPU MQ4 reference trace),
 //! 1 (one visit vs CPU debug), 2 (all 48 visits vs MQ4 trace),
-//! 3 (token-0 logits vs CPU MQ4 + llama oracle), 4 (tok/s, unoptimized).
+//! 3 (token-0 logits vs CPU MQ4 + llama oracle), 3b (token 1..N logits vs
+//! the CPU cached decode), 4 (tok/s, unoptimized).
+//!
+//! The artifact path defaults to the Windows layout below; set `INKLING2_MQ4`
+//! to point at it elsewhere.
 
 use hipfire_arch_inkling2::arch_model::{Inkling2Bundle, Inkling2State};
 use hipfire_arch_inkling2::config::Inkling2Config;
-use hipfire_arch_inkling2::forward::{forward_token, lm_head_logits};
+use hipfire_arch_inkling2::forward::{
+    forward_token, forward_token_cached, lm_head_logits, CpuDecodeState,
+};
 use hipfire_arch_inkling2::gpu::{upload, Inkling2GpuState, Inkling2GpuWeights};
 use hipfire_arch_inkling2::weights::Inkling2Weights;
 use hipfire_arch_inkling2::{
@@ -46,7 +52,8 @@ fn ensure_home() {
 }
 
 fn open_artifact() -> (Inkling2Config, Inkling2Weights) {
-    let hfq = HfqFile::open(std::path::Path::new(ART)).expect("open artifact");
+    let art = std::env::var("INKLING2_MQ4").unwrap_or_else(|_| ART.to_string());
+    let hfq = HfqFile::open(std::path::Path::new(&art)).expect("open artifact");
     let cfg = Inkling2Config::from_metadata_json(&hfq.metadata_json).expect("parse config");
     let weights = Inkling2Weights::load(&hfq, &cfg).expect("index weights");
     (cfg, weights)
@@ -583,6 +590,72 @@ fn gate3_token0_logits() {
         }
     }
     eprintln!("gate3: PASS");
+}
+
+/// Gate 3b: logits at positions 0..N, GPU decode vs the CPU cached decode
+/// (`forward_token_cached`, which keeps a separate conv history per conv).
+/// Gate 3 runs at position 0, where every conv history is zero, so a bug in
+/// how the GPU keeps or indexes that history cannot show there; from
+/// position 1 on it can. Bars: the same argmax at every position and
+/// r >= `R_MIN` at every position.
+///
+/// `R_MIN` is empirical, from gfx1151: with the MoE post-conv history at the
+/// wrong offset (`4 * ekv`) this sequence gives r 0.959 / 0.968 / 0.952 at
+/// positions 1..3 and a different argmax at position 3; at the right offset
+/// (`2 * ekv + e`) r is 0.997 / 0.978 / 0.987 / 0.983. Positions >= 1 stay
+/// below position 0, which is not explained yet.
+#[test]
+#[ignore = "needs the 14 GB MQ4 artifact + a HIP GPU; slow CPU reference"]
+fn gate3b_multi_token_logits() {
+    const TOKENS: [u32; 4] = [5000, 12345, 777, 31274];
+    const R_MIN: f32 = 0.97;
+    let (cfg, weights) = open_artifact();
+    let vocab = cfg.unpadded_vocab_size;
+    let e = cfg.n_embd;
+
+    let mut want = Vec::with_capacity(TOKENS.len());
+    {
+        let (_, emb) = weights.f32("model.llm.embed.weight").expect("embed");
+        let mut st = CpuDecodeState::new(&cfg, 16).expect("cpu state");
+        for (pos, &t) in TOKENS.iter().enumerate() {
+            let x = &emb[t as usize * e..(t as usize + 1) * e];
+            let hidden =
+                forward_token_cached(&weights, &cfg, &mut st, x, pos).expect("cpu forward");
+            let l = lm_head_logits(&weights, &cfg, &hidden).expect("cpu logits");
+            want.push(l[..vocab].to_vec());
+        }
+    }
+
+    let mut gpu = test_gpu();
+    let (gw, gs) = upload_test_bundle(&cfg, &weights, &mut gpu, 64);
+    let mut bundle = make_bundle(cfg, weights, gw, gs);
+    let mut fails = Vec::new();
+    for (pos, &t) in TOKENS.iter().enumerate() {
+        let got = forward_token_gpu(&mut bundle, &mut gpu, t, pos).expect("gpu logits");
+        let w = &want[pos];
+        assert_eq!(got.len(), w.len());
+        let r = pearson(&got, w);
+        let (am_got, am_want) = (argmax(&got), argmax(w));
+        eprintln!(
+            "gate3b: pos {pos} tok {t}: r={r:.7} argmax gpu={am_got} cpu={am_want} max|d|={:.3e} mean|d|={:.3e}",
+            max_abs(&got, w),
+            mean_abs(&got, w)
+        );
+        if am_got != am_want {
+            fails.push(format!("pos {pos}: argmax gpu {am_got} vs cpu {am_want}"));
+        }
+        if r < R_MIN {
+            fails.push(format!("pos {pos}: r {r} below {R_MIN}"));
+        }
+    }
+    if let Some(gw) = bundle.gpu_weights.take() {
+        gw.free_gpu(&mut gpu);
+    }
+    if let Some(gs) = bundle.gpu_state.take() {
+        gs.free_gpu(&mut gpu);
+    }
+    assert!(fails.is_empty(), "gate3b: {}", fails.join("; "));
+    eprintln!("gate3b: PASS");
 }
 
 /// Gate 4: single-token tok/s, clearly labelled unoptimized.
