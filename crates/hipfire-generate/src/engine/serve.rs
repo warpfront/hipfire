@@ -315,24 +315,33 @@ impl Driver {
                 continue;
             }
             let mut ended = Vec::new();
-            // Requests that arrive while this tick's prompts run join its
-            // burst while the resident state is free.
-            loop {
-                let mut ctx = Ctx::of(
-                    &mut self.lives,
-                    self.max_batch_tokens,
-                    self.route,
-                    sched,
-                    m,
-                    runner,
-                    gpus,
-                    stdout,
-                )?;
-                ended.extend(self.core.prompts(&mut ctx));
-                if !self.core.takes_arrivals() || !self.arrivals(sched, m, stdout, inbox)? {
-                    break;
+            if let Err(error) = self.tick(sched, m, runner, gpus, stdout, inbox, &mut ended) {
+                // Requests that ended before the error and were not settled
+                // hand their drafter back here: `fail_all` only reaches live
+                // runs.
+                for drafting in ended.into_iter().filter_map(|ended| ended.drafting) {
+                    m.speculator.get_or_insert(drafting.drafter);
                 }
+                return Err(error);
             }
+        }
+    }
+
+    /// One tick: the prompt epochs, with requests that arrive while the
+    /// resident state is free joining its burst, then the lane epoch; every
+    /// request that ended is settled (and leaves `ended`).
+    #[allow(clippy::too_many_arguments)]
+    fn tick(
+        &mut self,
+        sched: &mut ContinuousBatchScheduler,
+        m: &mut LoadedModel,
+        runner: &mut MeshRunner,
+        gpus: &mut Gpus,
+        stdout: &mut Stdout,
+        inbox: &mut DaemonInbox,
+        ended: &mut Vec<Ended>,
+    ) -> Result<(), String> {
+        loop {
             let mut ctx = Ctx::of(
                 &mut self.lives,
                 self.max_batch_tokens,
@@ -343,13 +352,27 @@ impl Driver {
                 gpus,
                 stdout,
             )?;
-            ended.extend(self.core.lanes_step(&mut ctx));
-            let mut attested = Ok(());
-            for ended in ended {
-                attested = attested.and(ctx.settle(&mut self.core, ended));
+            ended.extend(self.core.prompts(&mut ctx));
+            if !self.core.takes_arrivals() || !self.arrivals(sched, m, stdout, inbox)? {
+                break;
             }
-            attested.inspect_err(|_| self.poisoned = true)?;
         }
+        let mut ctx = Ctx::of(
+            &mut self.lives,
+            self.max_batch_tokens,
+            self.route,
+            sched,
+            m,
+            runner,
+            gpus,
+            stdout,
+        )?;
+        ended.extend(self.core.lanes_step(&mut ctx));
+        let mut attested = Ok(());
+        for ended in ended.drain(..) {
+            attested = attested.and(ctx.settle(&mut self.core, ended));
+        }
+        attested.inspect_err(|_| self.poisoned = true)
     }
 
     /// Cancel the queued requests the client aborted, drain the inbox and

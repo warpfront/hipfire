@@ -48,6 +48,8 @@
 //!   first token ([`Emit::holds_first`]) and streams it with the tick's
 //!   burst, as an AR request streams its first lane token (so a burst's
 //!   first tokens do not leave one prompt apart, the serial prefill's shape).
+//!   "First" counts prompt rows: a prompt the session restored whole runs
+//!   0 rows, so the request after it is still the tick's first prompt.
 //!   Otherwise it stays resident until it finishes and the next queued
 //!   request takes the resident state after it. [`Ended`] hands a resident
 //!   one's drafter back.
@@ -1406,6 +1408,37 @@ mod tests {
                 Call::Park(2),
                 Call::Emit(2),
                 Call::Windows(vec![0, 1, 2]),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_first_prompt_of_every_tick_streams_its_first_token_at_once() {
+        let prompts = vec![vec![1, 2], vec![3, 4, 5], vec![6, 7], vec![8, 9]];
+        let mut b = fake(&prompts, 4, 4);
+        b.eos = u32::MAX;
+        b.sampled = Vec::new();
+        b.spec = vec![0, 1, 2, 3];
+        b.windows = true;
+        let mut s = Scheduler::default();
+        s.admit(0);
+        s.admit(1);
+        s.tick(&mut b);
+        b.calls.clear();
+        // The next tick counts its prompt rows from zero again.
+        s.admit(2);
+        s.admit(3);
+        s.tick(&mut b);
+        assert_eq!(
+            b.calls[..7],
+            [
+                Call::Prefill(2),
+                Call::Emit(2),
+                Call::Park(2),
+                Call::Prefill(3),
+                Call::Park(3),
+                Call::Emit(3),
+                Call::Windows(vec![0, 1, 2, 3]),
             ]
         );
     }
