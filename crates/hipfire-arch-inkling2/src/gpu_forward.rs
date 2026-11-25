@@ -1390,7 +1390,10 @@ fn step_visit(
                 }
             };
             Some((
-                o.prev_blocks.as_slice(),
+                // The bank is the previous pass's blocks after the prelude and
+                // the first core block (`blocks[prelude_len + 1..]`), as in the
+                // CPU reference; the mix appends `prev_out`.
+                &o.prev_blocks[skip..],
                 o.prev_out.as_ref().expect("prev_out"),
                 &gw.cross_pass[core_i],
                 ctrls,
