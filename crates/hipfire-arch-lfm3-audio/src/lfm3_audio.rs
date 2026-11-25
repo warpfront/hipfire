@@ -1471,9 +1471,12 @@ pub fn projector_forward(
 
 // AUDIO-DBG helpers (HIPFIRE_AUDIO_DEBUG=1): per-stage FNV-1a hashes so a
 // hash that differs across identical runs pins the nondeterministic GPU stage.
-fn dbg_audio() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("HIPFIRE_AUDIO_DEBUG").ok().as_deref() == Some("1"))
+// Also read by the daemon's ASR route for its mel / audio-token hashes.
+pub fn dbg_audio() -> bool {
+    static V: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_AUDIO_DEBUG").as_deref() == Ok("1")
+    });
+    *V
 }
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;

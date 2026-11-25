@@ -19,6 +19,7 @@ developer_callsite	*	HIPFIRE_ALLOW_MQ2_LLOYD#developer_var=ok.as_deref.==Some("1
 developer_callsite	*	HIPFIRE_ALLOW_MQ3_LLOYD#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_ALLOW_UNIT_IMATRIX#developer_var=ok.as_deref.!=Some("1")
 developer_callsite	*	HIPFIRE_AR_GRAPH_TRACE#developer_var=ok.as_deref.==Some("1")
+developer_callsite	*	HIPFIRE_AUDIO_DEBUG#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_AWQ_EXPERTS#developer_var=ok.as_deref.==Some("down")
 developer_callsite	*	HIPFIRE_AWQ_EXPERTS#developer_var=ok.as_deref.==Some("none")
 developer_callsite	*	HIPFIRE_AWQ_F1_ONLY#developer_var=ok.as_deref.==Some("1")
@@ -420,6 +421,8 @@ developer_callsite	*	HIPFIRE_NO_Q8_ROUTER#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_NO_SPILL#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_NULL_STREAM_LEDGER#developer_var=as_deref
 developer_callsite	*	HIPFIRE_OFFLOAD_DEBUG#developer_var=is_ok
+developer_callsite	*	HIPFIRE_OMNI_CODEC_DIR#developer_var=-
+developer_callsite	*	HIPFIRE_OMNI_SEED#developer_var=ok.and_then.unwrap_or_else
 developer_callsite	*	HIPFIRE_PACK_JOBS#developer_var=ok
 developer_callsite	*	HIPFIRE_PARENT_ROUTE_SCALE#developer_var=-
 developer_callsite	*	HIPFIRE_PLE_HOT_DEBUG#developer_var=is_ok_and
@@ -614,6 +617,7 @@ developer_callsite	*	HIPFIRE_VISION_SIDECAR#developer_var=ok
 developer_callsite	*	HIPFIRE_VL_DUMP_DIR#developer_var=ok.map
 developer_callsite	*	HIPFIRE_VL_FILE#developer_var=-
 developer_callsite	*	HIPFIRE_VL_MAX_PIXELS#developer_var=ok.and_then.filter.map.unwrap_or(VISION_MAX_PIXELS)
+developer_callsite	*	HIPFIRE_VL_MAX_PIXELS#developer_var=ok.and_then.filter.unwrap_or(LFM3_VL_DEFAULT_MAX_PIXELS)
 developer_callsite	*	HIPFIRE_VL_PREFILL#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_VL_SEQUENTIAL#developer_var=ok.is_some_and
 developer_callsite	*	HIPFIRE_VMM_PROMOTE_AT#developer_var=ok.and_then

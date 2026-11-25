@@ -1239,7 +1239,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1707
+**Count:** 1710
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1273,6 +1273,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ATTN_FLASH` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_ATTN_QRESIDENT` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
 | `HIPFIRE_ATTN_TILE_SIZE` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-runtime/src/llama.rs | developer |
+| `HIPFIRE_AUDIO_DEBUG` | crates/hipfire-arch-lfm3-audio/src/lfm3_audio.rs | developer |
 | `HIPFIRE_AWQ_EXPERTS` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_AWQ_F1_ONLY` | crates/hipfire-quantize/src/calibration.rs, scripts/archive/awq_alpha_sweep.sh | developer |
 | `HIPFIRE_AWQ_NORM_WAVEGRID` | crates/hipfire-runtime/examples/probe_awq_wavegrid.rs, crates/rdna-compute/src/gemv.rs | developer |
@@ -1461,7 +1462,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DETECTED_ARCH` | scripts/_detect-gpu.sh, scripts/test-kernels.sh | harness |
 | `HIPFIRE_DETECTED_NAME` | scripts/_detect-gpu.sh | harness |
 | `HIPFIRE_DETECTED_VRAM_GB` | scripts/_detect-gpu.sh | harness |
-| `HIPFIRE_DETERMINISTIC` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | experimental |
+| `HIPFIRE_DETERMINISTIC` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-lfm3-omni/src/depth.rs | experimental |
 | `HIPFIRE_DEVICE` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs, crates/hipfire-config/src/env_audit.rs | developer |
 | `HIPFIRE_DEVICES` | crates/hipfire-arch-qwen35/examples/dflash_draft_emit_oracle.rs, crates/hipfire-arch-qwen35/examples/prefill_ragged_oracle.rs | stable |
 | `HIPFIRE_DFLASH_BLOCK` | crates/hipfire-config/src/lib.rs | stable |
@@ -2277,6 +2278,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_OFFLOAD_DEBUG` | crates/rdna-compute/src/dispatch.rs | developer |
 | `HIPFIRE_OFFLOAD_EXEC` | crates/hipfire-arch-qwen35-embed/src/vision.rs, crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs | stable |
 | `HIPFIRE_OFFLOAD_PASSBACK_SHARE` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_OMNI_CODEC_DIR` | crates/hipfire-generate/src/lfm3.rs | developer |
+| `HIPFIRE_OMNI_SEED` | crates/hipfire-generate/src/lfm3.rs | developer |
 | `HIPFIRE_OOM_GUARD` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/kv_slots.rs | stable |
 | `HIPFIRE_ORACLE_DIVERGE` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | harness |
 | `HIPFIRE_ORACLE_DUMP` | crates/saddle-lab/examples/tmp_gemm_v2_oracle.rs | harness |

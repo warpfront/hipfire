@@ -267,15 +267,17 @@ pub fn generate_lfm3(
     // THINK-1: derive started_in_think from the frame actually rendered, not
     // from `max_think_tokens != 1`. That flag is correct for the Jinja path
     // (it keys the template's think opener) but wrong for the Plain fallback
-    // (HIPFIRE_JINJA_CHAT=0 or a render failure): Plain emits no think
+    // (no chat template, or a render failure): Plain emits no think
     // opener, so flagging started_in_think=true there mislabels the whole
     // answer as reasoning_content. Same derivation as the lfm2moe/qwen routes
     // (render_tail_opens_think on the rendered template; false for Plain).
     // The prompt build emits no events, so it can run before the contract
     // opener (which must stay the first event on the stream).
     let prompt_build: Option<(Vec<u32>, bool)> = m.tokenizer.as_ref().map(|tokenizer| {
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        // The Jinja opt-out (`prompt.jinja_chat`) was
+        // retired in 0.5.0: chat prompts render through the model template
+        // whenever one is present, as on every other route.
+        let try_jinja = m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -1420,7 +1422,7 @@ pub fn generate_lfm3_audio(
         }
         h
     }
-    let dbg = std::env::var("HIPFIRE_AUDIO_DEBUG").ok().as_deref() == Some("1");
+    let dbg = lfm3_audio::dbg_audio();
     if dbg {
         let mel_bytes: Vec<u8> = mel.iter().flat_map(|f| f.to_le_bytes()).collect();
         eprintln!(
@@ -1864,7 +1866,7 @@ pub fn generate_lfm3_audio(
 /// Omni TTS seed: HIPFIRE_OMNI_SEED for reproducible runs (batch-vs-streaming
 /// equivalence testing), else time-based.
 pub fn omni_seed() -> u64 {
-    std::env::var("HIPFIRE_OMNI_SEED")
+    hipfire_config::developer_var("HIPFIRE_OMNI_SEED")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or_else(|| {
@@ -1913,7 +1915,7 @@ pub fn generate_lfm3_omni(
         );
         return;
     }
-    let codec_dir = match std::env::var("HIPFIRE_OMNI_CODEC_DIR") {
+    let codec_dir = match hipfire_config::developer_var("HIPFIRE_OMNI_CODEC_DIR") {
         Ok(d) => d,
         Err(_) => {
             write_error(
