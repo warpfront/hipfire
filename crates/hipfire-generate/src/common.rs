@@ -2417,6 +2417,26 @@ mod tests {
         assert_eq!(fit_max_tokens(81_920, 1_000, 32_768), 81_920);
     }
 
+    /// #1225: the budget fitted for a spec request must come from the final
+    /// (spliced-history) prompt, not the cold re-encode. Spliced assistant
+    /// turns replay the exact generated tokens and can render longer than
+    /// the cold prompt; a budget fitted on the cold length then fails the
+    /// `generate_spec` guard once the spliced prompt is more than
+    /// `FIT_MAX_TOKENS_MARGIN - block_size` tokens longer.
+    #[test]
+    fn omitted_max_tokens_fits_the_final_spec_prompt() {
+        let _fit = FitMaxTokensGuard::set(true);
+        let (cap, block, cold) = (131_072, 3, 51_950);
+        let spliced = cold + 62;
+        let fitted_cold = fit_max_tokens(393_216, cold, cap);
+        assert!(spec_ctx_request_fits(cold, fitted_cold, block, cap));
+        assert!(!spec_ctx_request_fits(spliced, fitted_cold, block, cap));
+        let fitted = fit_max_tokens(393_216, spliced, cap);
+        assert_eq!(fitted, cap - spliced - FIT_MAX_TOKENS_MARGIN);
+        assert!(spec_ctx_request_fits(spliced, fitted, block, cap));
+        assert_eq!(context_length_refusal(spliced, fitted, cap), None);
+    }
+
     #[test]
     fn spec_ctx_request_fits_holds_one_block_margin() {
         // Sum is prompt + max_tokens + block_size vs ctx_capacity: exactly

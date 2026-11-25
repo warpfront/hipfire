@@ -3497,9 +3497,8 @@ pub fn generate_dflash(
         hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
     );
     let prompt_tokens: Vec<u32> = if is_qwen4 {
-        // Cold stage of the shared Qwen4 render; the history stage runs after
-        // the context-fit checks, where the cache plan used to render it.
-        match render_qwen4_prompt_cold(
+        // The shared canonical Qwen4 render, cached history included.
+        match render_qwen4_prompt(
             m,
             Qwen4PromptRoute::Mtp,
             system_prompt,
@@ -3624,9 +3623,10 @@ pub fn generate_dflash(
     // min(max_seq, DEFAULT_DFLASH_CTX_CAP (8192)) to bound draft-side VRAM on
     // large-max_seq serve loads. A request that outgrows the cap cannot run
     // spec — but DFlash is verify-gated, so AR produces the same tokens, just
-    // slower. Emit a correlated info event and hand the request back to the
-    // caller's AR fallthrough (handled=false: no gen_start/done yet). Mirrors
-    // the hard guard in generate_spec (belt-and-suspenders last line).
+    // slower. The check below emits a correlated info event and hands the
+    // request back to the caller's AR fallthrough (handled=false: no
+    // gen_start/done yet) once the final prompt is rendered. Mirrors the hard
+    // guard in generate_spec (belt-and-suspenders last line).
     // The target's admitted context bounds every route: the speculator was
     // built before the measured post-load fit and can report the larger
     // pre-fit capacity, so on its own it would let a session grow the
@@ -3638,43 +3638,6 @@ pub fn generate_dflash(
         .map_or(usize::MAX, |s| s.ctx_capacity())
         .min(admitted);
     let spec_block_size = m.speculator.as_ref().map(|s| s.block_size()).unwrap_or(0);
-    // An omitted client max_tokens fits the target context first (the same
-    // budget the AR fallback would use), then the draft capacity decides
-    // spec vs AR.
-    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_tokens.len(), admitted);
-    // A conversation (cached prefix included) that cannot fit the admitted
-    // context is refused here, before any allocation or route choice.
-    if let Some(message) =
-        crate::common::context_length_refusal(prompt_tokens.len(), max_tokens, admitted)
-    {
-        emit_active_attempt_error(stdout, Some(id), &message, "context_length", false, false);
-        let _ = stdout.flush();
-        return true;
-    }
-    // Shared margin with the `generate_spec` hard guard below: prompt +
-    // budget + one draft block must fit, so any request the loop would refuse
-    // falls back to AR here instead of erroring after `gen_start`.
-    if !spec_ctx_request_fits(
-        prompt_tokens.len(),
-        max_tokens,
-        spec_block_size,
-        spec_ctx_capacity,
-    ) {
-        emit_qwen_ar_info(
-            stdout,
-            id,
-            &format!(
-                "prompt={} + max_tokens={} exceeds {} draft ctx capacity {} — falling back to AR (identical output, slower)",
-                prompt_tokens.len(),
-                max_tokens,
-                if spec_name == "mtp" { "MTP" } else { "DFlash" },
-                spec_ctx_capacity
-            ),
-        );
-        // The AR body below continues the live state.
-        settle_deferred_spec_seed(m, gpu);
-        return false;
-    }
 
     // Prompt-cache plan (native DFlash reuse). Decide whether this turn is a
     // pure extension of the cached conversation. On a HIT we reuse target KV
@@ -3694,31 +3657,6 @@ pub fn generate_dflash(
     // below); every other model keeps the conversation/checkpoint plan.
     let session_reuse = m.state.as_deref().is_some_and(|s| s.spec_session_reuse());
     let cache_disabled = session_reuse;
-    // Qwen4 history stage of the shared canonical render, after the cold-length
-    // fit checks above (same order as the former cache-plan stage).
-    let prompt_tokens: Vec<u32> = if is_qwen4 {
-        match render_qwen4_prompt_history(
-            m,
-            Qwen4PromptRoute::Mtp,
-            system_prompt,
-            prompt,
-            assistant_prefix,
-            tools,
-            messages_history,
-            enable_thinking,
-            reasoning_effort,
-            prompt_tokens,
-        ) {
-            Ok(tokens) => tokens,
-            Err((message, kind)) => {
-                emit_active_attempt_error(stdout, Some(id), &message, kind, false, false);
-                let _ = stdout.flush();
-                return true;
-            }
-        }
-    } else {
-        prompt_tokens
-    };
     let (conversation_tokens, dflash_ckpt_positions): (&[u32], Vec<usize>) = if session_reuse {
         (&[][..], Vec::new())
     } else {
@@ -3825,6 +3763,46 @@ pub fn generate_dflash(
         Some(p) => p.rendered.clone(),
         None => prompt_tokens,
     };
+    // Every context-fit decision below runs on this final prompt: a spliced
+    // history (the exact tokens earlier turns generated) can render longer
+    // than the cold re-encode, and `generate_spec` guards the final prompt.
+    // An omitted client max_tokens fits the target context first (the same
+    // budget the AR fallback would use), then the draft capacity decides
+    // spec vs AR.
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_tokens.len(), admitted);
+    // A conversation (cached prefix included) that cannot fit the admitted
+    // context is refused here, before any allocation or route choice.
+    if let Some(message) =
+        crate::common::context_length_refusal(prompt_tokens.len(), max_tokens, admitted)
+    {
+        emit_active_attempt_error(stdout, Some(id), &message, "context_length", false, false);
+        let _ = stdout.flush();
+        return true;
+    }
+    // Shared margin with the `generate_spec` hard guard below: prompt +
+    // budget + one draft block must fit, so any request the loop would refuse
+    // falls back to AR here instead of erroring after `gen_start`.
+    if !spec_ctx_request_fits(
+        prompt_tokens.len(),
+        max_tokens,
+        spec_block_size,
+        spec_ctx_capacity,
+    ) {
+        emit_qwen_ar_info(
+            stdout,
+            id,
+            &format!(
+                "prompt={} + max_tokens={} exceeds {} draft ctx capacity {} — falling back to AR (identical output, slower)",
+                prompt_tokens.len(),
+                max_tokens,
+                if spec_name == "mtp" { "MTP" } else { "DFlash" },
+                spec_ctx_capacity
+            ),
+        );
+        // The AR body below continues the live state.
+        settle_deferred_spec_seed(m, gpu);
+        return false;
+    }
     // Whole-prompt reuse: only an advertised prompt-end payload of exactly this
     // prompt, over a retained conversation that begins with it, authorises
     // `start_pos == prompt.len()`. A request without a rendered history plans
@@ -5629,7 +5607,12 @@ pub fn generate_spec(
         crate::ar::emit_active_route_error(
             stdout,
             Some(id),
-            &format!("prompt+block_size exceeds ctx_capacity {}", ctx_capacity,),
+            &format!(
+                "prompt={} + block_size={} exceeds ctx_capacity {}",
+                prompt_tokens.len(),
+                block_size,
+                ctx_capacity,
+            ),
             "validation",
             false,
             false,
@@ -5645,7 +5628,10 @@ pub fn generate_spec(
             stdout,
             Some(id),
             &format!(
-                "prompt+max_tokens exceeds ctx_capacity {} (raise max_seq or shorten the request)",
+                "prompt={} + max_tokens={} + block_size={} exceeds ctx_capacity {} (raise max_seq or shorten the request)",
+                prompt_tokens.len(),
+                max_tokens,
+                block_size,
                 ctx_capacity,
             ),
             "context_length",
@@ -11696,13 +11682,12 @@ pub(crate) fn render_qwen4_prompt_history(
     }
 }
 
-/// Canonical Qwen4 singleton prompt for `generate_qwen4_ar` and the lane batch
-/// driver (route `Ar`): [`render_qwen4_prompt_cold`] then
-/// [`render_qwen4_prompt_history`]. Returns the full prompt ids and
+/// Canonical Qwen4 singleton prompt for `generate_qwen4_ar`, native MTP
+/// (`generate_dflash`) and the lane batch driver: [`render_qwen4_prompt_cold`]
+/// then [`render_qwen4_prompt_history`]. Returns the full prompt ids and
 /// `started_in_think`. The error pair is `(message, error_kind)` for
 /// `emit_active_attempt_error` (always `"validation"`). An empty prompt is NOT
-/// checked here. `generate_dflash` (native MTP) calls the two stages separately
-/// because its context-fit checks run between them on the cold ids.
+/// checked here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_qwen4_prompt(
     m: &mut LoadedModel,
@@ -13152,5 +13137,37 @@ mod spec_prefill_plan_tests {
             resume_from: None,
         };
         assert_eq!(hit_plan().unless_live_state_lost(false, &prompt), miss);
+    }
+}
+
+#[cfg(test)]
+mod spec_context_fit_order_tests {
+    /// #1225: `generate_dflash` fits an omitted max_tokens and decides
+    /// refusal / spec / AR on the final prompt (spliced cached history), the
+    /// same prompt `generate_spec`'s hard guard checks. Fitting on the cold
+    /// render let a cache-hit turn whose spliced history renders longer pass
+    /// the entry and then be refused by `generate_spec`.
+    #[test]
+    fn generate_dflash_fits_the_context_on_the_final_prompt() {
+        let src = include_str!("qwen.rs");
+        let start = src
+            .find("pub fn generate_dflash(")
+            .expect("generate_dflash");
+        let end = src.find("pub fn generate_spec(").expect("generate_spec");
+        let body = &src[start..end];
+        let final_prompt = body
+            .find("let prompt_tokens: Vec<u32> = match &cache_plan {")
+            .expect("final prompt");
+        for check in [
+            "crate::common::fit_max_tokens(",
+            "crate::common::context_length_refusal(",
+            "if !spec_ctx_request_fits(",
+        ] {
+            assert_eq!(body.matches(check).count(), 1, "one `{check}` call");
+            assert!(
+                body.find(check).unwrap() > final_prompt,
+                "`{check}` must run on the final prompt"
+            );
+        }
     }
 }
