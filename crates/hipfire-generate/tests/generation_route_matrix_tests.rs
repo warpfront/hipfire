@@ -310,6 +310,13 @@ fn capability_rows() -> Vec<(GenerationRoute, GenerationRouteInputs)> {
             },
         ),
         (
+            GenerationRoute::InklingAr,
+            GenerationRouteInputs {
+                arch_id: 24,
+                ..base()
+            },
+        ),
+        (
             GenerationRoute::RaonAr,
             GenerationRouteInputs {
                 arch_id: 19,
