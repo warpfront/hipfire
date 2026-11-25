@@ -146,7 +146,7 @@ built first.** That is the prerequisite, not the refactor.
 
 ## Blocker update — the VRAM oracle exists and Qwen3.5's baseline is clean
 
-`scripts/vram_leak_harness.py` was the named prerequisite for the `pp_scratch_set` step. It
+`scripts/archive/vram_leak_harness.py` was the named prerequisite for the `pp_scratch_set` step. It
 now exists, and it discriminates.
 
 Measured on the 4×gfx1201 host (single GPU), five/four load-unload cycles:

@@ -121,7 +121,7 @@ checks is fixed and excluded.
 
 ## Cancellation and rollback
 
-`scripts/test-ds4-heterogeneous-abort-resume.sh` closes a real streaming client
+`scripts/archive/test-ds4-heterogeneous-abort-resume.sh` closes a real streaming client
 socket during decode. Cancellation is observed only before a layer or after
 the shared/routed branches rejoin, so an abort arriving in flight drains to a
 safe cross-device boundary before owner state is cleared.
@@ -160,7 +160,7 @@ direct-HIP profile.
   12 passed, 0 failed.
 - `python3 scripts/serve_harness.py --self-test`: all three proof groups pass.
 - `python3 -m py_compile scripts/serve_harness.py`: passed.
-- `bash -n scripts/test-ds4-heterogeneous-abort-resume.sh`: passed.
+- `bash -n scripts/archive/test-ds4-heterogeneous-abort-resume.sh`: passed.
 - `scripts/fmt-changed.sh` on the changed daemon file: passed.
 - `git diff --check`: passed.
 - GPU lock released after every accepted and rejected GPU run.

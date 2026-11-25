@@ -493,7 +493,7 @@ What landed:
 
 | Step | Status | Where |
 |---|---|---|
-| Step 0 — Bench expansion | ✅ shipped | `scripts/quant_cohort.sh` + `eval_hipfire` (via #113 / #233 / #235 / #236) |
+| Step 0 — Bench expansion | ✅ shipped | `scripts/archive/quant_cohort.sh` + `eval_hipfire` (via #113 / #233 / #235 / #236) |
 | Step 0.5 — Reproduce on gfx1100 | ✅ done (9B + 0.8B) | cohorts `2026-05-11-cohort-phase-a-step-0.5/` (9B), `2026-05-11-cohort-phase-a-0.8b-step-0.5+1+2/` (0.8B). 9B MFP4 reproduced fivetide's +25% PPL gap (we measured +38% on prefill mode); 0.8B reproduced +93.8% → +104% PPL gap |
 | Step 1+2 — L4 weighted-LS for HFP4/MFP4 | ✅ shipped, **mixed empirical result** | `crates/hipfire-quantize/src/main.rs` `--l4` flag (commit `739465c7`). Cohort: HFP4-L4 -1% KLD on 0.8B but +5.8% on 9B; MFP4-L4 -4% KLD on 9B but +6.6% on 0.8B. L4 in its current 3-candidate form is **rotation-and-model-size conditional**, not a clean lever — see §1.5 |
 | Step 3 — `--tensor-type` regex CLI | ⏸️ pending | Mechanism only; no quality change expected; not on critical path |
@@ -514,7 +514,7 @@ The pivot below adjusts Phase A in response to these findings.
 
 **Step 0 — Bench expansion (3–5 days). Prerequisite for everything below.**
 
-Today's `scripts/bench_quant_quality.sh` emits MSE + final-norm sanity + train-pursuit smoke test. That's not enough to distinguish PPL-good-KLD-bad from PPL-bad-KLD-good. Extend the bench to emit, per format variant:
+Today's `scripts/archive/bench_quant_quality.sh` emits MSE + final-norm sanity + train-pursuit smoke test. That's not enough to distinguish PPL-good-KLD-bad from PPL-bad-KLD-good. Extend the bench to emit, per format variant:
 
 - Per-tensor MSE vs FP16 safetensors reference (already in `quant_quality_mse.rs`)
 - **KLD vs FP16 reference logits** on a held-out corpus (~50k tokens; new — requires a daemon-side option to dump per-token logit distributions and a reference run on the same prompts)
@@ -526,9 +526,9 @@ Output: single markdown table per quantization variant, suitable for diffing acr
 
 **Status 2026-05-12 — Step 0 shipped.** All 5 metrics live after the #113 / #233 / #236 merges plus the MFP4G32 v2 batched WMMA work (#235):
 
-- `scripts/quant_cohort.sh` — cohort runner; orchestrates MSE + KLD + PPL + HumanEval + reasoning smoke per variant. Per-variant artifacts land under `benchmarks/quality-baselines/results/YYYY-MM-DD-cohort-<label>/` matching the canonical #113 schema. KLD/PPL columns now populated via real `eval_hipfire` invocations (CI verified against shipped MQ4 9B kldseq: reduce reproduces commit `cdbf07c`'s 0.876237 to 4 decimal places).
+- `scripts/archive/quant_cohort.sh` — cohort runner; orchestrates MSE + KLD + PPL + HumanEval + reasoning smoke per variant. Per-variant artifacts land under `benchmarks/quality-baselines/results/YYYY-MM-DD-cohort-<label>/` matching the canonical #113 schema. KLD/PPL columns now populated via real `eval_hipfire` invocations (CI verified against shipped MQ4 9B kldseq: reduce reproduces commit `cdbf07c`'s 0.876237 to 4 decimal places).
 - `crates/hipfire-runtime/examples/quant_quality_mse.rs` — extended with HFP4G32 (qt=21) and MFP4G32 (qt=24) dequant. Sanity-verified against `/local/hipfire/qwen3.6-35b-a3b-mfp4.hfq` (MFP4G32 mean MSE 1.24e-6, matches PR #225 expectation).
-- `scripts/bench_humaneval_completion.sh` — per-variant completion capture on the 3 in-tree humaneval prompts.
+- `scripts/archive/bench_humaneval_completion.sh` — per-variant completion capture on the 3 in-tree humaneval prompts.
 - `crates/hipfire-runtime/examples/eval_hipfire.rs` — canonical KLD scoring (per #113). Defaults to `--scoring-mode prefill`, which is **~7× faster end-to-end on gfx1100** than per-token mode and produces a different (more accurate) measurement class — see §5.3 of `issue-113-quant-quality-eval.md`.
 
 **Target arch update 2026-05-12.** Phase A bench cohorts will run on **gfx1100 (7900 XTX) not gfx906**. The reasoning:
@@ -910,7 +910,7 @@ Promotion-path remainder:
 Raw per-layer dumps at `/data/cache/hipfire/q3.5-0.8b-{hf,hipfire}-hidden-chunk0.bin` (not committed, 192 MB each); the comparator output is reproducible from the scripts in `scripts/dump_hf_hidden_states.py`, `scripts/compare_hidden_states.py`, and the new example binary.
 
 **Cross-engine sanity check (Step B, 2026-05-12 evening) — confirms Step A is well-posed.**
-Before starting per-layer instrumentation, validated that the BF16 reference itself is consistent across engines. Ran `scripts/cross_engine_check.py` — extracts chunk-0 tokens from `qwen3.5-0.8b-bf16.kldref.bin` (built by llama.cpp), runs the same 2048 tokens through HF transformers BF16 on CPU, computes the per-position KL divergence between llama.cpp's stored top-K distribution and HF's distribution on the same chunk.
+Before starting per-layer instrumentation, validated that the BF16 reference itself is consistent across engines. Ran `scripts/archive/cross_engine_check.py` — extracts chunk-0 tokens from `qwen3.5-0.8b-bf16.kldref.bin` (built by llama.cpp), runs the same 2048 tokens through HF transformers BF16 on CPU, computes the per-position KL divergence between llama.cpp's stored top-K distribution and HF's distribution on the same chunk.
 
 | Direction | Mean KLD (chunk 0, 1023 positions) | Max |
 |---|---:|---:|
@@ -938,7 +938,7 @@ llama.cpp and HF transformers BF16 agree on Qwen3.5-0.8B chunk-0 to within ~0.00
 | Phase 1 — Quantizer | AWQ pre-scaling for MQ4G256: `compute_awq_scales` (log-space accumulation, geo-mean normalized), `awq_pre_scale_weights` (in-place `W' = W · diag(s)`), F16 sidecar emission `<weight>.awq_scale.weight`, CLI flags `--awq` / `--awq-alpha` | `crates/hipfire-quantize/src/main.rs` (commit `83054300`); 5 new tests in `awq_tests` module |
 | Phase 2a — Runtime infra | `awq_scale: Option<GpuTensor>` field on `WeightTensor`; sidecar loader (F16→F32 host-side); `fused_rmsnorm_mq_rotate_awq` HIP symbol (extra per-channel divide before FWHT; **now derived** from `kernels/src/fused_rmsnorm_mq_rotate.hip` via `-DHIPFIRE_RMSNORM_AWQ`, not a separate `*_awq.hip`); dispatch wrappers | `crates/hipfire-runtime/src/{hfq,llama}.rs`, `crates/rdna-compute/src/{dispatch,kernels}.rs` (commit `e51a3cd9` originally shipped a dedicated fork; derivation is current) |
 | Phase 2b — Forward-pass wiring | Helper `fused_rmsnorm_rotate_mq_batched_for` that takes the next-linear's `WeightTensor` and dispatches AWQ variant when it carries `awq_scale`; converted 10 call sites across decode + batched paths | `crates/hipfire-runtime/src/llama.rs`, `crates/hipfire-arch-qwen35/src/qwen35.rs` (commit `a4265ce4`) |
-| Bench infra fix | Replaced broken `tail -1 serve.log \| grep "warm-up complete"` race + obsolete `pgrep "examples/daemon"` fallback with `wait_for_model_ready` (polls `/v1/models` for requested basename) | `scripts/quant_cohort.sh`, `scripts/bench_humaneval_completion.sh` (commit `21772a4d`) |
+| Bench infra fix | Replaced broken `tail -1 serve.log \| grep "warm-up complete"` race + obsolete `pgrep "examples/daemon"` fallback with `wait_for_model_ready` (polls `/v1/models` for requested basename) | `scripts/archive/quant_cohort.sh`, `scripts/archive/bench_humaneval_completion.sh` (commit `21772a4d`) |
 
 Sidecar emission verified: AWQ-quantized 9B has 248 `awq_scale` tensors stored (matches 32 layers × ~8 linears/layer); baseline has 0. AWQ-disabled code path is byte-identical to pre-AWQ.
 
@@ -1001,7 +1001,7 @@ If pp512 regression exceeds 10%, fall back to HFP4XSG256 (plan B per §1.4): one
 
 ### Phase D — Validation as canonical bench (1 week)
 
-14. Standing benchmark: extend `scripts/bench_quant_quality.sh` to run the full MSE + KLD + smoke-test triple under three configurations (uncalibrated MFP4, calibrated MFP4, calibrated MFP4 + per-tensor bit allocation) on three reference models (Qwen3.5-9B, Qwen3.6-A3B, a Gemma3 family member). Lock as the regression bar.
+14. Standing benchmark: extend `scripts/archive/bench_quant_quality.sh` to run the full MSE + KLD + smoke-test triple under three configurations (uncalibrated MFP4, calibrated MFP4, calibrated MFP4 + per-tensor bit allocation) on three reference models (Qwen3.5-9B, Qwen3.6-A3B, a Gemma3 family member). Lock as the regression bar.
 15. Update CLAUDE.md: any quantization-format change MUST regress this triple.
 
 ---
@@ -1056,9 +1056,9 @@ The strategic claims above were authored before the Step 0.5 / Step 1+2 / Step 5
 - `crates/hipfire-runtime/src/hfq.rs` — `.hfq` file format reader
 - `crates/hipfire-runtime/examples/quant_quality_mse.rs` — per-tensor MSE harness
 - `crates/hipfire-runtime/examples/compare_hfq.rs` — tensor-by-tensor NRMSE diff
-- `scripts/bench_quant_quality.sh` — combined MSE + smoke triple (predecessor to `quant_cohort.sh`)
-- `scripts/quant_cohort.sh` — Phase A Step 0 cohort runner; orchestrates MSE + (KLD stub) + (PPL stub) + HumanEval + reasoning smoke per variant
-- `scripts/bench_humaneval_completion.sh` — per-variant HumanEval prompt completion capture
+- `scripts/archive/bench_quant_quality.sh` — combined MSE + smoke triple (predecessor to `quant_cohort.sh`)
+- `scripts/archive/quant_cohort.sh` — Phase A Step 0 cohort runner; orchestrates MSE + (KLD stub) + (PPL stub) + HumanEval + reasoning smoke per variant
+- `scripts/archive/bench_humaneval_completion.sh` — per-variant HumanEval prompt completion capture
 
 ### External
 - OCP Microscaling Formats (MX) v1.0 — element format reference for E2M1

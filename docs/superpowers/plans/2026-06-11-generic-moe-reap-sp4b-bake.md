@@ -13,7 +13,7 @@
 > **CPU-verifiable.** Anchor test: a bake with NO overrides + NO keep (keep-all) must be **byte-identical** to the normal `--format <base>` quantize of the same model (bake is a pure superset hook). Override and prune are verified by targeted tests. Serving a baked model whose experts mix tiers within a layer still needs SP2 to run on GPU; a uniform-tier or per-layer-tier baked model serves through existing dispatch.
 
 **Scope notes:**
-- **ds4 hash-layer `tid2eid` remap under prune is DEFERRED** (a follow-up): pruning a deepseek4 model's hash layers (0–2) requires rewriting `tid2eid` to the compact expert space (the logic exists in `scripts/reap/build_reap_keepmap.py`). This plan prunes score-layer experts + non-ds4 arches correctly; a ds4 bake with `keep` errors out on hash layers with a clear "tid2eid remap not yet supported in bake — use load-time keep-map" message rather than producing a wrong model. Override-bake (no prune) works for ds4.
+- **ds4 hash-layer `tid2eid` remap under prune is DEFERRED** (a follow-up): pruning a deepseek4 model's hash layers (0–2) requires rewriting `tid2eid` to the compact expert space (the logic exists in `scripts/archive/reap/build_reap_keepmap.py`). This plan prunes score-layer experts + non-ds4 arches correctly; a ds4 bake with `keep` errors out on hash layers with a clear "tid2eid remap not yet supported in bake — use load-time keep-map" message rather than producing a wrong model. Override-bake (no prune) works for ds4.
 - Imatrix-weighted lloyd override tiers: `quantize_to_format` covers the self-calibrating tiers; an override to an imatrix-calibrated tier is out of scope (overlay/bake both use the self-calibrating encoders).
 
 ---
@@ -177,7 +177,7 @@ git commit -m "feat(reap): bake prunes+renumbers kept experts, gathers router/bi
 ### Task 3: Docs
 
 **Files:**
-- Modify: `scripts/reap/README.md`
+- Modify: `scripts/archive/reap/README.md`
 
 - [ ] **Step 1: Document bake**
 
@@ -186,7 +186,7 @@ Add a "Bake (freeze) — SP4b" subsection under the overlay section: `hipfire-qu
 - [ ] **Step 2: Commit**
 
 ```bash
-git add scripts/reap/README.md
+git add scripts/archive/reap/README.md
 git commit -m "docs(reap): bake-to-standalone workflow (SP4b)"
 ```
 

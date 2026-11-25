@@ -56,7 +56,7 @@ Concrete symptoms visible in-tree today:
    - `scripts/collect_hessian.py`, `scripts/*calib*`, `python3 -m tools.hfq.verify_calib_artifacts`
 
 3. **Alignment / draft training is script-local**, not a scheduled candidate
-   loop: `scripts/mtp_train/*`, `scripts/distill/*`, `scripts/dflash_train_poc.py`.
+   loop: `scripts/mtp_train/*`, `scripts/distill/*`, `scripts/archive/dflash_train_poc.py`.
    Path C trainer work is already closed as a failed experiment in the lean-up
    map; Roundhouse must not resurrect it as product authority.
 
@@ -189,13 +189,13 @@ Until then these paths remain the live owners. “Migrate” means clean cutover
 | `hipfire-ds4-parent/src/hessian.rs` (generic E8H1 / accum API) | online parent Hessian | **salvage into `capture`** | Only generic accum + write path — see § 6 |
 | `hipfire-ds4-parent/src/plog.rs` | plog read/write/compare | **salvage into `teacher` / `score`** | Format helpers only |
 | `hipfire-ds4-parent/src/manifest.rs` | parent capture manifest schema | **salvage patterns into `waybill`** | Do not import DS4-only fields as global required set without generalization |
-| `scripts/fetch_calibration_corpus.sh` | corpus fetch | `corpus` | |
+| `scripts/archive/fetch_calibration_corpus.sh` | corpus fetch | `corpus` | |
 | `python3 -m tools.hfq.verify_calib_artifacts` | artifact checks | `corpus` / `waybill` verify | |
 | `scripts/collect_hessian.py` | Hessian helper | `capture` or delete after cutover | |
 | `scripts/calibrate_multigpu.sh`, `mi300x_calib_rest.sh`, `package_mi300x_calib.sh`, `mq4_masked_calib.py` | campaign wrappers | `schedule` recipes or stay as thin callers | Campaign glue is not product admission |
 | `scripts/mtp_train/*` | MTP head training experiments | `workers/` (dev-only) | Not Path C resurrection; explicit research worker |
 | `scripts/distill/*` | distill parallel helpers | `workers/` (dev-only) | |
-| `scripts/dflash_train_poc.py` | DFlash train POC | `workers/` or archive | Lean-up map closed Path C as failed experiment — no product promise |
+| `scripts/archive/dflash_train_poc.py` | DFlash train POC | `workers/` or archive | Lean-up map closed Path C as failed experiment — no product promise |
 | `scripts/reap/kld_compare.*`, `run_ppl_kld.sh` | PPL/KLD compare helpers | `score` adapters or keep under Reap callers | Reap plan ownership stays in `hipfire-reap` |
 | `benchmarks/quality-baselines/harness/{kldref_format.py,kld_diff.py,kld_reduce.py}` | Legacy Python KLD parse/reduce | Call or retire behind `saddle-quant` | Canonical Rust formats live in `crates/saddle-quant/src/format/{kldref,kldseq}.rs`; do not fork them |
 | `hipfire-arch-deepseek4/reference_oracle/` (torch teacher) | DS4 teacher PPL/plog | External **teacher backend** registered by `teacher` | Remains the DS4 calibration teacher authority |

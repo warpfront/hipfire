@@ -202,7 +202,7 @@ git commit -m "test(reap): SP4-overlay -> SP3-load end-to-end (real containers, 
 
 **Files:**
 - Modify: `crates/hipfire-reap/src/source.rs`, `lib.rs`
-- Modify: `scripts/reap/README.md`
+- Modify: `scripts/archive/reap/README.md`
 
 - [ ] **Step 1: Remove `TensorSource`, keep `ExpertPlan`**
 
@@ -215,7 +215,7 @@ In the "Selective re-quant (overlay)" section (added by SP4), update the "Consum
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/hipfire-reap/src/source.rs crates/hipfire-reap/src/lib.rs scripts/reap/README.md
+git add crates/hipfire-reap/src/source.rs crates/hipfire-reap/src/lib.rs scripts/archive/reap/README.md
 git commit -m "refactor(reap): drop vestigial TensorSource (overlay now in HfqFile); SP3 docs"
 ```
 

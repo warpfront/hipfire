@@ -13,7 +13,7 @@ The underlying attractor was **not** a precision cliff in the MoE / router / fin
 
 The env-var fallback (`HIPFIRE_QWEN_MOE_FINAL_NORM_RAW`) is therefore redundant and was removed together with this investigation closure. The router-precision / fast-path-eligibility hypotheses below are not falsified, but are no longer load-bearing for the documented spiral; the precision interactions remain a real consideration for future MoE quality work but they're not the reasoning-loop cause.
 
-Reproducer: `scripts/test_pr228_spiral_check.sh` (A/B/C against the same prompt + daemon).
+Reproducer: `scripts/archive/test_pr228_spiral_check.sh` (A/B/C against the same prompt + daemon).
 
 ---
 

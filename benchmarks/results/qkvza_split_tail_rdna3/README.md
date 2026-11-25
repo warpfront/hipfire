@@ -5,7 +5,7 @@ This directory contains the consolidated local W7900 evidence for the opt-in
 
 The benchmark toggles only `HIPFIRE_QKVZA_SPLIT_TAIL` and runs the production
 `bench_qwen35_mq4` prefill path through
-`scripts/bench_qwen36_qkvza_split_tail_ab.sh`.
+`scripts/archive/bench_qwen36_qkvza_split_tail_ab.sh`.
 
 Common setup:
 

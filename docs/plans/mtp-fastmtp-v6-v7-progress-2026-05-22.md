@@ -4,7 +4,7 @@
 **Branch:** `mtp-hiptrx-rocprof`
 **Hardware:** 1× MI300X VF (training); k9lin 7900 XTX (bench)
 **Model:** Qwen3.6-27B
-**Code:** `scripts/mtp_train/mtp_train_27b_v6_K3.py` + `v7_K5.py`
+**Code:** `scripts/archive/mtp_train/mtp_train_27b_v6_K3.py` + `v7_K5.py`
 
 ## TL;DR
 
@@ -92,12 +92,12 @@ LRU canonical prompt per-step accept rates (v7):
 
 ## What we've shipped
 
-- `scripts/mtp_train/mtp_module.py` — Qwen MTP loader (validated end-to-end)
-- `scripts/mtp_train/mtp_train_0p8b.py` — smoke (validated +10.71pp in 70s)
-- `scripts/mtp_train/mtp_train_27b.py` — single-step CE (v1)
-- `scripts/mtp_train/mtp_train_27b_v5_recursive.py` — K=2 recursive (v5)
-- `scripts/mtp_train/mtp_train_27b_v6_K3.py` — K=3 + 20K corpus (v6)
-- `scripts/mtp_train/mtp_train_27b_v7_K5.py` — K=5 + 20K corpus (v7)
+- `scripts/archive/mtp_train/mtp_module.py` — Qwen MTP loader (validated end-to-end)
+- `scripts/archive/mtp_train/mtp_train_0p8b.py` — smoke (validated +10.71pp in 70s)
+- `scripts/archive/mtp_train/mtp_train_27b.py` — single-step CE (v1)
+- `scripts/archive/mtp_train/mtp_train_27b_v5_recursive.py` — K=2 recursive (v5)
+- `scripts/archive/mtp_train/mtp_train_27b_v6_K3.py` — K=3 + 20K corpus (v6)
+- `scripts/archive/mtp_train/mtp_train_27b_v7_K5.py` — K=5 + 20K corpus (v7)
 - 7 trained .mtp checkpoints (v1-v7) on mi300 `/workspace/mtp-fastmtp/`
 - v6, v7 .mtp at `/tmp/qwen3.6-27b-trained-{v6,v7}.mtp` on k9lin
 

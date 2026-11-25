@@ -33,7 +33,7 @@ target-model sidecars for Carnice / Qwen3.6-27B / dense Qwen models.
 Generate with:
 
 ```
-bash scripts/fetch_hermes_corpus.sh benchmarks/calib/hermes-corpus.txt
+bash scripts/archive/fetch_hermes_corpus.sh benchmarks/calib/hermes-corpus.txt
 ```
 
 ### `aureth-corpus.txt` (~127 MB / ~32M tokens)
@@ -45,7 +45,7 @@ Used to calibrate Qwen3.5-A3B / Qwen3.6-A3B sidecars per
 ```
 hf download --repo-type dataset OusiaResearch/Aureth-Corpus-Hermes4.3-Generated \
   compiled_corpus.jsonl --local-dir benchmarks/calib/aureth-raw
-python3 scripts/aureth_to_corpus.py \
+python3 scripts/archive/aureth_to_corpus.py \
   benchmarks/calib/aureth-raw/compiled_corpus.jsonl \
   benchmarks/calib/aureth-corpus.txt
 ```

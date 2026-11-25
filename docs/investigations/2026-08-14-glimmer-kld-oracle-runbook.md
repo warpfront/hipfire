@@ -50,7 +50,7 @@ plumbing; Glimmer needs the equivalent, and Glimmer did not exist in June.
 
 - **bartowski-v5** raw multilingual/code/structured — "diversity /
   outlier-channel coverage (what AWQ protects)"
-- **agentic ChatML** via `scripts/fetch_calibration_corpus.sh` — "matches
+- **agentic ChatML** via `scripts/archive/fetch_calibration_corpus.sh` — "matches
   hipfire's DEPLOYMENT distribution (chat + tool + flow)"
 
 emitting `hfim-blend-calib.txt` plus a DISJOINT held-out `hfim-agentic-eval.txt`

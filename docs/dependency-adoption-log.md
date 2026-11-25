@@ -134,7 +134,7 @@ Implemented by commit `b15e6f884`.
 ## Future beta follow-ups
 
 - Add a `QuantizeArgs::try_parse_from` regression using the live argument shape
-  from `scripts/mi300x_v3_matrix.sh` so script/CLI drift fails in unit tests.
+  from `scripts/archive/mi300x_v3_matrix.sh` so script/CLI drift fails in unit tests.
 - Add a generated safetensors fixture that checks tensor names, shapes, absolute
   data offsets, and emitted HFQ byte parity through the shared reader.
 - Add a localhost HTTP/SSE test for the `ureq` 3 TUI migration, including

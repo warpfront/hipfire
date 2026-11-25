@@ -115,7 +115,7 @@ substitute for the integrated serving test.
 Reproducible integration smoke:
 
 ```sh
-bash scripts/test-packed-mq4-smoke.sh benchmarks/results/NEW-RUN 1
+bash scripts/archive/test-packed-mq4-smoke.sh benchmarks/results/NEW-RUN 1
 ```
 
 The runner refuses existing output directories, runs both formats sequentially,

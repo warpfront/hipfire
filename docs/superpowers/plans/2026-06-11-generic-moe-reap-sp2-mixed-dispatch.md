@@ -205,7 +205,7 @@ git commit -m "feat(reap): qwen35/lfm2moe populate per-expert tier tables when a
 
 ### Task 5: Docs
 
-- [ ] **Step 1:** In `scripts/reap/README.md`, add an "Intra-layer mixed tiers — SP2" note: per-expert tiers within a layer now bucket the top-k and reuse single-tier kernels; buffer arches (qwen35/lfm2moe) supported; blob arches (ds4/minimax) need per-tier sub-blobs (follow-on); the bucketing-equivalence + serve gates are GPU-owed.
+- [ ] **Step 1:** In `scripts/archive/reap/README.md`, add an "Intra-layer mixed tiers — SP2" note: per-expert tiers within a layer now bucket the top-k and reuse single-tier kernels; buffer arches (qwen35/lfm2moe) supported; blob arches (ds4/minimax) need per-tier sub-blobs (follow-on); the bucketing-equivalence + serve gates are GPU-owed.
 
 - [ ] **Step 2: Commit** `docs(reap): SP2 mixed-tier dispatch notes`.
 

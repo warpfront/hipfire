@@ -31,7 +31,7 @@ Production Qwen prefill command:
 BUILD=0 GPU_ID=0 KV_MODE=asym3 PREFILL=8192 RUNS=3 SLEEP_SECS=10 \
 MODEL=$HOME/.hipfire/models/qwen3.6-27b.mq4 \
 SIDECAR=$PWD/experiments/flash-attn-ck-sidecar/build-gfx1201/libhipfire_flash_attn_ck.so \
-./scripts/bench_ck_q8_prefill_ab.sh
+./scripts/archive/bench_ck_q8_prefill_ab.sh
 ```
 
 Results:

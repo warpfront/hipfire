@@ -170,7 +170,7 @@ generation — none of which is reachable until gap 4 is closed.
   `rejected_mq2lloyd_payload_diagnostic_only`, and
   `docs/specs/2026-07-23-deepseek4-mq2r-e8-recipe.md` records a rejected restamp
   at 7.92 tok/s vs 30.21 AR. The artifact is fine — its 2376 payload tensors are
-  recipe-agnostic Q8/F16 (`scripts/quantize-dspark.sh`, `--format
+  recipe-agnostic Q8/F16 (`scripts/archive/quantize-dspark.sh`, `--format
   deepseek4-q8-mtp`). Because the defect is recipe-driven and arch-independent,
   the July gfx1151 measurement is very likely the same bug, not a bad sidecar.
   Whether a *properly P3-calibrated* sidecar beats this one is now an open
@@ -627,7 +627,7 @@ draft :   6.00 GB /  3 stages = 1.999 GB per stage
 => a draft stage weighs 1.05x a trunk layer
 ```
 
-The sidecar is built by `scripts/quantize-dspark.sh` with
+The sidecar is built by `scripts/archive/quantize-dspark.sh` with
 `--format deepseek4-q8-mtp --include-prefix mtp.`, and that format falls back to
 **Q8F16** (`crates/hipfire-quantize/src/main.rs:5082`, tier selection
 `:7037-7043`). The trunk it drafts for is MQ2R: dense qt=35 MFP4G32E8SOA (~4-bit,

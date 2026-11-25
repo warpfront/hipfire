@@ -1692,7 +1692,7 @@ GiB, for all 241, per replicated card). The marker `gfx1201-q8f16-v1` selects no
 IU4 route and applies under `auto` on exact gfx1201 only (`1` applies it
 elsewhere; the C8 lane stages stay per lane wherever the arch has no row-twin
 proof for their Q8_0 route). A pipeline-parallel load refuses any overlay.
-`scripts/q8_overlay_writer.py encode --tier attn|gdn_in|gdn_out|head|full`
+`scripts/archive/q8_overlay_writer.py encode --tier attn|gdn_in|gdn_out|head|full`
 writes the payloads from BF16 safetensors.
 
 ### Qwen4 expert hotset sidecar

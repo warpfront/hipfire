@@ -276,7 +276,7 @@ The `load_weights` site carries the rationale block citing 1e01c0b
 5. **MoE spiral path.** Was load-bearing in earlier revisions of this
    plan; superseded after commit `9b4ab74a` (repeat_penalty 1.3 → 1.0
    default) dissolved the spiral. See the updated mitigation note
-   above and the script `scripts/test_pr228_spiral_check.sh` which
+   above and the script `scripts/archive/test_pr228_spiral_check.sh` which
    reproduces the A/B (rp=1.0 coherent / rp=1.3 spiral / workaround
    coherent) for any future agent who needs to re-confirm.
 

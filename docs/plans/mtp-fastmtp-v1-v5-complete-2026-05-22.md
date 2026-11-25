@@ -110,10 +110,10 @@ acceptance improvement until MTP can sustain longer chains.
 
 | File | Purpose | Size/LOC |
 |---|---|---|
-| `scripts/mtp_train/mtp_module.py` | Custom Qwen MTP loader (130 LOC) | — |
-| `scripts/mtp_train/mtp_baseline.py` | Pretrained MTP eval | — |
-| `scripts/mtp_train/mtp_train_0p8b.py` | 0.8B smoke (validated) | — |
-| `scripts/mtp_train/mtp_train_27b.py` | Single-step CE 27B | — |
+| `scripts/archive/mtp_train/mtp_module.py` | Custom Qwen MTP loader (130 LOC) | — |
+| `scripts/archive/mtp_train/mtp_baseline.py` | Pretrained MTP eval | — |
+| `scripts/archive/mtp_train/mtp_train_0p8b.py` | 0.8B smoke (validated) | — |
+| `scripts/archive/mtp_train/mtp_train_27b.py` | Single-step CE 27B | — |
 | `/workspace/mtp-fastmtp/corpus_v2/` (mi300) | Code corpus (498 distill + 164 HE+ + calib) | 16 MB |
 | `/workspace/mtp-fastmtp/qwen3.6-27b-trained-v5.mtp` (mi300) | Best checkpoint | 215 MB |
 | `/tmp/qwen3.6-27b-trained-v5.mtp` (k9lin) | Bench-ready | 215 MB |

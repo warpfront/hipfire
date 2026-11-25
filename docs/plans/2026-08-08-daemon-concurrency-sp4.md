@@ -31,7 +31,7 @@
   | `qwen3.6:35b-a3b` | ~20 GB | 10.6 KB | 25.8 GB — fits | 24.4 GB — fits |
 
   asym3 would have relaxed the 27B's limit but was **rejected on quality** (~30% of top-1 token choices change), so the cap is real, not temporary.
-- **Three gates green after every task:** `./scripts/no-gpu-ci.sh` exit 0; `./scripts/kernel_resource_gate.sh` identical to its baseline (compile-only, always runnable); `./scripts/attn_legacy_baseline.sh` bitwise identical (needs GPU).
+- **Three gates green after every task:** `./scripts/no-gpu-ci.sh` exit 0; `./scripts/kernel_resource_gate.sh` identical to its baseline (compile-only, always runnable); `./scripts/archive/attn_legacy_baseline.sh` bitwise identical (needs GPU).
 - `no-gpu-ci.sh` flakes with `ExecutableFileBusy` in the unrelated `hipfire-client` crate under parallel load — if you retry, **say so** rather than presenting the retry as a first-run pass.
 - Check exit statuses directly; `cmd | tail && echo OK` prints OK when only `tail` succeeded.
 - Licence header on new files. Commit with `git add <specific paths>` — never `git add -A`.

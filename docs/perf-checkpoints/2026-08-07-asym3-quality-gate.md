@@ -141,7 +141,7 @@ the asym3 multi-slot path across 248 checks.
   decisive result for "should it be the default" and is *not* a broad quality
   evaluation of asym3.
 - **The coherence gates (`coherence-gate-qwen35-*`) and
-  `scripts/kv_quality_dashboard.py` were not run.** Three agent stalls consumed
+  `scripts/archive/kv_quality_dashboard.py` were not run.** Three agent stalls consumed
   the budget for them. They would strengthen the picture but are unlikely to
   reverse a 30% top-1 disagreement.
 - Long-context behaviour is untested (see above).

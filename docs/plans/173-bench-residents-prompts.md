@@ -67,7 +67,7 @@ In scope (slice 1, this PR):
 3. Print `@@@ ROW <i>: <label> @@@` and `@@@ ROW <i> END @@@` separators
    on stderr in multi-prompt mode only. Single-prompt (`--prompt`) mode
    emits zero new lines — output stays byte-identical to current.
-4. Add a small smoke harness `scripts/dflash_bench_resident_smoke.sh`
+4. Add a small smoke harness `scripts/archive/dflash_bench_resident_smoke.sh`
    that runs a 2-row manifest on the smallest available DFlash model and
    asserts both rows produce non-empty output. Validates the new flag
    end-to-end without depending on a 27 B model.
@@ -85,7 +85,7 @@ Out of scope, separate work:
 - `benchmarks/scripts/bench_dflash_27b_gfx906.sh` — does not exist on
   master (lives on PR #158's `feat/gfx906-mmq-redesign`). Should be
   authored on that branch using the new flag.
-- `scripts/bench_humaneval_dflash.py`, `scripts/dflash_branch_bench.sh`,
+- `scripts/bench_humaneval_dflash.py`, `scripts/archive/dflash_branch_bench.sh`,
   `scripts/sweep_dflash_full.sh`, `scripts/mq3-mq2-sweep.sh` — same
   fix applies; each is its own follow-up.
 - Daemon JSON-lines `done` event additions (`mean_committed`, `mean_B`).
@@ -196,7 +196,7 @@ Validation requirements that must hold:
   skipping line N: <reason>")` and continue. Don't panic and lose the
   battery.
 
-### `scripts/dflash_bench_resident_smoke.sh` (new, slice 1)
+### `scripts/archive/dflash_bench_resident_smoke.sh` (new, slice 1)
 
 ~30 lines. Picks the smallest staged DFlash-compatible model from
 `$HIPFIRE_MODELS_DIR` (e.g. 0.8B or 4B with matching DFlash drafter),
@@ -254,7 +254,7 @@ and the flag is proven on the smoke harness.
    linchpin test for state-reset completeness.
 4. Different prompts: 2-row manifest with distinct prompts, both rows
    complete and produce sensible-looking output (eyeball decode).
-5. `scripts/dflash_bench_resident_smoke.sh` exits 0 on whatever DFlash
+5. `scripts/archive/dflash_bench_resident_smoke.sh` exits 0 on whatever DFlash
    model is staged; skips cleanly otherwise.
 6. `--prompts-file` + `--cask-sidecar` → exit 2 with clear error message.
 7. Wallclock check: invoking the binary once with a 2-row manifest is

@@ -267,12 +267,12 @@ Smoke image current PASS: F1 1.000, 13/13 text exact-match, max
 
 The per-stage dump scaffolding
 (`HIPFIRE_DOTS_OCR_DUMP_DIR=...` +
-`scripts/diff_dots_ocr_stages.py`) is retained as a diagnostic — if
+`scripts/archive/diff_dots_ocr_stages.py`) is retained as a diagnostic — if
 something IS broken, it usually shows up in early-block cosine too.
 But cos < 0.99 at block N is NOT itself a failure unless end-to-end
 output is also bad. When in doubt about whether a divergence is "us
 wrong" or "HF bf16 drift", run
-`scripts/numpy_attention_replay.py` on captured QKV: if our GPU
+`scripts/archive/numpy_attention_replay.py` on captured QKV: if our GPU
 output matches numpy F32 and HF doesn't, the divergence is HF's bf16
 drift not our bug.
 

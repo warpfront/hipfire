@@ -66,12 +66,12 @@ last captured state matches hipfire's pre-final-norm capture point.
 
 Computes per-layer relative L2 and cosine between two `HFHS` dumps.
 
-`scripts/compare_layer_positions.py`
+`scripts/archive/compare_layer_positions.py`
 
 Buckets one layer's drift by position, which helps distinguish steady input
 bias from recurrent or long-context accumulation.
 
-`scripts/cross_engine_check.py`
+`scripts/archive/cross_engine_check.py`
 
 Checks whether the BF16 `.kldref` distribution and an HF Transformers run agree
 on the same token chunk. Use this before blaming hipfire if the external
@@ -135,7 +135,7 @@ python3 scripts/compare_hidden_states.py \
 For position-bucketed analysis:
 
 ```bash
-python3 scripts/compare_layer_positions.py \
+python3 scripts/archive/compare_layer_positions.py \
   --hf /tmp/q3.5-0.8b-hf-hidden-chunk0.bin \
   --hipfire /tmp/q3.5-0.8b-hipfire-hidden-chunk0.bin \
   --layer 4

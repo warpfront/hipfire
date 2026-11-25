@@ -647,7 +647,7 @@ Expected: compiles; `hipfire-reap` unit tests (incl. the new `load_legacy_keepma
 
 - [ ] **Step 5b: [GPU — DEFERRED] ds4 identity NLL gate**
 
-The identity NLL gate (existing keep-all-256 sidecar): confirm a keep-all `reap_plan.json` reproduces the no-plan baseline NLL to 10 decimals (use `scripts/reap/build_keepall_sidecar.py` regenerated to emit `reap_plan.json`, or point `HIPFIRE_DEEPSEEK4_REAP_KEEPMAP` at the legacy sidecar to exercise `load_legacy_keepmap`).
+The identity NLL gate (existing keep-all-256 sidecar): confirm a keep-all `reap_plan.json` reproduces the no-plan baseline NLL to 10 decimals (use `scripts/archive/reap/build_keepall_sidecar.py` regenerated to emit `reap_plan.json`, or point `HIPFIRE_DEEPSEEK4_REAP_KEEPMAP` at the legacy sidecar to exercise `load_legacy_keepmap`).
 **Do NOT run under the GPU embargo** — leave unchecked; note "deferred: GPU in use". The lift must be behavior-preserving; this is the gate to run once the GPU frees.
 
 - [ ] **Step 6: Commit**
@@ -778,20 +778,20 @@ git commit -m "feat(minimax): generic REAP keep-map loader wiring"
 
 **Files:**
 - Create: `crates/hipfire-reap/tests/identity_gate.md` (documented manual gate runner) or extend `scripts/reap/`
-- Modify: `scripts/reap/build_keepall_sidecar.py` → emit `reap_plan.json` (generic)
+- Modify: `scripts/archive/reap/build_keepall_sidecar.py` → emit `reap_plan.json` (generic)
 
 - [ ] **Step 1: Generalize the keep-all sidecar builder**
 
-Update `scripts/reap/build_keepall_sidecar.py` to write a generic `reap_plan.json` with `keep.per_layer = [[0..N-1]] * num_layers` for a given (num_layers, n_experts), arch-agnostic.
+Update `scripts/archive/reap/build_keepall_sidecar.py` to write a generic `reap_plan.json` with `keep.per_layer = [[0..N-1]] * num_layers` for a given (num_layers, n_experts), arch-agnostic.
 
 - [ ] **Step 2: [GPU — DEFERRED] Run the identity gate on every wired arch**
 
-For each of ds4, qwen35, lfm2moe, minimax with an available MoE checkpoint: load with `HIPFIRE_REAP_PLAN=<keepall dir>` and confirm logits/NLL match the no-plan baseline to 10 decimals. Record results in `scripts/reap/README.md`.
+For each of ds4, qwen35, lfm2moe, minimax with an available MoE checkpoint: load with `HIPFIRE_REAP_PLAN=<keepall dir>` and confirm logits/NLL match the no-plan baseline to 10 decimals. Record results in `scripts/archive/reap/README.md`.
 **Do NOT run under the GPU embargo** — leave unchecked, note "deferred: GPU in use". Expected (when run): all 4 reproduce baseline (exact no-op under keep-all).
 
 - [ ] **Step 3: [GPU — DEFERRED] ds4 end-to-end smoke**
 
-Reproduce the known K144 result through the new generic path: full-256 PPL ≈ 7.56 vs pruned-144 ≈ 17.73 on wikitext2 ctx=1024 (existing `scripts/reap/run_ppl_kld.sh`, regenerated keep-map as `reap_plan.json`).
+Reproduce the known K144 result through the new generic path: full-256 PPL ≈ 7.56 vs pruned-144 ≈ 17.73 on wikitext2 ctx=1024 (existing `scripts/archive/reap/run_ppl_kld.sh`, regenerated keep-map as `reap_plan.json`).
 **Do NOT run under the GPU embargo** — leave unchecked, note "deferred: GPU in use". Expected (when run): matches pre-lift numbers — no regression.
 
 - [ ] **Step 4: Commit the (Python/script) changes**

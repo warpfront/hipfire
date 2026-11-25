@@ -154,9 +154,9 @@ MI300X — R9700/gfx1201 is newer than MI300X for the relevant ops.
 
 From tonight's Phase 1 Track A (`project_mtp_hiptrx_session_2026_05_21`):
 
-- `scripts/distill/run_distill_parallel.sh` — multi-GPU distill harness on 4× R9700
+- `scripts/archive/distill/run_distill_parallel.sh` — multi-GPU distill harness on 4× R9700
 - `~/.hipfire/distill_artifacts_2026_05_21/distill_raw_249prompts.tar.gz` (70K argmax tokens, too small but format proven)
-- `scripts/distill/aggregate_argmax.py` — argmax label extraction
+- `scripts/archive/distill/aggregate_argmax.py` — argmax label extraction
 - `crates/hipfire-runtime/examples/mtp_extract.rs` — converts trained weights → `.mtp` format
 
 What we DON'T have (Path A blockers):

@@ -208,7 +208,7 @@ If Phase 0 shows the composition architecture is sound, invest in solo
 MTP perf. Two parallel tracks:
 
 **Track A: Trained sidecar on hiptrx**
-- `scripts/run_distill_parallel.sh` exists from earlier session work
+- `scripts/archive/distill/run_distill_parallel.sh` exists from earlier session work
 - Currently defaults to `--kv-mode asym3`; needs `--kv-mode q8` flag added
   to match production deployment
 - Run trunk-argmax distillation across wide corpus on 4× R9700

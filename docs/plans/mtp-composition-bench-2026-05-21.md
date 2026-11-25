@@ -154,7 +154,7 @@ git bisect against `cf449fcd` (pre-rebase HEAD) on a future session.
 **Pipeline executed end-to-end on 4× R9700:**
 1. Synthesized 249 diverse prompts (Python stdlib + hipfire Rust source +
    English/code/dialogue/QA), ~726 chars mean
-2. Ran `scripts/distill/run_distill_parallel.sh ... --kv-mode q8` —
+2. Ran `scripts/archive/distill/run_distill_parallel.sh ... --kv-mode q8` —
    249/249 prompts complete in ~22 min wall, 70,313 tokens emitted,
    5,422 unique trunk-argmax tokens
 3. `aggregate_argmax.py` → v2 sidecar JSON (top-16384 covers 100% of

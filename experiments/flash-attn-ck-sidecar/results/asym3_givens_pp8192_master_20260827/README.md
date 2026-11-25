@@ -13,7 +13,7 @@ Command:
 
 ```bash
 BUILD=0 GPU_ID=0 KV_MODE=asym3 PREFILL=8192 RUNS=5 SLEEP_SECS=10 \
-  ./scripts/bench_ck_q8_prefill_ab.sh
+  ./scripts/archive/bench_ck_q8_prefill_ab.sh
 ```
 
 Results after two warmups per arm:

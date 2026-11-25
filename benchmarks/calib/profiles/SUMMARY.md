@@ -50,7 +50,7 @@ Stretch goal (5M re-cal) skipped: structurally confirmed not to help.
 ## Artifacts
 
 - `benchmarks/calib/blended-corpus.txt` — md5 c96c7ca1b189ccc19b09565ccb0c010e
-  (built ad-hoc; committed in `scripts/fetch_calibration_corpus.sh --recipe blended`)
+  (built ad-hoc; committed in `scripts/archive/fetch_calibration_corpus.sh --recipe blended`)
 - `models/{qwen3.6-27b,qwen3.6-35b-a3b,qwen3.5-35b-a3b}/*.mq4.triattn.blended_v3.bin`
 - This dir: 6 profile traces in CSV format (per-chunk timing breakdowns)
 

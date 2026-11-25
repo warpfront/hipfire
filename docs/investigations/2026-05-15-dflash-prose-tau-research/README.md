@@ -87,9 +87,9 @@ but enough to close most of the bench-vs-production gap.
 Branch `feat/mtp` already has the scaffolding for trunk-argmax
 distillation:
 
-- `scripts/sample_prompts.py` — corpus generation
-- `scripts/run_distill_parallel.sh` — hiptrx parallel trunk forward
-- `scripts/aggregate_argmax.py` — collect target argmax targets
+- `scripts/archive/distill/sample_prompts.py` — corpus generation
+- `scripts/archive/distill/run_distill_parallel.sh` — hiptrx parallel trunk forward
+- `scripts/archive/distill/aggregate_argmax.py` — collect target argmax targets
 
 Built originally for MTP head training, the same pipeline produces
 exactly what Direct Alignment / DistillSpec need as input — target's

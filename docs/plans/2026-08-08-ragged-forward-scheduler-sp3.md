@@ -29,7 +29,7 @@
 - **Never write to `~/.hipfire/`.** Everything needed is an env var.
 - **No device `assert()`** — `compiler.rs` never passes `-DNDEBUG`, so they ship in release (SP1 measured 64 B/lane of scratch on four kernels).
 - **Three gates green after every task:**
-  - `./scripts/attn_legacy_baseline.sh` vs `scripts/attn_legacy_baseline.beta.txt` → bitwise identical (needs GPU).
+  - `./scripts/archive/attn_legacy_baseline.sh` vs `scripts/archive/attn_legacy_baseline.beta.txt` → bitwise identical (needs GPU).
   - `./scripts/kernel_resource_gate.sh` vs `scripts/kernel_resource_gate.beta.txt` → identical (compile-only, always runnable; covers six kernels including DeltaNet).
   - `./scripts/no-gpu-ci.sh` → exit 0. It flakes with `ExecutableFileBusy` in the unrelated `hipfire-client` crate under parallel load; if you retry, **say so** rather than presenting the retry as a first-run pass.
 - Check exit statuses directly; `cmd | tail && echo OK` prints OK when only `tail` succeeded.

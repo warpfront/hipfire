@@ -44,7 +44,7 @@ PYTEST_PATHS=(
     scripts/hw-gate/tests
     scripts/test_registry_gen_ornith.py scripts/test_registry_gen_vision.py
     scripts/test_registry_gen_coverage.py scripts/test_registry_gen_decider.py
-    scripts/test_lmx_corpus.py scripts/test_ck_runtime_bundle.py
+    scripts/test_ck_runtime_bundle.py
     scripts/test_check_changelog.py scripts/test_check_conflict_markers.py scripts/test_kernel_idproof.py
     scripts/test_agentic_gate_driver.py
     scripts/test_post_land_smoke.py scripts/test_post_land_smoke_orchestrator.py
@@ -52,8 +52,7 @@ PYTEST_PATHS=(
     scripts/test_registry_gen_flash_next.py scripts/test_registry_gen_ple.py
     scripts/test_route_plan_build.py scripts/test_route_plan_walk.py
     scripts/test_ep_hot_units.py scripts/test_k0rank.py scripts/test_fn_ep_gate_chunk.py
-    scripts/test_gfx1100_xts_scope.py scripts/test_q8_overlay_writer.py scripts/test_subq4_g2_carrier.py
-    scripts/slowlink-gap/quality_test_scorer.py scripts/slowlink-gap/quality_test_campaign.py
+    scripts/test_gfx1100_xts_scope.py
 )
 if python3 -c 'import pytest, numpy' 2>/dev/null; then
     python3 -m pytest "${PYTEST_PATHS[@]}"

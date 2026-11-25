@@ -357,7 +357,7 @@ git commit -m "feat(reap): --reap-overlay mode emits subset overlay.hfq (CPU, by
 ### Task 5: Docs
 
 **Files:**
-- Modify: `scripts/reap/README.md`
+- Modify: `scripts/archive/reap/README.md`
 
 - [ ] **Step 1: Document the overlay workflow**
 
@@ -366,7 +366,7 @@ Add a "Selective re-quant (overlay)" section: the `--reap-overlay` invocation, t
 - [ ] **Step 2: Commit**
 
 ```bash
-git add scripts/reap/README.md
+git add scripts/archive/reap/README.md
 git commit -m "docs(reap): selective re-quant overlay workflow"
 ```
 

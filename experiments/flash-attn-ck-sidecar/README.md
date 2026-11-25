@@ -153,7 +153,7 @@ The workspace is allocated once when `Gpu` is created. Missing or insufficient
 workspace produces a one-time route reason and retains native attention. The
 Asym3 D256 cell is attempted only after the Qwen attention family has completed
 its native KV write and resolved a sequential, non-tree, non-windowed prefill;
-decode and graph capture remain native. Use `scripts/bench_ck_q8_prefill_ab.sh`
+decode and graph capture remain native. Use `scripts/archive/bench_ck_q8_prefill_ab.sh`
 with `KV_MODE=q8`, `KV_MODE=asym3`, or `KV_MODE=fwht3` for a reproducible
 production-path A/B.
 The script also requires native and CK prefill to produce the same next-token ID.

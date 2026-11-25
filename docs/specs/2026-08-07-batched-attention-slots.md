@@ -513,9 +513,9 @@ Measure asym3 against a q8 reference on **both** models:
 
 - **KLD of next-token distributions** over a fixed prompt set, using the existing
   KLD tooling (`benchmarks/quality-baselines/harness/kld_reduce.py`,
-  `scripts/reap/kld_compare.py`). Report mean *and* median — the two diverge
+  `scripts/archive/reap/kld_compare.py`). Report mean *and* median — the two diverge
   sharply on long-tail distributions and the mean alone has misled before.
-- **KV-mode identicality** via `scripts/kv_quality_dashboard.py`, which already
+- **KV-mode identicality** via `scripts/archive/kv_quality_dashboard.py`, which already
   exists for exactly this comparison.
 - **Coherence** via the `coherence-gate-qwen35-*` scripts on real prose and code
   prompts at the long contexts agents actually run at — not short prompts, since

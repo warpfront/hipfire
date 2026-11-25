@@ -407,13 +407,13 @@ Quantifying the achievable recovery is future scheduler work, not this task.
   requires the wrapper, and `cargo run`'s own build-then-exec makes the
   wrapped process tree harder to bound cleanly. Behavior is otherwise
   identical; the env var and binary are the same.
-- **The legacy-fingerprint check (`scripts/attn_legacy_baseline.sh`) was run
+- **The legacy-fingerprint check (`scripts/archive/attn_legacy_baseline.sh`) was run
   *without* `run-bounded.sh`,** unlike every other command in this task.
   `run-bounded.sh` prints its own banner lines to stdout before exec'ing the
   wrapped command; those lines are not filtered by
   `attn_legacy_baseline.sh`'s internal `grep`, so wrapping it corrupts the
   exact-text diff against the committed fingerprint
-  (`scripts/attn_legacy_baseline.beta.txt`) with two spurious leading lines.
+  (`scripts/archive/attn_legacy_baseline.beta.txt`) with two spurious leading lines.
   This script's shapes (max `CTX=8192`, `N=256`) are small and were not
   implicated in the OOM incident, so running it unwrapped is safe; the
   fingerprint diff came back `LEGACY_BITWISE_IDENTICAL`, re-verified after

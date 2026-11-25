@@ -11,7 +11,7 @@ The CLI harness is the rebuilt research CLI (same config schema, saved output an
 Command:
 
 ```bash
-python3 scripts/bench_dflash_shared_rotation_e2e.py \
+python3 scripts/archive/bench_dflash_shared_rotation_e2e.py \
   --cli ../hipfire-q38-dflash-20261007/target/release/hipfire \
   --daemon /tmp/hipfire-q38-dflash-final-20261009-artifact/daemon \
   --cases benchmarks/gemma4_eseries_long_decode.json \
@@ -35,7 +35,7 @@ Separate GPU-event projection-group measurements (rotation plus existing GEMMs, 
 After rebasing onto beta 740818f37, the official serving battery passed five cases with omitted flags and five with explicit flags set to 1; compared outputs, finish reasons, generated lengths and tau matched. Reproduce this default-on check using the unmodified upstream CLI/daemon built from this branch:
 
 ```bash
-python3 scripts/verify_dflash_shared_rotation_default.py \
+python3 scripts/archive/verify_dflash_shared_rotation_default.py \
   --out benchmarks/results/qwen38-shared-rotation-default-check
 ```
 

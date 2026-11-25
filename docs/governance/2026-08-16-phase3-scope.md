@@ -90,7 +90,7 @@ is printed rather than inferred. A warning, not a job.
 
 ### 3A.4 — fixtures only where the router routes to nothing
 
-`scripts/vl-golden.sh` (added `116745d56`) is the pattern: 65 s, one committed
+`scripts/archive/vl-golden.sh` (added `116745d56`) is the pattern: 65 s, one committed
 fixture, byte-exact, distinguishes an empty run (exit 2, OOM or busy GPU) from
 real drift (exit 1), wired to `hipfire-loader/**` and `hipfire-arch-dots-ocr/**`.
 Its negative control is verified — corrupt the fixture and it fails with a diff.

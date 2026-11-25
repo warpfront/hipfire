@@ -699,11 +699,11 @@ Run: `cargo run --release -p rdna-compute --features deltanet --example test_q8_
 Expected: same pass output as on a clean `origin/beta` checkout. Capture both and compare:
 
 ```bash
-./scripts/attn_legacy_baseline.sh > /tmp/after.txt 2>&1
-diff scripts/attn_legacy_baseline.beta.txt /tmp/after.txt && echo LEGACY_BITWISE_IDENTICAL
+./scripts/archive/attn_legacy_baseline.sh > /tmp/after.txt 2>&1
+diff scripts/archive/attn_legacy_baseline.beta.txt /tmp/after.txt && echo LEGACY_BITWISE_IDENTICAL
 ```
 
-`scripts/attn_legacy_baseline.beta.txt` is a **committed fingerprint captured
+`scripts/archive/attn_legacy_baseline.beta.txt` is a **committed fingerprint captured
 from pristine `origin/beta` code** across 11 shapes covering both models'
 head configurations (GQA 8:1 and 6:1) plus awkward context/row counts. It is
 verified deterministic across runs.
@@ -1005,8 +1005,8 @@ Expected: PASS, 7 tests (unchanged from Task 3 — this task adds no new host-si
 Run:
 ```bash
 cargo build --release -p rdna-compute --features deltanet
-./scripts/attn_legacy_baseline.sh > /tmp/after6.txt 2>&1
-diff scripts/attn_legacy_baseline.beta.txt /tmp/after6.txt && echo LEGACY_UNCHANGED
+./scripts/archive/attn_legacy_baseline.sh > /tmp/after6.txt 2>&1
+diff scripts/archive/attn_legacy_baseline.beta.txt /tmp/after6.txt && echo LEGACY_UNCHANGED
 ```
 Expected: `LEGACY_UNCHANGED` against the Task 4 Step 5 baseline.
 
@@ -1523,7 +1523,7 @@ Expected: for each model the two lines differ, and the `asym3` line names asym3.
 
 - [ ] **Step 2: Run the KLD comparison**
 
-Use the existing tooling: `benchmarks/quality-baselines/harness/kld_reduce.py` and `scripts/reap/kld_compare.py`. Report **mean and median** — they diverge sharply on long-tail distributions and the mean alone has misled before.
+Use the existing tooling: `benchmarks/quality-baselines/harness/kld_reduce.py` and `scripts/archive/reap/kld_compare.py`. Report **mean and median** — they diverge sharply on long-tail distributions and the mean alone has misled before.
 
 Score on the model's **own generated output**, not a reference completion; scoring against reference output flatters the quantised model.
 
@@ -1531,7 +1531,7 @@ Do **not** use synthetic filler prompts. Long prompts built from a small random 
 
 - [ ] **Step 3: Run the KV identicality dashboard**
 
-Run `scripts/kv_quality_dashboard.py` over the quantisation-gate output for both arms.
+Run `scripts/archive/kv_quality_dashboard.py` over the quantisation-gate output for both arms.
 
 - [ ] **Step 4: Run coherence at agent-realistic context**
 

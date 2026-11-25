@@ -27,7 +27,7 @@
 - **`positions[]` is authoritative for the causal/position bound — never `desc.seq_len`.** The descriptor supplies the slab base address only. Violating this caused SP1's only Critical defect.
 - **ABI: `v_base == k_base` for Q8_0 arenas.** The Q8 flash-prefill kernel uses one shared slab offset; keeping both bases live costs 23 VGPRs and 25% occupancy. asym3 is exempt — its K and V strides genuinely differ.
 - **Two gates must stay green after every task:**
-  - `./scripts/attn_legacy_baseline.sh` diffed against `scripts/attn_legacy_baseline.beta.txt` → bitwise identical.
+  - `./scripts/archive/attn_legacy_baseline.sh` diffed against `scripts/archive/attn_legacy_baseline.beta.txt` → bitwise identical.
   - `./scripts/kernel_resource_gate.sh` diffed against `scripts/kernel_resource_gate.beta.txt` → identical. This is compile-only and safe to run under memory pressure. A deliberate cost updates the baseline in the same commit, with the reason.
 - **`./scripts/no-gpu-ci.sh` must exit 0.** Production `src/` may not read `HIPFIRE_*` directly — route through `feature_flags.rs`, or take it as a parameter and let `examples/` (exempt) read it.
 - Check exit statuses directly. `cmd | tail && echo OK` prints OK when only `tail` succeeded — this masked a failing `cargo test` twice during SP1.
@@ -529,8 +529,8 @@ Expected: builds clean, `RESOURCE_GATE_OK`. The gate does not cover this kernel,
 
 Only if `pgrep -f 'hipfire/bin/daemon'` finds nothing and `MemAvailable` allows:
 ```bash
-./scripts/run-bounded.sh ./scripts/attn_legacy_baseline.sh > /tmp/sp2t3leg.txt 2>&1
-diff scripts/attn_legacy_baseline.beta.txt /tmp/sp2t3leg.txt && echo LEGACY_BITWISE_IDENTICAL
+./scripts/run-bounded.sh ./scripts/archive/attn_legacy_baseline.sh > /tmp/sp2t3leg.txt 2>&1
+diff scripts/archive/attn_legacy_baseline.beta.txt /tmp/sp2t3leg.txt && echo LEGACY_BITWISE_IDENTICAL
 ```
 Expected: `LEGACY_BITWISE_IDENTICAL`. If the box is busy, say so in the report and leave this step unchecked rather than running it anyway.
 

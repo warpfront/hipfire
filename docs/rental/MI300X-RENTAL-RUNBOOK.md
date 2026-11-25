@@ -21,7 +21,7 @@
 >   `692a726dde53508cb53de1a74c720e75a7c9f33e`). A fresh matrix stops at KLD
 >   unless matching `$WORK/kldref/<slug>-bf16.kldref.bin` files are **preseeded**.
 >   Do not treat “generated kldref as scripted” as a live route.
-> - **Bootstrap is destructive.** `scripts/mi300x_bootstrap.sh` runs
+> - **Bootstrap is destructive.** `scripts/archive/mi300x_bootstrap.sh` runs
 >   `git reset --hard origin/$HIPFIRE_BRANCH` on the clone. Reruns destroy
 >   uncommitted work. `HIPFIRE_BRANCH` tracks a moving branch tip, not an
 >   immutable commit. Use only a disposable clone; pin and record the resulting
@@ -81,10 +81,10 @@ These are tracked in `iterative-awq-gptq` + `worktree-awq-raw-sumsq-converter`
 branches on origin:
 - `scripts/convert_gguf_imatrix_to_npz.py` — GGUF imatrix → raw-sumsq npz
 - `scripts/mq4_masked_calib.py` — `--awq-raw-sumsq-npz` flag, F1-default scope
-- `scripts/mi300x_bootstrap.sh` — this runbook's automation
-- `scripts/mi300x_smoke_gfx942.sh` — pre-flight verification
-- `scripts/mi300x_v3_matrix.sh` — model sweep
-- `scripts/mi300x_sub_0_10_attempt.sh` — final lever
+- `scripts/archive/mi300x_bootstrap.sh` — this runbook's automation
+- `scripts/archive/mi300x_smoke_gfx942.sh` — pre-flight verification
+- `scripts/archive/mi300x_v3_matrix.sh` — model sweep
+- `scripts/archive/mi300x_sub_0_10_attempt.sh` — final lever
 
 ## Step-by-step
 
@@ -142,7 +142,7 @@ already exist.
 ### 5. Smoke test (~5 min)
 
 ```bash
-bash /workspace/hipfire/scripts/mi300x_smoke_gfx942.sh
+bash /workspace/hipfire/scripts/archive/mi300x_smoke_gfx942.sh
 ```
 
 Verifies:
@@ -158,7 +158,7 @@ burn paid time on a broken stack.**
 ### 6. v3 matrix sweep (~7-8 h)
 
 ```bash
-bash /workspace/hipfire/scripts/mi300x_v3_matrix.sh
+bash /workspace/hipfire/scripts/archive/mi300x_v3_matrix.sh
 ```
 
 Runs v3 recipe + KLD + coherence + tok/s on all 5 trunk models:
@@ -183,7 +183,7 @@ corrupt tool-call schema. The script excludes router for A3B by default; set
 ### 7. Sub-0.10 KLD attempt (~40 min)
 
 ```bash
-bash /workspace/hipfire/scripts/mi300x_sub_0_10_attempt.sh
+bash /workspace/hipfire/scripts/archive/mi300x_sub_0_10_attempt.sh
 ```
 
 Uses the `--awq-raw-sumsq-npz` lever (commit 59d6be49) to bypass the
