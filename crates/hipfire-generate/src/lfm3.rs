@@ -1199,32 +1199,13 @@ pub fn generate_lfm3_audio(
     // ── Audio decode (WAV → mono F32 @ 16 kHz) ──
     // Any input rate is accepted: a mismatching WAV is linearly resampled to
     // the model's rate (the HF `load_audio` backend resamples too; 24 kHz
-    // browser/TTS audio no longer has to be pre-converted).
-    let waveform = match lfm3_wav::decode_wav_any(audio_bytes) {
-        Ok(w) if w.sample_rate == sr => w,
-        Ok(w) => {
-            let n = ((w.samples.len() as u64) * (sr as u64) / (w.sample_rate as u64)) as usize;
-            let mut out = vec![0.0f32; n.max(1)];
-            let ratio = w.sample_rate as f64 / sr as f64;
-            for (i, o) in out.iter_mut().enumerate() {
-                let src = i as f64 * ratio;
-                let i0 = src as usize;
-                let i1 = (i0 + 1).min(w.samples.len() - 1);
-                let f = (src - i0 as f64) as f32;
-                *o = w.samples[i0] * (1.0 - f) + w.samples[i1] * f;
-            }
-            eprintln!(
-                "[lfm3-audio] resampled {} samples @ {}Hz → {} samples @ {}Hz (linear)",
-                w.samples.len(),
-                w.sample_rate,
-                out.len(),
-                sr
-            );
-            lfm3_wav::Waveform {
-                samples: out,
-                sample_rate: sr,
-            }
-        }
+    // browser/TTS audio no longer has to be pre-converted). The decoder and
+    // resampler refuse empty clips, out-of-range header rates and over-long
+    // clips instead of panicking or sizing an allocation from the header.
+    let waveform = match lfm3_wav::decode_wav_any(audio_bytes)
+        .and_then(|w| lfm3_wav::resample_linear(w, sr))
+    {
+        Ok(w) => w,
         Err(e) => {
             write_error(stdout, id, &format!("lfm3-audio: WAV decode failed: {e}"));
             return;
@@ -1236,6 +1217,26 @@ pub fn generate_lfm3_audio(
         waveform.samples.len() as f64 / sr as f64,
         sr
     );
+
+    // The clip's audio tokens alone must fit the context before mel and the
+    // encoder run; the exact prompt check follows once the prompt is built.
+    let n_audio_expected = lfm3_audio::audio_token_count(&audio_config.mel, waveform.samples.len());
+    let cap = m.lfm3().unwrap().state.max_seq;
+    if n_audio_expected.saturating_add(max_tokens) > cap {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "lfm3-audio: audio exceeds context capacity: audio_tokens={} + max_tokens={} > capacity={}",
+                n_audio_expected, max_tokens, cap
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
 
     // ── Mel + encoder + projector → projected audio tokens ──
     let mel = lfm3_mel::log_mel_from_waveform(&waveform.samples, &audio_config.mel);

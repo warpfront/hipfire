@@ -4,14 +4,14 @@
 
 //! Minimal PCM WAV decoder for LFM3-Audio input.
 //!
-//! Decodes a RIFF/WAVE file to a mono F32 waveform at the model's expected
-//! sample rate (16 kHz). Supports 16/24/32-bit signed-integer and 32-bit
+//! Decodes a RIFF/WAVE file to a mono F32 waveform at its own sample rate.
+//! Supports 16/24/32-bit signed-integer and 32-bit
 //! float PCM (mono or multi-channel→mean) — the common ASR test-audio
 //! formats. Multi-channel clips are mixed to mono by averaging channels
 //! (matching the HF `channel_reduction: "mean"`). The HF `load_audio` backend
-//! (librosa/torchcodec) resamples to 16 kHz; this decoder requires the file to
-//! already be 16 kHz (resampling is a follow-up — the feature extractor checks
-//! `sampling_rate` and refuses a mismatch).
+//! (librosa/torchcodec) resamples to 16 kHz; [`resample_linear`] does the
+//! same for the ASR route. Headers are untrusted: the sample rate and clip
+//! length are bounded and an input with no complete sample frame is refused.
 //!
 //! Limitations (NITS-1): `WAVE_FORMAT_EXTENSIBLE` and 8-bit PCM are rejected
 //! (not in the LFM3-Audio test set); a trailing partial frame shorter than one
@@ -24,6 +24,15 @@ pub struct Waveform {
     pub sample_rate: u32,
 }
 
+/// Lowest / highest `fmt ` sample rate accepted. The rate scales the resampled
+/// length (`len * target / rate`), so a 1 Hz header would turn a small upload
+/// into a huge allocation; real capture rates sit well inside this range.
+pub const MIN_SAMPLE_RATE: u32 = 1_000;
+pub const MAX_SAMPLE_RATE: u32 = 384_000;
+
+/// Longest clip accepted, in seconds of audio.
+pub const MAX_DURATION_SECS: u64 = 600;
+
 #[derive(Debug)]
 pub enum WavError {
     NotWav,
@@ -31,6 +40,7 @@ pub enum WavError {
     UnsupportedFormat(String),
     SampleRateMismatch { got: u32, expected: u32 },
     NoData,
+    TooLong { secs: u64, max_secs: u64 },
 }
 
 impl std::fmt::Display for WavError {
@@ -45,7 +55,10 @@ impl std::fmt::Display for WavError {
                     "sample rate {got} Hz != expected {expected} Hz (resample first)"
                 )
             }
-            WavError::NoData => write!(f, "WAV has no data chunk"),
+            WavError::NoData => write!(f, "WAV has no complete sample frame"),
+            WavError::TooLong { secs, max_secs } => {
+                write!(f, "WAV is {secs} s long; the limit is {max_secs} s")
+            }
         }
     }
 }
@@ -84,7 +97,7 @@ pub fn decode_wav_any(bytes: &[u8]) -> Result<Waveform, WavError> {
             bytes[pos + 7],
         ]) as usize;
         let body_start = pos + 8;
-        let body_end = (body_start + chunk_size).min(bytes.len());
+        let body_end = body_start.saturating_add(chunk_size).min(bytes.len());
         match chunk_id {
             b"fmt " => {
                 if body_end < body_start + 16 {
@@ -102,11 +115,18 @@ pub fn decode_wav_any(bytes: &[u8]) -> Result<Waveform, WavError> {
             _ => {}
         }
         // chunks are word-aligned (pad to even)
-        pos = body_start + chunk_size + (chunk_size & 1);
+        pos = body_start
+            .saturating_add(chunk_size)
+            .saturating_add(chunk_size & 1);
     }
 
     if fmt_sample_rate == 0 {
         return Err(WavError::BadHeader("no fmt chunk".into()));
+    }
+    if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&fmt_sample_rate) {
+        return Err(WavError::BadHeader(format!(
+            "sample rate {fmt_sample_rate} Hz is outside {MIN_SAMPLE_RATE}..={MAX_SAMPLE_RATE} Hz"
+        )));
     }
     if data.is_empty() {
         return Err(WavError::NoData);
@@ -177,10 +197,70 @@ pub fn decode_wav_any(bytes: &[u8]) -> Result<Waveform, WavError> {
             )))
         }
     };
+    // A data chunk shorter than one interleaved frame decodes to nothing.
+    if samples.is_empty() {
+        return Err(WavError::NoData);
+    }
+    check_duration(samples.len(), fmt_sample_rate)?;
 
     Ok(Waveform {
         samples,
         sample_rate: fmt_sample_rate,
+    })
+}
+
+fn check_duration(num_samples: usize, sample_rate: u32) -> Result<(), WavError> {
+    let secs = num_samples as u64 / u64::from(sample_rate.max(1));
+    if secs > MAX_DURATION_SECS {
+        return Err(WavError::TooLong {
+            secs,
+            max_secs: MAX_DURATION_SECS,
+        });
+    }
+    Ok(())
+}
+
+/// Linear resample to `target_sr` (the ASR route's resampler). Refuses an
+/// empty waveform, a rate outside [`MIN_SAMPLE_RATE`]..=[`MAX_SAMPLE_RATE`]
+/// and a clip longer than [`MAX_DURATION_SECS`] instead of indexing past the
+/// end or sizing the output from an untrusted header.
+pub fn resample_linear(w: Waveform, target_sr: u32) -> Result<Waveform, WavError> {
+    if w.samples.is_empty() {
+        return Err(WavError::NoData);
+    }
+    for rate in [w.sample_rate, target_sr] {
+        if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&rate) {
+            return Err(WavError::BadHeader(format!(
+                "sample rate {rate} Hz is outside {MIN_SAMPLE_RATE}..={MAX_SAMPLE_RATE} Hz"
+            )));
+        }
+    }
+    check_duration(w.samples.len(), w.sample_rate)?;
+    if w.sample_rate == target_sr {
+        return Ok(w);
+    }
+    // Both rates are bounded and the clip is at most MAX_DURATION_SECS long,
+    // so `n` is at most MAX_DURATION_SECS * MAX_SAMPLE_RATE (+1); the checked
+    // ops make that explicit rather than relying on it.
+    let n = (w.samples.len() as u64)
+        .checked_mul(u64::from(target_sr))
+        .map(|v| v / u64::from(w.sample_rate))
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| WavError::BadHeader("resampled length overflows".into()))?
+        .max(1);
+    let last = w.samples.len() - 1;
+    let mut out = vec![0.0f32; n];
+    let ratio = w.sample_rate as f64 / target_sr as f64;
+    for (i, o) in out.iter_mut().enumerate() {
+        let src = i as f64 * ratio;
+        let i0 = (src as usize).min(last);
+        let i1 = (i0 + 1).min(last);
+        let f = (src - i0 as f64) as f32;
+        *o = w.samples[i0] * (1.0 - f) + w.samples[i1] * f;
+    }
+    Ok(Waveform {
+        samples: out,
+        sample_rate: target_sr,
     })
 }
 
@@ -217,10 +297,17 @@ mod tests {
                 v.to_le_bytes()
             })
             .collect();
+        pcm16_mono_wav(&data, sr)
+    }
+
+    /// A 16-bit mono PCM WAV around raw `data` bytes (padded to even, as RIFF
+    /// chunks are).
+    fn pcm16_mono_wav(data: &[u8], sr: u32) -> Vec<u8> {
         let data_size = data.len() as u32;
+        let pad = data.len() & 1;
         let mut out = Vec::new();
         out.extend_from_slice(b"RIFF");
-        out.extend_from_slice(&(36 + data_size).to_le_bytes());
+        out.extend_from_slice(&(36 + data_size + pad as u32).to_le_bytes());
         out.extend_from_slice(b"WAVE");
         out.extend_from_slice(b"fmt ");
         out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
@@ -232,7 +319,72 @@ mod tests {
         out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
         out.extend_from_slice(b"data");
         out.extend_from_slice(&data_size.to_le_bytes());
-        out.extend_from_slice(&data);
+        out.extend_from_slice(data);
+        out.extend(std::iter::repeat_n(0u8, pad));
         out
+    }
+
+    /// fivetide's #1066 review, blocking item 2: a 46-byte PCM16 44.1 kHz WAV
+    /// whose data chunk is 1 byte decoded to zero samples, and the resampler
+    /// indexed `samples[0]` ("index out of bounds: the len is 0 but the index
+    /// is 0"), killing the daemon. Both the decoder and the resampler now
+    /// refuse it.
+    #[test]
+    fn data_chunk_shorter_than_one_frame_is_refused() {
+        let bytes = pcm16_mono_wav(&[0x7f], 44_100);
+        assert_eq!(bytes.len(), 46);
+        assert!(matches!(decode_wav_any(&bytes), Err(WavError::NoData)));
+        let empty = Waveform {
+            samples: Vec::new(),
+            sample_rate: 44_100,
+        };
+        assert!(matches!(
+            resample_linear(empty, 16_000),
+            Err(WavError::NoData)
+        ));
+    }
+
+    /// The resampled length is `len * target / rate`: a 1 Hz header must be
+    /// refused, not turned into a 16000x allocation.
+    #[test]
+    fn absurd_sample_rate_is_refused() {
+        let bytes = pcm16_mono_wav(&[0u8; 64], 1);
+        assert!(matches!(
+            decode_wav_any(&bytes),
+            Err(WavError::BadHeader(_))
+        ));
+        let w = Waveform {
+            samples: vec![0.0; 32],
+            sample_rate: 1,
+        };
+        assert!(matches!(
+            resample_linear(w, 16_000),
+            Err(WavError::BadHeader(_))
+        ));
+    }
+
+    #[test]
+    fn clip_longer_than_the_limit_is_refused() {
+        let sr = MIN_SAMPLE_RATE;
+        let w = Waveform {
+            samples: vec![0.0; (MAX_DURATION_SECS as usize + 1) * sr as usize],
+            sample_rate: sr,
+        };
+        assert!(matches!(
+            resample_linear(w, 16_000),
+            Err(WavError::TooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn resamples_44k1_to_16k() {
+        let w = Waveform {
+            samples: vec![0.5; 44_100],
+            sample_rate: 44_100,
+        };
+        let r = resample_linear(w, 16_000).unwrap();
+        assert_eq!(r.sample_rate, 16_000);
+        assert_eq!(r.samples.len(), 16_000);
+        assert!(r.samples.iter().all(|&s| (s - 0.5).abs() < 1e-6));
     }
 }

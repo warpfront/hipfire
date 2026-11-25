@@ -362,6 +362,19 @@ fn conv_out_dim(d: usize) -> usize {
     (d + 2 - 3) / 2 + 1 // = (d - 1)/2 + 1  (floor)
 }
 
+/// Audio tokens the encoder will produce for a clip of `num_samples` samples:
+/// the padded mel frame count through the downsampler's three stride-2 convs
+/// (one token per 8 mel frames). Cheap, so a route can check context capacity
+/// before running mel or the encoder.
+pub fn audio_token_count(mel: &MelConfig, num_samples: usize) -> usize {
+    let padded = mel.pad_length(num_samples);
+    if padded < mel.n_fft {
+        return 0;
+    }
+    let frames = 1 + (padded - mel.n_fft) / mel.hop_length;
+    conv_out_dim(conv_out_dim(conv_out_dim(frames)))
+}
+
 /// Standard Conv2d (k=3, s=2, p=1). `x`: [Cin, H, W] row-major. `w`: [Cout, Cin, 3, 3].
 fn conv2d_k3s2p1(x: &[f32], cin: usize, h: usize, w: usize, w_w: &HostW, bias: &[f32]) -> Vec<f32> {
     let cout = w_w.shape[0];
