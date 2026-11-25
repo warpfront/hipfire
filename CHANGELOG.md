@@ -506,7 +506,7 @@
   - **Evidence (gfx1151 before the gfx12 gate, logical emulation only, `qwen3.8-flash-next-gptq3.mq4`, 2 prompts x 64 tokens):** every completed AR run is byte-identical to the single card and to the host barrier (logits, mirrors, state digests): EP2 5 runs, EP4 3 runs. A delayed rank (200 ms) gives the same bytes; 800 ms, a failure before or after the boundary launch and a forged ledger all fail the request without a hang. Under emulation 4 of 10 AR runs (`GPU_MAX_HW_QUEUES=16`; EP4 with the default 4 queues never completes) and every native-MTP run stop with a device wait timeout: a device-wide runtime call on one rank waits for a peer parked on a boundary on the shared device. Receipts `~/mesh-validation/HIPF-66` (halo).
   - **Physical EP2 (2 x R9700 gfx1201, PCIe P2P, emulation off, commit `6ec14ca7f`):** AR host vs kernel byte-identical in 3 runs (130 logits records, 260 mirror hashes, 24 state digests); native MTP greedy token streams identical across single, host and kernel; no `device wait timeout` without a profiler. Decode through `hipfire serve --spec mtp`, kernel/host tok/s (3 fresh loads per arm alternating, 95% CI over loads): code C1 1.040 [0.854, 1.267], story C1 1.020 [0.928, 1.121], code C8 1.024 [0.997, 1.053], story C8 1.014 [1.006, 1.023]. **The 8% AR and 5% speculative targets are not met.** Under `rocprofv3 --kernel-trace` one of two runs stopped with `device wait timeout` (rank 1, epoch 5711), cause open.
 
-## v0.4.8 — 2026-11-24
+## v0.4.8 — 2026-11-25
 
 0.4.8 is a bug-fix patch release on top of 0.4.7. It backports fixes from beta for bugs that 0.4.7 users can hit; it removes nothing and changes no default numerics. Every entry names its beta commit.
 
