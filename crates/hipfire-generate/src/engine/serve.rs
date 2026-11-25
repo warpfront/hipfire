@@ -305,39 +305,7 @@ impl Driver {
                 ));
             }
             self.settle_terminals(sched, m, runner, gpus, stdout)?;
-            for key in sched.inbox.iter().cloned().collect::<Vec<_>>() {
-                let Some(admission) = sched.pending.get(&key).map(|req| req.admission) else {
-                    continue;
-                };
-                if batch_check_abort(&key.id, key.attempt_id, admission) {
-                    let _scope =
-                        BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
-                    emit_generation_start(self.route, stdout, &key.id, false);
-                    // Never admitted: a pre-admission cancel is legacy, as at the inbox drain.
-                    emit_generation_cancel(self.route, stdout, &key.id, 0);
-                    sched.abort_queued(&key, admission);
-                }
-            }
-            let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer missing")?;
-            let batch_size = sched.max_batch;
-            let barrier = drain_qwen_batch_inbox(
-                sched,
-                m,
-                batch_size,
-                is_vmm_batch_request_eligible,
-                tokenizer,
-                m.chat_template.as_ref(),
-                self.route,
-                stdout,
-                inbox,
-                true,
-            )?;
-            if let Some(barrier) = barrier {
-                inbox.push_front(barrier);
-            }
-            while let Some((key, ticket)) = sched.try_assign_one() {
-                self.admit(sched, m, stdout, key, ticket)?;
-            }
+            self.arrivals(sched, m, stdout, inbox)?;
             if sched.active_count() == 0 && sched.inbox.is_empty() {
                 return Ok(());
             }
@@ -345,6 +313,25 @@ impl Driver {
                 // Only terminals awaiting their client are left.
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
+            }
+            let mut ended = Vec::new();
+            // Requests that arrive while this tick's prompts run join its
+            // burst while the resident state is free.
+            loop {
+                let mut ctx = Ctx::of(
+                    &mut self.lives,
+                    self.max_batch_tokens,
+                    self.route,
+                    sched,
+                    m,
+                    runner,
+                    gpus,
+                    stdout,
+                )?;
+                ended.extend(self.core.prompts(&mut ctx));
+                if !self.core.takes_arrivals() || !self.arrivals(sched, m, stdout, inbox)? {
+                    break;
+                }
             }
             let mut ctx = Ctx::of(
                 &mut self.lives,
@@ -356,13 +343,60 @@ impl Driver {
                 gpus,
                 stdout,
             )?;
-            let ended = self.core.tick(&mut ctx);
+            ended.extend(self.core.lanes_step(&mut ctx));
             let mut attested = Ok(());
             for ended in ended {
                 attested = attested.and(ctx.settle(&mut self.core, ended));
             }
             attested.inspect_err(|_| self.poisoned = true)?;
         }
+    }
+
+    /// Cancel the queued requests the client aborted, drain the inbox and
+    /// admit what the batch scheduler assigns. Whether it admitted any.
+    fn arrivals(
+        &mut self,
+        sched: &mut ContinuousBatchScheduler,
+        m: &mut LoadedModel,
+        stdout: &mut Stdout,
+        inbox: &mut DaemonInbox,
+    ) -> Result<bool, String> {
+        for key in sched.inbox.iter().cloned().collect::<Vec<_>>() {
+            let Some(admission) = sched.pending.get(&key).map(|req| req.admission) else {
+                continue;
+            };
+            if batch_check_abort(&key.id, key.attempt_id, admission) {
+                let _scope =
+                    BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+                emit_generation_start(self.route, stdout, &key.id, false);
+                // Never admitted: a pre-admission cancel is legacy, as at the inbox drain.
+                emit_generation_cancel(self.route, stdout, &key.id, 0);
+                sched.abort_queued(&key, admission);
+            }
+        }
+        let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer missing")?;
+        let batch_size = sched.max_batch;
+        let barrier = drain_qwen_batch_inbox(
+            sched,
+            m,
+            batch_size,
+            is_vmm_batch_request_eligible,
+            tokenizer,
+            m.chat_template.as_ref(),
+            self.route,
+            stdout,
+            inbox,
+            true,
+        )?;
+        if let Some(barrier) = barrier {
+            inbox.push_front(barrier);
+        }
+        let mut admitted = false;
+        while let Some((key, ticket)) = sched.try_assign_one() {
+            self.admit(sched, m, stdout, key, ticket)?;
+            admitted = true;
+        }
+        Ok(admitted)
     }
 
     /// Render and admit `key` (its scheduler lane `ticket.lane` is Running);

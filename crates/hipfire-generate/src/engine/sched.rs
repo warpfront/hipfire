@@ -24,12 +24,14 @@
 //!   one epoch per tick (a prompt chunk, a decode, or the move into a lane);
 //!   once its request moved into a lane the next queued request takes it in
 //!   the same tick, so a burst of short prompts all prefill before the lane
-//!   epoch that runs their first tokens. The requests that moved this tick
-//!   stream their first lane token together right before that epoch, not
-//!   after it ran them; one that this token ends never runs it. A prompt
-//!   epoch that takes the tick past its row budget ([`Batch::row_budget`])
-//!   streams the tokens held so far first: a held token never waits for
-//!   more prompt rows than one tick runs.
+//!   epoch that runs their first tokens; requests that arrive while the
+//!   resident state is free join the burst ([`Scheduler::takes_arrivals`]).
+//!   The requests that moved this tick stream their first lane token
+//!   together right before that epoch, not after it ran them; one that this
+//!   token ends never runs it. A prompt epoch that takes the tick past its
+//!   row budget ([`Batch::row_budget`]) streams the tokens held so far
+//!   first: a held token never waits for more prompt rows than one tick
+//!   runs.
 //! - A request that samples (temperature, penalties) parks like a greedy one:
 //!   its lane row comes back as logits and it draws with its own RNG, so its
 //!   tokens are the singleton's for the same seed.
@@ -166,6 +168,8 @@ pub struct Scheduler {
     held: bool,
     /// Round-robin start of the next lane epoch.
     cursor: usize,
+    /// Prompt rows this tick ran so far ([`Batch::row_budget`]).
+    prompt_rows: usize,
 }
 
 impl Scheduler {
@@ -254,8 +258,22 @@ impl Scheduler {
         }
     }
 
-    /// One step of every live request; returns the requests that ended.
+    /// One step of every live request: [`Self::prompts`], then
+    /// [`Self::lanes_step`]. Returns the requests that ended.
     pub fn tick(&mut self, b: &mut impl Batch) -> Vec<Ended> {
+        let mut ended = self.prompts(b);
+        ended.extend(self.lanes_step(b));
+        ended
+    }
+
+    /// The resident epochs of a tick. A request that left the resident state
+    /// for a lane hands it to the next in line within the tick: queued
+    /// prompts that each finish in one epoch all reach this tick's lane
+    /// epoch (their first tokens share it), a longer prompt takes one epoch
+    /// per tick. Aborts are polled again before every epoch inside the tick,
+    /// as `drive` does. While [`Self::takes_arrivals`], requests admitted
+    /// after it returned run their prompts in this tick on a further call.
+    pub fn prompts(&mut self, b: &mut impl Batch) -> Vec<Ended> {
         let mut ended = Vec::new();
         let live: Vec<usize> = (0..self.reqs.len())
             .filter(|&idx| self.reqs[idx].is_some())
@@ -265,14 +283,21 @@ impl Scheduler {
                 ended.push(self.end(idx, Exit::Aborted));
             }
         }
-        // A request that left the resident state for a lane hands it to the
-        // next in line within the tick: queued prompts that each finish in
-        // one epoch all reach this tick's lane epoch (their first tokens
-        // share it), a longer prompt takes one epoch per tick. Aborts are
-        // polled again before every epoch inside the tick, as `drive` does.
-        let mut prompt_rows = 0;
-        while self.start(b, &mut ended) && self.resident_epoch(b, &mut prompt_rows, &mut ended) {}
+        while self.start(b, &mut ended) && self.resident_epoch(b, &mut ended) {}
+        ended
+    }
+
+    /// Whether a request admitted now still begins in this tick: the
+    /// resident state is free and nothing holds it.
+    pub fn takes_arrivals(&self) -> bool {
+        self.resident.is_none() && !self.held
+    }
+
+    /// The lane epoch that ends a tick.
+    pub fn lanes_step(&mut self, b: &mut impl Batch) -> Vec<Ended> {
+        let mut ended = Vec::new();
         self.lane_epoch(b, &mut ended);
+        self.prompt_rows = 0;
         ended
     }
 
@@ -319,15 +344,9 @@ impl Scheduler {
     /// The resident request's next epoch; a request that decodes while
     /// others are live moves into a lane (after one drained decode when its
     /// next token is still on the device; a speculative one at its next
-    /// window boundary). `prompt_rows` counts this tick's prompt rows.
-    /// Whether the resident state is free for the next request (it moved or
-    /// was aborted).
-    fn resident_epoch(
-        &mut self,
-        b: &mut impl Batch,
-        prompt_rows: &mut usize,
-        ended: &mut Vec<Ended>,
-    ) -> bool {
+    /// window boundary). Whether the resident state is free for the next
+    /// request (it moved or was aborted).
+    fn resident_epoch(&mut self, b: &mut impl Batch, ended: &mut Vec<Ended>) -> bool {
         let Some(idx) = self.resident else {
             return false;
         };
@@ -342,8 +361,8 @@ impl Scheduler {
         if let Some(rows) = prompt {
             // First tokens held for this tick's burst go out before a prompt
             // epoch that takes the tick past its row budget.
-            *prompt_rows += rows;
-            if *prompt_rows > b.row_budget() {
+            self.prompt_rows += rows;
+            if self.prompt_rows > b.row_budget() {
                 self.stream_fresh(b, ended);
             }
         }
@@ -1382,6 +1401,53 @@ mod tests {
                 Call::Windows(vec![0, 1, 2]),
             ]
         );
+    }
+
+    #[test]
+    fn requests_admitted_while_the_resident_state_is_free_join_the_ticks_burst() {
+        let prompts = vec![vec![1, 2], vec![3, 4, 5], vec![6], vec![7, 8]];
+        let mut b = fake(&prompts, 4, 4);
+        b.eos = u32::MAX;
+        b.sampled = Vec::new();
+        b.spec = vec![0, 1, 2, 3];
+        b.windows = true;
+        let mut s = Scheduler::default();
+        s.admit(0);
+        s.admit(1);
+        s.prompts(&mut b);
+        // Both moved into their lanes: the resident state is free, so the
+        // next arrivals prefill in this tick and stream with them.
+        assert!(s.takes_arrivals());
+        s.admit(2);
+        s.admit(3);
+        s.prompts(&mut b);
+        s.lanes_step(&mut b);
+        assert_eq!(
+            b.calls[..13],
+            [
+                Call::Prefill(0),
+                Call::Park(0),
+                Call::Prefill(1),
+                Call::Park(1),
+                Call::Prefill(2),
+                Call::Park(2),
+                Call::Prefill(3),
+                Call::Park(3),
+                Call::Emit(0),
+                Call::Emit(1),
+                Call::Emit(2),
+                Call::Emit(3),
+                Call::Windows(vec![0, 1, 2, 3]),
+            ]
+        );
+        // A lone request keeps the resident state: an arrival waits for the
+        // next tick.
+        let mut b = fake(&prompts, 4, 4);
+        b.eos = u32::MAX;
+        let mut s = Scheduler::default();
+        s.admit(0);
+        s.prompts(&mut b);
+        assert!(!s.takes_arrivals());
     }
 
     #[test]
