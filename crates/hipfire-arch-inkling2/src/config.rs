@@ -214,7 +214,37 @@ impl Inkling2Config {
             loop_cfg,
         })
     }
+
+    /// Full-attention log scaling τ at zero-based `pos` (applied to Q and R
+    /// on global visits; exactly 1 while `pos + 1 <= log_floor`).
+    pub fn full_attention_tau(&self, pos: usize) -> f32 {
+        crate::oracle::tau(pos, self.log_floor, self.log_alpha)
+    }
+
+    /// Whether the GPU forward executes a full-attention visit at `pos`: it
+    /// implements only unit τ and refuses the step otherwise (a NaN τ from a
+    /// degenerate config refuses too).
+    pub fn gpu_full_tau_supported(&self, pos: usize) -> bool {
+        (self.full_attention_tau(pos) - 1.0).abs() <= GPU_UNIT_TAU_TOLERANCE
+    }
+
+    /// Positions the GPU forward can execute below `bound`: the first
+    /// position whose full-attention visit [`Self::gpu_full_tau_supported`]
+    /// refuses, or `bound` when none does (or no layer is full-attention).
+    /// Independent of KV capacity and of the upstream trained window.
+    pub fn gpu_position_limit(&self, bound: usize) -> usize {
+        if self.swa_layers.iter().all(|&swa| swa) {
+            return bound;
+        }
+        // τ is exactly 1 below `log_floor`, so the scan starts there.
+        (self.log_floor.min(bound)..bound)
+            .find(|&pos| !self.gpu_full_tau_supported(pos))
+            .unwrap_or(bound)
+    }
 }
+
+/// Largest |τ − 1| the GPU forward treats as unit full-attention scaling.
+const GPU_UNIT_TAU_TOLERANCE: f32 = 1e-7;
 
 #[cfg(test)]
 mod tests {
@@ -333,5 +363,30 @@ mod tests {
         assert!(cfg.swa_layers[6]);
         assert_eq!(cfg.loop_cfg.n_slot(), 48);
         assert_eq!(cfg.n_experts, 128);
+    }
+
+    #[test]
+    fn gpu_position_limit_is_the_first_non_unit_tau_position() {
+        let mut cfg = Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
+        // Mini: floor 8192, alpha 0.1 — positions 0..=8191 run, 8192 refuses.
+        assert!(cfg.gpu_full_tau_supported(8191));
+        assert!(!cfg.gpu_full_tau_supported(8192));
+        assert_eq!(cfg.full_attention_tau(8191), 1.0);
+        assert_eq!(cfg.gpu_position_limit(32768), 8192);
+        // A smaller bound (KV capacity) is never exceeded.
+        assert_eq!(cfg.gpu_position_limit(8192), 8192);
+        assert_eq!(cfg.gpu_position_limit(4096), 4096);
+        // Tracks the config, not a constant.
+        cfg.log_floor = 1000;
+        assert_eq!(cfg.gpu_position_limit(32768), 1000);
+        // alpha so small that f32 τ rounds to 1 for a few rows past floor.
+        cfg.log_alpha = 1e-5;
+        let limit = cfg.gpu_position_limit(32768);
+        assert!(limit > 1000 && limit < 32768, "{limit}");
+        assert!(!cfg.gpu_full_tau_supported(limit));
+        assert!((0..limit).all(|pos| cfg.gpu_full_tau_supported(pos)));
+        // No full-attention layer: τ never gates.
+        cfg.swa_layers.iter_mut().for_each(|swa| *swa = true);
+        assert_eq!(cfg.gpu_position_limit(32768), 32768);
     }
 }

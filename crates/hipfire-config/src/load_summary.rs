@@ -30,7 +30,8 @@ pub enum Facet {
     /// Load-time prefill decisions (chunk rows, expert staging, trunk route).
     /// Accumulates; identical text is recorded once.
     Prefill,
-    /// Post-load measured context-fit verdict. Last write wins.
+    /// Post-load context-fit verdict: the measured fit, or a route's
+    /// executable-position limit below `max_seq`. Last write wins.
     ContextFit,
     /// The effective KV layout the carrier resolved from the requested mode
     /// (e.g. `fp8` for a requested `auto`). Last write wins.

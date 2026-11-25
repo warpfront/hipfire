@@ -6613,6 +6613,101 @@ pub fn generate_lfm2moe(
     }
 }
 
+/// Context admission for one Inkling request, as the `context_length`
+/// refusal message (`None` = admitted). The decode loop forwards every
+/// budgeted token, the last included, so positions `0..prompt + max_tokens`
+/// must fit both the allocated KV `capacity` and the GPU forward's
+/// `position_limit` (`Inkling2Config::gpu_position_limit`). The limit wins
+/// when both are exceeded, since a larger `max_seq` cannot raise it.
+fn inkling_context_refusal(
+    prompt: usize,
+    max_tokens: usize,
+    capacity: usize,
+    position_limit: usize,
+) -> Option<String> {
+    // saturating_add: an adversarially huge max_tokens must not wrap usize
+    // and slip under either limit.
+    let needed = prompt.saturating_add(max_tokens);
+    if needed > position_limit {
+        let action = if prompt < position_limit {
+            format!(
+                "lower max_tokens to at most {} or shorten the prompt",
+                position_limit - prompt
+            )
+        } else {
+            format!("shorten the prompt below {position_limit} tokens")
+        };
+        return Some(format!(
+            "prompt exceeds executable context: prompt={prompt} + max_tokens={max_tokens} > position_limit={position_limit} (the inkling2 GPU forward implements full-attention log scaling only below position {position_limit}, whatever max_seq; capacity={capacity}) — {action}"
+        ));
+    }
+    (needed > capacity).then(|| {
+        format!("prompt exceeds context capacity: prompt={prompt} + max_tokens={max_tokens} > capacity={capacity} — reload model with a larger max_seq")
+    })
+}
+
+#[cfg(test)]
+mod inkling_context_refusal_tests {
+    use super::inkling_context_refusal;
+
+    #[test]
+    fn admits_exactly_up_to_the_tighter_limit() {
+        // Positions 0..prompt+max_tokens are forwarded, so equality fits.
+        assert_eq!(inkling_context_refusal(4000, 96, 4096, 8192), None);
+        assert_eq!(inkling_context_refusal(8064, 128, 8448, 8192), None);
+        assert_eq!(inkling_context_refusal(1, 0, 1, 8192), None);
+    }
+
+    #[test]
+    fn capacity_refusal_keeps_the_counted_message() {
+        let msg = inkling_context_refusal(4001, 96, 4096, 8192).unwrap();
+        assert_eq!(
+            msg,
+            "prompt exceeds context capacity: prompt=4001 + max_tokens=96 > capacity=4096 — reload model with a larger max_seq"
+        );
+    }
+
+    #[test]
+    fn position_limit_refuses_whatever_the_capacity() {
+        // One row past the limit, with room in the KV.
+        let msg = inkling_context_refusal(8065, 128, 8448, 8192).unwrap();
+        assert!(
+            msg.starts_with(
+                "prompt exceeds executable context: prompt=8065 + max_tokens=128 > position_limit=8192 "
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("capacity=8448"), "{msg}");
+        assert!(
+            msg.ends_with("lower max_tokens to at most 127 or shorten the prompt"),
+            "{msg}"
+        );
+        // Both exceeded (9k prompt at the 4096 default load): reloading with
+        // a larger max_seq cannot help, so the limit names the action.
+        let msg = inkling_context_refusal(9000, 128, 4096, 8192).unwrap();
+        assert!(
+            msg.contains("prompt=9000 + max_tokens=128 > position_limit=8192"),
+            "{msg}"
+        );
+        assert!(
+            msg.ends_with("shorten the prompt below 8192 tokens"),
+            "{msg}"
+        );
+        // A full-limit prompt cannot decode even one token.
+        let msg = inkling_context_refusal(8192, 1, 8448, 8192).unwrap();
+        assert!(
+            msg.ends_with("shorten the prompt below 8192 tokens"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn huge_max_tokens_does_not_wrap() {
+        let msg = inkling_context_refusal(10, usize::MAX, 4096, 8192).unwrap();
+        assert!(msg.contains("position_limit=8192"), "{msg}");
+    }
+}
+
 /// Inkling-2-Mini (arch_id=24) generate path — plain GPU AR.
 ///
 /// Stateless like `generate_maple`: every turn cold-resets the GPU session
@@ -6752,26 +6847,24 @@ pub fn generate_inkling(
     }
 
     let eos_tok = m.inkling2().unwrap().eos_tok;
-    // KV row budget lives in the GPU session state (sized from `max_seq` at
-    // load); overflow fails closed inside `forward_token_gpu` (no SWA
-    // eviction), so guard the whole run up front like the lfm2moe path.
-    let cap = m
-        .inkling2()
-        .unwrap()
-        .gpu_state
-        .as_ref()
-        .map(|s| s.max_seq)
-        .unwrap_or(m.max_seq);
-    let max_tokens = fit_max_tokens(max_tokens, prompt_ids.len(), cap);
-    if prompt_ids.len().saturating_add(max_tokens) > cap {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_ids.len(), max_tokens, cap),
-            "context_length",
-            false,
-            false
-        );
+    // Admission before any state change: the KV row budget lives in the GPU
+    // session state (sized from `max_seq` at load; full visits fail closed
+    // past it), and the GPU forward refuses full-attention visits past the
+    // config's unit-τ range independently of capacity. Refuse here, with
+    // counts, instead of partway through prefill or decode.
+    let (cap, position_limit) = {
+        let b = m.inkling2().unwrap();
+        let cap = b.gpu_state.as_ref().map(|s| s.max_seq).unwrap_or(m.max_seq);
+        (
+            cap,
+            b.config.gpu_position_limit(inkling2::INKLING2_MAX_CONTEXT),
+        )
+    };
+    let max_tokens = fit_max_tokens(max_tokens, prompt_ids.len(), cap.min(position_limit));
+    if let Some(refusal) =
+        inkling_context_refusal(prompt_ids.len(), max_tokens, cap, position_limit)
+    {
+        emit_active_attempt_error(stdout, Some(id), &refusal, "context_length", false, false);
         let _ = stdout.flush();
         return;
     }
@@ -6837,7 +6930,7 @@ pub fn generate_inkling(
     for &tok in &prompt_ids {
         m.conversation_tokens.push(tok);
     }
-    let prefill_ms = t0.elapsed().as_millis();
+    let prefill_s = t0.elapsed().as_secs_f64();
 
     // Decode loop. Sample host-side from the running logits vector with the
     // request's full sampler contract (temp 0 = greedy argmax, matching the
@@ -6921,6 +7014,7 @@ pub fn generate_inkling(
 
     m.seq_pos = prompt_len + generated_count;
 
+    let decode_s = decode_t0.elapsed().as_secs_f64();
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
     let tok_s = if generated_count > 0 {
@@ -6928,14 +7022,24 @@ pub fn generate_inkling(
     } else {
         0.0
     };
+    let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
+    let round1 = |v: f64| (v * 10.0).round() / 10.0;
     let finish_reason = if hit_eos { "stop" } else { "length" };
+    // Native metric keys. Every turn cold-resets and prefills the whole
+    // prompt one row per forward, so nothing is cached and the first token
+    // follows the prefill directly.
     let mut pending_done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated_count,
         "tok_s": (tok_s * 100.0).round() / 100.0,
-        "prefill_ms": prefill_ms,
-        "decode_ms": decode_ms as f64,
+        "prefill_tokens": prompt_len,
+        "cached_tokens": 0,
+        "prefill_ms": round1(prefill_s * 1000.0),
+        "prefill_tok_s": round1(rate(prompt_len, prefill_s)),
+        "ttft_ms": round1(prefill_s * 1000.0),
+        "decode_ms": round1(decode_s * 1000.0),
+        "decode_tok_s": round1(rate(generated_count, decode_s)),
         "total_ms": total_ms,
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),

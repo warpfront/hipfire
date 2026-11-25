@@ -13224,6 +13224,29 @@ impl Carrier for Inkling2Carrier {
         };
         self.admit_options(ctx.draft_path, options)?;
         let bundle = hipfire_arch_inkling2::load_inkling2_bundle(src, ctx)?;
+        // Load summary states the route that actually runs: F16 KV whatever
+        // the requested mode, one prompt row per forward (no chunking), and
+        // the executable context when the forward's full-attention τ limit
+        // is below the allocated max_seq.
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Kv,
+            format!("{:?}", hipfire_arch_inkling2::INKLING2_KV_DTYPE).to_ascii_lowercase(),
+        );
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Prefill,
+            "single-row (one prompt token per forward, no chunking)",
+        );
+        let position_limit = bundle
+            .config
+            .gpu_position_limit(hipfire_arch_inkling2::INKLING2_MAX_CONTEXT);
+        if position_limit < ctx.max_seq {
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::ContextFit,
+                format!(
+                    "executable {position_limit}: the GPU forward refuses full-attention log scaling from position {position_limit}"
+                ),
+            );
+        }
         // No speculator on arch 24: every spec ask refused above, so the
         // load stays plain AR (no `build_speculator` call).
         Ok(LoadedModel {

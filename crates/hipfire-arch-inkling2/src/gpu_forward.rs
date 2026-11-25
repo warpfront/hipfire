@@ -848,17 +848,15 @@ fn run_visit(
             "v norm"
         );
     }
-    // Full-layer tau: exactly 1.0 for every pos the gates reach (and 05's
-    // short prefill); fail closed beyond instead of silently dropping it.
-    if !swa {
-        let t =
-            1.0 + cfg.log_alpha * ((pos + 1) as f64 / cfg.log_floor as f64).max(1.0).ln() as f32;
-        if (t - 1.0).abs() > 1e-7 {
-            free_all(gpu, tmp);
-            return Err(format!(
-                "inkling2 gpu fwd: full-layer tau {t} at pos {pos} unimplemented"
-            ));
-        }
+    // Full-layer tau: exactly 1.0 below `log_floor`; fail closed beyond
+    // instead of silently dropping it. Generate admission refuses requests
+    // that would reach this through `Inkling2Config::gpu_position_limit`.
+    if !swa && !cfg.gpu_full_tau_supported(pos) {
+        free_all(gpu, tmp);
+        return Err(format!(
+            "inkling2 gpu fwd: full-layer tau {} at pos {pos} unimplemented",
+            cfg.full_attention_tau(pos)
+        ));
     }
     // Sinks + relative bias (sink folded in by the gather).
     let sinks = step!(at(gpu, &mut tmp, &[nh], "sinks"), "alloc");
