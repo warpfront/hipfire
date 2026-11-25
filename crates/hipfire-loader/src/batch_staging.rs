@@ -888,20 +888,31 @@ fn stage_qwen4_lanes(
         Some(bundle) => bundle.set_lanes_sampled(req.sampled),
         None => return refuse("model state not Qwen4"),
     }
-    // Engine window lanes draw sampled windows naive; the resident windows of
-    // the same requests verify naive too, so a parked request continues the
-    // singleton's seeded stream.
+    // Engine window lanes draw sampled windows naive on the host; the resident
+    // windows of the same requests verify naive too, so a parked request
+    // continues the singleton's seeded stream. Device lane draws (gfx1201)
+    // are another rule: there sampled requests stay resident.
     if topology == "single"
         && hipfire_runtime::config::get().engine_loop
         && spec_on_k.is_some()
         && req.sampled
     {
-        if let Some(drafter) = m
+        if hipfire_arch_qwen4::lane::lane_device_sample(gpu) {
+            eprintln!(
+                "[daemon] qwen4 engine lanes: device lane draws; sampled speculative requests stay resident"
+            );
+            if let Some(bundle) = m.qwen4_mut() {
+                bundle.set_lanes_sampled(false);
+            }
+        } else if let Some(drafter) = m
             .speculator
             .as_mut()
             .and_then(|s| s.drafter_any_mut())
             .and_then(|any| any.downcast_mut::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>())
         {
+            eprintln!(
+                "[daemon] qwen4 engine lanes: sampled MTP verify = naive (HIPFIRE_MTP_SAMPLED_MODE ignored)"
+            );
             drafter.force_sampled_naive();
         }
     }

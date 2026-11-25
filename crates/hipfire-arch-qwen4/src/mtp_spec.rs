@@ -5478,6 +5478,21 @@ impl Qwen4MtpDrafter {
     }
 }
 
+/// A naive sampled request's lane sampler at its promotion: `seed` is the AR
+/// sampler RNG state its next draw takes, so the lane continues the stream.
+/// `seeded` keeps the lane in the row-exact class (a promoted lane is
+/// single-card, where it changes nothing).
+pub(crate) fn naive_promoted_sampling(cfg: &SpecRequestConfig) -> crate::lane::LaneSampling {
+    crate::lane::LaneSampling {
+        temperature: cfg.temp,
+        top_p: cfg.top_p,
+        top_k: cfg.top_k,
+        min_p: (cfg.min_p > 0.0).then_some(cfg.min_p),
+        seed: hipfire_runtime::llama::sampler_rng_snapshot(),
+        seeded: true,
+    }
+}
+
 impl Qwen4MtpDrafter {
     pub fn new(max_k: usize, ctx_capacity: usize, end_of_turn: Option<u32>) -> Self {
         let max_k = max_k.clamp(1, DERIVED_MAX_DRAFTS);
@@ -5635,15 +5650,7 @@ impl Qwen4MtpDrafter {
         if !state.naive {
             return Err("a sampled window lane needs the naive sampled verify".into());
         }
-        let cfg = &self.request;
-        Ok(Some(crate::lane::LaneSampling {
-            temperature: cfg.temp,
-            top_p: cfg.top_p,
-            top_k: cfg.top_k,
-            min_p: (cfg.min_p > 0.0).then_some(cfg.min_p),
-            seed: hipfire_runtime::llama::sampler_rng_snapshot(),
-            seeded: true,
-        }))
+        Ok(Some(naive_promoted_sampling(&self.request)))
     }
 
     /// The configured request carries a non-neutral repeat / presence /

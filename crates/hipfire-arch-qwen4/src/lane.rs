@@ -1047,6 +1047,15 @@ pub struct LaneHost {
     pub ignore_eos: bool,
 }
 
+impl LaneHost {
+    /// Draw this lane's tokens with `sampling`; its RNG starts at
+    /// [`LaneSampling::initial_rng`].
+    pub(crate) fn sample_with(&mut self, sampling: LaneSampling) {
+        self.rng = sampling.initial_rng();
+        self.sampling = Some(sampling);
+    }
+}
+
 /// Staging of the lanes' native MTP windows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaneSpecConfig {
@@ -2118,7 +2127,7 @@ pub(crate) fn lane_sample_step(
 
 /// Whether sampled lanes draw on the device (exact gfx1201, and the device's
 /// support): [`lane_sample_device`] instead of [`lane_sample_step`].
-pub(crate) fn lane_device_sample(gpu: &Gpu) -> bool {
+pub fn lane_device_sample(gpu: &Gpu) -> bool {
     gpu.flags.qwen4_lane_device_sample_enabled()
         && hipfire_runtime::lane_draw::lane_draws_supported(gpu)
 }
@@ -3244,13 +3253,11 @@ impl Qwen4LaneStore {
         sampling: LaneSampling,
     ) -> Result<(), String> {
         self.check_lane_sampling(epoch, &sampling)?;
-        let host = &mut self
-            .table
+        self.table
             .get_mut(epoch)
             .expect("checked by check_lane_sampling")
-            .host;
-        host.rng = sampling.initial_rng();
-        host.sampling = Some(sampling);
+            .host
+            .sample_with(sampling);
         Ok(())
     }
 
@@ -3270,13 +3277,11 @@ impl Qwen4LaneStore {
             return Err("set_promoted_sampling: a step is in flight".to_string());
         }
         sampling.validate()?;
-        let host = &mut self
-            .table
+        self.table
             .get_mut(epoch)
             .ok_or_else(|| format!("set_promoted_sampling: unknown epoch {epoch:?}"))?
-            .host;
-        host.rng = sampling.initial_rng();
-        host.sampling = Some(sampling);
+            .host
+            .sample_with(sampling);
         Ok(())
     }
 
@@ -5317,6 +5322,50 @@ mod lane_sampling_tests {
                 got.push(picks[0]);
             }
             assert_eq!(got, ar, "case {case}");
+            assert_eq!(host.rng, state, "case {case}");
+        }
+        sampler_rng_restore(saved);
+    }
+
+    /// A request promoted mid-turn continues the naive stream: the lane's
+    /// draws after the promotion are the AR draws the singleton would take
+    /// next (HIPF-553).
+    #[test]
+    fn a_promoted_lane_continues_the_singletons_stream() {
+        let _g = rng_guard();
+        let saved = sampler_rng_snapshot();
+        for case in 0..26u32 {
+            let s = sampling_for(case);
+            let (ran, total) = (7usize, 30usize);
+            let logits = logit_rows(case + 2000, total);
+            let (ar, state) = ar_draws(&logits, total, &s);
+            // The singleton drew `ran` tokens, then parks.
+            reset_cpu_sampler_rng(s.seed);
+            for i in 0..ran {
+                sample_top_k_p(row(&logits, i), s.temperature, s.top_p, s.top_k, s.min_p);
+            }
+            let cfg = hipfire_runtime::spec::SpecRequestConfig {
+                temp: s.temperature,
+                top_p: s.top_p,
+                top_k: s.top_k,
+                min_p: s.min_p.unwrap_or(0.0),
+                rng_seed: u64::from(s.seed),
+                ..Default::default()
+            };
+            let mut host = host_with(None);
+            host.sample_with(crate::mtp_spec::naive_promoted_sampling(&cfg));
+            let mut scratch = SampleScratch::new();
+            let mut got = Vec::new();
+            for i in ran..total {
+                let mut picks = [u32::MAX - 1];
+                lane_sample_step(&mut host, None, &mut picks, 0, VOCAB, &mut scratch, |sc| {
+                    sc.set_for_test(row(&logits, i));
+                    Ok(())
+                })
+                .unwrap();
+                got.push(picks[0]);
+            }
+            assert_eq!(got, ar[ran..], "case {case}");
             assert_eq!(host.rng, state, "case {case}");
         }
         sampler_rng_restore(saved);
