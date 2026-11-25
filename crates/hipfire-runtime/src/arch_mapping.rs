@@ -108,6 +108,11 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     ("embeddinggemma2", 18),
     // arch 22 — gemma4 EAGLE drafter (single-block spec-decode head for arch 13)
     ("gemma4_unified_assistant", 22),
+    // Google's published drafters (`google/gemma-4-*-it-assistant`) use
+    // `gemma4_assistant` / `Gemma4AssistantForCausalLM`; both keys are longer
+    // than `gemma4`, so they win the substring match over arch 13.
+    ("gemma4_assistant", 22),
+    ("gemma4assistant", 22),
     // arch 23 — muse_glimmer DFlash drafter
     ("muse_glimmer_assistant", 23),
     // arch 40 — flux MMDiT diffusion trunk (image-gen component block 40–47;
