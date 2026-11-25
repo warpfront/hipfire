@@ -744,6 +744,7 @@ fn spec_step(run: &mut RequestRun, io: &mut (impl Forwards + Emit + ?Sized)) -> 
                 // A part-run advance: nothing of the request is kept live,
                 // its abort (the next poll) rolls back.
                 run.position = 0;
+                d.owed.clear();
                 return Ok(());
             }
             run.position += tokens.len();

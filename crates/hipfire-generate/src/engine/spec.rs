@@ -193,7 +193,7 @@ pub fn keep_fed(
     fed: usize,
     prompt_len: usize,
 ) -> bool {
-    if !state.spec_session_reuse() || fed < prompt_len || fed > history.len() {
+    if !state.spec_session_reuse() || !fed_keepable(history.len(), fed, prompt_len) {
         return false;
     }
     if !crate::common::fail_closed_device_sync(&mut gpus.devices[0]).rolled_back {
@@ -201,6 +201,11 @@ pub fn keep_fed(
     }
     state.session_commit_live_mesh(gpus, &history[..fed]);
     true
+}
+
+/// `fed` rows are a whole prompt plus decode rows of the history.
+fn fed_keepable(history: usize, fed: usize, prompt_len: usize) -> bool {
+    (prompt_len..=history).contains(&fed)
 }
 
 /// The engine's speculative forwards on a single-card target: the legacy
@@ -320,6 +325,9 @@ impl Forwards for DraftForwards<'_> {
     ) -> Result<bool, String> {
         let id = self.id;
         let abort = || check_abort(id);
+        // Every shipped drafter handles the advance and returns `true` even
+        // when an abort stopped it; the `commit_live` position gate then
+        // refuses the part-run state. `false` only from the target fallback.
         if spec_forced_advance(None, self.gpu, d, self.target, tokens, position, &abort)? {
             return Ok(true);
         }
@@ -851,5 +859,14 @@ mod tests {
         assert_eq!(exit, Exit::Aborted);
         assert_eq!(m.trims.len(), 1);
         assert_eq!(run.position, 0);
+    }
+
+    #[test]
+    fn only_a_whole_prompt_within_the_history_is_kept() {
+        assert!(fed_keepable(9, 5, 5));
+        assert!(fed_keepable(9, 9, 5));
+        assert!(!fed_keepable(9, 4, 5), "a part-run prompt is not kept");
+        assert!(!fed_keepable(9, 0, 5), "an aborted advance or realign");
+        assert!(!fed_keepable(9, 10, 5), "past the committed history");
     }
 }
