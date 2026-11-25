@@ -326,8 +326,9 @@ impl Forwards for DraftForwards<'_> {
         let id = self.id;
         let abort = || check_abort(id);
         // Every shipped drafter handles the advance and returns `true` even
-        // when an abort stopped it; the `commit_live` position gate then
-        // refuses the part-run state. `false` only from the target fallback.
+        // when an abort stopped it; the part-run state is not kept live (on
+        // Qwen4 MTP the `commit_live` position gate refuses it). `false` only
+        // from the target fallback.
         if spec_forced_advance(None, self.gpu, d, self.target, tokens, position, &abort)? {
             return Ok(true);
         }
