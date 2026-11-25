@@ -19131,7 +19131,7 @@ mod qwen4_ep_mtp_resident_tests {
     }
 }
 
-// ─── Lfm3Carrier (arch 24) ────────────────────────────────────────────
+// ─── Lfm3Carrier (arch 26) ────────────────────────────────────────────
 //
 // LFM3 (LiquidAI) text backbone with optional VL / audio / omni towers,
 // detected by tensor presence (the qwen35-vl precedent: one arch_id, towers
@@ -19144,7 +19144,7 @@ impl Carrier for Lfm3Carrier {
         "lfm3"
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
-        arch_id == 24
+        arch_id == hipfire_arch_lfm3::ARCH_ID
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
@@ -19190,7 +19190,7 @@ impl Carrier for Lfm3Carrier {
             ModelSource::Hfq(mut hfq) => {
                 let config = lfm3::config::Lfm3Config::from_hfq(&hfq)?;
                 let weights = lfm3::lfm3::Lfm3Weights::load(&mut hfq, &config, ctx.gpu)?;
-                // LFM3-VL vision tower by tensor presence (arch_id stays 24).
+                // LFM3-VL vision tower by tensor presence (arch_id stays 26).
                 if hfq
                     .tensor_data("model.vision_tower.patchifier.weight")
                     .is_some()

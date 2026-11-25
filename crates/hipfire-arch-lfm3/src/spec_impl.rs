@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! LFM3 (arch_id 24) GPU bundle — the (config, weights, state, eos_tok) quadruple
-//! the loader folds into the loader's LFM3 bundle registration and the daemon's `arch_id == 24`
+//! LFM3 (arch_id 26) GPU bundle — the (config, weights, state, eos_tok) quadruple
+//! the loader folds into the loader's LFM3 bundle registration and the daemon's `arch_id == 26`
 //! generate branch drives.
 //!
 //! Phase 1 is AR-only (no spec-decode target), so — unlike `Lfm2MoeBundle` —

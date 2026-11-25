@@ -650,7 +650,7 @@ mod tests {
                 24 => Some("inkling2"),
                 17 => Some("qwen35-embed"),
                 18 => Some("embeddinggemma2"),
-                24 => Some("lfm3"),
+                26 => Some("lfm3"),
                 40 => Some("flux"),
                 45 => Some("flux2"),
                 // Drafter sidecars (22, 23) are intentionally not retry

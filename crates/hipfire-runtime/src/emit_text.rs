@@ -2313,7 +2313,7 @@ mod tests {
         assert_no_protocol_leak(&vis);
     }
 
-    /// LFM3 (arch 24) emits the Qwen3-style XML its vendor template renders:
+    /// LFM3 (arch 26) emits the Qwen3-style XML its vendor template renders:
     /// `<tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>\n</function>\n</tool_call>`
     /// (see the LFM3-1.7B `tokenizer_config.json` `response_template.tool_calls`
     /// regex). The router must parse that exact shape, withhold it from visible

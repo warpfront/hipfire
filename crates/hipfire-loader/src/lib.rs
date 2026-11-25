@@ -538,7 +538,7 @@ pub fn vision_route(arch_id: u32) -> VisionRoute {
         5 | 6 => VisionRoute::QwenVl,
         16 => VisionRoute::Qwen4Vl,
         11 => VisionRoute::Lfm2Vl,
-        24 => VisionRoute::Lfm3Vl,
+        26 => VisionRoute::Lfm3Vl,
         _ => VisionRoute::None,
     }
 }
@@ -983,7 +983,7 @@ pub use raon::RaonBundle;
 
 pub use inkling2::Inkling2Bundle;
 
-/// LFM3 (arch_id=24) GPU bundle.
+/// LFM3 (arch_id=26) GPU bundle.
 ///
 /// Defined here rather than in `hipfire-arch-lfm3` because it carries the
 /// optional VL / audio / omni tower state, whose types live in
@@ -1655,7 +1655,7 @@ impl LoadedModel {
         }
     }
 
-    /// LFM3 bundle if this model is arch_id=24, else None.
+    /// LFM3 bundle if this model is arch_id=26, else None.
     pub fn lfm3(&self) -> Option<&Lfm3Bundle> {
         self.state
             .as_deref()
@@ -1668,7 +1668,7 @@ impl LoadedModel {
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<Lfm3Bundle>())
     }
 
-    /// LFM3-VL vision config, if this model is arch_id=24 and a vision tower was
+    /// LFM3-VL vision config, if this model is arch_id=26 and a vision tower was
     /// loaded (detected by `model.vision_tower.patchifier.weight`). Text-only
     /// LFM3 returns None.
     pub fn lfm3_vision_config(&self) -> Option<&lfm3_vl::VisionConfig> {
@@ -7975,7 +7975,7 @@ mod registry_tests {
             if id == 15 {
                 continue;
             }
-            // LFM3 (24) declares QwenJinja only so the engine forwards
+            // LFM3 (26) declares QwenJinja only so the engine forwards
             // `thinking` / `reasoning_effort` / `max_think_tokens` (its vendor
             // template keys a real `enable_thinking` boolean). That contract
             // does not imply replay: the template's generation turn computes
@@ -7990,7 +7990,7 @@ mod registry_tests {
             // replay) matches the template. If LFM3 ever opts into
             // `preserve_thinking`, give it its own `arch_label` AND a replay
             // rule, and delete this exemption.
-            if id == 24 {
+            if id == 26 {
                 continue;
             }
             let label = arch_label(id);

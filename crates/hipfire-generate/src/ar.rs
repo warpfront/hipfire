@@ -976,7 +976,7 @@ impl GenerationRoute {
     /// call fails the turn closed.
     ///
     /// `LfmAr` covers both LFM tool callers: LFM2.5-MoE (arch 11) and LFM3
-    /// (arch 24). `generate_lfm2moe` withholds the `<|tool_call_start|>` span
+    /// (arch 26). `generate_lfm2moe` withholds the `<|tool_call_start|>` span
     /// and parses Liquid's Pythonic body; `generate_lfm3` withholds the
     /// Qwen3-style `<tool_call><function=…>` span through the same strict
     /// `ToolOutputRouter` that `qwen_ar` uses (LFM3's vendor template emits
@@ -1014,7 +1014,7 @@ impl GenerationRoute {
     /// `Qwen35Emit`). Each matches only the answer channel, holds a possible
     /// stop prefix back, and never emits the stop text. `RaonAr` rides the
     /// same `generate_ar_with_forward` producer as Qwen4 AR, and `RaonSpec`
-    /// the `Qwen35Emit` matcher like `Qwen4Spec`. `LfmAr` (LFM3 arch 24 and
+    /// the `Qwen35Emit` matcher like `Qwen4Spec`. `LfmAr` (LFM3 arch 26 and
     /// LFM2.5-MoE arch 11) honours stop through the runtime `StopMatcher` fed
     /// in its host-side decode loop — same hold-back semantics: the stop text
     /// itself is never emitted, and a held partial tail is flushed as a final
@@ -1955,8 +1955,8 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
                 GenerationRoute::LfmAr
             };
         }
-        // LFM3 (arch 24): AR-only (no `SpecTarget` yet) → the LFM AR route.
-        24 => {
+        // LFM3 (arch 26): AR-only (no `SpecTarget` yet) → the LFM AR route.
+        26 => {
             return GenerationRoute::LfmAr;
         }
         12 => {
@@ -3476,7 +3476,7 @@ pub fn generate(
             return;
         }
         GenerationRoute::LfmAr => {
-            if m.arch_id == 24 {
+            if m.arch_id == 26 {
                 crate::lfm3::generate_lfm3(
                     m,
                     gpu,

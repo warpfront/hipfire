@@ -1703,7 +1703,7 @@
       "file": "lfm3-1.7b.q8.hfq",
       "size_gb": 1.9,
       "min_vram_gb": 5.0,
-      "desc": "LiquidAI LFM3-1.7B hybrid conv/full-attn/sliding-attn text model (arch_id=24). Q8 HFQ; local-only until the quant is published. Routing-ready — product admission is owned by admissions.yml, not the registry.",
+      "desc": "LiquidAI LFM3-1.7B hybrid conv/full-attn/sliding-attn text model (arch_id=26). Q8 HFQ; local-only until the quant is published. Routing-ready — product admission is owned by admissions.yml, not the registry.",
       "quant_recipe": "q8"
     },
     "raon-1-mini-preview": {

@@ -68,8 +68,9 @@ pub const PLE_AUX_SUFFIXES: [&str; 2] = [".plehot", ".plehotrows"];
 /// completion trunks a `/v1/models` pick can generate text from. `8`
 /// (dots.ocr) and `11` (LFM2.5 / LFM2.5-VL) are present: both answer text
 /// completions. `16` (Qwen4 / Flash-Next) is present as a text-serving primary
-/// arch: an unregistered local Flash-Next trunk must be advertised too.
-pub const SERVE_TRUNK_ARCH_IDS: &[u32] = &[0, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+/// arch: an unregistered local Flash-Next trunk must be advertised too. `26`
+/// (LFM3, text / VL / audio / omni on one id) answers text completions.
+pub const SERVE_TRUNK_ARCH_IDS: &[u32] = &[0, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26];
 
 /// Header-only read of an HFQ container's `arch_id`: the 32-byte container
 /// header, no mmap, no metadata JSON parse, no tensor index.

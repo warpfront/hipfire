@@ -23,7 +23,7 @@
 //!   * **Projector** (`Lfm3AudioProjector`) — LayerNorm(768) + GELU(erf) MLP
 //!     768→2048→2048. Runs on GPU (reuses `layernorm_batched` / `gelu_erf_f32`).
 //!
-//! arch_id stays 24 (audio detected by `encoder.downsample.*` /
+//! arch_id stays 26 (audio detected by `encoder.downsample.*` /
 //! `model.audio_encoder.downsample.*` tensors — see AUDIO-NAME-1 below).
 //! presence). The text decoder is owned by `hipfire-arch-lfm3::Lfm3`.
 

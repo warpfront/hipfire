@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! LFM3 (arch_id 24) generation bodies.
+//! LFM3 (arch_id 26) generation bodies.
 //!
 //! Lifted from the pre-merge `hipfire-runtime/examples/daemon.rs` (lfm3-port)
 //! into `hipfire-generate`, matching the other per-arch bodies.
@@ -52,13 +52,13 @@ fn emit_active_attempt_error(
 /// span from the client stream, so no raw XML leaks into `content` and no
 /// tool-span text can be mis-matched as a user `stop` sequence.
 ///
-/// Arch 24 is a LEGACY-contract route (`Lfm3Carrier::caps` declares
+/// Arch 26 is a LEGACY-contract route (`Lfm3Carrier::caps` declares
 /// `semantic_contract_version: None`), so calls surface the legacy way: a
 /// `{"type":"tool_calls"}` event read by the client fold BEFORE the
 /// commit_ready terminal, plus `finish_reason == "tool_calls"` on `done` —
 /// the same convention `generate_lfm2moe` and `generate_maple` use. The
 /// canonical `calls` are also staged on the terminal so the payload is
-/// v2-ready if arch 24 ever grows a router-backed producer.
+/// v2-ready if arch 26 ever grows a router-backed producer.
 ///
 /// When the request declares no tools the router is `disabled()`, so
 /// tool-looking text stays ordinary visible content and can never fail the
@@ -367,8 +367,8 @@ pub fn generate_lfm3(
     // Contract opener: the CLI serve's StreamContractGate rejects every
     // pre-gen_start event (PreStartEvent → client abort → drain deadlock), so
     // this path MUST emit gen_start before any token/error event. Matches the
-    // main generate() opener (line ~15614); arch 13 latches the legacy
-    // contract (gen_start_contract_version_for_arch returns None for 13).
+    // main generate() opener; arch 26 latches the legacy contract
+    // (gen_start_contract_version_for_arch returns None for it).
     emit_gen_start(
         stdout,
         id,
@@ -391,7 +391,7 @@ pub fn generate_lfm3(
         emit_active_attempt_error(
             stdout,
             Some(id),
-            "lfm3 bundle missing on arch_id=13 generate",
+            "lfm3 bundle missing on arch_id=26 generate",
             "validation",
             false,
             false,
@@ -670,7 +670,7 @@ pub fn generate_lfm3(
         "attempt_id": active_attempt_id(),
     });
     // Legacy contract: the canonical `calls` ride the staged done (so the
-    // payload is v2-ready if arch 24 ever grows a router-backed producer) and
+    // payload is v2-ready if arch 26 ever grows a router-backed producer) and
     // the `{"type":"tool_calls"}` event the client fold reads precedes the
     // commit_ready terminal.
     emit_lfm3_tool_terminal(stdout, id, &mut pending_done, finish_reason, &tool_calls);

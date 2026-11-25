@@ -381,7 +381,7 @@ const SAFE_ROUTES: &[GenerationRoute] = &[
     // messages parsed by token id (`MessageFrameRouter`), validated against
     // the declared tools, and staged only on a `tool_calls` terminal.
     GenerationRoute::InklingAr,
-    // Arch 11 (LFM2.5-MoE) and arch 24 (LFM3), legacy contract like Maple.
+    // Arch 11 (LFM2.5-MoE) and arch 26 (LFM3), legacy contract like Maple.
     // `generate_lfm2moe` withholds the `<|tool_call_start|>` span and parses
     // Liquid's Pythonic body; `generate_lfm3` withholds the Qwen3-style
     // `<tool_call><function=…>` span through the strict `ToolOutputRouter` that

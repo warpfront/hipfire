@@ -98,7 +98,7 @@ required-features = ["lab"]
 name = "fn_wide_kl_oracle"
 required-features = ["lab"]
 
-# LFM3 (arch 24) tower probes: ASR streaming, audio codec, depth decoder, omni
+# LFM3 (arch 26) tower probes: ASR streaming, audio codec, depth decoder, omni
 # stream equivalence and TTS. Each drives a real GPU forward, so they are lab
 # examples like the probes above.
 [[example]]
