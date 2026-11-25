@@ -640,7 +640,7 @@ through to per-model / registry / daemon defaults when omitted):
 | `chat_template_kwargs.preserve_thinking` | Keep `<think>` in final non-stream content |
 | `thinking` / `thinking.type` | Mode axis (`on`/`off`, or DeepSeek-style `enabled`/`disabled`). Thinking disabled wins and drops effort/cap with a warning. |
 | `reasoning.effort` / `reasoning_effort` | **Semantic effort only** — prompt strength. Never mapped to a think-token budget. Family ladders differ; unsupported/cross-family values are dropped with a warning (see below). |
-| `reasoning.max_tokens` / `max_think_tokens` | Explicit **integer** think-span cap on Qwen Jinja contracts. `0` or omitted = uncapped. DeepSeek, Gemma, Glimmer, and unsupported contracts drop it with a warning. Independent of effort. |
+| `reasoning.max_tokens` / `max_think_tokens` | Explicit **integer** think-span cap on Qwen Jinja contracts. `0` or omitted = uncapped. DeepSeek, Gemma, Glimmer, Inkling (`message_frames`), and unsupported contracts drop it with a warning. Independent of effort. |
 | `thinking_budget` / `reasoning.budget` | Legacy **named** cap preset only on non-effort-native Qwen templates that still accept it. Dropped+warned elsewhere. |
 
 ### `POST /v1/messages` (Anthropic Messages API)
@@ -832,9 +832,9 @@ map in [`CONFIG.md`](CONFIG.md). HTTP accepts the same meanings as CLI/config.
 - Effort is **never** converted into a token cap (including on Qwen3.6 and other
   non-effort-native templates).
 - Qwen3.8 and Ornith 1.5 default to an uncapped think span unless the request sets a
-  positive integer cap (semantic effort stays independent of that cap). DeepSeek V4 and
-  Muse Glimmer expose semantic effort but no independent parent-defined cap; cap fields
-  are dropped+warned.
+  positive integer cap (semantic effort stays independent of that cap). DeepSeek V4,
+  Muse Glimmer and Inkling-2-Mini expose semantic effort but no independent
+  parent-defined cap; cap fields are dropped+warned.
 - A request that omits effort (or sends `auto`) on Qwen3.8 or Ornith 1.5 defers to
   configured effort, and if none is set resolves to hipfire's `medium` default (the
   official template default is `xhigh`). An explicit non-`auto` `reasoning_effort` /
@@ -895,6 +895,13 @@ curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application
   "messages": [{"role": "user", "content": "hi"}],
   "reasoning_effort": "high"
 }'
+
+# Inkling-2-Mini — template effort (none…max); off renders the template's own "none" rung
+curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "/path/to/inkling2-mini-mq4.hfq",
+  "messages": [{"role": "user", "content": "hi"}],
+  "reasoning_effort": "low"
+}'
 ```
 
 | Family | Mode | Effort | Cap |
@@ -905,6 +912,14 @@ curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application
 | DeepSeek V4 | `thinking.type` enabled/disabled (default on) | `low` \| `high` \| `max` (`medium`/`xhigh`→`high`) | Integer only; default uncapped |
 | Gemma4 | Boolean; default **off** | Dropped+warned | Dropped+warned unless explicit engine integer |
 | Muse Glimmer | Always on (off dropped) | `low` \| `medium` \| `high` \| `xhigh` | Integer only; default uncapped |
+| Inkling-2-Mini (`message_frames`) | On by default; off (toggle or effort `none`/`off`/`chat`) renders effort `none` (`0`); the model may still write a thinking message | Template-probed `low` \| `medium` \| `high` \| `xhigh` \| `max` (absent/`auto`: template default `0.9` = `high`); other values dropped+warned | Dropped+warned |
+
+Inkling-2-Mini writes its thinking and its answer as separate model messages
+framed by protocol tokens (`<|message_model|><|content_thinking|>…<|end_message|>`,
+then `<|content_text|>`). The daemon splits them by token id into
+`reasoning_content` and `content`, the same wire shape as Qwen; the frame tokens
+never reach the client. A turn that ends inside the thinking message returns it
+as `reasoning_content` with empty `content`.
 
 When `messages` contains no `system` or `developer` role, the serve layer inserts `prompt.system` from a per-model TOML override or the registry card's `recommended_settings.system_prompt`. A client-supplied system/developer message always wins.
 

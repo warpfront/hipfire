@@ -4762,6 +4762,10 @@ mod tests {
             Some(ReasoningContract::MuseGlimmer)
         );
         assert_eq!(
+            ReasoningContract::from_wire_name("message_frames"),
+            Some(ReasoningContract::MessageFrames)
+        );
+        assert_eq!(
             ReasoningContract::from_wire_name("unsupported"),
             Some(ReasoningContract::Unsupported)
         );
@@ -4779,6 +4783,7 @@ mod tests {
             ReasoningContract::DeepSeek4,
             ReasoningContract::GemmaBoolean,
             ReasoningContract::MuseGlimmer,
+            ReasoningContract::MessageFrames,
         ] {
             let wire = contract.wire_name();
             assert_eq!(ReasoningContract::from_wire_name(wire), Some(contract));

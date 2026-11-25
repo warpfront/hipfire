@@ -149,6 +149,25 @@ pub fn emit_reasoning_token(stdout: &mut impl std::io::Write, id: &str, text: &s
     let _ = stdout.flush();
 }
 
+/// Emit channel events from a producer whose `Content` is already
+/// client-visible (a token-indexed router such as
+/// [`MessageFrameRouter`](hipfire_runtime::emit_text::MessageFrameRouter),
+/// whose answer channel carries no in-band protocol), in order, draining
+/// `events` so the caller reuses its buffer.
+pub fn emit_channel_events(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    events: &mut Vec<hipfire_runtime::emit_text::ThinkRouteEvent>,
+) {
+    use hipfire_runtime::emit_text::ThinkRouteEvent;
+    for event in events.drain(..) {
+        match event {
+            ThinkRouteEvent::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+            ThinkRouteEvent::Content(text) => emit_visible_token(stdout, id, &text),
+        }
+    }
+}
+
 /// Canonical `{id?, name, arguments}` array for staged terminal / tool_calls events.
 pub fn tool_calls_canonical_json(
     calls: &[hipfire_runtime::prompt_frame::ToolCall],

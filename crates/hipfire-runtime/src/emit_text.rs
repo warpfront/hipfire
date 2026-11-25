@@ -314,6 +314,179 @@ fn longest_think_prefix_suffix(text: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Protocol-token ids of a message-framed reasoning protocol
+/// (`ReasoningContract::MessageFrames`). The model writes every message as
+/// `<|message_model|>[name]<|content_KIND|>body<|end_message|>`: reasoning is
+/// kind `<|content_thinking|>`, the answer kind `<|content_text|>`, and the
+/// turn ends on the separate sampling-end token (EOS), which the decode loop
+/// owns. Markers are matched by token id, never by text, so prose that spells
+/// a marker out of ordinary tokens stays prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageFrameMarkers {
+    /// Opens one model message.
+    pub message_open: u32,
+    /// Closes the current message; never ends the turn.
+    pub message_close: u32,
+    /// Content kind of a reasoning message.
+    pub reasoning: u32,
+    /// Content kind of an answer message.
+    pub text: u32,
+    /// Every other special token, sorted. Never rendered as text: a role
+    /// header or a content kind other than the two above.
+    pub protocol: Vec<u32>,
+}
+
+impl MessageFrameMarkers {
+    pub const MESSAGE_OPEN: &'static str = "<|message_model|>";
+    pub const MESSAGE_CLOSE: &'static str = "<|end_message|>";
+    pub const REASONING: &'static str = "<|content_thinking|>";
+    pub const TEXT: &'static str = "<|content_text|>";
+
+    /// Resolve the markers from the tokenizer's special tokens; `None` when
+    /// the vocabulary lacks any of the four.
+    pub fn from_tokenizer(tokenizer: &crate::tokenizer::Tokenizer) -> Option<Self> {
+        let message_open = tokenizer.special_token_id(Self::MESSAGE_OPEN)?;
+        let message_close = tokenizer.special_token_id(Self::MESSAGE_CLOSE)?;
+        let reasoning = tokenizer.special_token_id(Self::REASONING)?;
+        let text = tokenizer.special_token_id(Self::TEXT)?;
+        let markers = [message_open, message_close, reasoning, text];
+        let mut protocol: Vec<u32> = tokenizer
+            .special_tokens()
+            .iter()
+            .map(|(_, id)| *id)
+            .filter(|id| !markers.contains(id))
+            .collect();
+        protocol.sort_unstable();
+        protocol.dedup();
+        Some(Self {
+            message_open,
+            message_close,
+            reasoning,
+            text,
+            protocol,
+        })
+    }
+}
+
+/// Where the next decoded bytes of a framed turn belong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameSpan {
+    /// Answer text, and any text outside a message (plain output).
+    Content,
+    Reasoning,
+    /// Between `message_open` and the content kind: the message name.
+    Header,
+}
+
+/// Incremental router for [`MessageFrameMarkers`] protocols: committed token
+/// ids in, ordered [`ThinkRouteEvent`]s out, marker tokens never rendered.
+///
+/// Owns the turn's UTF-8 reassembly: a character split over several tokens is
+/// held until complete, and a marker that arrives mid-character flushes the
+/// held bytes (lossily) into the span they were generated in. Every event
+/// depends only on the token sequence, so streamed and non-streamed turns
+/// concatenate to the same channels. A message closed by `<|end_message|>`
+/// leaves the turn open; only [`Self::finish_into`] (EOS, length, abort) ends
+/// it, keeping whatever the open span held in its channel. A content kind
+/// other than reasoning/text (tool invocation) routes its body to content;
+/// structured tool parsing is not part of this router.
+///
+/// `Content` events carry no protocol markers: on this protocol they are the
+/// client-visible answer.
+pub struct MessageFrameRouter {
+    markers: MessageFrameMarkers,
+    text: crate::tokenizer::TokenTextStream,
+    span: FrameSpan,
+    header: String,
+    finished: bool,
+}
+
+impl MessageFrameRouter {
+    pub fn new(markers: MessageFrameMarkers) -> Self {
+        Self {
+            markers,
+            text: crate::tokenizer::TokenTextStream::new(),
+            span: FrameSpan::Content,
+            header: String::new(),
+            finished: false,
+        }
+    }
+
+    /// Route one committed token, appending to `out`. Inert after
+    /// [`Self::finish_into`].
+    pub fn push_token(
+        &mut self,
+        tokenizer: &crate::tokenizer::Tokenizer,
+        token: u32,
+        out: &mut Vec<ThinkRouteEvent>,
+    ) {
+        if self.finished {
+            return;
+        }
+        let m = &self.markers;
+        if token == m.message_open {
+            self.close_span(out);
+            self.span = FrameSpan::Header;
+        } else if token == m.message_close {
+            self.close_span(out);
+            self.span = FrameSpan::Content;
+        } else if token == m.reasoning {
+            self.enter_body(FrameSpan::Reasoning, out);
+        } else if token == m.text {
+            self.enter_body(FrameSpan::Content, out);
+        } else if m.protocol.binary_search(&token).is_ok() {
+            if self.span == FrameSpan::Header {
+                self.enter_body(FrameSpan::Content, out);
+            } else {
+                let tail = self.text.flush();
+                self.route(tail, out);
+            }
+        } else {
+            let fragment = self.text.push(tokenizer, token);
+            self.route(fragment, out);
+        }
+    }
+
+    /// End of turn: flush held bytes into the open span and release an
+    /// unfinished header as content. Repeated calls are inert.
+    pub fn finish_into(&mut self, out: &mut Vec<ThinkRouteEvent>) {
+        if self.finished {
+            return;
+        }
+        self.close_span(out);
+        self.finished = true;
+    }
+
+    /// Flush held bytes into the current span; a header that never named a
+    /// content kind carried text, so it is released as content.
+    fn close_span(&mut self, out: &mut Vec<ThinkRouteEvent>) {
+        let tail = self.text.flush();
+        self.route(tail, out);
+        if self.span == FrameSpan::Header && !self.header.is_empty() {
+            out.push(ThinkRouteEvent::Content(std::mem::take(&mut self.header)));
+        }
+    }
+
+    /// A content kind arrived: the header so far is the message name.
+    fn enter_body(&mut self, span: FrameSpan, out: &mut Vec<ThinkRouteEvent>) {
+        let tail = self.text.flush();
+        self.route(tail, out);
+        self.header.clear();
+        self.span = span;
+    }
+
+    fn route(&mut self, text: String, out: &mut Vec<ThinkRouteEvent>) {
+        if text.is_empty() {
+            return;
+        }
+        match self.span {
+            FrameSpan::Content => out.push(ThinkRouteEvent::Content(text)),
+            FrameSpan::Reasoning => out.push(ThinkRouteEvent::Reasoning(text)),
+            FrameSpan::Header => self.header.push_str(&text),
+        }
+    }
+}
+
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
 

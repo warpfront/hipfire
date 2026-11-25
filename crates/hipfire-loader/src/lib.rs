@@ -7899,7 +7899,7 @@ mod registry_tests {
                 .caps()
         };
 
-        // ── Per-carrier declared capabilities (11 architectures) ──
+        // ── Per-carrier declared capabilities (12 architectures) ──
         let text_only = ArchCaps::default();
         assert_eq!(caps_of("qwen2"), text_only);
         assert_eq!(
@@ -7970,6 +7970,14 @@ mod registry_tests {
                 reasoning_contract: ReasoningContract::MuseGlimmer,
                 semantic_contract_version: Some(2),
                 supports_continuous_batch: true,
+                ..text_only
+            }
+        );
+        assert_eq!(
+            caps_of("inkling2"),
+            ArchCaps {
+                reasoning_contract: ReasoningContract::MessageFrames,
+                semantic_contract_version: Some(2),
                 ..text_only
             }
         );

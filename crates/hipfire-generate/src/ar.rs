@@ -3186,7 +3186,9 @@ pub fn generate(
         GenerationRoute::InklingAr => {
             // Arch 24 (Inkling-2-Mini). Single-GPU AR over the 48-visit GPU
             // forward. No spec, no batch, no tools/stop/min_tokens on this
-            // route (refused upstream by the capability gates).
+            // route (refused upstream by the capability gates). Thinking is
+            // controlled only through the template's `reasoning_effort`
+            // (`MessageFrames` contract): no think-token cap or force-close.
             let _ = (
                 budget_alert_at_tok,
                 budget_alert_text,
@@ -3194,8 +3196,7 @@ pub fn generate(
                 think_mode,
                 cactus_delta,
                 logprobs_top_k,
-                enable_thinking,
-                reasoning_effort,
+                max_think_tokens,
                 user_explicit_sampling,
             );
             let _ = (stop, min_tokens);
@@ -3215,7 +3216,7 @@ pub fn generate(
                 repeat_window,
                 presence_penalty,
                 frequency_penalty,
-                max_think_tokens,
+                hipfire_engine::prompt::message_frames_effort(enable_thinking, reasoning_effort),
                 tools,
                 messages_history,
                 request_seed,

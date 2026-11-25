@@ -6716,8 +6716,13 @@ mod inkling_context_refusal_tests {
 /// token with the request's full sampler contract
 /// (`sampler::sample_cpu`: temp 0 reduces to argmax, matching 04's
 /// `generate_cpu`). No spec, no batch, no tools/stop router on this route
-/// (refused upstream by the capability gates); the model's thinking markers
-/// stream as ordinary text. Prefill loops one token at a time — the GPU
+/// (refused upstream by the capability gates). The model writes its
+/// thinking and its answer as separate protocol-framed messages;
+/// [`MessageFrameRouter`] splits them by token id into the typed
+/// `reasoning` / `token` events of semantic contract v2, so the framing
+/// never reaches the client and the sampled ids are untouched.
+/// `reasoning_effort` is the template variable (thinking off is `"none"`,
+/// `None` the template default). Prefill loops one token at a time — the GPU
 /// forward only does single-token steps, no prefill kernel exists here.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_inkling(
@@ -6736,7 +6741,7 @@ pub fn generate_inkling(
     repeat_window: usize,
     presence_penalty: f32,
     frequency_penalty: f32,
-    max_think_tokens: usize,
+    reasoning_effort: Option<&str>,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     request_seed: u32,
@@ -6765,6 +6770,22 @@ pub fn generate_inkling(
         let _ = stdout.flush();
         return;
     }
+    // The carrier declares `MessageFrames`: without its protocol tokens the
+    // turn could not be split, so refuse rather than leak frames as text.
+    let Some(frame_markers) = hipfire_runtime::emit_text::MessageFrameMarkers::from_tokenizer(
+        m.tokenizer.as_ref().unwrap(),
+    ) else {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "inkling2 tokenizer lacks the message-frame protocol tokens",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    };
 
     // Prompt build (same two-path branch as the lfm2moe AR path): the model
     // carries an embedded chat template (brief 07 serves with it), so render
@@ -6779,10 +6800,11 @@ pub fn generate_inkling(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: max_think_tokens != 1,
+                // The template reads only `reasoning_effort`.
+                enable_thinking: true,
                 bos_token: None,
                 reasoning_strength: None,
-                reasoning_effort: None,
+                reasoning_effort,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -6953,7 +6975,8 @@ pub fn generate_inkling(
     let mut generated_count: usize = 0;
     let prompt_len = prompt_ids.len();
     let decode_t0 = Instant::now();
-    let mut text_stream = TokenTextStream::new();
+    let mut frames = hipfire_runtime::emit_text::MessageFrameRouter::new(frame_markers);
+    let mut frame_events = Vec::new();
     loop {
         if check_abort(id) {
             let ep = production_fail_closed_rollback(m, gpu, None, None);
@@ -6975,8 +6998,18 @@ pub fn generate_inkling(
             break;
         }
 
+        // Probe-mode token-id stream (HIPFIRE_EMIT_TOKEN_IDS=1): the sampled
+        // ids, independent of how the frame router presents them.
+        emit_committed_event(
+            stdout,
+            id,
+            next_tok,
+            generated_count,
+            decode_t0.elapsed().as_millis() as u64,
+        );
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        emit_dense_token_text(stdout, id, &text_stream.push(tokenizer, next_tok));
+        frames.push_token(tokenizer, next_tok, &mut frame_events);
+        hipfire_engine::emit::emit_channel_events(stdout, id, &mut frame_events);
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -7004,7 +7037,8 @@ pub fn generate_inkling(
             }
         }
     }
-    emit_dense_token_text(stdout, id, &text_stream.flush());
+    frames.finish_into(&mut frame_events);
+    hipfire_engine::emit::emit_channel_events(stdout, id, &mut frame_events);
 
     if check_abort(id) {
         let ep = production_fail_closed_rollback(m, gpu, None, None);

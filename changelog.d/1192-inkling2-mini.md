@@ -8,6 +8,5 @@
   The quantizer ingests the checkpoint's NVFP4/MXFP8 packed experts and leaves the MTP
   sidecar (arch id 25, reserved) out of the trunk. Out of scope for now, and refused
   cleanly: speculative decoding (`--spec mtp|dflash`), batching and slots, PP/EP/TP,
-  and vision. Reasoning is streamed as visible text (the reasoning contract is
-  `Unsupported`). Prefill runs one token at a time, so long prompts are slow, and a
-  single prefill of about 3k tokens can run out of VRAM.
+  and vision. Prefill runs one token at a time, so long prompts are slow, and a single
+  prefill of about 3k tokens can run out of VRAM.

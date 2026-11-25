@@ -1,0 +1,92 @@
+[
+ {
+  "name": "default_effort",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 2+2?"
+   }
+  ],
+  "reasoning_effort": null,
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 2+2?<|end_message|>"
+ },
+ {
+  "name": "thinking_off_none",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 2+2?"
+   }
+  ],
+  "reasoning_effort": "none",
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>What is 2+2?<|end_message|>"
+ },
+ {
+  "name": "effort_low",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 2+2?"
+   }
+  ],
+  "reasoning_effort": "low",
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>What is 2+2?<|end_message|>"
+ },
+ {
+  "name": "effort_high",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 2+2?"
+   }
+  ],
+  "reasoning_effort": "high",
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 2+2?<|end_message|>"
+ },
+ {
+  "name": "effort_max",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 2+2?"
+   }
+  ],
+  "reasoning_effort": "max",
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>What is 2+2?<|end_message|>"
+ },
+ {
+  "name": "system_then_user",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "Name a prime."
+   }
+  ],
+  "reasoning_effort": null,
+  "expected": "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Name a prime.<|end_message|>"
+ },
+ {
+  "name": "history_with_reasoning",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   },
+   {
+    "role": "assistant",
+    "content": "Hello!",
+    "reasoning_content": "Greet back."
+   },
+   {
+    "role": "user",
+    "content": "Again"
+   }
+  ],
+  "reasoning_effort": "medium",
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|><|content_thinking|>Greet back.<|end_message|><|message_model|><|content_text|>Hello!<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Again<|end_message|>"
+ }
+]

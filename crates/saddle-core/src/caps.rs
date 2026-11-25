@@ -38,6 +38,13 @@ pub enum ReasoningContract {
     DeepSeek4,
     GemmaBoolean,
     MuseGlimmer,
+    /// Reasoning and answer arrive as separate model messages framed by
+    /// protocol tokens (`<|message_model|><|content_thinking|>…<|end_message|>`
+    /// then `<|content_text|>`), split by token id. The chat template's
+    /// `reasoning_effort` is the only control: thinking off renders effort
+    /// `none`, which lowers but does not forbid a thinking message. No
+    /// parent-defined think-token cap.
+    MessageFrames,
 }
 
 impl ReasoningContract {
@@ -48,6 +55,7 @@ impl ReasoningContract {
             Self::DeepSeek4 => "deepseek4",
             Self::GemmaBoolean => "gemma_boolean",
             Self::MuseGlimmer => "muse_glimmer",
+            Self::MessageFrames => "message_frames",
         }
     }
 
@@ -58,8 +66,16 @@ impl ReasoningContract {
             "deepseek4" => Some(Self::DeepSeek4),
             "gemma_boolean" => Some(Self::GemmaBoolean),
             "muse_glimmer" => Some(Self::MuseGlimmer),
+            "message_frames" => Some(Self::MessageFrames),
             _ => None,
         }
+    }
+
+    /// Whether the chat template itself defines the `reasoning_effort`
+    /// vocabulary, so the daemon probes it at load and serve forwards only
+    /// the rungs the probe found.
+    pub const fn template_defines_effort(self) -> bool {
+        matches!(self, Self::QwenJinja | Self::MessageFrames)
     }
 }
 
@@ -305,6 +321,7 @@ mod tests {
             ReasoningContract::DeepSeek4,
             ReasoningContract::GemmaBoolean,
             ReasoningContract::MuseGlimmer,
+            ReasoningContract::MessageFrames,
         ] {
             assert_eq!(
                 ReasoningContract::from_wire_name(contract.wire_name()),

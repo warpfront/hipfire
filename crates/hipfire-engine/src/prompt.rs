@@ -42,6 +42,19 @@ pub fn qwen_jinja_reasoning(
     }
 }
 
+/// Template `reasoning_effort` for a `ReasoningContract::MessageFrames` turn,
+/// from [`qwen_jinja_reasoning`]'s outputs. Thinking off renders the
+/// template's `none` rung, which lowers but does not forbid a thinking
+/// message; thinking on forwards the request's effort, and `None` leaves the
+/// variable undefined so the template default renders.
+pub fn message_frames_effort(enable_thinking: bool, effort: Option<&str>) -> Option<&str> {
+    if enable_thinking {
+        effort
+    } else {
+        Some("none")
+    }
+}
+
 /// A generate request's `prompt` (default `"Hello"`), normalized with
 /// `maybe_normalize_prompt`. The singleton dispatch and the Glimmer lane
 /// render share it so both tokenize identical bytes.
@@ -164,4 +177,22 @@ pub fn batch_render_prompt_tokens(
         .build_with_user_tokens(&q_tokens)
     };
     Ok((new_tokens, started_in_think))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_frames_effort_maps_off_to_none_and_keeps_default_undefined() {
+        assert_eq!(message_frames_effort(false, None), Some("none"));
+        assert_eq!(message_frames_effort(false, Some("high")), Some("none"));
+        assert_eq!(message_frames_effort(true, None), None);
+        assert_eq!(message_frames_effort(true, Some("low")), Some("low"));
+        // The daemon derives both inputs from the typed toggle.
+        let (on, effort) = qwen_jinja_reasoning(Some(true), Some("auto"), 0);
+        assert_eq!(message_frames_effort(on, effort.as_deref()), None);
+        let (on, effort) = qwen_jinja_reasoning(Some(false), Some("low"), 0);
+        assert_eq!(message_frames_effort(on, effort.as_deref()), Some("none"));
+    }
 }

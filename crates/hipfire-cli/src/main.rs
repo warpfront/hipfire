@@ -6020,6 +6020,7 @@ pub(crate) fn apply_http_reasoning_request(
         ReasoningContract::QwenJinja => effort_native,
         ReasoningContract::DeepSeek4 => true,
         ReasoningContract::MuseGlimmer => true,
+        ReasoningContract::MessageFrames => effort_native,
         _ => false,
     };
     if matches!(contract, ReasoningContract::Unsupported) {
@@ -6102,7 +6103,9 @@ pub(crate) fn apply_http_reasoning_request(
         .reduce(|previous, value| previous && value);
     let is_off_effort = matches!(
         contract,
-        ReasoningContract::QwenJinja | ReasoningContract::DeepSeek4
+        ReasoningContract::QwenJinja
+            | ReasoningContract::DeepSeek4
+            | ReasoningContract::MessageFrames
     ) && matches!(effort_raw, Some("none") | Some("off") | Some("chat"));
     if is_off_effort {
         if toggle_opt == Some(true) {
@@ -6207,7 +6210,9 @@ pub(crate) fn apply_http_reasoning_request(
                 "closed_think"
             }
         }
-        ReasoningContract::GemmaBoolean | ReasoningContract::MuseGlimmer => "plain",
+        ReasoningContract::GemmaBoolean
+        | ReasoningContract::MuseGlimmer
+        | ReasoningContract::MessageFrames => "plain",
         ReasoningContract::Unsupported => "plain",
     };
     request["assistant_prefix"] = serde_json::json!(prefix);
@@ -6264,7 +6269,9 @@ pub(crate) fn apply_http_reasoning_request(
         (None, "none".to_string())
     } else if matches!(
         contract,
-        ReasoningContract::DeepSeek4 | ReasoningContract::MuseGlimmer
+        ReasoningContract::DeepSeek4
+            | ReasoningContract::MuseGlimmer
+            | ReasoningContract::MessageFrames
     ) && (has_explicit_body_max
         || has_explicit_config_max
         || body_budget_present
@@ -6536,6 +6543,30 @@ pub(crate) fn apply_http_reasoning_request(
             };
             effective_effort = Some(normalized.to_string());
             request["reasoning_effort"] = serde_json::json!(normalized);
+        }
+        ReasoningContract::MessageFrames => {
+            // The template owns the ladder: forward only a probed rung and
+            // leave `auto`/absent undefined so the template default renders.
+            let raw = effort_raw
+                .filter(|value| *value != "auto")
+                .map(str::to_owned)
+                .or_else(|| {
+                    (config_effort_is_explicit && config_effort != "auto")
+                        .then(|| config_effort.clone())
+                });
+            match raw {
+                None => {}
+                Some(raw) if !effort_native => push_warn(format!(
+                    "reasoning_effort '{raw}' dropped: loaded chat template does not natively support effort"
+                )),
+                Some(raw) if supported_efforts.contains(&raw) => {
+                    request["reasoning_effort"] = serde_json::json!(raw);
+                    effective_effort = Some(raw);
+                }
+                Some(raw) => push_warn(format!(
+                    "reasoning_effort '{raw}' dropped: not in supported {supported_efforts:?}; template default applies"
+                )),
+            }
         }
         ReasoningContract::GemmaBoolean => {
             effective_effort = None;
@@ -21415,6 +21446,87 @@ effort = "high"
         )
         .unwrap_err();
         assert!(format!("{err}").contains("must be between 0 and 393216"));
+    }
+
+    /// Inkling-style message frames: the template's probed ladder carries
+    /// effort, off is the template's own `none` rung through the typed
+    /// toggle, no think-token cap, no assistant prefix.
+    #[test]
+    fn http_reasoning_message_frames_effort_toggle_and_caps() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let ladder: Vec<String> = ["low", "medium", "high", "xhigh", "max"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let run = |body: serde_json::Value, native: bool| {
+            let mut req = serde_json::json!({});
+            let res = apply_http_reasoning_request(
+                &body,
+                &resolved,
+                &mut req,
+                ReasoningContract::MessageFrames,
+                native,
+                &ladder,
+            )
+            .unwrap();
+            (req, res)
+        };
+
+        // Default: thinking on, effort undefined so the template default
+        // renders (prompt bytes identical to a request that sends nothing).
+        let (req, res) = run(serde_json::json!({}), true);
+        assert_eq!(req["thinking_enabled"], true);
+        assert_eq!(req["assistant_prefix"], "plain");
+        assert!(req.get("reasoning_effort").is_none());
+        assert_eq!(res.effective_mode, "enabled");
+        assert_eq!(res.effective_effort, None);
+        assert!(res.warnings.is_empty(), "{:?}", res.warnings);
+
+        let (req, res) = run(serde_json::json!({ "reasoning_effort": "auto" }), true);
+        assert!(req.get("reasoning_effort").is_none());
+        assert_eq!(res.effective_effort, None);
+
+        // A probed rung is forwarded verbatim.
+        let (req, res) = run(serde_json::json!({ "reasoning_effort": "low" }), true);
+        assert_eq!(req["reasoning_effort"], "low");
+        assert_eq!(res.effective_effort.as_deref(), Some("low"));
+
+        // Off: every spelling reaches the daemon as the typed toggle.
+        for body in [
+            serde_json::json!({ "reasoning_effort": "none" }),
+            serde_json::json!({ "chat_template_kwargs": { "enable_thinking": false } }),
+            serde_json::json!({ "thinking": { "type": "disabled" } }),
+        ] {
+            let (req, res) = run(body.clone(), true);
+            assert_eq!(req["thinking_enabled"], false, "{body}");
+            assert_eq!(req["assistant_prefix"], "plain", "{body}");
+            assert!(req.get("reasoning_effort").is_none(), "{body}");
+            assert_eq!(res.effective_mode, "disabled", "{body}");
+        }
+
+        // Off-ladder or non-native effort is dropped with a warning.
+        let (req, res) = run(serde_json::json!({ "reasoning_effort": "minimal" }), true);
+        assert!(req.get("reasoning_effort").is_none());
+        assert!(res.warnings.iter().any(|w| w.contains("'minimal' dropped")));
+        let (req, res) = run(serde_json::json!({ "reasoning_effort": "low" }), false);
+        assert!(req.get("reasoning_effort").is_none());
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("does not natively support")));
+
+        // No parent-defined cap: dropped and warned, never forwarded.
+        let (req, res) = run(
+            serde_json::json!({ "reasoning_effort": "high", "max_think_tokens": 512 }),
+            true,
+        );
+        assert!(req.get("max_think_tokens").is_none());
+        assert!(res.effective_cap.is_none());
+        assert_eq!(req["reasoning_effort"], "high");
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("max_think_tokens") && w.contains("message_frames")));
     }
 
     #[test]

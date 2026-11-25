@@ -20,7 +20,7 @@ pub(crate) struct EffortProbe {
 }
 
 impl EffortProbe {
-    /// Non-QwenJinja contracts are never probed: nothing to report.
+    /// Contracts without a template-defined effort are never probed: nothing to report.
     pub(crate) fn not_probed() -> Self {
         Self {
             native: false,
@@ -83,9 +83,10 @@ pub(crate) fn probe_loaded_effort(
     }
 }
 
-/// Ordinary-ack probe: probes only the `qwen_jinja` contract (every other
-/// contract reports false/[]/null), logs a failed probe once with the
-/// effective template source, and returns the ack's
+/// Ordinary-ack probe: probes only contracts whose chat template defines the
+/// effort vocabulary (`qwen_jinja`, `message_frames`; every other contract
+/// reports false/[]/null), logs a failed probe once with the effective
+/// template source, and returns the ack's
 /// `(reasoning_effort_native, reasoning_efforts, reasoning_effort_probe_error)`
 /// values already serialized as JSON.
 pub(crate) fn loaded_ack_parts(
@@ -94,7 +95,9 @@ pub(crate) fn loaded_ack_parts(
     template: Option<&str>,
     template_source: Option<&str>,
 ) -> (bool, String, String) {
-    let probe = if reasoning_contract == "qwen_jinja" {
+    let probed = saddle_core::caps::ReasoningContract::from_wire_name(reasoning_contract)
+        .is_some_and(|contract| contract.template_defines_effort());
+    let probe = if probed {
         probe_loaded_effort(tokenizer, template)
     } else {
         EffortProbe::not_probed()
@@ -243,5 +246,30 @@ mod tests {
         assert_eq!(fields["reasoning_effort_native"], serde_json::json!(false));
         assert_eq!(fields["reasoning_efforts"], serde_json::json!([]));
         assert!(fields["reasoning_effort_probe_error"].is_string());
+    }
+
+    /// Byte-exact chat template embedded in the Inkling-2-Mini MQ4 artifact.
+    const INKLING2_REAL: &str =
+        include_str!("../../hipfire-runtime/tests/fixtures/inkling2/chat_template.jinja");
+
+    /// The `message_frames` contract is probed like `qwen_jinja`: the ack
+    /// publishes the template's own ladder. Contracts without a template-defined
+    /// effort stay unprobed even with an effort-bearing template.
+    #[test]
+    fn message_frames_contract_acks_the_template_ladder() {
+        let tokenizer = probe_tokenizer();
+        let (native, efforts, error) = loaded_ack_parts(
+            "message_frames",
+            Some(&tokenizer),
+            Some(INKLING2_REAL),
+            None,
+        );
+        assert!(native);
+        assert_eq!(efforts, r#"["low","medium","high","xhigh","max"]"#);
+        assert_eq!(error, "null");
+        let (native, efforts, error) =
+            loaded_ack_parts("muse_glimmer", Some(&tokenizer), Some(INKLING2_REAL), None);
+        assert!(!native);
+        assert_eq!((efforts.as_str(), error.as_str()), ("[]", "null"));
     }
 }

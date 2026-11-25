@@ -13159,8 +13159,14 @@ impl Carrier for Inkling2Carrier {
         Some(hip_bridge::SlabMode::Up64M)
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
-        // Text-only skeleton: default IS the declaration.
-        saddle_core::caps::ArchCaps::default()
+        // Text-only single-stream AR. `generate_inkling` splits the model's
+        // protocol-framed thinking and answer messages by token id into the
+        // typed v2 `reasoning` / `token` events.
+        saddle_core::caps::ArchCaps {
+            reasoning_contract: saddle_core::caps::ReasoningContract::MessageFrames,
+            semantic_contract_version: Some(2),
+            ..saddle_core::caps::ArchCaps::default()
+        }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
         saddle_core::sampling::SamplingDefaults::new(1.0, 1.0, 1.0)
