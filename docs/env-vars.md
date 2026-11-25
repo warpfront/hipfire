@@ -1939,7 +1939,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GPU_TOPK` | crates/saddle-lab/examples/infer_qwen35.rs | harness |
 | `HIPFIRE_GQA_CHUNK` | crates/rdna-compute/src/attention.rs | developer |
 | `HIPFIRE_GQA_FUSED` | crates/hipfire-arch-qwen2/src/qwen2.rs, crates/hipfire-dispatch/src/families/kv_tier.rs | developer |
-| `HIPFIRE_GRAPH` | benchmarks/scripts/bench_pp_gfx906.sh, crates/hipfire-arch-maple/examples/maple_decode_profile.rs | experimental |
+| `HIPFIRE_GRAPH` | benchmarks/scripts/bench_pp_gfx906.sh, crates/hipfire-arch-inkling2/tests/gpu_parity.rs | experimental |
 | `HIPFIRE_GRAPH_PREFILL` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs | harness |
 | `HIPFIRE_GRID_TOKFAST` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GTT_CEILING_GIB` | scripts/run-bounded.sh | harness |
@@ -1979,7 +1979,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_HIPCC` | crates/hipfire-cli/src/main.rs, crates/hipfire-cli/src/setup.rs | developer |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | .agents/skills/hipfire-autoheal/triage.sh, benchmarks/scripts/mq4v2_k5120_gfx1201_validate.sh | experimental |
 | `HIPFIRE_HIP_WAIT` | crates/rdna-compute/src/dispatch.rs | developer |
-| `HIPFIRE_HOME` | benchmarks/scripts/mq4v2_k5120_gfx1201_validate.sh, crates/hipfire-arch-qwen4/src/artifact.rs | stable |
+| `HIPFIRE_HOME` | benchmarks/scripts/mq4v2_k5120_gfx1201_validate.sh, crates/hipfire-arch-inkling2/tests/gpu_parity.rs | stable |
 | `HIPFIRE_HOST` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_HOST_SITE_LEDGER` | crates/hip-bridge/src/site_ledger.rs | developer |
 | `HIPFIRE_HOST_TIMING` | crates/hipfire-generate/src/qwen.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs | developer |
