@@ -109,6 +109,7 @@ module	conv1d_silu_split_qknorm_b128	developer-opt-in	Non-default developer over
 module	conv1d_silu_split_qknorm_b32	developer-opt-in	Non-default developer override: HIPFIRE_CONV_QKNORM_SHAPE; rdna-compute/src/norm.rs:4976-5004
 module	conv1d_silu_split_qknorm_b512	developer-opt-in	Non-default developer override: HIPFIRE_CONV_QKNORM_SHAPE; rdna-compute/src/norm.rs:4976-5004
 module	conv1d_silu_split_qknorm_b64	developer-opt-in	Non-default developer override: HIPFIRE_CONV_QKNORM_SHAPE; rdna-compute/src/norm.rs:4976-5004
+module	conv2d_gated_f32	non-core-family	Non-core family route: LFM3-VL (arch 26); rdna-compute/src/norm.rs:8016
 module	convert_f32_to_bf16	non-core-family	Non-core family route: Muse Glimmer, Gemma, LFM2; hipfire-arch-lfm2moe/src/forward_batch.rs:102
 module	copy_f32_strided_slot_buffer	non-core-family	Non-core family route: DeepSeek4; hipfire-arch-deepseek4/src/forward.rs:12725
 module	deepseek4_attn_swa	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:23015
@@ -331,6 +332,7 @@ module	gated_rmsnorm_sigmoid_rows	non-core-family	Raon RDA output norm (non-w128
 module	gated_rmsnorm_sigmoid_rows_w128	non-core-family	Raon RDA w128 output norm; hipfire-arch-raon/src/rda.rs:627
 module	gdn_chunk_scan_emu_bf16	developer-opt-in	Non-default developer override: HIPFIRE_GDN_SCAN_OUT_EMU; rdna-compute/src/norm.rs:5573-5587
 module	gdn_chunk_scan_emu_f16	developer-opt-in	Non-default developer override: HIPFIRE_GDN_SCAN_OUT_EMU; rdna-compute/src/norm.rs:5573-5587
+module	gelu_erf_f32	non-core-family	Non-core family route: LFM3-VL, LFM3-Audio (arch 26); rdna-compute/src/norm.rs:7973
 module	gelu_new_mul_f32	non-core-family	Non-core family route: Flux/VAE; rdna-compute/src/text_encoder.rs:179
 module	gelu_tanh_f32	config-opt-in	Non-default configuration: vision.mode / vision.rs; qwen35_vl.rs:1386
 module	gemm_bf16_mfma_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:32743
@@ -1073,11 +1075,13 @@ module	rope_tail_yarn_interleaved_at_slot_buf	non-core-family	Non-core family ro
 module	rope_tail_yarn_interleaved_batched	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:22566
 module	rope_tail_yarn_interleaved_staged_buf_f32	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:19442
 module	rope_tail_yarn_interleaved_wide	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:22422
+module	rope_zero_tail	non-core-family	Non-core family route: LFM3 (arch 26); rdna-compute/src/norm.rs:1693
 module	rotate_with_rms_gfx1100	config-opt-in	Non-default configuration: kernel.rdna; rdna-compute/src/gemv.rs:2767-2769
 module	rotate_with_rms_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemv.rs:3304
 module	rotate_x_mq_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	rotate_x_mq_awq_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	round_h_bf16_quality_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_EMU_BF16_H; rdna-compute/src/gemv.rs:4453-4460
+module	sigmoid_head_gate_mul	non-core-family	Non-core family route: LFM3, LFM3-Omni (arch 26); rdna-compute/src/norm.rs:3332
 module	sigmoid_mul_rotate_x_mq_awq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:7171
 module	sigmoid_mul_rotate_x_mq_awq_i8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL; rdna-compute/src/gemv.rs:7166
 module	sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
@@ -1126,6 +1130,7 @@ module	vae_im2col	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-
 module	vae_layout	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/vae_gpu.rs:1103
 module	vae_upsample2x	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/vae_gpu.rs:1320
 module	vit_attention_f32	config-opt-in	Non-default configuration: attention.rs / vision.rs; rdna-compute/src/attention.rs:16766
+module	vit_attention_gqa_f32	non-core-family	Non-core family route: LFM3-VL, LFM3-Omni (arch 26); rdna-compute/src/attention.rs:16392
 module	vit_attention_qtiled_f32	config-opt-in	Non-default configuration: attention.rs / vision.mode; rdna-compute/src/attention.rs:16945
 module	vit_attention_wmma_f16	non-core-family	Vision tower self-attention (Qwen-VL ViT, non-core vision tower) selected by select_vit_attn (default WMMA when head_dim<=80); hipfire-arch-qwen35-vl/src/qwen35_vl.rs:3146
 module	vit_attention_wmma_f16_gfx12	non-core-family	Vision tower self-attention (Qwen-VL ViT, non-core vision tower) selected by select_vit_attn (default WMMA when head_dim<=80); hipfire-arch-qwen35-vl/src/qwen35_vl.rs:3146
