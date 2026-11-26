@@ -334,9 +334,7 @@ fn view2(t: &GpuTensor, rows: usize, cols: usize) -> Result<GpuTensor, String> {
     let len = rows
         .checked_mul(cols)
         .and_then(|n| n.checked_mul(4))
-        .ok_or_else(|| {
-            format!("inkling2 gpu fwd: view2 [{rows},{cols}] extent overflows")
-        })?;
+        .ok_or_else(|| format!("inkling2 gpu fwd: view2 [{rows},{cols}] extent overflows"))?;
     Ok(GpuTensor {
         buf: sub_buf(t, 0, len, "view2")?,
         shape: vec![rows, cols],
@@ -353,12 +351,12 @@ fn head_view(t: &GpuTensor, h: usize, hd: usize) -> Result<GpuTensor, String> {
             t.dtype
         ));
     }
-    let row_len = hd.checked_mul(4).ok_or_else(|| {
-        "inkling2 gpu fwd: head view extent overflows".to_string()
-    })?;
-    let off = h.checked_mul(row_len).ok_or_else(|| {
-        format!("inkling2 gpu fwd: head view head {h}*{hd} overflows")
-    })?;
+    let row_len = hd
+        .checked_mul(4)
+        .ok_or_else(|| "inkling2 gpu fwd: head view extent overflows".to_string())?;
+    let off = h
+        .checked_mul(row_len)
+        .ok_or_else(|| format!("inkling2 gpu fwd: head view head {h}*{hd} overflows"))?;
     Ok(GpuTensor {
         buf: sub_buf(t, off, row_len, "head_view")?,
         shape: vec![hd],
@@ -375,12 +373,12 @@ fn copy_row_from(
     e: usize,
     what: &str,
 ) -> Result<(), String> {
-    let need = e.checked_mul(4).ok_or_else(|| {
-        format!("inkling2 gpu fwd: copy_row_from [{e}] extent overflows")
-    })?;
-    let off = row.checked_mul(need).ok_or_else(|| {
-        format!("inkling2 gpu fwd: copy_row_from row {row}*{e} overflows")
-    })?;
+    let need = e
+        .checked_mul(4)
+        .ok_or_else(|| format!("inkling2 gpu fwd: copy_row_from [{e}] extent overflows"))?;
+    let off = row
+        .checked_mul(need)
+        .ok_or_else(|| format!("inkling2 gpu fwd: copy_row_from row {row}*{e} overflows"))?;
     let view = GpuTensor {
         buf: sub_buf(src_2d, off, need, "copy_row_from src")?,
         shape: vec![e],
@@ -1901,10 +1899,7 @@ mod tests {
     fn fake_tensor(backing: &[u8], shape: Vec<usize>, dtype: DType) -> GpuTensor {
         GpuTensor {
             buf: unsafe {
-                DeviceBuffer::from_raw(
-                    backing.as_ptr() as *mut std::ffi::c_void,
-                    backing.len(),
-                )
+                DeviceBuffer::from_raw(backing.as_ptr() as *mut std::ffi::c_void, backing.len())
             },
             shape,
             dtype,

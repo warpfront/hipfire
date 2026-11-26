@@ -27,7 +27,7 @@
 use hipfire_arch_inkling2::arch_model::{Inkling2Bundle, Inkling2State};
 use hipfire_arch_inkling2::config::Inkling2Config;
 use hipfire_arch_inkling2::forward_token_gpu;
-use hipfire_arch_inkling2::gpu::{Inkling2GpuState, Inkling2GpuWeights, upload};
+use hipfire_arch_inkling2::gpu::{upload, Inkling2GpuState, Inkling2GpuWeights};
 use hipfire_arch_inkling2::weights::Inkling2Weights;
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
