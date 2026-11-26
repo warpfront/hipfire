@@ -156,8 +156,16 @@ fn q8ef_snapshot_restore_rollback_continue_is_byte_exact_hw() {
         let channel = qkv * 4;
         for pos in 0..keep {
             let slot = pos % 3;
-            conv[slot * channel..(slot + 1) * channel]
-                .copy_from_slice(&inputs[pos * channel..(pos + 1) * channel]);
+            // The rollback stores kept rows BF16-rounded, as the conv kernels do (#1199).
+            conv[slot * channel..(slot + 1) * channel].copy_from_slice(
+                &inputs[pos * channel..(pos + 1) * channel]
+                    .chunks_exact(4)
+                    .flat_map(|b| {
+                        let x = f32::from_ne_bytes(b.try_into().unwrap());
+                        half::bf16::from_f32(x).to_f32().to_ne_bytes()
+                    })
+                    .collect::<Vec<u8>>(),
+            );
         }
         conv
     };
