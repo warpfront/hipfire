@@ -52,7 +52,7 @@ use crate::gpu::{
     swa_gather_map, swa_slot, Inkling2Controller, Inkling2GpuLayer, Inkling2GpuState,
     Inkling2GpuWeights, INKLING2_CONV_WIDTH,
 };
-use hip_bridge::KernargBlob;
+use hip_bridge::{DeviceBuffer, KernargBlob};
 use hipfire_runtime::llama::{rotate_x_mq_for, weight_gemv};
 use rdna_compute::ffn_activation::{
     CombineOrder, FfnActivation, FfnActivationRows, FfnAwq, MoeCombine, MoeRouterTopK, RouterKind,
@@ -292,33 +292,78 @@ fn free_all(gpu: &mut Gpu, ts: Vec<GpuTensor>) {
     }
 }
 
-/// Non-owning `[rows, cols]` F32 view of a whole buffer.
-fn view2(t: &GpuTensor, rows: usize, cols: usize) -> GpuTensor {
-    assert_eq!(t.dtype, DType::F32, "inkling2 gpu fwd: view of non-F32");
-    assert_eq!(
-        t.buf.size(),
-        rows * cols * 4,
-        "inkling2 gpu fwd: view extent"
-    );
-    GpuTensor {
-        buf: t.buf.byte_view(0, rows * cols * 4),
+/// Checked non-owning byte-range view into a pool-served buffer.
+///
+/// The reuse pool best-fit may hand a larger buffer to an exact-size request,
+/// so a bigger buffer is normal: the view takes the logical
+/// `[byte_offset, byte_offset + byte_len)` prefix (same elements a fresh
+/// exact buffer would hold — `>=`, not `==`). A short buffer fails closed
+/// with `Err` (surfaces as 503) instead of an `assert!` panic that would
+/// kill the daemon when the pool retires under OOM pressure. Never clamps:
+/// short is refused, never silently truncated.
+fn sub_buf(
+    t: &GpuTensor,
+    byte_offset: usize,
+    byte_len: usize,
+    what: &str,
+) -> Result<DeviceBuffer, String> {
+    let end = byte_offset.checked_add(byte_len).ok_or_else(|| {
+        format!("inkling2 gpu fwd: {what}: offset {byte_offset}+len {byte_len} overflows")
+    })?;
+    let have = t.buf.size();
+    if end > have {
+        return Err(format!(
+            "inkling2 gpu fwd: {what}: need [{byte_offset},{end}) of {have} buffer bytes"
+        ));
+    }
+    Ok(t.buf.byte_view(byte_offset, byte_len))
+}
+
+/// Non-owning `[rows, cols]` F32 view of a whole buffer. The pool best-fit may
+/// hand a larger buffer to an exact-size request; the view takes the logical
+/// prefix (same elements a fresh exact buffer would hold), so `>=` is the
+/// correct gate, not `==`. Short buffers and wrong dtypes fail closed with
+/// `Err`, never a daemon-killing `assert!`.
+fn view2(t: &GpuTensor, rows: usize, cols: usize) -> Result<GpuTensor, String> {
+    if t.dtype != DType::F32 {
+        return Err(format!(
+            "inkling2 gpu fwd: view2 of {:?}, need F32",
+            t.dtype
+        ));
+    }
+    let len = rows
+        .checked_mul(cols)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| {
+            format!("inkling2 gpu fwd: view2 [{rows},{cols}] extent overflows")
+        })?;
+    Ok(GpuTensor {
+        buf: sub_buf(t, 0, len, "view2")?,
         shape: vec![rows, cols],
         dtype: DType::F32,
-    }
+    })
 }
 
 /// Non-owning `[hd]` F32 view of one head row inside a `[heads*hd]` buffer.
-fn head_view(t: &GpuTensor, h: usize, hd: usize) -> GpuTensor {
-    assert_eq!(
-        t.dtype,
-        DType::F32,
-        "inkling2 gpu fwd: head view of non-F32"
-    );
-    GpuTensor {
-        buf: t.buf.byte_view(h * hd * 4, hd * 4),
+/// A short pool buffer fails closed with `Err`, never a `byte_view` panic.
+fn head_view(t: &GpuTensor, h: usize, hd: usize) -> Result<GpuTensor, String> {
+    if t.dtype != DType::F32 {
+        return Err(format!(
+            "inkling2 gpu fwd: head view of {:?}, need F32",
+            t.dtype
+        ));
+    }
+    let row_len = hd.checked_mul(4).ok_or_else(|| {
+        "inkling2 gpu fwd: head view extent overflows".to_string()
+    })?;
+    let off = h.checked_mul(row_len).ok_or_else(|| {
+        format!("inkling2 gpu fwd: head view head {h}*{hd} overflows")
+    })?;
+    Ok(GpuTensor {
+        buf: sub_buf(t, off, row_len, "head_view")?,
         shape: vec![hd],
         dtype: DType::F32,
-    }
+    })
 }
 
 /// Copy row `row` of a `[rows, e]` buffer into a flat `[e]` buffer.
@@ -330,11 +375,23 @@ fn copy_row_from(
     e: usize,
     what: &str,
 ) -> Result<(), String> {
+    let need = e.checked_mul(4).ok_or_else(|| {
+        format!("inkling2 gpu fwd: copy_row_from [{e}] extent overflows")
+    })?;
+    let off = row.checked_mul(need).ok_or_else(|| {
+        format!("inkling2 gpu fwd: copy_row_from row {row}*{e} overflows")
+    })?;
     let view = GpuTensor {
-        buf: src_2d.buf.byte_view(row * e * 4, e * 4),
+        buf: sub_buf(src_2d, off, need, "copy_row_from src")?,
         shape: vec![e],
         dtype: DType::F32,
     };
+    if dst.buf.size() < need {
+        return Err(format!(
+            "inkling2 gpu fwd: copy_row_from dst: need {need} of {} buffer bytes",
+            dst.buf.size()
+        ));
+    }
     hip(
         gpu.copy_rows_strided_f32(&view, dst, 1, e, e, e, 0, None),
         what,
@@ -342,7 +399,17 @@ fn copy_row_from(
 }
 
 fn dup(gpu: &mut Gpu, src: &GpuTensor, what: &str) -> Result<GpuTensor, String> {
-    let n = src.buf.size() / 4;
+    // Size the copy from the shape, not the buffer: the pool best-fit may
+    // hand a larger buffer to an exact-size request, and sizing from the
+    // buffer would clone pool slack into the copy. The buffer must still
+    // hold all logical elements; a short buffer fails closed, never a panic.
+    let n: usize = src.shape.iter().product();
+    if src.buf.size() / 4 < n {
+        return Err(format!(
+            "inkling2 gpu fwd: dup {what}: buffer {} words < shape {n}",
+            src.buf.size() / 4
+        ));
+    }
     let out = gpu
         .alloc_tensor(&[n], DType::F32)
         .map_err(|e| format!("inkling2 gpu fwd: dup {what}: {e:?}"))?;
@@ -409,7 +476,10 @@ fn gpu_mix(
         Ok(i) => i,
         Err(msg) => return fail(gpu, tmp, msg),
     };
-    let qv = view2(query, qr, e);
+    let qv = match view2(query, qr, e) {
+        Ok(v) => v,
+        Err(msg) => return fail(gpu, tmp, msg),
+    };
     if let Err(e2) = gpu.inkling2_mix_f32_gpu(&tmp[b], &qv, &tmp[normed], &tmp[out], n, e, qr, eps)
     {
         return fail(gpu, tmp, format!("inkling2 gpu fwd: mix: {e2:?}"));
@@ -603,7 +673,7 @@ fn run_visit(
             let mut m = [0usize; 4];
             for j in 0..4 {
                 let qj = GpuTensor {
-                    buf: cross.buf.byte_view(j * e * 4, e * 4),
+                    buf: step!(sub_buf(cross, j * e * 4, e * 4, "cross"), "view"),
                     shape: vec![1, e],
                     dtype: DType::F32,
                 };
@@ -824,17 +894,17 @@ fn run_visit(
     step!(cap_put(cap, gpu, "v_conv", &tmp[v_conv]), "capture");
     // Clips + V head-norm.
     {
-        let qv = view2(&tmp[q], nh, hd);
+        let qv = step!(view2(&tmp[q], nh, hd), "view");
         step!(
             gpu.inkling2_l2_clip_rows_f32(&qv, Some(&layer.q_clip), nh, hd, cfg.qk_clip),
             "q clip"
         );
-        let kv = view2(&tmp[k_conv], nkv, hd);
+        let kv = step!(view2(&tmp[k_conv], nkv, hd), "view");
         step!(
             gpu.inkling2_l2_clip_rows_f32(&kv, None, nkv, hd, cfg.qk_clip),
             "k clip"
         );
-        let rv = view2(&tmp[r], nh, cfg.n_rel);
+        let rv = step!(view2(&tmp[r], nh, cfg.n_rel), "view");
         step!(
             gpu.inkling2_l2_clip_rows_f32(&rv, Some(&layer.rel_clip), nh, cfg.n_rel, cfg.rel_clip),
             "r clip"
@@ -842,7 +912,7 @@ fn run_visit(
     }
     let vc = step!(at(gpu, &mut tmp, &[ekv], "vc"), "alloc");
     {
-        let vin = view2(&tmp[v_conv], nkv, hd);
+        let vin = step!(view2(&tmp[v_conv], nkv, hd), "view");
         step!(
             gpu.inkling2_rmsnorm_nogamma_f32(&vin, &tmp[vc], nkv, hd, eps),
             "v norm"
@@ -899,7 +969,7 @@ fn run_visit(
     let si = tmp.len() - 1;
     let rel_bias = step!(at(gpu, &mut tmp, &[nh, n_kv], "rel_bias"), "alloc");
     {
-        let rv = view2(&tmp[r], nh, cfg.n_rel);
+        let rv = step!(view2(&tmp[r], nh, cfg.n_rel), "view");
         step!(
             gpu.inkling2_rel_bias_gather_f32(
                 &rv,
@@ -923,13 +993,13 @@ fn run_visit(
     step!(cap_put(cap, gpu, "rel_bias", &tmp[rel_bias]), "capture");
     // KV write (F32 -> F16 rows), then decode attention over 0..n_kv.
     for h in 0..nkv {
-        let src_k = head_view(&tmp[k_conv], h, hd);
+        let src_k = step!(head_view(&tmp[k_conv], h, hd), "view");
         let dst_k = gs.k_cache[visit][h].sub_offset(wpos * hd, hd);
         step!(
             gpu.convert_f32_to_f16_into(&src_k, &dst_k, hd),
             "k cache write"
         );
-        let src_v = head_view(&tmp[vc], h, hd);
+        let src_v = step!(head_view(&tmp[vc], h, hd), "view");
         let dst_v = gs.v_cache[visit][h].sub_offset(wpos * hd, hd);
         step!(
             gpu.convert_f32_to_f16_into(&src_v, &dst_v, hd),
@@ -939,7 +1009,7 @@ fn run_visit(
     gs.visit_cap[visit] = pos + 1;
     let attn_heads = step!(at(gpu, &mut tmp, &[eattn], "attn_heads"), "alloc");
     {
-        let qv = view2(&tmp[q], nh, hd);
+        let qv = step!(view2(&tmp[q], nh, hd), "view");
         step!(
             launch_attn(
                 gpu,
@@ -1813,5 +1883,114 @@ mod tests {
         // Shape mismatches fail closed too.
         assert!(swa_gather_map(&tags[..100], 50, SWA_WINDOW_ROWS).is_err());
         assert!(swa_gather_map(&tags, 50, 0).is_err());
+    }
+
+    // View-cut bounds gates (upstream #1192): the reuse pool best-fit may
+    // hand a LARGER buffer to an exact-size request (Kaden's case: 15704 B
+    // handed to a 12288 B view). The view must take the logical prefix;
+    // a SHORT buffer must fail closed with Err (503), never panic the
+    // daemon, and never silently clamp. Host-only: view cuts are pure
+    // pointer arithmetic + size checks, no kernel launch.
+    use super::{head_view, sub_buf, view2};
+    use hip_bridge::DeviceBuffer;
+    use rdna_compute::{DType, GpuTensor};
+
+    /// Fake pool buffer: host backing, never launched. Views only read the
+    /// pointer + size, so no device is touched. The backing vec must stay
+    /// alive while views exist (same rule as a real pool buffer).
+    fn fake_tensor(backing: &[u8], shape: Vec<usize>, dtype: DType) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe {
+                DeviceBuffer::from_raw(
+                    backing.as_ptr() as *mut std::ffi::c_void,
+                    backing.len(),
+                )
+            },
+            shape,
+            dtype,
+        }
+    }
+
+    #[test]
+    fn view2_oversized_pool_buffer_takes_logical_prefix() {
+        // Kaden's exact bytes: 15704 B buffer, 12288 B ([1, 3072]) wanted.
+        let backing = vec![0xABu8; 15704];
+        let t = fake_tensor(&backing, vec![3926], DType::F32);
+        let v = view2(&t, 1, 3072).expect("oversized buffer must view");
+        assert_eq!(v.shape, vec![1, 3072]);
+        assert_eq!(v.dtype, DType::F32);
+        // Prefix, not the whole buffer: slack is excluded from the view.
+        assert_eq!(v.buf.size(), 12288);
+        assert_eq!(v.buf.as_ptr(), t.buf.as_ptr());
+    }
+
+    #[test]
+    fn view2_exact_size_unchanged() {
+        // Happy path is bit-identical to the old assert-gated behavior:
+        // same shape, same extent, same base.
+        let backing = vec![0u8; 12288];
+        let t = fake_tensor(&backing, vec![3072], DType::F32);
+        let v = view2(&t, 1, 3072).expect("exact buffer must view");
+        assert_eq!(v.shape, vec![1, 3072]);
+        assert_eq!(v.buf.size(), 12288);
+        assert_eq!(v.buf.as_ptr(), t.buf.as_ptr());
+    }
+
+    #[test]
+    fn view2_short_buffer_fails_closed() {
+        // One word short: Err, never a panic, never a clamped view.
+        let backing = vec![0u8; 12284];
+        let t = fake_tensor(&backing, vec![3071], DType::F32);
+        assert!(view2(&t, 1, 3072).is_err());
+    }
+
+    #[test]
+    fn view2_wrong_dtype_fails_closed() {
+        let backing = vec![0u8; 12288];
+        let t = fake_tensor(&backing, vec![3072], DType::F16);
+        assert!(view2(&t, 1, 3072).is_err());
+    }
+
+    #[test]
+    fn view2_extent_overflow_fails_closed() {
+        // Checked arithmetic: no panic even in debug builds.
+        let backing = vec![0u8; 16];
+        let t = fake_tensor(&backing, vec![4], DType::F32);
+        assert!(view2(&t, usize::MAX, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn sub_buf_never_clamps() {
+        let backing = vec![0u8; 100];
+        let t = fake_tensor(&backing, vec![25], DType::F32);
+        // Exact and prefix both fine.
+        assert_eq!(sub_buf(&t, 0, 100, "t").unwrap().size(), 100);
+        assert_eq!(sub_buf(&t, 0, 64, "t").unwrap().size(), 64);
+        assert_eq!(sub_buf(&t, 36, 64, "t").unwrap().size(), 64);
+        // Short by one byte, and offset+len overflow: Err, not clamped.
+        assert!(sub_buf(&t, 0, 101, "t").is_err());
+        assert!(sub_buf(&t, 37, 64, "t").is_err());
+        assert!(sub_buf(&t, usize::MAX, 1, "t").is_err());
+    }
+
+    #[test]
+    fn head_view_short_buffer_fails_closed() {
+        // [8, 128] F32 head bank = 4096 B; head 7 needs [3584, 4096).
+        let backing = vec![0u8; 4096];
+        let bank = fake_tensor(&backing, vec![1024], DType::F32);
+        let v = head_view(&bank, 7, 128).expect("exact head must view");
+        assert_eq!(v.shape, vec![128]);
+        assert_eq!(v.buf.size(), 512);
+        // Head past the end, and a truncated bank: Err, never a panic.
+        assert!(head_view(&bank, 8, 128).is_err());
+        let short = fake_tensor(&backing[..4000], vec![1000], DType::F32);
+        assert!(head_view(&short, 7, 128).is_err());
+        // Oversized pool buffer takes the logical prefix.
+        let big = vec![0u8; 5000];
+        let big_bank = fake_tensor(&big, vec![1250], DType::F32);
+        assert_eq!(head_view(&big_bank, 0, 128).unwrap().buf.size(), 512);
+        // Wrong dtype fails closed.
+        let f16 = fake_tensor(&backing, vec![1024], DType::F16);
+        assert!(head_view(&f16, 0, 128).is_err());
     }
 }
