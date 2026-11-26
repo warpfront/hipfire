@@ -637,6 +637,11 @@ def self_test():
     assert not perf_ok({"prefill_tok_s_delta_pct": -2.1, "decode_tok_s_delta_pct": 0.0})
     assert not perf_ok({"prefill_tok_s_delta_pct": 0.0, "decode_tok_s_delta_pct": 2.1})
     assert not perf_ok({"prefill_tok_s_delta_pct": None, "decode_tok_s_delta_pct": 0.0})
+    assert ok(arm(), perf={"median": {"g_perf": "intended"}})
+    gain = {"prefill_tok_s_delta_pct": 0.0, "decode_tok_s_delta_pct": 2.3}
+    assert perf_ok(gain, decode_gain=True) == "intended" and not perf_ok(gain)
+    assert not perf_ok({"prefill_tok_s_delta_pct": 0.0, "decode_tok_s_delta_pct": -2.1}, decode_gain=True)
+    assert not perf_ok({"prefill_tok_s_delta_pct": -2.1, "decode_tok_s_delta_pct": 2.3}, decode_gain=True)
     assert not ok(arm(iso="ax"), leg=arm(iso="ax"))  # state leaked into a later request
     part = arm(iso="ax")
     part["cold"][0]["done"]["prefill_tokens"] = 5
@@ -832,10 +837,13 @@ def wait_gpu_released(timeout_s=120):
                     time.sleep(0.5)
 
 
-def perf_ok(m):
-    """G-perf: both median tok/s deltas within +-2 %."""
-    return all(m.get(k) is not None and abs(m[k]) <= 2.0
-               for k in ("prefill_tok_s_delta_pct", "decode_tok_s_delta_pct"))
+def perf_ok(m, decode_gain=False):
+    """G-perf: both median tok/s deltas within +-2 %. With the route's
+    `perf_decode_gain` (intended diff 7) a decode gain above +2 % is "intended"."""
+    p, d = m.get("prefill_tok_s_delta_pct"), m.get("decode_tok_s_delta_pct")
+    if p is None or d is None or abs(p) > 2.0 or d < -2.0:
+        return False
+    return True if d <= 2.0 else ("intended" if decode_gain else False)
 
 
 def run_perf(args, route, out):
@@ -869,7 +877,7 @@ def run_perf(args, route, out):
     for k in ("prefill_tok_s", "decode_tok_s"):
         lg, en = summary["legacy"][k], summary["engine"][k]
         summary[f"{k}_delta_pct"] = round(100 * (en - lg) / lg, 2) if lg and en else None
-    summary["g_perf"] = perf_ok(summary)
+    summary["g_perf"] = perf_ok(summary, route.get("perf_decode_gain", False))
     return {"reps": rows, "median": summary}
 
 

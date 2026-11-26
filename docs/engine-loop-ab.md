@@ -77,6 +77,8 @@ own route files: Qwen4 native MTP via `"mtp_mode": "on"`, a DFlash drafter via
 - `conc`: the concurrency matrix, see Concurrency.
 - `batch_load` (default `{"continuous_batch_size": 4, "serve_vmm_batch": {}}`):
   merged over `load` for the batch-path cache scenario.
+- `perf_decode_gain` (default false): a G-perf decode gain above +2 % is
+  `intended` (intended diff 7). Set it only on a Gemma 4 AR route.
 
 ## Scenarios
 
@@ -150,6 +152,13 @@ These are reported as `intended` and do not fail the run:
    generated token. On a Gemma 4 EAGLE route (`load` names a `drafter`), equal
    token ids at different positions are `intended` (HIPF-471); on every other
    route a position difference is a diff (HIPF-552).
+7. **Gemma 4 AR decode gain.** The engine greedy decode reads back only the
+   device argmax. Legacy `generate_gemma4` reads back all 262144 logits per
+   token and samples on the host. The engine decode is therefore faster: about
+   +2.3 % on Gemma 4 26B-A4B on halo, with equal tokens (HIPF-589). On a route
+   with `perf_decode_gain`, G-perf reports a decode delta above +2 % as
+   `intended`. A decode delta below −2 % and a prefill delta outside ±2 %
+   still fail.
 
 Every other difference is a diff.
 
@@ -174,10 +183,10 @@ A run passes when all of these hold:
   a legacy-vs-legacy run of the same route before it counts.
 - **G-perf** (`--perf`): fresh loads, interleaved legacy/engine,
   `--perf-reps` (3) per arm. The run takes the median prefill and decode
-  tok/s. Both deltas must be within ±2 %. Each rep records the loadavg,
-  foreign `/dev/kfd` holders and the current gfxclk. Take perf numbers only
-  under the lock with no foreign `cargo`/`rustc`, and treat a single delta
-  under ~5 % on halo as noise until it repeats.
+  tok/s. Both deltas must be within ±2 % (see intended diff 7). Each rep
+  records the loadavg, foreign `/dev/kfd` holders and the current gfxclk. Take
+  perf numbers only under the lock with no foreign `cargo`/`rustc`, and treat
+  a single delta under ~5 % on halo as noise until it repeats.
 - Both daemons exit 0.
 - With `--conc`: every concurrency gate below.
 
