@@ -42,6 +42,7 @@ SPEC = re.compile(r"^(tau|cycles|rounds|accepted|mtp_windows|floor_ar_windows|ar
 # Greedy scenarios whose done envelopes feed G-spec (aborted requests excluded).
 GREEDY = ("cold", "multi_turn", "interleaved", "abort_prefill", "abort_decode", "eos_budget", "isolation")
 COLD = "Write one sentence about the sea."
+COUNT = "List the numbers from 1 to 100, one per line, as digits."  # decodes long: aborts land mid-decode
 LONG = (
     "Summarize the following notes in two sentences.\n"
     + "".join(f"Note {i}: the {w} sensor on rack {i % 7} reported {i * 13 % 97} units. "
@@ -92,28 +93,40 @@ class Daemon:
         """Run one request to its terminal event. abort_now sends the abort right
         behind the request (lands before or during prefill); abort_at_token sends
         it after that many token or reasoning events (mid-decode)."""
-        msg = {"type": "generate", "id": rid, "attempt_id": 1, **req}
-        self.send(msg)
-        if abort_now:
-            self.send({"type": "abort", "id": rid, "attempt_id": 1})
-        events, ids, n = [], [], 0
-        while True:
+        return self.generate_many([(rid, req, "now" if abort_now else abort_at_token)])[rid]
+
+    def generate_many(self, specs):
+        """Run several requests at once to their terminal events; returns {rid: result}.
+        specs: [(rid, req, abort)]; abort is None, "now" (sent right behind the
+        request), "start" (sent on its `gen_start`: admitted, so it lands in the
+        prompt) or N (sent after N token or reasoning events: mid-decode)."""
+        live = {}
+        for rid, req, abort in specs:
+            self.send({"type": "generate", "id": rid, "attempt_id": 1, **req})
+            if abort == "now":
+                self.send({"type": "abort", "id": rid, "attempt_id": 1})
+            live[rid] = {"req": req, "abort": abort, "events": [], "ids": []}
+        out = {}
+        while len(out) < len(live):
             e = self.recv()
-            if e.get("id") != rid:
+            rid, t = e.get("id"), e.get("type")
+            s = live.get(rid)
+            if s is None or rid in out:
                 continue
-            t = e.get("type")
-            if t in ("token", "reasoning"):
-                events.append([t[0], e.get("text", "")])
-                n += 1
-                if abort_at_token is not None and n == abort_at_token:
+            if t == "gen_start" and s["abort"] == "start":
+                self.send({"type": "abort", "id": rid, "attempt_id": 1})
+            elif t in ("token", "reasoning"):
+                s["events"].append([t[0], e.get("text", "")])
+                if isinstance(s["abort"], int) and len(s["events"]) == s["abort"]:
                     self.send({"type": "abort", "id": rid, "attempt_id": 1})
             elif t == "committed":  # HIPFIRE_EMIT_TOKEN_IDS=1: exact token ids
-                ids.append([e.get("tok_id"), e.get("pos")])
+                s["ids"].append([e.get("tok_id"), e.get("pos")])
             elif t == "commit_ready":
                 self.send({"type": "commit", "id": rid, "attempt_id": 1})
             elif t in ("done", "error"):
-                return result(t, events, ids, req.get("max_tokens"),
-                              {k: v for k, v in e.items() if k not in ("type", "id", "attempt_id")})
+                out[rid] = result(t, s["events"], s["ids"], s["req"].get("max_tokens"),
+                                  {k: v for k, v in e.items() if k not in ("type", "id", "attempt_id")})
+        return out
 
     def close(self):
         try:
@@ -127,6 +140,7 @@ class Daemon:
             self.p.wait(timeout=120)
         except subprocess.TimeoutExpired:
             self.p.kill()
+        self.log.close()
         return self.p.returncode
 
 
@@ -183,9 +197,8 @@ def run_arm(args, route, arm, out, eos_n=None):
         res["abort_prefill"] = [d.generate("ap", greedy(LONG, mt), abort_now=True),
                                 d.generate("ap-next", greedy(LONG, mt))]
         # abort mid-decode after 8 tokens, then the same prompt again (prefix reuse)
-        cnt = "List the numbers from 1 to 100, one per line, as digits."
-        res["abort_decode"] = [d.generate("ad", greedy(cnt, 4 * mt), abort_at_token=8),
-                               d.generate("ad-next", greedy(cnt, mt))]
+        res["abort_decode"] = [d.generate("ad", greedy(COUNT, 4 * mt), abort_at_token=8),
+                               d.generate("ad-next", greedy(COUNT, mt))]
         # stop on the last budget token: probe the natural length, then rerun with
         # the budget ending exactly at the EOS (both tokens-counting conventions).
         # Both arms rerun at the legacy n: the engine does not count EOS, so its own
@@ -208,6 +221,112 @@ def run_arm(args, route, arm, out, eos_n=None):
     finally:
         res["daemon_rc"] = d.close()
     return res
+
+
+# ── Batch-path cache scenario (`--batch`, HIPF-472) ─────────────────────────
+# Plain `generate` requests run the singleton route, which keeps one session
+# record; the N records live behind the continuous-batch route (`serve.vmm_batch`).
+BATCH_LOAD = {"continuous_batch_size": 4, "serve_vmm_batch": {}}
+# Twin conversation pairs (identical messages): P aborts its second turn in the
+# prompt, D in decode; the twin's second turn is the control the retry must match.
+BATCH_TURNS = {"P": ("Explain how a hash map resolves collisions.", LONG),
+               "D": ("Name five rivers in Europe.", COUNT)}
+
+
+def batch_req(messages, max_tokens):
+    """A greedy chat turn as `hipfire bench --backend batch` sends it
+    (bench_concurrency.rs build_request): neutral penalties keep it batch-eligible."""
+    return {"messages": messages, "prompt": messages[-1]["content"], "temperature": 0.0, "top_p": 1.0,
+            "max_tokens": max_tokens, "repeat_penalty": 1.0, "presence_penalty": 0.0, "min_p": 0.0,
+            "thinking_enabled": False, "assistant_prefix": "closed_think", "serve_continuous_batch": True}
+
+
+def run_batch(args, route, arm, out):
+    """One fresh daemon on the continuous-batch route: turn 0 of P, P~, D, D~ at once;
+    then their turn 1 at once, P's aborted on `gen_start` (in the prompt), D's after
+    8 tokens; then P's and D's turn 1 again. Returns {request: result}."""
+    prefix = f"{out}/{route['name']}.batch.{arm}"
+    d = Daemon(args.daemon, arm_env(route, arm), prefix, args.timeout)
+    mt = route.get("max_tokens", 64)
+    res = {}
+    try:
+        res["loaded"] = d.load(route["model"], {**route.get("load", {}), **route.get("batch_load", BATCH_LOAD)})
+        hist = {c: [{"role": "user", "content": BATCH_TURNS[c[0]][0]}] for c in ("P", "P~", "D", "D~")}
+        res.update(d.generate_many([(c + "0", batch_req(hist[c], mt), None) for c in hist]))
+        for c in hist:
+            hist[c] += [{"role": "assistant", "content": res[c + "0"]["text"]},
+                        {"role": "user", "content": BATCH_TURNS[c[0]][1]}]
+        res.update(d.generate_many([("P1", batch_req(hist["P"], mt), "start"), ("P~1", batch_req(hist["P~"], mt), None),
+                                    ("D1", batch_req(hist["D"], 4 * mt), 8), ("D~1", batch_req(hist["D~"], mt), None)]))
+        res.update(d.generate_many([("P1r", batch_req(hist["P"], mt), None), ("D1r", batch_req(hist["D"], mt), None)]))
+    finally:
+        res["daemon_rc"] = d.close()
+    with open(f"{prefix}.jsonl") as f:
+        res["refused"] = refused_records(f, Path(f"{prefix}.stderr").read_text(errors="replace"))
+    return res
+
+
+def hist_len(r):
+    """Tokens a finished turn commits to its conversation: the prompt plus every
+    committed id (EOS included; legacy `tokens` counts it, the engine's does not).
+    A follow-up that reuses the whole turn reports exactly this as `cached_tokens`."""
+    d = r["done"]
+    n = len(r["ids"]) if r["ids"] else (d.get("tokens") or 0) + (d.get("finish_reason") == "stop")
+    return (d.get("cached_tokens") or 0) + (d.get("prefill_tokens") or 0) + n
+
+
+def batch_checks(rows, expect_engine):
+    """The `--batch` gates on one arm's rows (the run gates the engine arm only;
+    legacy fn-lanes keep no records). Pure: --self-test drives it with fakes.
+    - every request ends in `done`; the aborted ones `aborted`, the others batched
+    - the twins' turn 0 are token-exact (identical prompts at once)
+    - every turn 1 that finished (P~1, D~1, and the retries P1r, D1r after the
+      aborts) reuses at least its conversation's committed turn 0
+    - a retry with the control's reuse gives the control's tokens and ids"""
+    fails, unex, notes = [], [], []
+    cached = lambda r: r["done"].get("cached_tokens") or 0
+    same = lambda a, b: (a["events"], a["ids"]) == (b["events"], b["ids"])
+    for name in ("P0", "P~0", "D0", "D~0", "P1", "P~1", "D1", "D~1", "P1r", "D1r"):
+        r, aborted = rows[name], name in ("P1", "D1")
+        if r["type"] != "done":
+            fails.append(f"{name} error: {r['done'].get('message')}")
+            continue
+        if expect_engine and r["done"].get("loop") != "engine":
+            fails.append(f"{name} loop {r['done'].get('loop')!r}")
+        if aborted and r["done"].get("finish_reason") != "aborted":
+            unex.append(f"{name}: the abort did not land (finish_reason {r['done'].get('finish_reason')})")
+        if not aborted and not (r["done"].get("continuous_batch") or {}).get("executed"):
+            unex.append(f"{name} ran on the singleton route, not batched")
+    if rows["P1"]["events"]:
+        unex.append(f"P1: the abort landed after {len(rows['P1']['events'])} decode events, not in the prompt")
+    if len(rows["D1"]["events"]) > rows["D1"]["max_tokens"] // 2:
+        unex.append(f"D1: the abort landed at {len(rows['D1']['events'])}/{rows['D1']['max_tokens']} events")
+    for a, b in (("P0", "P~0"), ("D0", "D~0")):
+        if not same(rows[a], rows[b]):
+            fails.append(f"twins {a}/{b} differ at turn 0")
+    reuse = {}
+    for turn, prev in (("P~1", "P~0"), ("D~1", "D~0"), ("P1r", "P0"), ("D1r", "D0")):
+        reuse[turn] = [cached(rows[turn]), hist_len(rows[prev])]
+        if reuse[turn][0] < reuse[turn][1]:
+            fails.append(f"{turn} reused {reuse[turn][0]} < {reuse[turn][1]} (its committed turn 0)")
+    for retry, ctrl in (("P1r", "P~1"), ("D1r", "D~1")):
+        if cached(rows[retry]) != cached(rows[ctrl]):
+            notes.append(f"{retry} reused {cached(rows[retry])}, control {ctrl} {cached(rows[ctrl])}: tokens not compared")
+        elif not same(rows[retry], rows[ctrl]):
+            fails.append(f"{retry} tokens differ from {ctrl} at the same reuse")
+    if rows.get("daemon_rc") != 0:
+        fails.append(f"daemon rc {rows.get('daemon_rc')}")
+    if rows.get("refused"):  # the engine's own reason for a cold turn (e.g. a retired MTP lane)
+        notes.append(f"lane records not continued (engine log): {', '.join(rows['refused'])}")
+    return {"ok": not fails, "fails": fails, "unexercised": unex, "notes": notes, "reuse": reuse}
+
+
+def refused_records(lines, log_text):
+    """The requests whose lane record the engine logged as not continued: tag N is
+    the N-th `gen_start` on the daemon's stdout (see refused_followups)."""
+    starts = [e.get("id") for e in map(json.loads, (ln for ln in lines if '"gen_start"' in ln))
+              if e.get("type") == "gen_start"]
+    return [starts[t - 1] if 0 < t <= len(starts) else f"tag {t}" for t in map(int, REFUSAL.findall(log_text))]
 
 
 def strip_timing(v):
@@ -609,9 +728,72 @@ def conc_self_test():
     kept = cj(leg=cold4, c={})
     assert kept["ok"] and not kept["unexercised"] and kept["reference_c1_ne_cn"]["legacy-noslots"] == 1, kept
     lost = cj(eng=conc_arm("engine", "noslots", mt4=req("zz", cached=0)), leg=cold4, c={})
-    assert lost["fails"] == ["engine-noslots: C1 != CN 1"], lost["fails"]
-    odd = cj(eng=conc_arm("engine", "noslots", mt4=req("cd", cached=3)), leg=cold4, c={})
+    assert lost["fails"] == ["engine-noslots: C1 != CN 1", "engine-noslots: cached_tokens < C1 1"], lost["fails"]
+    odd = cj(eng=conc_arm("engine", "noslots", mt4=req("cd", cached=7)), leg=cold4, c={})
     assert odd["ok"] and odd["engine"]["engine-noslots"]["ref_reuse_unmatched"] == ["multiturn/4/1/0/1"]
+    # a lost record: the k=4 follow-up reuses less than at k=1 (the legacy ref reused 0 there),
+    # unless the engine logged that it refused the record
+    shorter = conc_arm("engine", "noslots", mt4=req("cd", cached=3))
+    lost_rec = cj(eng=shorter, leg=cold4, c={})
+    assert lost_rec["fails"] == ["engine-noslots: cached_tokens < C1 1"], lost_rec["fails"]
+    shorter["refused"] = ["multiturn/4/1/0/1"]
+    exempt = cj(eng=shorter, leg=cold4, c={})
+    assert exempt["ok"] and exempt["engine"]["engine-noslots"]["refused"] == ["multiturn/4/1/0/1"]
+
+    # refusal tags: tag N = the N-th gen_start; the refused request is the record's next turn
+    ev = lambda t, rid, att=1, **kw: json.dumps({"type": t, "id": rid, "attempt_id": att, **kw})
+    bat = {"continuous_batch": {"executed": True}}
+    wire = [ev("gen_start", "bench-batch-1-W1-0"), ev("done", "bench-batch-1-W1-0", **bat),
+            ev("gen_start", "bench-batch-2-Q1-3"), ev("gen_start", "bench-batch-2-Q1-5"),  # tags 2, 3
+            ev("done", "bench-batch-2-Q1-3", **bat), ev("gen_start", "bench-batch-2-Q1-3", 2),
+            ev("done", "bench-batch-2-Q1-5", **bat), ev("done", "bench-batch-2-Q1-3", 2, **bat)]
+    log = ("[engine] lane record 2 not continued: lane record 2: the MTP head is at 7, the trunk at 9\n"
+           "[engine] lane record 3 not continued: x\n[engine] lane record 1 not continued: x\n"
+           "[engine] lane record 99 not continued: x\n")
+    order = bench_order(["multiturn"], [1, 4], 1)
+    assert refused_followups(wire, log, order) == (["multiturn/4/1/3/1"], [3, 99])
+    singleton = wire[:-1] + [ev("done", "bench-batch-2-Q1-3", 2, execution_mode="sequential")]
+    assert refused_followups(singleton, log, order) == ([], [2, 3, 1, 99])  # no tag order to trust
+
+    batch_self_test()
+
+
+def batch_self_test():
+    def row(text="ab", typ="done", cached=0, prefill=5, finish="stop", batched=True, loop="engine", mt=64):
+        done = {"cached_tokens": cached, "prefill_tokens": prefill, "finish_reason": finish, "loop": loop,
+                "continuous_batch": {"executed": batched}}
+        return result(typ, [["t", c] for c in text], [[ord(c), i] for i, c in enumerate(text)], mt, done)
+    assert hist_len(row("abc", cached=2, prefill=5)) == 10  # prompt 7 + 3 committed ids
+    assert hist_len({"ids": [], "done": {"prefill_tokens": 5, "tokens": 3, "finish_reason": "stop"}}) == 9
+
+    def rows(**over):
+        base = {"P0": row(), "P~0": row(), "D0": row(), "D~0": row(),  # turn 0 commits 5 + 2 = 7
+                "P1": row("", finish="aborted"), "D1": row("x" * 8, finish="aborted", mt=256),
+                "P~1": row("cd", cached=7), "D~1": row("ef", cached=7),
+                "P1r": row("cd", cached=7), "D1r": row("ef", cached=7), "daemon_rc": 0}
+        return {**base, **over}
+    good = batch_checks(rows(), True)
+    assert good["ok"] and not good["unexercised"] and not good["notes"], good
+    assert good["reuse"]["P1r"] == [7, 7]
+    assert batch_checks(rows(P1r=row("cd", cached=0)), True)["fails"] == ["P1r reused 0 < 7 (its committed turn 0)"]
+    assert batch_checks(rows(**{"D~1": row("ef", cached=3)}), True)["fails"] == ["D~1 reused 3 < 7 (its committed turn 0)"]
+    assert batch_checks(rows(D1r=row("eX", cached=7)), True)["fails"] == ["D1r tokens differ from D~1 at the same reuse"]
+    more = batch_checks(rows(D1r=row("eX", cached=9)), True)  # more reuse than the control: not compared
+    assert more["ok"] and more["notes"]
+    assert batch_checks(rows(**{"P~0": row("aX")}), True)["fails"] == ["twins P0/P~0 differ at turn 0"]
+    assert not batch_checks(rows(P0=row(loop="legacy")), True)["ok"]
+    assert batch_checks(rows(P0=row(loop="legacy")), False)["ok"]
+    assert not batch_checks(rows(D1r=row(typ="error")), True)["ok"]
+    assert not batch_checks(rows(daemon_rc=1), True)["ok"]
+    late = batch_checks(rows(P1=row("ab", finish="aborted"), D1=row("x" * 200, finish="aborted", mt=256)), True)
+    assert late["ok"] and len(late["unexercised"]) == 2
+    assert batch_checks(rows(D1=row("x" * 9, finish="length", mt=256)), True)["unexercised"]
+    assert batch_checks(rows(P1r=row("cd", cached=7, batched=False)), True)["unexercised"]
+    noted = batch_checks(rows(refused=["P0", "P~0"]), True)
+    assert noted["ok"] and noted["notes"] == ["lane records not continued (engine log): P0, P~0"]
+    starts = [json.dumps({"type": "gen_start", "id": i}) for i in ("P0", "P~0", "D0")] + ['{"type":"token","id":"P0"}']
+    assert refused_records(starts, "[engine] lane record 2 not continued: x\n[engine] lane record 7 not continued: y\n"
+                           ) == ["P~0", "tag 7"]
 
 
 def host_state(own_pid=None):
@@ -735,6 +917,51 @@ def wire_requests(lines, order):
     return out
 
 
+REFUSAL = re.compile(r"\[engine\] lane record (\d+) not continued")
+
+
+def refused_followups(lines, log_text, order):
+    """Measured follow-ups whose lane record the engine logged as not continued
+    (`[engine] lane record <tag> not continued`). A tag is the engine's admission
+    number (engine/serve.rs `NEXT_TAG`, from 1, taken right before the request's
+    `gen_start`), so tag N is the N-th `gen_start` on the wire: the turn that left
+    the record. The refused request is the first later one with the same round
+    nonce and conversation and the next turn. Returns (keys as wire_requests,
+    unmapped tags); every tag is unmapped unless every `done` on the wire ran
+    batched, because a singleton request takes no tag."""
+    starts, all_batched = [], True
+    for line in lines:
+        if '"gen_start"' not in line and '"done"' not in line:
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get("type") == "gen_start":
+            starts.append((str(e.get("id")), e.get("attempt_id", 1)))
+        elif e.get("type") == "done":
+            all_batched = all_batched and bool((e.get("continuous_batch") or {}).get("executed"))
+    tags = [int(t) for t in REFUSAL.findall(log_text)]
+    if not all_batched:
+        return [], tags
+    keys, unmapped = set(), []
+    for tag in tags:
+        if not 0 < tag <= len(starts):
+            unmapped.append(tag)
+            continue
+        rid, att = starts[tag - 1]
+        nonce, conv = rid.split("-")[-2:]
+        if not nonce.startswith("Q"):  # a warmup's record: no measured follow-up
+            continue
+        nxt = next((r for r, a in starts[tag:] if r.split("-")[-2:] == [nonce, conv] and a == att + 1), None)
+        if nxt is None:
+            unmapped.append(tag)
+            continue
+        wl, k = order[int(nxt.split("-")[-3]) - 1]
+        keys.add(f"{wl}/{k}/{nonce[1:]}/{conv}/{att}")
+    return sorted(keys), unmapped
+
+
 def pctl(xs, p):
     """Linear-interpolated percentile (numpy's default, as bench_concurrency.rs)."""
     xs = sorted(xs)
@@ -800,9 +1027,13 @@ def run_conc(args, route, out):
             cells = []
         with wire.open() as f:
             reqs = wire_requests(f, bench_order(workloads, points, runs))
+        with wire.open() as f:
+            refused, unmapped = refused_followups(f, Path(f"{base}.log").read_text(errors="replace"),
+                                                  bench_order(workloads, points, runs))
         arms[f"{loop}-{backend}"] = {
             "loop": loop, "backend": backend, "rc": rc, "cmd": " ".join(cmd), "host": host,
-            "cells": {f"{x['workload']}/{x['k']}": cell_metrics(x) for x in cells}, "reqs": reqs}
+            "cells": {f"{x['workload']}/{x['k']}": cell_metrics(x) for x in cells}, "reqs": reqs,
+            "refused": refused, "refusals_unmapped": unmapped}
     return arms
 
 
@@ -813,7 +1044,9 @@ def judge_conc(arms, c, expect_engine):
     - every request ends in `done`; `loop` stamps as in loop_checks
     - C1 == CN: each k>1 request's tokens and ids equal the same request at k=1
     - G-tok: tokens and ids equal the `ref` arm's (default legacy-noslots)
-    - cache: each multi-turn follow-up reuses at least the ref arm's `cached_tokens`
+    - cache: each multi-turn follow-up reuses at least the ref arm's `cached_tokens`,
+      and at k>1 at least the same request at k=1 (C1), unless the engine logged
+      that it refused to continue its lane record (`refused`, refused_followups)
     - G-spec: mean tau per cell >= ref - 1 %
     - target (k>1): out tok/s >= target - tol, TTFT p50 and p99 <= target + tol"""
     tol = c.get("tol_pct", 2.0) / 100
@@ -857,7 +1090,13 @@ def judge_conc(arms, c, expect_engine):
             unexercised.append(f"{tag}: {len(r['ref_reuse_unmatched'])} requests reused a prefix length no ref "
                                f"request did (tokens not compared)")
         follow = [k for k in reqs if k.startswith("multiturn/") and not k.endswith("/0")]
+        refused = set(a.get("refused", []))
         r["cache_below_ref"] = sorted(k for k in follow if cached(reqs[k]) < cached(rr.get(k)))
+        # vs C1: legacy-noslots reuses nothing at k>1, so only C1 sees a lost record (Loki HIPF-586 S3)
+        r["cache_below_c1"] = sorted(k for k in follow if k.split("/")[1] != "1" and k not in refused
+                                     and cached(reqs[k]) < cached(reqs.get(at(k, 1))))
+        r["refused"] = sorted(k for k in follow if k in refused)
+        r["refusals_unmapped"] = a.get("refusals_unmapped", [])
         r["cache_hits"] = [sum(cached(reqs[k]) > 0 for k in follow), sum(cached(rr.get(k)) > 0 for k in follow),
                            len(follow)]
         if follow and not r["cache_hits"][0]:
@@ -878,6 +1117,7 @@ def judge_conc(arms, c, expect_engine):
                     and m["ttft_p99_ms"] <= t["ttft_p99_ms"] * (1 + tol))
         for name, bad in (("errors", r["errors"]), ("loop", loop_bad), ("C1 != CN", r["c1_ne_cn"]),
                           ("tokens != ref", r["ne_ref"]), ("cached_tokens < ref", r["cache_below_ref"]),
+                          ("cached_tokens < C1", r["cache_below_c1"]),
                           ("G-spec", not all(r["g_spec"].values())),
                           ("target", [k for k, v in r["target"].items() if not v])):
             if bad:
@@ -914,7 +1154,9 @@ def main():
     ap.add_argument("--perf-reps", type=int, default=3)
     ap.add_argument("--timeout", type=float, default=1800, help="per-event timeout, seconds")
     ap.add_argument("--conc", action="store_true", help="also run the route's concurrency matrix (`conc`)")
-    ap.add_argument("--conc-only", action="store_true", help="run only the concurrency matrix")
+    ap.add_argument("--conc-only", action="store_true", help="skip the A/B scenarios; run the concurrency matrix")
+    ap.add_argument("--batch", action="store_true", help="also run the batch-path cache scenario")
+    ap.add_argument("--batch-only", action="store_true", help="skip the A/B scenarios; run the batch-path scenario")
     ap.add_argument("--hipfire", help="hipfire CLI for --conc (default: next to --daemon)")
     args = ap.parse_args()
     if args.self_test:
@@ -923,7 +1165,8 @@ def main():
         ap.error("--daemon, --route and --out are required")
     route = json.loads(Path(args.route).read_text())
     route.setdefault("name", Path(args.route).stem)
-    conc_on = args.conc or args.conc_only
+    conc_on, batch_on = args.conc or args.conc_only, args.batch or args.batch_only
+    ab_on = not (args.conc_only or args.batch_only)
     if conc_on and "conc" not in route:
         ap.error("--conc needs a `conc` block in the route file")
     args.hipfire = args.hipfire or str(Path(args.daemon).with_name("hipfire"))
@@ -938,7 +1181,7 @@ def main():
     harness = {"sha256": hashlib.sha256(me.read_bytes()).hexdigest(), "git_head": git("rev-parse", "HEAD"),
                "dirty": bool(git("status", "--porcelain", "--", str(me)))}
     res, t0, j, perf, conc, unex, summary = {}, time.time(), {"ok": True}, None, None, [], []
-    if not args.conc_only:
+    if ab_on:
         for arm in ARMS:
             res[arm] = run_arm(args, route, arm, out,
                                None if arm == "legacy" else res["legacy"]["eos_budget"][0]["done"].get("tokens", 0))
@@ -964,7 +1207,16 @@ def main():
         conc = judge_conc(arms, route["conc"], route.get("expect_engine", False))
         unex += conc["unexercised"]
         summary.append("conc=" + ("pass" if conc["ok"] else "FAIL: " + "; ".join(conc["fails"])))
-    ok = j["ok"] and (conc is None or conc["ok"])
+    batch = None
+    if batch_on:
+        brows = {arm: run_batch(args, route, arm, out) for arm in ARMS}
+        # gated on the engine arm; legacy fn-lanes keep no lane records (reference row)
+        batch = {"engine": batch_checks(brows["engine"], route.get("expect_engine", False)),
+                 "legacy_reference": batch_checks(brows["legacy"], False), "arms": brows}
+        unex += [f"batch: {u}" for u in batch["engine"]["unexercised"]]
+        summary.append(f"batch reuse={batch['engine']['reuse']} "
+                       + ("pass" if batch["engine"]["ok"] else "FAIL: " + "; ".join(batch["engine"]["fails"])))
+    ok = j["ok"] and (conc is None or conc["ok"]) and (batch is None or batch["engine"]["ok"])
     verdict = ("pass-partial" if unex else "pass") if ok else "fail"
     summary = ", ".join(summary)
 
@@ -983,7 +1235,10 @@ def main():
         receipt["hipfire"] = {"path": os.path.realpath(args.hipfire),
                               "md5": hashlib.md5(Path(args.hipfire).read_bytes()).hexdigest()}
         receipt["conc"] = {**conc, "arms": arms}
-    rpath = out / f"{route['name']}{'.conc' if args.conc_only else ''}.json"
+    if batch:
+        receipt["batch"] = batch
+    parts = [p for p, on in (("conc", conc_on), ("batch", batch_on)) if on]
+    rpath = out / f"{route['name']}{'' if ab_on else '.' + '-'.join(parts)}.json"
     rpath.write_text(json.dumps(receipt, indent=1))
 
     ev = out / "EVIDENCE.md"

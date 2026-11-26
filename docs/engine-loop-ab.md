@@ -17,24 +17,29 @@ Every run loads a model, so hold the halo GPU lock:
 flock ~/.halo-gpu.lock python3 scripts/engine_loop_ab.py \
     --daemon target/release/daemon \
     --route qwen4-ar.json \
-    --out ~/mesh-validation/<KEY> [--perf] [--conc | --conc-only]
+    --out ~/mesh-validation/<KEY> [--perf] [--conc | --conc-only] [--batch | --batch-only]
 ```
 
 Exit code `0` means every gate passed (see Gates). `1` means a gate failed, and
 `2` means a harness or daemon failure (load error, daemon exit, event timeout).
 `--self-test` checks the diff rules and gates without a GPU. `--conc` also runs
 the route's concurrency matrix (see Concurrency), `--conc-only` runs only that;
-both need the `hipfire` CLI (`--hipfire`, default: next to `--daemon`). Outputs
-in `--out`:
+both need the `hipfire` CLI (`--hipfire`, default: next to `--daemon`).
+`--batch` also runs the batch-path cache scenario (see Batch-path cache
+scenario), `--batch-only` runs only that; `--conc-only --batch` runs both
+without the A/B scenarios. Outputs in `--out`:
 
-- `<route>.json` (`<route>.conc.json` with `--conc-only`): the receipt. It holds
-  the verdict, the per-scenario status and notes, the sampled, loop, isolation,
-  G-spec, G-perf and concurrency results, the daemon (and CLI) md5, the fixture
-  sha256, the harness sha256 (plus git head and a dirty flag when run from a
-  checkout), the host state and every arm's raw results.
-- `<route>.<arm>.jsonl` / `.stderr`: each daemon's raw stdout and stderr.
+- `<route>.json` (`<route>.conc.json`, `.batch.json` or `.conc-batch.json`
+  without the A/B scenarios): the receipt. It holds the verdict, the
+  per-scenario status and notes, the sampled, loop, isolation, G-spec, G-perf,
+  concurrency and batch results, the daemon (and CLI) md5, the fixture sha256,
+  the harness sha256 (plus git head and a dirty flag when run from a checkout),
+  the host state and every arm's raw results.
+- `<route>.<arm>.jsonl` / `.stderr`: each daemon's raw stdout and stderr
+  (`<route>.batch.<arm>.*` for the batch scenario).
 - `<route>.conc.<loop>-<backend>.{json,log,wire.jsonl}`: each concurrency arm's
-  bench JSON, bench stderr and the tapped daemon stdout.
+  bench JSON, bench stderr (with the daemon's stderr) and the tapped daemon
+  stdout.
 - `EVIDENCE.md`: one row per run, with the harness sha256, daemon md5, fixture
   sha256, exact command, receipt path, result and disposition.
 
@@ -70,6 +75,8 @@ own route files: Qwen4 native MTP via `"mtp_mode": "on"`, a DFlash drafter via
   `"loop": "engine"`. Set it on every route on the engine allowlist, so that
   an engine arm that silently fell back to legacy fails.
 - `conc`: the concurrency matrix, see Concurrency.
+- `batch_load` (default `{"continuous_batch_size": 4, "serve_vmm_batch": {}}`):
+  merged over `load` for the batch-path cache scenario.
 
 ## Scenarios
 
@@ -228,7 +235,16 @@ rows; legacy fn-lanes are not row-exact by default):
   reuse no `ref` request matched is listed (`ref_reuse_unmatched`) and marks
   the run `pass-partial`.
 - **cache:** every multi-turn follow-up reuses at least the `ref` arm's
-  `cached_tokens`; no follow-up with a prefix hit on the engine marks the run
+  `cached_tokens`, and at k>1 at least the same request at k=1
+  (`cache_below_c1`; legacy-noslots reuses nothing at k>1, so only C1 sees a
+  lost lane record, Loki HIPF-586 S3). A follow-up exempt from the C1 check is
+  one whose lane record the engine logged as `[engine] lane record <tag> not
+  continued` (`refused`). The harness maps a tag to its request through the
+  wire: tag N is the N-th `gen_start` (the engine takes the tag right before
+  it), and the refused request is the next turn of that conversation. The
+  mapping needs every request on the wire batched (a singleton request takes
+  no tag); otherwise the tags are listed as `refusals_unmapped` and exempt
+  nothing. No follow-up with a prefix hit on the engine marks the run
   `pass-partial`
 - **G-spec:** mean tau per cell at least the `ref` cell's − 1 %
 - **target** (k>1): output tok/s at least the target's − `tol_pct`, TTFT p50
@@ -239,7 +255,47 @@ An arm whose bench exits non-zero or yields no cells fails the run. A
 On Qwen4 the engine's N-request scheduler serves the `batch` backend
 (`serve.vmm_batch`, HIPF-505): the engine arm is `["engine", "batch"]`.
 
+## Batch-path cache scenario (`--batch`)
+
+Plain `generate` requests run the singleton route, which keeps one session
+record, so the A/B scenarios cannot show what the N-request scheduler's lane
+records keep. `--batch` loads one more daemon per arm with `load` +
+`batch_load` and sends greedy chat turns as `hipfire bench --backend batch`
+does (`serve_continuous_batch`, neutral penalties, thinking off). Two twin
+pairs of conversations (identical messages): P (abort in the prompt) and D
+(abort in decode).
+
+| step | requests, sent together | abort |
+|---|---|---|
+| 1 | turn 0 of P, P~, D, D~ | – |
+| 2 | turn 1 of P (a ~3k-token user turn), P~, D (counting to 100, 4× budget), D~ | P on its `gen_start` (admitted, so it lands in the prompt); D after 8 token events |
+| 3 | turn 1 of P and D again (`P1r`, `D1r`) | – |
+
+Gates, on the engine arm (the legacy arm is a reference row: legacy fn-lanes
+keep no records):
+
+- every request ends in `done`; P1 and D1 `aborted`; `loop` is `engine` with
+  `expect_engine`
+- the twins' turn 0 are token-exact
+- **reuse:** P~1, D~1 (concurrent follow-ups) and the retries P1r, D1r
+  (after the aborts) reuse at least their conversation's committed turn 0:
+  `cached_tokens` >= its prompt plus every committed id (a follow-up that
+  reuses the whole turn reports exactly that). The receipt lists
+  `reuse[turn] = [cached, committed turn 0]`.
+- a retry with its control's reuse (P1r vs P~1, D1r vs D~1, identical
+  prompts) has the control's tokens and ids; with a different reuse the pair is
+  only noted
+
+The notes also list the requests whose lane record the engine logged as not
+continued (`refused`, tag N = the N-th `gen_start` on the daemon's stdout), so
+a reuse failure caused by a known refusal (e.g. a retired MTP lane) is
+attributable. Such a failure still fails the gate.
+
+Unexercised (`pass-partial`): an abort that did not land, P1's abort after
+decode tokens, D1's past half its budget, or a finished request that did not
+run batched (`continuous_batch.executed`).
+
 ## Coverage gaps
 
-- No Gemma 4 spec route: no Gemma 4 EAGLE drafter artifact exists
-  (fixture-missing; the drafter is also gated off by default).
+- Gemma 4 EAGLE has no concurrency arm: `hipfire bench` cannot pass a
+  drafter (the drafter itself is a HIPF-522 fixture since HIPF-542).
