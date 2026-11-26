@@ -58,6 +58,7 @@ use hipfire_runtime::llama::{rotate_x_mq_for, weight_gemv};
 use rdna_compute::ffn_activation::{
     CombineOrder, FfnActivation, FfnActivationRows, FfnAwq, MoeCombine, MoeRouterTopK, RouterKind,
 };
+use rdna_compute::inkling2_attention::inkling2_attn_fa2_splits;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -1109,7 +1110,32 @@ fn run_visit(
     }
     gs.visit_cap[visit] = pos + 1;
     let attn_heads = step!(at(gpu, &mut tmp, &[eattn], "attn_heads"), "alloc");
-    {
+    if gs.attn_fa2 {
+        // Split-KV FA2 (gfx1201): same q / KV / biased scores / ring slots;
+        // partition scratch is a visit temp like every other intermediate.
+        let splits = inkling2_attn_fa2_splits(n_kv);
+        let lse = step!(at(gpu, &mut tmp, &[splits, nh], "fa2_lse"), "alloc");
+        let oacc = step!(at(gpu, &mut tmp, &[splits, nh, hd], "fa2_oacc"), "alloc");
+        let qv = step!(view2(&tmp[q], nh, hd), "view");
+        step!(
+            hip(
+                gpu.inkling2_attn_decode_fa2(
+                    &qv,
+                    &gs.k_cache[visit],
+                    &gs.v_cache[visit],
+                    &tmp[rel_bias],
+                    &tmp[si],
+                    &tmp[lse],
+                    &tmp[oacc],
+                    &tmp[attn_heads],
+                    n_kv,
+                    splits
+                ),
+                "attn fa2"
+            ),
+            "attn"
+        );
+    } else {
         let qv = step!(view2(&tmp[q], nh, hd), "view");
         step!(
             launch_attn(
