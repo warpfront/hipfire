@@ -63,6 +63,7 @@ impl Qwen4Bundle {
         sampling: Option<crate::lane::LaneSampling>,
     ) -> Result<()> {
         let epoch = lane_epoch(tag);
+        let parts_none = parts.is_none();
         let seed = *generated.last().ok_or("park: no pending seed")?;
         let position = prompt.len() + generated.len() - 1;
         if self.state.position != position {
@@ -92,9 +93,32 @@ impl Qwen4Bundle {
         // The prompt's boundary snapshots stay published: the reset that
         // follows the swap drops the resident turn.
         self.session_publish_captures();
+        // An AR lane takes its turn's resident snapshot along: its rows move
+        // into the lane, so a cancel can rewind the lane to it.
+        let mark = parts_none
+            .then(|| self.session.as_mut().and_then(|s| s.take_mark(prompt)))
+            .flatten();
         if let Err(error) = self.commit_promotion(gpu, &epoch) {
             let _ = self.release_lane(&epoch);
+            if let Some(mark) = mark {
+                self.discard_lane_mark(mark);
+            }
             return Err(format!("lane promotion: {error}"));
+        }
+        if let Some(mark) = mark {
+            // Marks of lanes released elsewhere (poisoned steps) go first.
+            let stale: Vec<u64> = self
+                .lane_marks
+                .iter()
+                .map(|&(t, _)| t)
+                .filter(|&t| self.lanes().and_then(|s| s.lane(&lane_epoch(t))).is_none())
+                .collect();
+            for t in stale {
+                if let Some(old) = self.take_lane_mark(t) {
+                    self.discard_lane_mark(old);
+                }
+            }
+            self.lane_marks.push((tag, mark));
         }
         if remaining > 0 {
             self.lane_executor()
@@ -102,6 +126,17 @@ impl Qwen4Bundle {
                 .map_ahead_decode(gpu, &epoch, remaining);
         }
         Ok(())
+    }
+
+    fn take_lane_mark(&mut self, tag: u64) -> Option<LiveMark> {
+        let at = self.lane_marks.iter().position(|(t, _)| *t == tag)?;
+        Some(self.lane_marks.swap_remove(at).1)
+    }
+
+    fn discard_lane_mark(&mut self, mark: LiveMark) {
+        if let Some(session) = self.session.as_mut() {
+            session.discard_mark(mark);
+        }
     }
 
     /// [`MeshLanes::step_windows`] with emitter-forced advances
@@ -468,15 +503,21 @@ impl MeshLanes for Qwen4Bundle {
         if let Some(seed) = unrun_seed(head.is_some(), at, seed, tokens) {
             self.windows(gpu, &[(tag, 0)], &[(epoch, vec![seed])])?;
         }
+        let marked = self
+            .lane_marks
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, mark)| mark.position());
         let lane = self
             .lanes()
             .and_then(|store| store.lane(&epoch))
             .ok_or_else(|| format!("lane record {tag} disappeared"))?;
         // Every row a lane ran is a committed pick: a position inside
         // `tokens` holds exactly that prefix; past it, a window ran beyond
-        // its stop.
+        // its stop, or a cancelled lane rewinds to its mark of `tokens`.
         let position = lane.state.position;
-        if position > tokens.len() {
+        let rewind = position > tokens.len() && marked == Some(tokens.len());
+        if position > tokens.len() && !rewind {
             return Err(format!(
                 "lane record {tag} sits at {position}, past its {} tokens",
                 tokens.len()
@@ -525,8 +566,21 @@ impl MeshLanes for Qwen4Bundle {
         } else {
             SessionRoute::Ar
         };
-        if let Some(session) = self.session.as_mut() {
-            session.adopt_live(&tokens[..position], route);
+        match self.take_lane_mark(tag) {
+            Some(mark) if rewind => {
+                let mut session = self.session.take().ok_or("a lane mark without a session")?;
+                let restored = session.restore_mark(gpu, self, mark, tokens);
+                self.session = Some(session);
+                restored?;
+            }
+            mark => {
+                if let Some(mark) = mark {
+                    self.discard_lane_mark(mark);
+                }
+                if let Some(session) = self.session.as_mut() {
+                    session.adopt_live(&tokens[..position], route);
+                }
+            }
         }
         Ok(())
     }
@@ -648,9 +702,19 @@ impl MeshLanes for Qwen4Bundle {
     }
 
     fn free_lane(&mut self, tag: u64) {
+        if let Some(mark) = self.take_lane_mark(tag) {
+            self.discard_lane_mark(mark);
+        }
         if let Err(error) = self.release_lane(&lane_epoch(tag)) {
             eprintln!("[engine] lane {tag} release: {error}");
         }
+    }
+
+    fn rewind_point(&self, tag: u64) -> Option<usize> {
+        self.lane_marks
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, mark)| mark.position())
     }
 }
 

@@ -35,8 +35,8 @@ use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
 use hipfire_runtime::ple_hot_store::HotRowStore;
 use hipfire_runtime::sampler::{apply_logit_policy_cpu, PenaltyTable, SamplerConfig};
 use hipfire_runtime::session_cache::{
-    stride_boundaries, SessionCache, SessionDriver, SessionPieceKey, SessionRoute, SessionState,
-    SnapshotParts, StateLayout, StatePart,
+    stride_boundaries, LiveMark, SessionCache, SessionDriver, SessionPieceKey, SessionRoute,
+    SessionState, SnapshotParts, StateLayout, StatePart,
 };
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
@@ -226,6 +226,9 @@ pub struct Qwen4Bundle {
     /// off. Message-end snapshots of a live continuation live in their own
     /// `/turns` scope (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`).
     session: Option<SessionDriver>,
+    /// Each AR lane's turn-start resident snapshot, taken from the session at
+    /// its park: a cancelled lane rewinds to it and stays a record.
+    lane_marks: Vec<(u64, LiveMark)>,
     pub(crate) pair_session_stage: Option<PairSessionStage>,
     /// Slow-link (S1) layer-major prompt transaction owner: admitted profile,
     /// boundary stages, the open window, receipt and failure injection.
@@ -1053,6 +1056,7 @@ impl Qwen4Bundle {
             lab_logits: crate::lab_window::LabLogitsTap::default(),
             penalty_stage: None,
             session: None,
+            lane_marks: Vec::new(),
             pair_session_stage: None,
             slowlink: SlowlinkOwner::default(),
             turn_snapshots: hipfire_config::developer_bool(TURN_SNAPSHOTS_ENV, false),
@@ -6594,6 +6598,7 @@ impl Qwen4Bundle {
             spec_hidden,
             dflash,
             session,
+            lane_marks,
             pair_session_stage,
             slowlink,
             penalty_stage,
@@ -6612,6 +6617,9 @@ impl Qwen4Bundle {
             rows
         });
         if let Some(mut session) = session {
+            for (_, mark) in lane_marks {
+                session.discard_mark(mark);
+            }
             session.clear(gpu);
         }
         let mut pair_stage_error = None;

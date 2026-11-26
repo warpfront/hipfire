@@ -479,6 +479,20 @@ struct Resident {
     cold_exact: bool,
 }
 
+/// A resident snapshot taken out of the cache with the state whose rows back
+/// it ([`SessionDriver::take_mark`]).
+pub struct LiveMark {
+    resident: Resident,
+    route: SessionRoute,
+}
+
+impl LiveMark {
+    /// Tokens the marked state holds.
+    pub fn position(&self) -> usize {
+        self.resident.key.1 as usize
+    }
+}
+
 /// Which resident a capture fills.
 #[derive(Clone, Copy)]
 enum ResidentSlot {
@@ -4317,6 +4331,73 @@ impl SessionDriver {
             tokens: tokens.to_vec(),
             route,
         });
+    }
+
+    /// Take the request in flight's deepest resident snapshot of a prefix of
+    /// its `prompt` out of the cache, before its state moves elsewhere (a
+    /// lane): the rows that back it move along, so [`Self::restore_mark`] can
+    /// rewind that state to the mark. `None` when the turn holds none.
+    pub fn take_mark(&mut self, prompt: &[u32]) -> Option<LiveMark> {
+        let route = self.turn.as_ref()?.1;
+        let cache = &mut self.cache;
+        let backs = |r: &Option<Resident>| {
+            r.as_ref().map_or(0, |r| {
+                let p = r.key.1 as usize;
+                (p <= prompt.len() && r.key.2 == prefix_fingerprint(&prompt[..p]))
+                    .then_some(p)
+                    .unwrap_or(0)
+            })
+        };
+        let slot = if backs(&cache.resident_pending) >= backs(&cache.resident) {
+            &mut cache.resident_pending
+        } else {
+            &mut cache.resident
+        };
+        if backs(slot) == 0 {
+            return None;
+        }
+        slot.take().map(|resident| LiveMark { resident, route })
+    }
+
+    /// Free a mark [`Self::take_mark`] took (at the next turn's start).
+    pub fn discard_mark(&mut self, mark: LiveMark) {
+        self.cache.release_bufs.push(mark.resident.buf);
+    }
+
+    /// The owners hold the state the mark was taken from, rows included:
+    /// rewind it to the mark and keep it as the live state of `tokens` (the
+    /// mark's prefix), the mark again its resident snapshot.
+    pub fn restore_mark(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        mark: LiveMark,
+        tokens: &[u32],
+    ) -> Result<(), String> {
+        let LiveMark { resident, route } = mark;
+        if tokens.len() != resident.key.1 as usize || prefix_fingerprint(tokens) != resident.key.2 {
+            self.cache.release_bufs.push(resident.buf);
+            return Err("session cache: the mark is not of these tokens".to_string());
+        }
+        let restored = restore_resident(
+            gpu,
+            state,
+            route,
+            &resident,
+            &mut self.cache.host_restores_total,
+        );
+        self.adopt_live(tokens, route);
+        match restored {
+            Ok(()) => {
+                self.cache.resident = Some(resident);
+                Ok(())
+            }
+            Err(error) => {
+                self.forget_live();
+                self.cache.release_bufs.push(resident.buf);
+                Err(error)
+            }
+        }
     }
 
     /// Drop every snapshot, pending ones included, and the live state.

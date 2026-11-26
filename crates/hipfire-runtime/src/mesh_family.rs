@@ -168,6 +168,12 @@ pub trait MeshLanes {
     fn step_lanes(&mut self, gpus: &mut Gpus, rows: &[(u64, u32, bool)]) -> Result<Vec<DecodeOut>>;
     /// Free `tag`'s lane (host only; the next park reuses its state).
     fn free_lane(&mut self, tag: u64);
+    /// The position a cancelled request's lane rewinds to (its turn-start
+    /// snapshot): kept as the record of that prefix, [`Self::unpark`] restores
+    /// it. `None`: the lane cannot rewind and is freed.
+    fn rewind_point(&self, _tag: u64) -> Option<usize> {
+        None
+    }
     /// Whether a finished conversation's lane is kept as its record
     /// ([`LaneRecord`]): a family whose decoded rows a cold turn would not
     /// reproduce frees the lane instead.

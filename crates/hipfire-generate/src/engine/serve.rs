@@ -696,7 +696,7 @@ impl Driver {
                     }
                     _ => {
                         if let Some(lanes) = lanes_of(m) {
-                            lanes.free_lane(live.tag);
+                            cancel_lane(lanes, &mut runner.records, live.tag, &live.prompt);
                         }
                     }
                 }
@@ -900,6 +900,19 @@ fn continued_record(records: &[LaneRecord], prompt: &[u32]) -> Option<usize> {
         .filter(|(_, r)| r.tokens.len() < prompt.len() && prompt.starts_with(&r.tokens))
         .max_by_key(|(_, r)| r.tokens.len())
         .map(|(at, _)| at)
+}
+
+/// A cancelled lane request: its lane rewinds to its turn start and stays its
+/// conversation's record, as a resident cancel rolls back to the prior turn;
+/// a lane that cannot rewind is freed.
+fn cancel_lane(lanes: &mut dyn MeshLanes, records: &mut Vec<LaneRecord>, tag: u64, prompt: &[u32]) {
+    match lanes.rewind_point(tag) {
+        Some(at) if lanes.keeps_records() && at < prompt.len() => records.push(LaneRecord {
+            tag,
+            tokens: prompt[..at].to_vec(),
+        }),
+        _ => lanes.free_lane(tag),
+    }
 }
 
 /// Free a lane for a park when none is free: the oldest record gives its
@@ -1175,6 +1188,15 @@ impl<'a> Ctx<'a> {
                 }
             }
             Place::Resident => self.rollback(live.request),
+            Place::Lane if matches!(exit, Exit::Aborted) => {
+                match self.state.mesh_family().and_then(|f| f.mesh_lanes()) {
+                    Some(lanes) => {
+                        cancel_lane(lanes, &mut self.runner.records, live.tag, &live.prompt);
+                        Ok(())
+                    }
+                    None => Err("the load staged no engine lanes".to_string()),
+                }
+            }
             Place::Lane => self.lanes().map(|lanes| lanes.free_lane(live.tag)),
             Place::Queued => Ok(()),
         };
