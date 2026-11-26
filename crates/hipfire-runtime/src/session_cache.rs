@@ -9058,4 +9058,62 @@ mod tests {
         // The pending DEVICE child is not a host victim.
         assert!(cache.plan_device_blocker().is_none());
     }
+
+    /// HIPF-599 (Loki, throwaway): a lane mark taken from a live continuation
+    /// rewinds the state it was taken with, after decode rows past it.
+    #[test]
+    fn loki_lane_mark_rewinds_to_the_turn_start() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: session cache tests require a GPU");
+            return;
+        };
+        let gpu = &mut gpu;
+        let mut toy = Toy {
+            fixed: gpu.alloc_tensor(&[FIXED_BYTES], DType::Raw).unwrap(),
+            rows: gpu
+                .alloc_tensor(&[ROW_CAPACITY * ROW_BYTES], DType::Raw)
+                .unwrap(),
+            position: 0,
+            tail_snapshot: false,
+        };
+        let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
+        let mut driver = SessionDriver::new(SessionCache::new(domain(), 8 * one));
+        let a = prompt(1, 2 * STRIDE + 5);
+        assert!(!driver
+            .begin(gpu, &mut toy, &a, SessionRoute::Ar, 0, false)
+            .unwrap());
+        while let Some(b) = driver.next_boundary() {
+            toy.advance(gpu, &a[..b]);
+            driver.at_turn_boundary(gpu, &mut toy, b).unwrap();
+        }
+        toy.advance(gpu, &a);
+        driver.commit_live(&toy, &a);
+        let mut b = a.clone();
+        b.extend(prompt(2, 20));
+        assert_eq!(driver.plan(&toy, &b, SessionRoute::Ar), a.len());
+        assert!(driver
+            .begin(gpu, &mut toy, &b, SessionRoute::Ar, a.len(), false)
+            .unwrap());
+        toy.advance(gpu, &b);
+        // The park: the mark leaves with the state, the reset drops the rest.
+        let mark = driver.take_mark(&b).expect("a live turn holds its start");
+        assert_eq!(mark.position(), a.len());
+        driver.forget_live();
+        let mut decoded = b.clone();
+        decoded.extend(prompt(3, 7));
+        toy.advance(gpu, &decoded);
+        // A mark of other tokens is refused.
+        let other = driver.take_mark(&b);
+        assert!(other.is_none());
+        driver.restore_mark(gpu, &mut toy, mark, &a).unwrap();
+        assert_eq!(toy.position, a.len());
+        assert_eq!(toy.bytes(gpu), (fixed_of(&a), rows_of(&a)));
+        assert_eq!(driver.plan(&toy, &b, SessionRoute::Ar), a.len());
+        assert!(driver
+            .begin(gpu, &mut toy, &b, SessionRoute::Ar, a.len(), false)
+            .unwrap());
+        driver.clear(gpu);
+        gpu.free_tensor(toy.fixed).unwrap();
+        gpu.free_tensor(toy.rows).unwrap();
+    }
 }
