@@ -48,10 +48,11 @@
 //! window and the log-scaling floor in both forwards, so a short run exercises
 //! SWA eviction and full-attention tau != 1.
 //!
-//! `eval` scores each chunk in a fresh process (`--chunks-per-process`
-//! chunks per process; the arch-24 GPU forward does not return its per-token
-//! controller scratch, so one 2048-token chunk is what a single R9700 process
-//! holds today). It writes `OUT.kldseq`, `OUT.kldseq.hfktok` (per-token KLD)
+//! `eval` scores `--chunks-per-process` chunks (default 1) per fresh process.
+//! The arch-24 GPU forward does not return its per-token controller scratch,
+//! so VRAM grows with every position a process runs; two 2048-token chunks
+//! per process fit an R9700 and give the same logits as one. It writes
+//! `OUT.kldseq`, `OUT.kldseq.hfktok` (per-token KLD)
 //! and `OUT.kldseq.json` (receipt: model/ref/binary SHA-256, route, per-chunk
 //! scores and logits digests). Run with `HIPFIRE_GRAPH=0
 //! HIPFIRE_NORMALIZE_PROMPT=0` and a fresh HOME, as the Qwen pins do.

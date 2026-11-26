@@ -185,6 +185,17 @@ recipe = "hipfire-arch-llama fixture::write_dense_q8_fixture: SplitMix64 seed 0x
 date = "2026-11-24"
 note = "same bytes on hiptrx (x86 Zen) and hipx (Strix Halo); the in-tree unit test fixture_matches_the_pinned_digest carries the md5"
 
+[model."inkling2-mini.mq4"]
+status = "current"
+role = "Inkling-2-Mini (arch 24) shipped RTN artifact: the paired-KLD baseline for Inkling speed and quality levers (FA2 decode attention, symmetric expert tiers)"
+file = "inkling2-mini-mq4.hfq"
+size_bytes = 13927188480
+sha256 = "9536b3fde8f38511032df41aaf1124cc81cb839a9deeb333c650a0b2961eebe3"
+md5 = "5f59320ff25abba935cc9ef9f31548b2"
+recipe = "hipfire-quantize --format mq4v2 --arch-id 24 from thinkingmachines/Inkling-2-Mini@c9d028302cd0f035fdf8e7e91f089a4ce94d2195: MQ4G256V2 dense, MQ4G256 (qt13) routed experts, packed qt44 embed, RTN, no imatrix (PR #1192)"
+date = "2026-11-26"
+note = "Raufaser's PR #1192 file; local copy ~/.hipfire/models/inkling2/ on hiptrx"
+
 # ---------------------------------------------------------------------------
 # DFlash drafts
 # ---------------------------------------------------------------------------
@@ -337,6 +348,28 @@ sha256 = "0d6c6a8cf00062cfeafc4be206a44b3cb68622f9174fe852ff1d2bea99b1f28b"
 date = "2026-11-11"
 pinned_in = "cd97a8182a"
 
+[reference."inkling2-src-wt2-24x2048.v3.kldref"]
+status = "current"
+corpus = "WT2"
+shape = "24 x 2048"
+teacher = "source checkpoint F32 dequant (thinkingmachines/Inkling-2-Mini@c9d028302cd0f035fdf8e7e91f089a4ce94d2195, model-00001-of-00001.safetensors sha256 65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1), CPU batched forward bit-identical to forward_token_cached"
+file = "inkling2-src-wt2-24x2048.v3.kldref"
+sha256 = "69cdc9f862931021ce69cb8daf36ee5306d31b1ffae77dce1e0b89fcd63ad12d"
+receipt = "/home/kaden/qcal/release-0.5.0/inkling/teacher/RESULT.md"
+date = "2026-11-26"
+note = "inkling_kld ref; corpus benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt, Inkling tokenizer, scored [1024, 2047)"
+
+[reference."inkling2-src-code24-24x2048.v3.kldref"]
+status = "current"
+corpus = "code24"
+shape = "24 x 2048"
+teacher = "source checkpoint F32 dequant (thinkingmachines/Inkling-2-Mini@c9d028302cd0f035fdf8e7e91f089a4ce94d2195, model-00001-of-00001.safetensors sha256 65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1), CPU batched forward bit-identical to forward_token_cached"
+file = "inkling2-src-code24-24x2048.v3.kldref"
+sha256 = "613eea4b066efc7fe5cf3fe0d75606244049a1f30e8670a90d53bd1b058618ed"
+receipt = "/home/kaden/qcal/release-0.5.0/inkling/teacher/RESULT.md"
+date = "2026-11-26"
+note = "inkling_kld ref; corpus heldout-hipfire-gptq-code.txt (the Qwen code24 text, sha256 bd185b2541498fa30835d4080200749c0e9413e81bd717d9c89ac00b9cf2ca25), Inkling tokenizer, scored [1024, 2047); 2048 wide, unlike the 512-wide Qwen code24 pin"
+
 # ---------------------------------------------------------------------------
 # Prompt fixtures (md5 verified against the committed file by check-pins)
 # ---------------------------------------------------------------------------
@@ -436,6 +469,18 @@ build_arch = ["gfx942"]
 receipt = "/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/"
 date = "2026-11-12"
 pinned_in = "947a59a8ac"
+
+[evaluator."inkling_kld-595afab91e"]
+status = "current"
+role = "Inkling-2-Mini (arch 24) paired KLD evaluator: CPU source-checkpoint teacher (ref), product loader + forward_token_gpu candidate (eval), paired CI (pair)"
+tool = "inkling_kld"
+commit = "595afab91e"
+binary_md5 = "d9e8e86884efca524ffe99a74661f3f9"
+binary_sha256 = "6e4371cc585f2ec3b20d69c726d9a4bfefdec13bab7ee55b7e6539c822df03b6"
+build_arch = ["gfx1201"]
+toolchain = "ROCm 10.1 / HIP 7.16.26385 / clang 24"
+receipt = "/home/kaden/qcal/release-0.5.0/inkling/teacher/RESULT.md"
+date = "2026-11-26"
 
 # ---------------------------------------------------------------------------
 # KLD pins: Qwen3.8-27B (eval_hipfire --scoring-mode prefill --max-chunks 24)
@@ -626,6 +671,39 @@ control_kld = 0.023089
 control_kldseq_sha256_prefix = "f3acb89b"
 date = "2026-11-11"
 pinned_in = "cd97a8182a"
+
+# Inkling-2-Mini (arch 24): inkling_kld eval, product loader + forward_token_gpu,
+# CPU source-checkpoint teacher. Method: docs/fixtures.md § Inkling-2-Mini.
+
+[kld."gfx1201.inkling2-mq4.wt2"]
+status = "current"
+arch = "gfx1201"
+route = "Inkling AR n=1 (hipfire_loader::load_model + forward_token_gpu per position, one fresh process per chunk), F16 KV, max_seq 32768"
+kv_flags = ""
+corpus = "WT2"
+kld = 0.032794
+kldseq_sha256 = "711353b5fd04cab36f0e0bd43b9d208540d36f09ba2597f704f31e2582c061f8"
+model = "inkling2-mini.mq4"
+reference = "inkling2-src-wt2-24x2048.v3.kldref"
+evaluator = "inkling_kld-595afab91e"
+receipt = "/home/kaden/qcal/release-0.5.0/inkling/teacher/RESULT.md"
+date = "2026-11-26"
+note = "byte-identical in two fresh runs, cards A and E (fabric j11270, j11271); every chunk's logits digest equal"
+
+[kld."gfx1201.inkling2-mq4.code24"]
+status = "current"
+arch = "gfx1201"
+route = "Inkling AR n=1 (hipfire_loader::load_model + forward_token_gpu per position, one fresh process per chunk), F16 KV, max_seq 32768"
+kv_flags = ""
+corpus = "code24"
+kld = 0.022878
+kldseq_sha256 = "0e254e267e135c866e24e7577911045f5573c87482d2d777adf287972a76b79e"
+model = "inkling2-mini.mq4"
+reference = "inkling2-src-code24-24x2048.v3.kldref"
+evaluator = "inkling_kld-595afab91e"
+receipt = "/home/kaden/qcal/release-0.5.0/inkling/teacher/RESULT.md"
+date = "2026-11-26"
+note = "byte-identical in two fresh runs, cards C and B (fabric j11272, j11273); every chunk's logits digest equal"
 
 # Previous: pre-canonical RDNA pins (ROCm 10.1 / HIP 7.16), superseded by the
 # canonical GDN prefill re-pin of 2026-11-12.

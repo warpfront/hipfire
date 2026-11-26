@@ -647,6 +647,66 @@ fixture are in
   incumbent under the same setting, never a lane against the singleton
   ([`lessons-0.4.5.md`](methodology/lessons-0.4.5.md) § 7).
 
+## Inkling-2-Mini (arch 24) quality pins
+
+Inkling has its own evaluator: `eval_hipfire` refuses arch 24.
+`hipfire-loader/examples/inkling_kld.rs` (`pin:evaluator/inkling_kld-595afab91e`)
+builds the references on the CPU and scores candidates through the product path.
+
+- **Teacher.** Thinking Machines published only the packed checkpoint (NVFP4 and
+  MXFP8 experts, BF16/F32 everything else), so that checkpoint is the teacher.
+  Its exact F32 dequant comes from the quantizer's strict decoders (the values
+  the shipped artifacts were quantized from). That dequant runs through a
+  token-batched CPU forward, which reorders `forward_token_cached` visit-major
+  and leaves every per-element operation unchanged. `inkling_kld fidelity`
+  compares it against the per-token reference: on 4 x 48 WT2 tokens and on
+  3 x 40 code24 tokens (with `--sliding-window 16 --log-floor 8`, which covers
+  SWA eviction and full-attention tau != 1), every hidden state and logit row
+  was bit-identical. The teacher takes about 6 min per 12 x 2048 tokens on
+  hiptrx's 48 build cores. A GPU teacher would not fit: an F16 copy of the
+  dequantized weights is about 52 GB, and the arch-24 GPU loader takes only the
+  MQ4 recipe.
+- **References.** WT2 `pin:reference/inkling2-src-wt2-24x2048.v3.kldref` uses
+  the committed slice `benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt`.
+  code24 `pin:reference/inkling2-src-code24-24x2048.v3.kldref` uses
+  `heldout-hipfire-gptq-code.txt`, the Qwen code24 text, which holds 64,019
+  Inkling tokens. Both are 24 x 2048 plain windows tokenized by the artifact's
+  own tokenizer, which matches the HF tokenizer token for token. They are HFKLDR
+  v3 files: top-256 plus residual, scored over `[1024, 2047)`. code24 is 2048
+  wide for Inkling, not the 512 of the Qwen code24 pin.
+- **Route.** `hipfire_loader::load_model` (the Inkling carrier, `max_seq`
+  32768, F16 KV), then `reset_session_state` and one `forward_token_gpu` per
+  position, which is how `generate_inkling` prefills. Each chunk runs in a fresh
+  process by default, because the arch-24 GPU forward keeps its per-token
+  controller scratch, so VRAM grows with every position. `--chunks-per-process 2`
+  also fits an R9700 and gives the same logits row for row (WT2, 4 chunks), but
+  is no faster.
+- **Pins.** gfx1201 RTN baseline on `pin:model/inkling2-mini.mq4`:
+  `pin:kld/gfx1201.inkling2-mq4.wt2` and `pin:kld/gfx1201.inkling2-mq4.code24`.
+  Each was reproduced byte for byte in two fresh runs on different R9700
+  cards, with fresh HOME and empty kernel caches.
+
+Reproduce one cell from the worktree root (the receipt records the commit
+of the working directory):
+
+```bash
+HIPFIRE_GRAPH=0 HIPFIRE_NORMALIZE_PROMPT=0 HOME=$(mktemp -d) HIPFIRE_KERNEL_CACHE=$(mktemp -d) \
+  target/release/examples/inkling_kld eval --model inkling2-mini-mq4.hfq \
+  --ref inkling2-src-wt2-24x2048.v3.kldref --output rtn-wt2.kldseq
+scripts/check-pins.py verify kld/gfx1201.inkling2-mq4.wt2 rtn-wt2.kldseq
+```
+
+Rebuild a reference with `inkling_kld ref --source model-00001-of-00001.safetensors
+--model inkling2-mini-mq4.hfq --slice TEXT --output REF --n-ctx 2048 --max-chunks 24
+--batch-chunks 12` (about 36 GiB peak RSS, of which the mapped source file is a
+large share). A candidate such as FA2 decode attention or a symmetric expert
+artifact is scored the same way and gated with
+`inkling_kld pair --base rtn.kldseq --cand cand.kldseq --output paired.json`.
+`pair` reports per-chunk deltas (candidate − base, negative = better) and
+paired-t and bootstrap 95% CIs for mean KLD, p99 and NLL, in the JSON schema of
+the gfx1151 A4 `paired.py` receipts. It refuses to pair runs scored against
+different references.
+
 ## Dense Q8 attention conformance fixture (generated)
 
 `pin:model/dense-q8-llama.hfq` is generated in-tree, not downloaded: a seeded
