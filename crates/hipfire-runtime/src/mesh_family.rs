@@ -227,8 +227,6 @@ pub struct LaneWindow {
     pub accepted: usize,
 }
 
-/// A committed conversation whose state stays in lane `tag`, holding exactly
-/// `tokens`: its next turn continues it live ([`MeshLanes::unpark`]).
 pub struct LaneRecord {
     pub tag: u64,
     pub tokens: Vec<u32>,
