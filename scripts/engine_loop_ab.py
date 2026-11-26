@@ -246,6 +246,7 @@ def run_batch(args, route, arm, out):
     then their turn 1 at once, P's aborted on `gen_start` (in the prompt), D's after
     8 tokens; then P's and D's turn 1 again. Returns {request: result}."""
     prefix = f"{out}/{route['name']}.batch.{arm}"
+    wait_gpu_released()  # a `--conc` bench's daemon can still hold the reservation (HIPF-472 r4)
     d = Daemon(args.daemon, arm_env(route, arm), prefix, args.timeout)
     mt = route.get("max_tokens", 64)
     res = {}
