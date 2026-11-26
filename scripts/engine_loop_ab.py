@@ -745,6 +745,10 @@ def conc_self_test():
     shorter["refused"] = ["multiturn/4/1/0/1"]
     exempt = cj(eng=shorter, leg=cold4, c={})
     assert exempt["ok"] and exempt["engine"]["engine-noslots"]["refused"] == ["multiturn/4/1/0/1"]
+    below_ref = conc_arm("engine", "noslots", cached=0)  # legacy-noslots reused 5 on every follow-up
+    assert not cj(eng=below_ref, c={})["ok"]
+    below_ref["refused"] = [k for k in below_ref["reqs"] if k.startswith("multiturn") and k.endswith("/1")]
+    assert not [f for f in cj(eng=below_ref, c={})["fails"] if "< ref" in f]  # refused: exempt vs ref too
     # C1 != CN exemptions: a refused follow-up (cold), or an earlier turn that reused more than at k=1
     cold_ref = conc_arm("engine", "noslots", mt4=req("zz", cached=0))
     cold_ref["refused"] = ["multiturn/4/1/0/1"]
@@ -1123,7 +1127,7 @@ def judge_conc(arms, c, expect_engine):
             unexercised.append(f"{tag}: {len(r['ref_reuse_unmatched'])} requests reused a prefix length no ref "
                                f"request did (tokens not compared)")
         follow = [k for k in reqs if k.startswith("multiturn/") and not k.endswith("/0")]
-        r["cache_below_ref"] = sorted(k for k in follow if cached(reqs[k]) < cached(rr.get(k)))
+        r["cache_below_ref"] = sorted(k for k in follow if k not in refused and cached(reqs[k]) < cached(rr.get(k)))
         # vs C1: legacy-noslots reuses nothing at k>1, so only C1 sees a lost record (Loki HIPF-586 S3)
         r["cache_below_c1"] = sorted(k for k in follow if k.split("/")[1] != "1" and k not in refused
                                      and cached(reqs[k]) < cached(reqs.get(at(k, 1))))
