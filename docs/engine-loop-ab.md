@@ -178,9 +178,11 @@ A run passes when all of these hold:
   `unexercised`.
 - **G-spec:** for a route whose legacy arm reports `tau`, the engine reports
   `tau` on the same requests and its mean over every greedy request is at
-  least legacy tau − 1 %. On Qwen4 MTP the legacy-vs-legacy spread already
-  exceeds 1 % (HIPF-474), so a G-spec failure there must be compared against
-  a legacy-vs-legacy run of the same route before it counts.
+  least legacy tau − 1 %. On a `spec_noise` route the legacy-vs-legacy spread
+  already exceeds 1 % (Qwen4 MTP, HIPF-474), so the harness runs the legacy
+  arm `--spec-reps` (2) times and the bound is the lowest legacy run's mean
+  − 1 % (HIPF-604). The extra runs write under `<out>/legacy-rep<N>/`; their
+  per-run means are in the receipt's `tau.legacy_rep_means`.
 - **G-perf** (`--perf`): fresh loads, interleaved legacy/engine,
   `--perf-reps` (3) per arm. The run takes the median prefill and decode
   tok/s. Both deltas must be within ±2 % (see intended diff 7). Each rep
@@ -260,7 +262,13 @@ rows; legacy fn-lanes are not row-exact by default):
   no tag); otherwise the tags are listed as `refusals_unmapped` and exempt
   nothing. No follow-up with a prefix hit on the engine marks the run
   `pass-partial`
-- **G-spec:** mean tau per cell at least the `ref` cell's − 1 %
+- **G-spec:** mean tau per cell at least the reference cell's − 1 %. The
+  reference is the `ref` arm at k=1 and the `legacy-batch` arm at k>1 when
+  that arm reports tau (HIPF-604): MTP window lanes accept fewer drafts per
+  window than a singleton, so a k>1 engine lane cell judged against the
+  serialized `noslots` ref fails by ~20 %. Legacy fn-lanes count zero-draft
+  `ArSynced` windows in `cycles`, which puts their tau ~0.8 % low; legacy
+  DFlash2 lanes report no tau, so DFlash2 k>1 cells fall back to `ref`
 - **target** (k>1): output tok/s at least the target's − `tol_pct`, TTFT p50
   and p99 at most the target's + `tol_pct`
 
