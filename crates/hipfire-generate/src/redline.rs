@@ -554,11 +554,7 @@ pub fn redline_is_dense_lfm(loaded: &LoadedModel) -> bool {
     if loaded.pp != 1 || loaded.ep.is_some() {
         return false;
     }
-    let Some(bundle) = loaded
-        .state
-        .as_ref()
-        .and_then(|s| (s.as_ref() as &dyn Any).downcast_ref::<lfm2moe::Lfm2MoeBundle>())
-    else {
+    let Some(bundle) = loaded.lfm2moe() else {
         return false;
     };
     bundle.config.is_dense()
@@ -668,23 +664,11 @@ pub fn redline_snapshot(
     gpu: &rdna_compute::Gpu,
     loaded: &LoadedModel,
 ) -> Result<RedlineSnapshot, String> {
-    if let Some(bundle) = loaded
-        .state
-        .as_ref()
-        .and_then(|s| (s.as_ref() as &dyn Any).downcast_ref::<Qwen35Bundle>())
-    {
+    if let Some(bundle) = loaded.qwen35() {
         redline_qwen_snapshot(gpu, bundle).map(RedlineSnapshot::Qwen)
-    } else if let Some(bundle) = loaded
-        .state
-        .as_ref()
-        .and_then(|s| (s.as_ref() as &dyn Any).downcast_ref::<deepseek4::Deepseek4Bundle>())
-    {
+    } else if let Some(bundle) = loaded.deepseek4() {
         redline_deepseek4_snapshot(gpu, bundle).map(RedlineSnapshot::Deepseek4)
-    } else if let Some(bundle) = loaded
-        .state
-        .as_ref()
-        .and_then(|s| (s.as_ref() as &dyn Any).downcast_ref::<lfm2moe::Lfm2MoeBundle>())
-    {
+    } else if let Some(bundle) = loaded.lfm2moe() {
         if !bundle.config.is_dense() {
             return Err("retained snapshot requires dense LFM".to_string());
         }
