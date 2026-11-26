@@ -925,7 +925,9 @@ impl Qwen4LaneStore {
                 1,
             )
             .ok()?,
-            None => census::LaneSpecBudget::new(1, k, 0, 0, *context, 1).ok()?,
+            None => census::LaneSpecBudget::new(1, k, 0, 0, *context, 1)
+                .ok()?
+                .with_head_lag_rows(crate::mesh_rank_copy::native_head_lag_rows(&scope, config)),
         };
         let census = census::lane_spec_census(&budget, &inputs).ok()?;
         [

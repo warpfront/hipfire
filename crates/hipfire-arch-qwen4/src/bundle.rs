@@ -226,7 +226,7 @@ pub struct Qwen4Bundle {
     /// off. Message-end snapshots of a live continuation live in their own
     /// `/turns` scope (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`).
     session: Option<SessionDriver>,
-    /// Each AR lane's turn-start resident snapshot, taken from the session at
+    /// Each lane's turn-start resident snapshot, taken from the session at
     /// its park: a cancelled lane rewinds to it and stays a record.
     lane_marks: Vec<(u64, LiveMark)>,
     pub(crate) pair_session_stage: Option<PairSessionStage>,

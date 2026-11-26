@@ -2666,7 +2666,7 @@ impl EpMeshLanes {
             verify_rows_per_lane: verify_rows,
             max_rows: store.max_lanes() * verify_rows,
             copy_take_cap: copy.map_or(0, |c| c.take_cap),
-            head_lag_rows: copy.map_or(0, |c| c.config.head_lag_rows),
+            head_lag_rows: store.head_lag_rows(),
             lab,
             pp_microbatch_lanes: None,
         })

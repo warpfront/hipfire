@@ -2626,10 +2626,11 @@ impl MeshRoot {
                 head_rank: lane.head_rank,
             };
             let sl = staged.get_mut(&lane.epoch).expect("staged lane");
-            // A crowded step runs no copy window, so a retired lane owes the
-            // head no rows for one (no per-token owed-row copies, no capacity
-            // flush): it plans as a copy-free lane and its lag is dropped.
+            // A crowded step runs no copy window. A retired lane still owes
+            // its head rows where the store holds owed-row storage, so its
+            // record continues live (HIPF-590).
             let copy_active = copy_step && sl.copy.as_ref().is_some_and(|c| c.active);
+            let owes_rows = budgets.head_lag_rows > 0;
             if let Some(forced) = &r.forced {
                 if forced.is_empty() || forced.len() > budgets.verify_rows_per_lane {
                     return Err(ProtocolError::Budget(format!(
@@ -2647,9 +2648,9 @@ impl MeshRoot {
                 }
                 plan.kind = LaneKind::Forced(forced.clone());
                 // A forced advance realigns a lagging head (the owed rows
-                // first); without a copy future there is nothing to realign.
+                // first); without owed-row storage there is nothing to realign.
                 plan.head = match lane.head {
-                    HeadState::Lag { .. } if !copy_active => HeadState::Free,
+                    HeadState::Lag { .. } if !owes_rows => HeadState::Free,
                     h => h,
                 };
             } else if let Some(policy) = sl.policy.as_mut() {
@@ -2679,16 +2680,17 @@ impl MeshRoot {
                     plan.native_depth = k_max.min(max_drafts);
                     plan.max_depth = plan.native_depth;
                 }
-                // The head at the window's start. A retired lane keeps head
-                // work only for a copy future (owed rows, no per-token head
-                // work); without one it is truly head-free.
+                // The head at the window's start. A retired lane owes its
+                // head rows where the store holds owed-row storage (no
+                // per-token head work, as the singleton's `head_lag`);
+                // without it the lane is truly head-free.
                 plan.head = match lane.head {
                     HeadState::Free => HeadState::Free,
-                    HeadState::Aligned if matches!(route, LaneRoute::ArRetired) && !copy_active => {
+                    HeadState::Aligned if matches!(route, LaneRoute::ArRetired) && !owes_rows => {
                         HeadState::Free
                     }
                     HeadState::Aligned => HeadState::Aligned,
-                    HeadState::Lag { from } if copy_active => HeadState::Lag { from },
+                    HeadState::Lag { from } if owes_rows => HeadState::Lag { from },
                     HeadState::Lag { .. } => HeadState::Free,
                 };
                 // The copy source (its own chooser, apart from the native
@@ -9072,8 +9074,11 @@ mod tests {
     }
 
     #[test]
-    fn mesh_lane_protocol_retired_lane_without_copy_future_is_head_free() {
-        let b = cycle_budgets();
+    fn mesh_lane_protocol_retired_lane_without_owed_row_storage_is_head_free() {
+        let b = WindowBudgets {
+            head_lag_rows: 0,
+            ..cycle_budgets()
+        };
         for kind in BOTH {
             let mut m = Mesh::new_with(kind, false, Some(copy_cfg()));
             let e = admit_retired(&mut m, false);
@@ -9099,6 +9104,23 @@ mod tests {
                 .calls
                 .iter()
                 .any(|c| matches!(c, Call::HeadRepair(h) if !h.is_empty()))));
+        }
+    }
+
+    /// With owed-row storage a retired lane owes its head rows also without
+    /// a copy future, so its record continues live (HIPF-590).
+    #[test]
+    fn mesh_lane_protocol_retired_lane_owes_rows_without_copy_future() {
+        let b = cycle_budgets(); // head_lag_rows = 4
+        for kind in BOTH {
+            let mut m = Mesh::new_with(kind, false, Some(copy_cfg()));
+            let e = admit_retired(&mut m, false);
+            m.script_window(1, 0, &[], &[1000]);
+            let (start, _) = m.step(&[req(1, 99)], &b);
+            assert_eq!(start.lanes[0].route, LaneRoute::ArRetired);
+            let (head, owed) = m.root.head_state(e).unwrap();
+            assert_eq!(head, HeadState::Lag { from: 30 }, "{kind:?}");
+            assert_eq!(owed.len(), 1);
         }
     }
 
@@ -9343,13 +9365,13 @@ mod tests {
         }
     }
 
-    /// A crowded step (more lanes than the copy cap) drops a retired copy
-    /// lane's owed head rows instead of accruing them (the copy window they
-    /// serve cannot run); a step within the cap keeps them.
+    /// A crowded step (more lanes than the copy cap) runs no copy window, but
+    /// a retired lane still owes its head rows (HIPF-590: its record
+    /// continues live).
     #[test]
-    fn mesh_lane_protocol_crowded_step_drops_a_retired_copy_lanes_owed_head_rows() {
+    fn mesh_lane_protocol_crowded_step_keeps_a_retired_lanes_owed_head_rows() {
         let b = cycle_budgets();
-        for (cap, expect_lag) in [(2usize, true), (1, false)] {
+        for cap in [2usize, 1] {
             let mut m = Mesh::new_with(MeshKind::Ep, false, Some(copy_cfg()));
             m.root.copy_max_lanes = cap;
             let e = admit_retired(&mut m, true);
@@ -9359,13 +9381,8 @@ mod tests {
             let (start, _) = m.step(&[req(1, 99), req(2, 99)], &b);
             assert_eq!(start.lanes[0].route, LaneRoute::ArRetired);
             let (head, owed) = m.root.head_state(e).unwrap();
-            if expect_lag {
-                assert_eq!(head, HeadState::Lag { from: 30 }, "cap {cap}");
-                assert_eq!(owed, &[5u32][..]);
-            } else {
-                assert_eq!(head, HeadState::Free, "cap {cap}");
-                assert!(owed.is_empty());
-            }
+            assert_eq!(head, HeadState::Lag { from: 30 }, "cap {cap}");
+            assert_eq!(owed, &[5u32][..]);
         }
     }
 

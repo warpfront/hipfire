@@ -63,7 +63,6 @@ impl Qwen4Bundle {
         sampling: Option<crate::lane::LaneSampling>,
     ) -> Result<()> {
         let epoch = lane_epoch(tag);
-        let parts_none = parts.is_none();
         let seed = *generated.last().ok_or("park: no pending seed")?;
         let position = prompt.len() + generated.len() - 1;
         if self.state.position != position {
@@ -93,11 +92,10 @@ impl Qwen4Bundle {
         // The prompt's boundary snapshots stay published: the reset that
         // follows the swap drops the resident turn.
         self.session_publish_captures();
-        // An AR lane takes its turn's resident snapshot along: its rows move
-        // into the lane, so a cancel can rewind the lane to it.
-        let mark = parts_none
-            .then(|| self.session.as_mut().and_then(|s| s.take_mark(prompt)))
-            .flatten();
+        // A lane takes its turn's resident snapshot along (an MTP lane's
+        // holds its head too): its rows move into the lane, so a cancel can
+        // rewind the lane to it.
+        let mark = self.session.as_mut().and_then(|s| s.take_mark(prompt));
         if let Err(error) = self.commit_promotion(gpu, &epoch) {
             let _ = self.release_lane(&epoch);
             if let Some(mark) = mark {
@@ -439,6 +437,10 @@ impl MeshLanes for Qwen4Bundle {
             .drafter_any_mut()
             .and_then(|any| any.downcast_mut::<crate::mtp_spec::Qwen4MtpDrafter>())
             .ok_or("an MTP lane takes a native Qwen4 MTP drafter")?;
+        // A lane that owes head rows starts with its head at the target.
+        if self.lanes().is_some_and(|store| store.head_lag_rows() > 0) {
+            drafter.catch_up_head_for_promotion(device(gpus)?, self)?;
+        }
         let sampling = drafter.naive_lane_sampling()?;
         let parts = drafter.promotion_parts()?;
         self.promote(
@@ -479,55 +481,75 @@ impl MeshLanes for Qwen4Bundle {
         if self.session.is_none() {
             return Err("no session cache: a lane record cannot continue live".into());
         }
+        let marked = self
+            .lane_marks
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, mark)| mark.position());
         // A window lane stops with its last pick unrun, which the singleton's
         // terminal flush runs: a forced one-row window runs it here, so the
         // record continues at the same row a resident turn would.
-        let (head, at, seed) = {
+        let (head, owed, at, seed) = {
             let store = self.lanes().ok_or("Qwen4 lanes are not staged")?;
             let lane = store
                 .lane(&epoch)
                 .ok_or_else(|| format!("lane record {tag} disappeared"))?;
             (
                 lane.spec.as_ref().map(|spec| spec.head.position()),
+                lane.spec
+                    .as_ref()
+                    .and_then(|spec| spec.lag.as_ref())
+                    .map_or(0, crate::mesh_rank_copy::HeadLagStore::owed),
                 lane.state.position,
                 store.root_seed(&epoch).or(lane.host.pending_seed),
             )
         };
-        // A retired lane's head lags with no owed rows: refused before the
-        // forced row, which it could not use.
-        if head.is_some_and(|head| head != at) {
+        // Every row a lane ran is a committed pick: a position inside
+        // `tokens` holds exactly that prefix; past it, a window ran beyond
+        // its stop, or a cancelled lane rewinds to its mark of `tokens` (the
+        // mark restores the head too: nothing of the lane's head is kept).
+        let rewind = at > tokens.len() && marked == Some(tokens.len());
+        if at > tokens.len() && !rewind {
             return Err(format!(
-                "lane record {tag}: the MTP head is at {head:?}, the trunk at {at}"
+                "lane record {tag} sits at {at}, past its {} tokens",
+                tokens.len()
             ));
         }
-        if let Some(seed) = unrun_seed(head.is_some(), at, seed, tokens) {
-            self.windows(gpu, &[(tag, 0)], &[(epoch, vec![seed])])?;
+        if !rewind {
+            // A retired lane's head lags by exactly its owed rows; a lane
+            // without owed-row storage cannot catch up and is refused before
+            // the forced row, which it could not use.
+            if head.is_some_and(|head| head + owed != at) {
+                return Err(format!(
+                    "lane record {tag}: the MTP head is at {head:?} with {owed} owed rows, the trunk at {at}"
+                ));
+            }
+            // The forced row appends the owed rows first.
+            if let Some(seed) = unrun_seed(head.is_some(), at, seed, tokens) {
+                self.windows(gpu, &[(tag, 0)], &[(epoch, vec![seed])])?;
+            }
+            // A record that ran no forced row catches its head up here.
+            self.with_lanes(|store, bundle| {
+                let lane = store
+                    .lane_mut(&epoch)
+                    .ok_or_else(|| format!("lane record {tag} disappeared"))?;
+                if lane.spec.is_some() {
+                    crate::mesh_rank_copy::flush_owed_head_rows(bundle, gpu, lane)?;
+                }
+                Ok::<(), String>(())
+            })
+            .map_err(text)?;
         }
-        let marked = self
-            .lane_marks
-            .iter()
-            .find(|(t, _)| *t == tag)
-            .map(|(_, mark)| mark.position());
         let lane = self
             .lanes()
             .and_then(|store| store.lane(&epoch))
             .ok_or_else(|| format!("lane record {tag} disappeared"))?;
-        // Every row a lane ran is a committed pick: a position inside
-        // `tokens` holds exactly that prefix; past it, a window ran beyond
-        // its stop, or a cancelled lane rewinds to its mark of `tokens`.
         let position = lane.state.position;
-        let rewind = position > tokens.len() && marked == Some(tokens.len());
-        if position > tokens.len() && !rewind {
-            return Err(format!(
-                "lane record {tag} sits at {position}, past its {} tokens",
-                tokens.len()
-            ));
-        }
         let mtp = match &lane.spec {
             None => false,
+            // The mark restores the head with the trunk.
+            Some(_) if rewind => true,
             Some(spec) => {
-                // A lane the floor retired decodes head-free: its head stays
-                // behind and keeps no owed rows, so it continues cold.
                 if spec.head.position() != position {
                     return Err(format!(
                         "lane record {tag}: the MTP head is at {}, the trunk at {position}",

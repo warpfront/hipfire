@@ -140,6 +140,9 @@ pub(crate) struct DecodeAdmission<'a> {
     /// A promoted singleton's drafter: per-depth agreement and whether its
     /// floor retired it.
     pub promoted: Option<(&'a [(f32, f32)], bool)>,
+    /// The store holds owed-row storage: a retired promoted request keeps its
+    /// (caught-up) head and owes its rows, else it is head-free.
+    pub owes_rows: bool,
 }
 
 impl LaneProto {
@@ -198,7 +201,7 @@ impl LaneProto {
             rng_seed: a.rng_seed,
             prompt: a.prompt.to_vec(),
             spec_k: a.spec_k,
-            head: if retired {
+            head: if retired && !a.owes_rows {
                 crate::mesh_lane_protocol::HeadState::Free
             } else {
                 crate::mesh_lane_protocol::HeadState::Aligned
@@ -1044,7 +1047,7 @@ fn plan_and_draft_with(
         copy_take_cap: copy.map_or(0, |c| c.take_cap),
         lab: store.routes(),
         pp_microbatch_lanes: None,
-        head_lag_rows: copy.map_or(0, |c| c.config.head_lag_rows),
+        head_lag_rows: store.head_lag_rows(),
     };
     let LaneProto {
         root,

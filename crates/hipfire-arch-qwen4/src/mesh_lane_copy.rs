@@ -262,8 +262,8 @@ pub(crate) struct HeadWindow<'a> {
 /// forced realignment): which rows the head owners append, where the head
 /// ends, and the record that follows.
 ///
-/// A retired lane with no copy future never reaches here (its plan head is
-/// `Free`: no lag hidden copies).
+/// A retired lane of a store without owed-row storage never reaches here
+/// (its plan head is `Free`: no lag hidden copies).
 pub(crate) fn head_outcome(w: &HeadWindow<'_>) -> HeadOutcome {
     let end_row = w.position + w.consumed;
     if w.head == HeadState::Free {

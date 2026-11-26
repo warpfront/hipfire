@@ -4604,12 +4604,14 @@ mod tests {
             .unwrap()
         };
         let mtp = lane_spec_census(
-            &LaneSpecBudget::new(lanes, k, 0, 0, context, 1).unwrap(),
+            &LaneSpecBudget::new(lanes, k, 0, 0, context, 1)
+                .unwrap()
+                .with_head_lag_rows(crate::mtp_gpu::MTP_FILL_ROWS),
             &inputs,
         )
         .unwrap();
         let line = |component| mtp.bytes_of(component).unwrap();
-        // Per MTP slot: mirrored state + ring + head + pending (no owed rows).
+        // Per MTP slot: mirrored state + ring + head + pending + owed rows.
         let per_slot = |component| line(component) / lanes as u64;
         let ar = ar_lane_census(1, &context, &inputs).unwrap();
         let ar_state = ar.bytes_of(CensusComponent::TargetState).unwrap();
@@ -4617,7 +4619,8 @@ mod tests {
         assert!(mirrored_state > ar_state, "the MTP slot keeps the mirror");
         let mtp_only = per_slot(CensusComponent::CaptureRing)
             + per_slot(CensusComponent::HeadState)
-            + per_slot(CensusComponent::PendingHidden);
+            + per_slot(CensusComponent::PendingHidden)
+            + per_slot(CensusComponent::HeadLag);
         // All slots MTP, or `spec_lanes` covering the store: the MTP store.
         let full = bytes(lanes, None);
         assert_eq!(full, mtp.total().unwrap());
@@ -4748,16 +4751,20 @@ mod tests {
             None,
         )
         .unwrap();
-        let lag = lane_spec_census(
-            &crate::mesh_rank_copy::copy_budget(lanes, k, &copy(0), 8, context, 1).unwrap(),
-            &inputs,
-        )
-        .unwrap()
-        .bytes_of(CensusComponent::HeadLag)
-        .unwrap();
+        let lag = |budget: LaneSpecBudget| {
+            lane_spec_census(&budget, &inputs)
+                .unwrap()
+                .bytes_of(CensusComponent::HeadLag)
+                .unwrap()
+        };
+        let copy_lag =
+            lag(crate::mesh_rank_copy::copy_budget(lanes, k, &copy(0), 8, context, 1).unwrap());
+        let native_lag = lag(LaneSpecBudget::new(lanes, k, 0, 0, context, 1)
+            .unwrap()
+            .with_head_lag_rows(crate::mtp_gpu::MTP_FILL_ROWS));
         assert_eq!(
             bytes(0, None),
-            legacy + lag,
+            legacy - native_lag + copy_lag,
             "step buffers match the legacy store"
         );
         // A mixed store: only the MTP slots carry a ring, wide on the first two.

@@ -1192,6 +1192,10 @@ mod tests {
                                 per_lane += MtpGpuState::device_bytes(&config, &context).unwrap()
                                     + ring
                                     + wide * f32_bytes;
+                                // The whole-model scope's owed head rows (HIPF-590).
+                                if scope == Qwen4BandScope::single(&config) {
+                                    per_lane += wide * f32_bytes * crate::mtp_gpu::MTP_FILL_ROWS;
+                                }
                                 let append = MtpAppendScratch::device_bytes(
                                     &config,
                                     crate::mtp_gpu::MTP_FILL_ROWS,

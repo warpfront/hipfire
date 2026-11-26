@@ -311,6 +311,21 @@ pub(crate) fn lag_allocation_sizes(config: &Qwen4Config, rows: usize) -> Option<
     Some(vec![u64::try_from(bytes).ok()?])
 }
 
+/// Owed head rows of a copy-less MTP lane: the singleton's bound
+/// ([`crate::mtp_gpu::MTP_FILL_ROWS`]) on the whole-model scope, so a retired
+/// lane keeps its head rows and its next turn continues live (HIPF-590).
+/// Pipeline bands keep a head-free retired lane (0).
+pub(crate) fn native_head_lag_rows(
+    scope: &crate::weights::Qwen4BandScope,
+    config: &Qwen4Config,
+) -> usize {
+    if *scope == crate::weights::Qwen4BandScope::single(config) {
+        crate::mtp_gpu::MTP_FILL_ROWS
+    } else {
+        0
+    }
+}
+
 /// One lane's owed-head-row storage: the target hidden of every owed token
 /// (token `i`'s own hidden is row `i`, the pair of token `i + 1`) and the
 /// rank's host record of the owed tokens (the same record the root keeps; the

@@ -1942,6 +1942,8 @@ fn commit_with_proto(
                         prompt: &lane.host.prompt,
                         spec_k: spec_config.map(|config| config.k),
                         promoted: None,
+                        // Read only for a retired promotion.
+                        owes_rows: false,
                     })?;
                 }
                 (ids, 0, 0)

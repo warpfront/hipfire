@@ -6907,10 +6907,22 @@ impl Qwen4MtpDrafter {
         self.floor.retired() || self.floor_needs_calibration()
     }
 
+    /// Append the head rows a retired request owes ([`HeadLag`]) before a
+    /// promotion moves its head into a lane that owes rows itself: the lane
+    /// starts with its head at the target.
+    pub(crate) fn catch_up_head_for_promotion(
+        &mut self,
+        gpu: &mut Gpu,
+        bundle: &mut Qwen4Bundle,
+    ) -> Result<(), String> {
+        self.catch_up_head(&mut Qwen4Ops::Single(gpu), bundle)
+    }
+
     /// What a promoted singleton hands its lane: the next window's row-0
     /// hidden, the per-depth agreement and whether the floor retired the
-    /// request (the head then lags the target, so the lane must stay
-    /// head-free). Err when no prefill ran (the drafter holds no pending
+    /// request (the head then lags the target, so the lane is head-free
+    /// unless [`Self::catch_up_head_for_promotion`] ran first). Err when no
+    /// prefill ran (the drafter holds no pending
     /// hidden). The drafter keeps no in-flight window state between windows;
     /// an active target snapshot in its verify scratch is a ticket of the
     /// bundle's trunk arena, which `Qwen4Bundle::prepare_promotion` refuses

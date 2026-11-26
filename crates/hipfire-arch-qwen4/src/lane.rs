@@ -1234,8 +1234,8 @@ pub struct LaneSpec {
     pub pending_hidden: GpuTensor,
     /// The routed window between `draft_step` and `commit_step`.
     pub(crate) window: Option<PendingWindow>,
-    /// Owed head rows of a retired lane with a copy future (`None`: the
-    /// store stages no copy lane, a retired lane is head-free).
+    /// Owed head rows of a retired lane (`None`: the store holds no owed-row
+    /// storage, a retired lane is head-free).
     pub(crate) lag: Option<HeadLagStore>,
     pub stats: LaneSpecStats,
 }
@@ -2533,9 +2533,9 @@ impl Qwen4LaneStore {
             }
         }
         // The copy lane widens the store's verify rows and the first
-        // `wide_lanes` slots' ring to `1 + max(k, take cap)` and adds the
-        // owed-row storage (`ring_rows` is the wide ring); without it the
-        // store keeps its `k + 1`-row shape exactly.
+        // `wide_lanes` slots' ring to `1 + max(k, take cap)` (`ring_rows` is
+        // the wide ring); without it the store keeps its `k + 1`-row shape.
+        // Every MTP lane of the whole-model scope holds owed-row storage.
         let (ring_rows, rows_cap, lag_rows, copy_arming) = match (spec, copy) {
             (Some(spec), Some(copy)) => {
                 if !scope.output {
@@ -2570,7 +2570,12 @@ impl Qwen4LaneStore {
             (None, Some(_)) => {
                 return Err("lane store: the copy lane needs MTP lanes (spec)".to_string());
             }
-            (Some(spec), None) => (spec.k + 1, max_lanes * (spec.k + 1), 0, None),
+            (Some(spec), None) => (
+                spec.k + 1,
+                max_lanes * (spec.k + 1),
+                crate::mesh_rank_copy::native_head_lag_rows(&scope, &bundle.config),
+                None,
+            ),
             (None, None) => (0, max_lanes, 0, None),
         };
         let rows = rows_cap + max_lanes;
@@ -2780,8 +2785,9 @@ impl Qwen4LaneStore {
         let census = match spec_k {
             None => census::ar_lane_census(max_lanes, context, &inputs).ok()?,
             Some(k) => {
-                let budget =
-                    census::LaneSpecBudget::new(max_lanes, k, 0, 0, *context, owner_mask).ok()?;
+                let budget = census::LaneSpecBudget::new(max_lanes, k, 0, 0, *context, owner_mask)
+                    .ok()?
+                    .with_head_lag_rows(crate::mesh_rank_copy::native_head_lag_rows(scope, config));
                 census::lane_spec_census(&budget, &inputs).ok()?
             }
         };
@@ -2892,7 +2898,9 @@ impl Qwen4LaneStore {
                 1,
             )
             .ok()?,
-            None => census::LaneSpecBudget::new(max_lanes, spec_k, 0, 0, *context, 1).ok()?,
+            None => census::LaneSpecBudget::new(max_lanes, spec_k, 0, 0, *context, 1)
+                .ok()?
+                .with_head_lag_rows(crate::mesh_rank_copy::native_head_lag_rows(&scope, config)),
         };
         let census = census::lane_spec_census(&budget, &inputs).ok()?;
         let mixed = census::mixed_lane_census(
@@ -3085,6 +3093,7 @@ impl Qwen4LaneStore {
             .and_then(|(config, _, _, _)| config.end_of_turn)
             .unwrap_or(bundle.config.eos_token_id);
         let promoted = parts.as_ref().map(|p| (p.agreement, p.retired));
+        let owes_rows = self.head_lag_rows() > 0;
         let admitted = self.proto_mut()?.admit_decoding(DecodeAdmission {
             epoch,
             position,
@@ -3094,6 +3103,7 @@ impl Qwen4LaneStore {
             prompt: &root_prompt,
             spec_k: k,
             promoted,
+            owes_rows,
         });
         if let Err(error) = admitted {
             let _ = self.table.release(&epoch);
@@ -3174,6 +3184,12 @@ impl Qwen4LaneStore {
     /// Whether the store runs the copy lane.
     pub fn copy_armed(&self) -> bool {
         self.copy.is_some()
+    }
+
+    /// Owed head rows one retired MTP lane holds before the root flushes
+    /// them (`WindowBudgets.head_lag_rows`; 0: a retired lane is head-free).
+    pub(crate) fn head_lag_rows(&self) -> usize {
+        self.spec.as_ref().map_or(0, |spec| spec.lag_rows)
     }
 
     /// Verify rows one lane holds at most: `1 + max(k, take cap)` with the
