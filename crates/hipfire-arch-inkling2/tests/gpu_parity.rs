@@ -19,7 +19,16 @@
 //! the CPU cached decode), 4 (tok/s, unoptimized).
 //!
 //! The artifact path defaults to the Windows layout below; set `INKLING2_MQ4`
-//! to point at it elsewhere.
+//! to point at it elsewhere. Off Windows there is no default: `INKLING2_MQ4`
+//! is required, `HIPFIRE_HOME` is left as set (or the hipfire default), and
+//! gates 0 and 2 still read and write their CPU traces under the Windows
+//! layout. Gate 3b on Linux, for example:
+//!
+//! ```sh
+//! INKLING2_MQ4=$HOME/.hipfire/models/inkling2/inkling2-mini-mq4.hfq HIPFIRE_GRAPH=0 \
+//!   cargo test --release -p hipfire-arch-inkling2 --test gpu_parity -- \
+//!   --ignored --nocapture --exact gate3b_multi_token_logits
+//! ```
 
 use hipfire_arch_inkling2::arch_model::{Inkling2Bundle, Inkling2State};
 use hipfire_arch_inkling2::config::Inkling2Config;
@@ -41,7 +50,7 @@ const CPU_LOGITS: &str = r"D:\hipfire-models\cpu-logits-tok0.txt";
 const RAW_LOGITS: &str = r"D:\hipfire-models\cpu-raw-logits-tok0.txt";
 
 fn ensure_home() {
-    if std::env::var("HIPFIRE_HOME").is_err() {
+    if cfg!(windows) && std::env::var("HIPFIRE_HOME").is_err() {
         std::env::set_var("HIPFIRE_HOME", r"D:\hipfire-models\inkling2-home");
     }
     assert_eq!(
@@ -52,8 +61,15 @@ fn ensure_home() {
 }
 
 fn open_artifact() -> (Inkling2Config, Inkling2Weights) {
-    let art = std::env::var("INKLING2_MQ4").unwrap_or_else(|_| ART.to_string());
-    let hfq = HfqFile::open(std::path::Path::new(&art)).expect("open artifact");
+    let art = match std::env::var("INKLING2_MQ4") {
+        Ok(p) => p,
+        Err(_) if cfg!(windows) => ART.to_string(),
+        Err(_) => panic!(
+            "set INKLING2_MQ4 to the inkling2-mini-mq4.hfq path ({ART} is the Windows default)"
+        ),
+    };
+    let hfq = HfqFile::open(std::path::Path::new(&art))
+        .unwrap_or_else(|e| panic!("open artifact {art}: {e}"));
     let cfg = Inkling2Config::from_metadata_json(&hfq.metadata_json).expect("parse config");
     let weights = Inkling2Weights::load(&hfq, &cfg).expect("index weights");
     (cfg, weights)
