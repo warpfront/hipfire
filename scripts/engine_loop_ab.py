@@ -744,6 +744,15 @@ def conc_self_test():
     shorter["refused"] = ["multiturn/4/1/0/1"]
     exempt = cj(eng=shorter, leg=cold4, c={})
     assert exempt["ok"] and exempt["engine"]["engine-noslots"]["refused"] == ["multiturn/4/1/0/1"]
+    # C1 != CN exemptions: a refused follow-up (cold), or an earlier turn that reused more than at k=1
+    cold_ref = conc_arm("engine", "noslots", mt4=req("zz", cached=0))
+    cold_ref["refused"] = ["multiturn/4/1/0/1"]
+    ex = cj(eng=cold_ref, leg=cold4, c={})
+    assert ex["ok"] and ex["engine"]["engine-noslots"]["c1_ne_cn_exempt"] == {"multiturn/4/1/0/1": "refused"}, ex
+    shared = conc_arm("engine", "noslots", mt4=req("zz", cached=5))
+    shared["reqs"]["multiturn/4/1/0/0"] = req(cached=3)  # turn 0 reused a shared prefix C1 ran cold
+    sx = cj(eng=shared, leg=cold4, c={})["engine"]["engine-noslots"]
+    assert sx["c1_ne_cn"] == [] and "multiturn/4/1/0/0 reused 3 > C1 0" in sx["c1_ne_cn_exempt"]["multiturn/4/1/0/1"]
 
     # refusal tags: tag N = the N-th gen_start; the refused request is the record's next turn
     ev = lambda t, rid, att=1, **kw: json.dumps({"type": t, "id": rid, "attempt_id": att, **kw})
@@ -1050,7 +1059,11 @@ def judge_conc(arms, c, expect_engine):
     (legacy fn-lanes are not row-exact by default, HIPF-469). Pure: --self-test
     drives it with fakes. Per engine arm:
     - every request ends in `done`; `loop` stamps as in loop_checks
-    - C1 == CN: each k>1 request's tokens and ids equal the same request at k=1
+    - C1 == CN: each k>1 request's tokens and ids equal the same request at k=1, except
+      a known reuse difference (`c1_ne_cn_exempt`): the request's lane record was
+      refused, or an earlier turn of its conversation reused more at k>1 than at k=1
+      (a prefix shared across conversations, Loki HIPF-597 N1); a cold prefill is not
+      token-exact with a reused prefix
     - G-tok: tokens and ids equal the `ref` arm's (default legacy-noslots)
     - cache: each multi-turn follow-up reuses at least the ref arm's `cached_tokens`,
       and at k>1 at least the same request at k=1 (C1), unless the engine logged
@@ -1087,7 +1100,18 @@ def judge_conc(arms, c, expect_engine):
         loop_bad = (any(v not in (None, "legacy", "engine") for v in loops)
                     or (None in loops and any(v is not None for v in loops))
                     or (expect_engine and any(v != "engine" for v in loops)))
-        r["c1_ne_cn"] = c1_ne_cn(reqs)
+        refused = set(a.get("refused", []))
+        r["c1_ne_cn"], r["c1_ne_cn_exempt"] = [], {}
+        for k in c1_ne_cn(reqs):
+            wl, kk, rnd, conv, turn = k.split("/")
+            earlier = [f"{wl}/{kk}/{rnd}/{conv}/{t}" for t in range(int(turn))]
+            why = ("refused" if k in refused else
+                   next((f"{e} reused {cached(reqs.get(e))} > C1 {cached(reqs.get(at(e, 1)))}" for e in earlier
+                         if cached(reqs.get(e)) > cached(reqs.get(at(e, 1)))), None))
+            if why:
+                r["c1_ne_cn_exempt"][k] = why
+            else:
+                r["c1_ne_cn"].append(k)
         # G-tok: against the ref request with the same prefix reuse (same k first),
         # since a reused prefix and a cold prefill are not token-exact
         refs = {k: next((y for y in (rr.get(at(k, kk)) for kk in [k.split("/")[1], *ks])
@@ -1098,7 +1122,6 @@ def judge_conc(arms, c, expect_engine):
             unexercised.append(f"{tag}: {len(r['ref_reuse_unmatched'])} requests reused a prefix length no ref "
                                f"request did (tokens not compared)")
         follow = [k for k in reqs if k.startswith("multiturn/") and not k.endswith("/0")]
-        refused = set(a.get("refused", []))
         r["cache_below_ref"] = sorted(k for k in follow if cached(reqs[k]) < cached(rr.get(k)))
         # vs C1: legacy-noslots reuses nothing at k>1, so only C1 sees a lost record (Loki HIPF-586 S3)
         r["cache_below_c1"] = sorted(k for k in follow if k.split("/")[1] != "1" and k not in refused

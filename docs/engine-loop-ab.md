@@ -238,7 +238,12 @@ rows; legacy fn-lanes are not row-exact by default):
   a multi-turn follow-up prefills cold, and a cold prefill is not token-exact
   with a reused prefix (Qwen4 AR mq4-xts, halo: 75 of 96 follow-ups at k=2/4
   differ from k=1, every stateless request and first turn is equal, HIPF-472).
-  An engine that keeps each conversation's prefix passes it.
+  An engine that keeps each conversation's prefix passes it. Exempt
+  (`c1_ne_cn_exempt`, with the reason): a follow-up whose lane record the
+  engine refused (`refused`, see cache), and a request with an earlier turn
+  of its conversation that reused more at k>1 than at k=1. The second case is
+  a prefix that two conversations share, reused at k>1 while k=1 ran it cold
+  (Loki HIPF-597 N1).
 - **G-tok:** tokens and ids equal the `ref` arm's request with the same
   `cached_tokens`, at the same k first, else at another k. A request whose
   reuse no `ref` request matched is listed (`ref_reuse_unmatched`) and marks
