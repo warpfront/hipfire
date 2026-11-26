@@ -251,7 +251,7 @@ rows; legacy fn-lanes are not row-exact by default):
 - **cache:** every multi-turn follow-up reuses at least the `ref` arm's
   `cached_tokens`, and at k>1 at least the same request at k=1
   (`cache_below_c1`; legacy-noslots reuses nothing at k>1, so only C1 sees a
-  lost lane record, Loki HIPF-586 S3). A follow-up exempt from the C1 check is
+  lost lane record, Loki HIPF-586 S3). A follow-up exempt from both checks is
   one whose lane record the engine logged as `[engine] lane record <tag> not
   continued` (`refused`). The harness maps a tag to its request through the
   wire: tag N is the N-th `gen_start` (the engine takes the tag right before
