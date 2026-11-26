@@ -213,6 +213,12 @@ impl MeshFamily for Gemma4Bundle {
             .unwrap_or(Ok(()))
     }
 
+    /// Only a snapshot boundary needs the drain; the chunks between queue back
+    /// to back, as the legacy prefill (HIPF-589).
+    fn prompt_epoch_drains(&self, end: usize) -> bool {
+        self.session.as_ref().and_then(SessionDriver::next_boundary) == Some(end)
+    }
+
     fn prepare_epoch(&mut self, _gpus: &mut Gpus, _route: MeshRoute, rows: usize) -> Result<usize> {
         Ok(rows)
     }

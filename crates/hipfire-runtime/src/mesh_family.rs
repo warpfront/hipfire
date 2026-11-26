@@ -71,9 +71,17 @@ pub trait MeshFamily {
     /// Rows of the next prompt epoch from [`Self::position`]: the family's
     /// schedule unit (session boundary, forward chunk, coprocessor pair group).
     fn next_prompt_rows(&mut self, gpus: &mut Gpus, prompt: &[u32]) -> Result<usize>;
-    /// The prompt epoch ending at `end` drained: capture a session boundary
-    /// there, and at the prompt end seal the prompt state.
+    /// The prompt epoch ending at `end` is done (drained where
+    /// [`Self::prompt_epoch_drains`]): capture a session boundary there, and
+    /// at the prompt end seal the prompt state.
     fn prompt_rows_done(&mut self, gpus: &mut Gpus, prompt: &[u32], end: usize) -> Result<()>;
+    /// Whether the prompt epoch ending at `end` drains before
+    /// [`Self::prompt_rows_done`]. A family whose unbounded epochs need no
+    /// host barrier returns `false` there, so its chunks queue back to back
+    /// (the prompt end always drains).
+    fn prompt_epoch_drains(&self, _end: usize) -> bool {
+        true
+    }
     /// After a failed prompt epoch: `Some(start)` when the family contained
     /// the fault (it latched the faulting route off) and the prompt reruns
     /// from `start`, `None` when the failure stands.
@@ -421,7 +429,9 @@ impl MeshRunner {
             head,
             None,
         )?;
-        self.settle(gpus)?;
+        if last || family.prompt_epoch_drains(end) {
+            self.settle(gpus)?;
+        }
         family.prompt_rows_done(gpus, prompt, end)?;
         let logits = if last {
             Some(self.read_logits(request, gpus)?)
