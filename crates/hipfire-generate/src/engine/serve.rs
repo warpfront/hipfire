@@ -985,7 +985,7 @@ fn park_cancelled(
     history: &[u32],
     request: &mut Option<MeshRequest>,
 ) -> Option<Result<(), String>> {
-    // A window store parks AR requests never; a prompt cut short has no history.
+    // A window (MTP) store parks no AR request: it rolls back. A prompt cut short has no history.
     if !lanes.keeps_records()
         || lanes.windows()
         || history.len() < prompt.len()

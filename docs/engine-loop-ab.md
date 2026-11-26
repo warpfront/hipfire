@@ -294,6 +294,8 @@ pairs of conversations (identical messages): P (abort in the prompt) and D
 | 3 | turn 1 of P and D again (`P1r`, `D1r`) | – |
 | 4 | turn 2 of D alone (counting again, 4× budget: it decodes on the resident state); P's turn 2 is sent right behind D2's abort, so it takes the resident state next | D after 8 token events |
 | 5 | turn 2 of D again (`D2r`) and of D~ (`D~2`, the control) | – |
+| 6 | turn 3 of D alone: it finishes on the resident state and the client aborts on `commit_ready`; P's turn 3 is sent right behind the abort | D on `commit_ready` |
+| 7 | turn 3 of D again (`D3r`) and of D~ (`D~3`) | – |
 
 Gates, on the engine arm (the legacy arm is a reference row: legacy fn-lanes
 keep no records):

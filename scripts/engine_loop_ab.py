@@ -132,7 +132,10 @@ class Daemon:
             elif t == "committed":  # HIPFIRE_EMIT_TOKEN_IDS=1: exact token ids
                 s["ids"].append([e.get("tok_id"), e.get("pos")])
             elif t == "commit_ready":
-                self.send({"type": "commit", "id": rid, "attempt_id": 1})
+                if s["abort"] == "ready":  # the turn finished; the client leaves it
+                    abort_(rid)
+                else:
+                    self.send({"type": "commit", "id": rid, "attempt_id": 1})
             elif t in ("done", "error"):
                 out[rid] = result(t, s["events"], s["ids"], s["req"].get("max_tokens"),
                                   {k: v for k, v in e.items() if k not in ("type", "id", "attempt_id")})
@@ -279,6 +282,12 @@ def run_batch(args, route, arm, out):
         res.update(d.generate_many([("D2", batch_req(hist["D"], 4 * mt), 8)],
                                    then={"D2": ("P2", batch_req(hist["P"], mt))}))
         res.update(d.generate_many([("D2r", batch_req(hist["D"], mt), None), ("D~2", batch_req(hist["D~"], mt), None)]))
+        for c, turn in (("P", "P2"), ("D", "D2r"), ("D~", "D~2")):
+            hist[c] += [{"role": "assistant", "content": res[turn]["text"]},
+                        {"role": "user", "content": BATCH_TURNS[c[0]][2]}]
+        res.update(d.generate_many([("D3", batch_req(hist["D"], mt), "ready")],
+                                   then={"D3": ("P3", batch_req(hist["P"], mt))}))
+        res.update(d.generate_many([("D3r", batch_req(hist["D"], mt), None), ("D~3", batch_req(hist["D~"], mt), None)]))
     finally:
         res["daemon_rc"] = d.close()
     with open(f"{prefix}.jsonl") as f:
@@ -307,8 +316,9 @@ def batch_checks(rows, expect_engine):
     fails, unex, notes = [], [], []
     cached = lambda r: r["done"].get("cached_tokens") or 0
     same = lambda a, b: (a["events"], a["ids"]) == (b["events"], b["ids"])
-    for name in ("P0", "P~0", "D0", "D~0", "P1", "P~1", "D1", "D~1", "P1r", "D1r", "D2", "P2", "D2r", "D~2"):
-        r, aborted = rows[name], name in ("P1", "D1", "D2")
+    for name in ("P0", "P~0", "D0", "D~0", "P1", "P~1", "D1", "D~1", "P1r", "D1r", "D2", "P2", "D2r", "D~2",
+                 "D3", "P3", "D3r", "D~3"):
+        r, aborted = rows[name], name in ("P1", "D1", "D2", "D3")
         if r["type"] != "done":
             fails.append(f"{name} error: {r['done'].get('message')}")
             continue
@@ -328,11 +338,12 @@ def batch_checks(rows, expect_engine):
             fails.append(f"twins {a}/{b} differ at turn 0")
     reuse = {}
     for turn, prev, n in (("P~1", "P~0", 0), ("D~1", "D~0", 0), ("P1r", "P0", 0), ("D1r", "D0", 0),
-                          ("P2", "P1r", 1), ("D~2", "D~1", 1), ("D2r", "D1r", 1)):
+                          ("P2", "P1r", 1), ("D~2", "D~1", 1), ("D2r", "D1r", 1),
+                          ("P3", "P2", 2), ("D~3", "D~2", 2), ("D3r", "D2r", 2)):
         reuse[turn] = [cached(rows[turn]), hist_len(rows[prev])]
         if reuse[turn][0] < reuse[turn][1]:
             fails.append(f"{turn} reused {reuse[turn][0]} < {reuse[turn][1]} (its committed turn {n})")
-    for retry, ctrl in (("P1r", "P~1"), ("D1r", "D~1"), ("D2r", "D~2")):
+    for retry, ctrl in (("P1r", "P~1"), ("D1r", "D~1"), ("D2r", "D~2"), ("D3r", "D~3")):
         if cached(rows[retry]) != cached(rows[ctrl]):
             notes.append(f"{retry} reused {cached(rows[retry])}, control {ctrl} {cached(rows[ctrl])}: tokens not compared")
         elif not same(rows[retry], rows[ctrl]):
@@ -831,7 +842,9 @@ def batch_self_test():
                 "P~1": row("cd", cached=7), "D~1": row("ef", cached=7),
                 "P1r": row("cd", cached=7), "D1r": row("ef", cached=7),  # turn 1 commits 7 + 5 + 2 = 14
                 "D2": row("x" * 8, finish="aborted", mt=256), "P2": row("gh", cached=14),
-                "D2r": row("ij", cached=14), "D~2": row("ij", cached=14), "daemon_rc": 0}
+                "D2r": row("ij", cached=14), "D~2": row("ij", cached=14),  # turn 2 commits 14 + 5 + 2 = 21
+                "D3": row("kl", finish="aborted"), "P3": row("mn", cached=21),
+                "D3r": row("kl", cached=21), "D~3": row("kl", cached=21), "daemon_rc": 0}
         return {**base, **over}
     good = batch_checks(rows(), True)
     assert good["ok"] and not good["unexercised"] and not good["notes"], good
@@ -841,7 +854,8 @@ def batch_self_test():
     assert batch_checks(rows(D1r=row("eX", cached=7)), True)["fails"] == ["D1r tokens differ from D~1 at the same reuse"]
     assert batch_checks(rows(D2r=row("ij", cached=0)), True)["fails"] == ["D2r reused 0 < 14 (its committed turn 1)"]
     assert batch_checks(rows(D2r=row("iX", cached=14)), True)["fails"] == ["D2r tokens differ from D~2 at the same reuse"]
-    more = batch_checks(rows(D1r=row("eX", cached=9), D2r=row("ij", cached=16)), True)  # more than the control: not compared
+    more = batch_checks(rows(D1r=row("eX", cached=9), D2r=row("ij", cached=16), D3r=row("kl", cached=23)),
+                        True)  # more than the control: not compared
     assert more["ok"] and more["notes"]
     assert batch_checks(rows(**{"P~0": row("aX")}), True)["fails"] == ["twins P0/P~0 differ at turn 0"]
     assert not batch_checks(rows(P0=row(loop="legacy")), True)["ok"]
