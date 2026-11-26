@@ -103,6 +103,101 @@ impl Qwen4Bundle {
         }
         Ok(())
     }
+
+    /// [`MeshLanes::step_windows`] with emitter-forced advances
+    /// ([`crate::lane_exec::Qwen4LaneExecutor::draft_step_forced`]).
+    fn windows(
+        &mut self,
+        gpu: &mut Gpu,
+        rows: &[(u64, usize)],
+        forced: &[(RequestEpoch, Vec<u32>)],
+    ) -> Result<Vec<LaneWindow>> {
+        let requests: Vec<(RequestEpoch, usize)> = rows
+            .iter()
+            .map(|&(tag, drafts)| (lane_epoch(tag), drafts))
+            .collect();
+        let drafted = self
+            .lane_executor()
+            .map_err(text)?
+            .draft_step_forced(gpu, &requests, forced)?;
+        let store = self.lanes().ok_or("Qwen4 lanes are not staged")?;
+        let mut slotted = Vec::with_capacity(rows.len());
+        for (epoch, _) in &requests {
+            let slot = store
+                .slot_of(epoch)
+                .ok_or_else(|| format!("engine lane {} is not admitted", epoch.request_tag))?;
+            let window = drafted
+                .iter()
+                .find(|window| window.epoch == *epoch)
+                .ok_or("the draft step omitted a lane")?;
+            if matches!(window.route, crate::lane_exec::LaneRoute::Batched { .. })
+                && window.drafts.is_empty()
+            {
+                return Err("a batched lane window drafted no tokens".into());
+            }
+            slotted.push((slot, *epoch, window.drafts.as_slice()));
+        }
+        slotted.sort_unstable_by_key(|&(slot, ..)| slot);
+        let mut plan = BatchStepPlan::default();
+        plan.batch.m_per_slot = vec![0; store.max_lanes()];
+        for &(slot, epoch, drafts) in &slotted {
+            let lane = store
+                .lane(&epoch)
+                .ok_or_else(|| format!("engine lane {} disappeared", epoch.request_tag))?;
+            let seed = store
+                .root_seed(&epoch)
+                .or(lane.host.pending_seed)
+                .ok_or("a decoding lane has no pending seed")?;
+            let begin = plan.batch.tokens.len();
+            let len = 1 + drafts.len();
+            plan.batch.tokens.push(seed);
+            plan.batch.tokens.extend_from_slice(drafts);
+            for j in 0..len {
+                plan.batch
+                    .positions
+                    .push(i32::try_from(lane.state.position + j).map_err(text)?);
+                plan.batch.row_slot.push(i32::try_from(slot).map_err(text)?);
+            }
+            plan.batch.m_per_slot[slot] = len;
+            plan.requests.push(RequestRows {
+                epoch,
+                rows: RowRange { begin, len },
+                kind: if drafts.is_empty() {
+                    RequestStepKind::Ar
+                } else {
+                    RequestStepKind::Verify {
+                        draft_len: drafts.len(),
+                    }
+                },
+            });
+            plan.decode_rows += len;
+        }
+        let advances = {
+            let mut executor = self.lane_executor().map_err(text)?;
+            let out = executor
+                .provision_step(gpu, &plan)
+                .and_then(|()| executor.forward_step(gpu, &plan))
+                .and_then(|stepped| executor.commit_step(gpu, &plan, stepped));
+            if out.is_err() {
+                executor.abort_step(&plan);
+            }
+            out?
+        };
+        requests
+            .iter()
+            .map(|(epoch, _)| {
+                advances
+                    .iter()
+                    .find(|advance| advance.epoch == *epoch && !advance.committed_ids.is_empty())
+                    .map(|advance| LaneWindow {
+                        committed: advance.committed_ids.clone(),
+                        drafted: advance.verified_rows.saturating_sub(1),
+                        accepted: advance.accepted_drafts,
+                    })
+                    .ok_or_else(|| format!("lane {} committed nothing", epoch.request_tag))
+            })
+            .collect()
+    }
 }
 
 impl MeshFamily for Qwen4Bundle {
@@ -330,112 +425,71 @@ impl MeshLanes for Qwen4Bundle {
     /// the root routes and drafts every lane, then one verify step over all
     /// of them commits each lane's greedy accept.
     fn step_windows(&mut self, gpus: &mut Gpus, rows: &[(u64, usize)]) -> Result<Vec<LaneWindow>> {
-        let gpu = device(gpus)?;
-        let requests: Vec<(RequestEpoch, usize)> = rows
-            .iter()
-            .map(|&(tag, drafts)| (lane_epoch(tag), drafts))
-            .collect();
-        let drafted = self
-            .lane_executor()
-            .map_err(text)?
-            .draft_step(gpu, &requests)?;
-        let store = self.lanes().ok_or("Qwen4 lanes are not staged")?;
-        let mut slotted = Vec::with_capacity(rows.len());
-        for (epoch, _) in &requests {
-            let slot = store
-                .slot_of(epoch)
-                .ok_or_else(|| format!("engine lane {} is not admitted", epoch.request_tag))?;
-            let window = drafted
-                .iter()
-                .find(|window| window.epoch == *epoch)
-                .ok_or("the draft step omitted a lane")?;
-            if matches!(window.route, crate::lane_exec::LaneRoute::Batched { .. })
-                && window.drafts.is_empty()
-            {
-                return Err("a batched lane window drafted no tokens".into());
-            }
-            slotted.push((slot, *epoch, window.drafts.as_slice()));
-        }
-        slotted.sort_unstable_by_key(|&(slot, ..)| slot);
-        let mut plan = BatchStepPlan::default();
-        plan.batch.m_per_slot = vec![0; store.max_lanes()];
-        for &(slot, epoch, drafts) in &slotted {
-            let lane = store
-                .lane(&epoch)
-                .ok_or_else(|| format!("engine lane {} disappeared", epoch.request_tag))?;
-            let seed = store
-                .root_seed(&epoch)
-                .or(lane.host.pending_seed)
-                .ok_or("a decoding lane has no pending seed")?;
-            let begin = plan.batch.tokens.len();
-            let len = 1 + drafts.len();
-            plan.batch.tokens.push(seed);
-            plan.batch.tokens.extend_from_slice(drafts);
-            for j in 0..len {
-                plan.batch
-                    .positions
-                    .push(i32::try_from(lane.state.position + j).map_err(text)?);
-                plan.batch.row_slot.push(i32::try_from(slot).map_err(text)?);
-            }
-            plan.batch.m_per_slot[slot] = len;
-            plan.requests.push(RequestRows {
-                epoch,
-                rows: RowRange { begin, len },
-                kind: if drafts.is_empty() {
-                    RequestStepKind::Ar
-                } else {
-                    RequestStepKind::Verify {
-                        draft_len: drafts.len(),
-                    }
-                },
-            });
-            plan.decode_rows += len;
-        }
-        let advances = {
-            let mut executor = self.lane_executor().map_err(text)?;
-            let out = executor
-                .provision_step(gpu, &plan)
-                .and_then(|()| executor.forward_step(gpu, &plan))
-                .and_then(|stepped| executor.commit_step(gpu, &plan, stepped));
-            if out.is_err() {
-                executor.abort_step(&plan);
-            }
-            out?
-        };
-        requests
-            .iter()
-            .map(|(epoch, _)| {
-                advances
-                    .iter()
-                    .find(|advance| advance.epoch == *epoch && !advance.committed_ids.is_empty())
-                    .map(|advance| LaneWindow {
-                        committed: advance.committed_ids.clone(),
-                        drafted: advance.verified_rows.saturating_sub(1),
-                        accepted: advance.accepted_drafts,
-                    })
-                    .ok_or_else(|| format!("lane {} committed nothing", epoch.request_tag))
-            })
-            .collect()
+        self.windows(device(gpus)?, rows, &[])
     }
 
-    /// The reverse of the promotion's swap: the lane's request states move
-    /// into the resident slot, and the session keeps them as its live state.
-    fn unpark(&mut self, gpus: &mut Gpus, tag: u64, tokens: &[u32]) -> Result<()> {
+    /// The reverse of the promotion's swap: the lane's request states (on an
+    /// MTP lane also its head, draft policy and pending hidden, into the
+    /// drafter) move into the resident slot, and the session keeps them as
+    /// its live state.
+    fn unpark(
+        &mut self,
+        gpus: &mut Gpus,
+        tag: u64,
+        tokens: &[u32],
+        drafter: Option<&mut dyn hipfire_runtime::spec::Speculator>,
+    ) -> Result<()> {
         let gpu = device(gpus)?;
         let epoch = lane_epoch(tag);
         if self.session.is_none() {
             return Err("no session cache: a lane record cannot continue live".into());
         }
-        let position = self
+        // A window lane stops with its last pick unrun, which the singleton's
+        // terminal flush runs: a forced one-row window runs it here, so the
+        // record continues at the same row a resident turn would.
+        let unrun = self.lanes().and_then(|store| {
+            let lane = store.lane(&epoch)?;
+            let at = lane.state.position;
+            let seed = store.root_seed(&epoch).or(lane.host.pending_seed);
+            (lane.spec.is_some() && at + 1 == tokens.len() && seed == Some(tokens[at]))
+                .then_some(tokens[at])
+        });
+        if let Some(seed) = unrun {
+            self.windows(gpu, &[(tag, 0)], &[(epoch, vec![seed])])?;
+        }
+        let lane = self
             .lanes()
             .and_then(|store| store.lane(&epoch))
-            .map(|lane| lane.state.position);
-        if position != Some(tokens.len()) {
+            .ok_or_else(|| format!("lane record {tag} disappeared"))?;
+        // Every row a lane ran is a committed pick: a position inside
+        // `tokens` holds exactly that prefix; past it, a window ran beyond
+        // its stop.
+        let position = lane.state.position;
+        if position > tokens.len() {
             return Err(format!(
-                "lane record {tag} sits at {position:?}, not at its {} tokens",
+                "lane record {tag} sits at {position}, past its {} tokens",
                 tokens.len()
             ));
         }
+        let mtp = match &lane.spec {
+            None => false,
+            Some(spec) => {
+                // A lane the floor retired decodes head-free: its head stays
+                // behind and keeps no owed rows, so it continues cold.
+                if spec.head.position() != position {
+                    return Err(format!(
+                        "lane record {tag}: the MTP head is at {}, the trunk at {position}",
+                        spec.head.position()
+                    ));
+                }
+                let drafter = drafter
+                    .and_then(|d| d.drafter_any_mut())
+                    .and_then(|any| any.downcast_mut::<crate::mtp_spec::Qwen4MtpDrafter>())
+                    .ok_or("an MTP lane record continues with a native Qwen4 MTP drafter")?;
+                drafter.adopt_pending_hidden(gpu, &spec.pending_hidden)?;
+                true
+            }
+        };
         // As the promotion: the resident request moves sealed.
         self.seal_gdn_streams(gpu).map_err(text)?;
         self.with_lanes(|store, bundle| {
@@ -445,14 +499,23 @@ impl MeshLanes for Qwen4Bundle {
             bundle.state.clamp_f16_valid();
             lane.state.clamp_f16_valid();
             bundle.state.swap_requests(&mut lane.state);
+            if let (Some(spec), Some(mtp)) = (lane.spec.as_mut(), bundle.mtp.as_mut()) {
+                std::mem::swap(&mut mtp.state, &mut spec.head);
+                mtp.draft.set_request_state(spec.draft);
+            }
             store.release(&epoch)
         })
         .map_err(text)?;
         // The kept state continues: request-local PLE work of an earlier
         // request must not publish into it (`session_begin`'s live rule).
         self.invalidate_ple_epoch().map_err(text)?;
+        let route = if mtp {
+            SessionRoute::Mtp
+        } else {
+            SessionRoute::Ar
+        };
         if let Some(session) = self.session.as_mut() {
-            session.adopt_live(tokens, SessionRoute::Ar);
+            session.adopt_live(&tokens[..position], route);
         }
         Ok(())
     }
@@ -577,11 +640,5 @@ impl MeshLanes for Qwen4Bundle {
         if let Err(error) = self.release_lane(&lane_epoch(tag)) {
             eprintln!("[engine] lane {tag} release: {error}");
         }
-    }
-
-    /// An MTP lane's state runs ahead of a window that stopped inside it: no
-    /// record continues it.
-    fn keeps_records(&self) -> bool {
-        !self.windows()
     }
 }

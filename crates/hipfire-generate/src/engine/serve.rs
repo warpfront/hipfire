@@ -1299,7 +1299,13 @@ impl Batch for Ctx<'_> {
                 .mesh_family()
                 .and_then(|family| family.mesh_lanes())
             {
-                if let Err(error) = lanes.unpark(self.gpus, record.tag, &record.tokens) {
+                // A speculative turn continues a window lane with its drafter.
+                let drafter: Option<&mut dyn Speculator> =
+                    match (&live.spec, self.speculator.as_mut()) {
+                        (Some(_), Some(drafter)) => Some(&mut **drafter),
+                        _ => None,
+                    };
+                if let Err(error) = lanes.unpark(self.gpus, record.tag, &record.tokens, drafter) {
                     eprintln!("[engine] lane record {} not continued: {error}", record.tag);
                     lanes.free_lane(record.tag);
                 }
@@ -1529,18 +1535,20 @@ impl Batch for Ctx<'_> {
             .as_mut()
             .ok_or("park of a missing request")?;
         let d = run.draft.as_mut().ok_or("a window lane needs a drafter")?;
-        self.state
+        let lanes = self
+            .state
             .mesh_family()
             .and_then(|family| family.mesh_lanes())
-            .ok_or("the load staged no engine lanes")?
-            .park_window(
-                self.gpus,
-                live.tag,
-                &live.prompt,
-                &d.emitted,
-                &mut *d.drafter,
-                remaining,
-            )?;
+            .ok_or("the load staged no engine lanes")?;
+        make_room(lanes, &mut self.runner.records);
+        lanes.park_window(
+            self.gpus,
+            live.tag,
+            &live.prompt,
+            &d.emitted,
+            &mut *d.drafter,
+            remaining,
+        )?;
         let mut d = run
             .take_window_drafting()
             .ok_or("a parked speculative request was not at a window boundary")?;

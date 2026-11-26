@@ -187,7 +187,13 @@ impl MeshLanes for Gemma4Bundle {
         Ok(())
     }
 
-    fn unpark(&mut self, _gpus: &mut Gpus, tag: u64, _tokens: &[u32]) -> Result<()> {
+    fn unpark(
+        &mut self,
+        _gpus: &mut Gpus,
+        tag: u64,
+        _tokens: &[u32],
+        _drafter: Option<&mut dyn hipfire_runtime::spec::Speculator>,
+    ) -> Result<()> {
         Err(format!("gemma4 lane {tag} is not a conversation record"))
     }
 

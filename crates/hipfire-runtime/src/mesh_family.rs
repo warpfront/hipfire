@@ -140,11 +140,19 @@ pub trait MeshLanes {
         seed: u32,
         remaining: usize,
     ) -> Result<()>;
-    /// Move `tag`'s lane, holding exactly `tokens` of a committed
-    /// conversation, back into the resident state as its live state (the
-    /// session adopts it); the lane is freed. The resident state must hold
+    /// Move `tag`'s lane, holding a prefix of `tokens` (a committed
+    /// conversation; a window lane may leave its last pick unrun), back into
+    /// the resident state as its live state (the session adopts it); the
+    /// lane is freed. A window lane's draft state moves back into `drafter`
+    /// (the reverse of [`Self::park_window`]). The resident state must hold
     /// no request.
-    fn unpark(&mut self, gpus: &mut Gpus, tag: u64, tokens: &[u32]) -> Result<()>;
+    fn unpark(
+        &mut self,
+        gpus: &mut Gpus,
+        tag: u64,
+        tokens: &[u32],
+        drafter: Option<&mut dyn crate::spec::Speculator>,
+    ) -> Result<()>;
     /// One epoch: every `(tag, token, logits)` lane runs `token`; returns, in
     /// order, each lane's argmax of that row ([`DecodeOut::Top1`]) or, with
     /// `logits`, the row itself ([`DecodeOut::Logits`], for the request's

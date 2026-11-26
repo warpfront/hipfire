@@ -6929,6 +6929,19 @@ impl Qwen4MtpDrafter {
         })
     }
 
+    /// The reverse of [`Self::promotion_parts`] for a lane record that
+    /// continues live: its next row's head hidden becomes this drafter's.
+    pub fn adopt_pending_hidden(&mut self, gpu: &mut Gpu, from: &GpuTensor) -> Result<(), String> {
+        let pending = self.pending_hidden.as_ref().ok_or_else(|| {
+            "Qwen4 MTP lane record: the drafter holds no request resources".to_string()
+        })?;
+        if pending.byte_size() != from.byte_size() {
+            return Err("Qwen4 MTP lane record: pending hidden size differs".to_string());
+        }
+        gpu.copy_d2d(from, pending, from.byte_size())
+            .map_err(|error| format!("Qwen4 MTP lane record pending hidden: {error}"))
+    }
+
     /// Developer-forced route that bypasses the floor.
     fn floor_forced() -> bool {
         matches!(
