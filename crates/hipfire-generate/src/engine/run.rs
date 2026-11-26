@@ -279,10 +279,13 @@ impl Job<'_> {
                 (exit, forwards.prompt_done)
             }
         };
-        // A finished request is acknowledged only once its last decode
-        // epochs drained (greedy decode leaves them in flight).
+        // A finished or aborted request is acknowledged only once its last
+        // epochs drained (greedy decode and the prompt leave them in flight);
+        // a failed drain is a device failure, not a client cancel.
         let exit = match (exit, runner.end(mesh_request, gpus)) {
-            (Exit::Finished(_), Err(error)) => Exit::Failed(format!("drain failed: {error}")),
+            (Exit::Finished(_) | Exit::Aborted, Err(error)) => {
+                Exit::Failed(format!("drain failed: {error}"))
+            }
             (exit, _) => exit,
         };
         let finish = match exit {

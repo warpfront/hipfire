@@ -1138,6 +1138,15 @@ impl<'a> Ctx<'a> {
             },
             exit => exit,
         };
+        // An aborted resident request may leave epochs in flight; a failed
+        // drain of them is a device failure, not a client cancel.
+        let exit = match exit {
+            Exit::Aborted if place == Place::Resident => match self.runner.settle(self.gpus) {
+                Ok(()) => Exit::Aborted,
+                Err(error) => Exit::Failed(format!("drain failed: {error}")),
+            },
+            exit => exit,
+        };
         let live = self.lives[idx]
             .take()
             .expect("an ended request is admitted");
