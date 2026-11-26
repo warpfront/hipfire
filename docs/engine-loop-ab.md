@@ -285,13 +285,15 @@ records keep. `--batch` loads one more daemon per arm with `load` +
 `batch_load` and sends greedy chat turns as `hipfire bench --backend batch`
 does (`serve_continuous_batch`, neutral penalties, thinking off). Two twin
 pairs of conversations (identical messages): P (abort in the prompt) and D
-(abort in decode).
+(abort in decode, in a lane at turn 1 and on the resident state at turn 2).
 
 | step | requests, sent together | abort |
 |---|---|---|
 | 1 | turn 0 of P, P~, D, D~ | – |
 | 2 | turn 1 of P (a ~3k-token user turn), P~, D (counting to 100, 4× budget), D~ | P on its `gen_start` (admitted, so it lands in the prompt); D after 8 token events |
 | 3 | turn 1 of P and D again (`P1r`, `D1r`) | – |
+| 4 | turn 2 of D alone (counting again, 4× budget: it decodes on the resident state); P's turn 2 is sent right behind D2's abort, so it takes the resident state next | D after 8 token events |
+| 5 | turn 2 of D again (`D2r`) and of D~ (`D~2`, the control) | – |
 
 Gates, on the engine arm (the legacy arm is a reference row: legacy fn-lanes
 keep no records):
@@ -300,11 +302,15 @@ keep no records):
   `expect_engine`
 - the twins' turn 0 are token-exact
 - **reuse:** P~1, D~1 (concurrent follow-ups) and the retries P1r, D1r
-  (after the aborts) reuse at least their conversation's committed turn 0:
+  (after the aborts) reuse at least their conversation's committed turn 0;
+  P2, D~2 and D2r (after the resident abort and P2's turn) reuse at least
+  their committed turn 1:
   `cached_tokens` >= its prompt plus every committed id (a follow-up that
   reuses the whole turn reports exactly that). The receipt lists
-  `reuse[turn] = [cached, committed turn 0]`.
-- a retry with its control's reuse (P1r vs P~1, D1r vs D~1, identical
+  `reuse[turn] = [cached, committed previous turn]`. D2r and D~2 have identical
+  prompts, so either may continue either record: both reuse only when D's
+  record survived D2's abort and P2's turn.
+- a retry with its control's reuse (P1r vs P~1, D1r vs D~1, D2r vs D~2, identical
   prompts) has the control's tokens and ids; with a different reuse the pair is
   only noted
 
@@ -314,7 +320,7 @@ a reuse failure caused by a known refusal (e.g. a retired MTP lane) is
 attributable. Such a failure still fails the gate.
 
 Unexercised (`pass-partial`): an abort that did not land, P1's abort after
-decode tokens, D1's past half its budget, or a finished request that did not
+decode tokens, D1's or D2's past half its budget, or a finished request that did not
 run batched (`continuous_batch.executed`).
 
 ## Coverage gaps

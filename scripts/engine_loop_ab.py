@@ -95,17 +95,27 @@ class Daemon:
         it after that many token or reasoning events (mid-decode)."""
         return self.generate_many([(rid, req, "now" if abort_now else abort_at_token)])[rid]
 
-    def generate_many(self, specs):
+    def generate_many(self, specs, then=None):
         """Run several requests at once to their terminal events; returns {rid: result}.
         specs: [(rid, req, abort)]; abort is None, "now" (sent right behind the
         request), "start" (sent on its `gen_start`: admitted, so it lands in the
-        prompt) or N (sent after N token or reasoning events: mid-decode)."""
+        prompt) or N (sent after N token or reasoning events: mid-decode).
+        then: {rid: (rid2, req2)} sends rid2's `generate` right behind rid's abort."""
         live = {}
-        for rid, req, abort in specs:
+
+        def generate(rid, req, abort):
             self.send({"type": "generate", "id": rid, "attempt_id": 1, **req})
-            if abort == "now":
-                self.send({"type": "abort", "id": rid, "attempt_id": 1})
             live[rid] = {"req": req, "abort": abort, "events": [], "ids": []}
+            if abort == "now":
+                abort_(rid)
+
+        def abort_(rid):
+            self.send({"type": "abort", "id": rid, "attempt_id": 1})
+            if rid in (then or {}):
+                generate(*then[rid], None)
+
+        for spec in specs:
+            generate(*spec)
         out = {}
         while len(out) < len(live):
             e = self.recv()
@@ -114,11 +124,11 @@ class Daemon:
             if s is None or rid in out:
                 continue
             if t == "gen_start" and s["abort"] == "start":
-                self.send({"type": "abort", "id": rid, "attempt_id": 1})
+                abort_(rid)
             elif t in ("token", "reasoning"):
                 s["events"].append([t[0], e.get("text", "")])
                 if isinstance(s["abort"], int) and len(s["events"]) == s["abort"]:
-                    self.send({"type": "abort", "id": rid, "attempt_id": 1})
+                    abort_(rid)
             elif t == "committed":  # HIPFIRE_EMIT_TOKEN_IDS=1: exact token ids
                 s["ids"].append([e.get("tok_id"), e.get("pos")])
             elif t == "commit_ready":
@@ -229,8 +239,9 @@ def run_arm(args, route, arm, out, eos_n=None):
 BATCH_LOAD = {"continuous_batch_size": 4, "serve_vmm_batch": {}}
 # Twin conversation pairs (identical messages): P aborts its second turn in the
 # prompt, D in decode; the twin's second turn is the control the retry must match.
-BATCH_TURNS = {"P": ("Explain how a hash map resolves collisions.", LONG),
-               "D": ("Name five rivers in Europe.", COUNT)}
+# D's third turn is aborted in decode on the resident state, P's third turn right behind it.
+BATCH_TURNS = {"P": ("Explain how a hash map resolves collisions.", LONG, COLD),
+               "D": ("Name five rivers in Europe.", COUNT, COUNT)}
 
 
 def batch_req(messages, max_tokens):
@@ -244,7 +255,9 @@ def batch_req(messages, max_tokens):
 def run_batch(args, route, arm, out):
     """One fresh daemon on the continuous-batch route: turn 0 of P, P~, D, D~ at once;
     then their turn 1 at once, P's aborted on `gen_start` (in the prompt), D's after
-    8 tokens; then P's and D's turn 1 again. Returns {request: result}."""
+    8 tokens; then P's and D's turn 1 again; then D's turn 2 alone (resident), aborted
+    after 8 tokens with P's turn 2 sent right behind the abort; then D's and D~'s turn 2.
+    Returns {request: result}."""
     prefix = f"{out}/{route['name']}.batch.{arm}"
     wait_gpu_released()  # a `--conc` bench's daemon can still hold the reservation (HIPF-472 r4)
     d = Daemon(args.daemon, arm_env(route, arm), prefix, args.timeout)
@@ -260,6 +273,12 @@ def run_batch(args, route, arm, out):
         res.update(d.generate_many([("P1", batch_req(hist["P"], mt), "start"), ("P~1", batch_req(hist["P~"], mt), None),
                                     ("D1", batch_req(hist["D"], 4 * mt), 8), ("D~1", batch_req(hist["D~"], mt), None)]))
         res.update(d.generate_many([("P1r", batch_req(hist["P"], mt), None), ("D1r", batch_req(hist["D"], mt), None)]))
+        for c, turn in (("P", "P1r"), ("D", "D1r"), ("D~", "D~1")):
+            hist[c] += [{"role": "assistant", "content": res[turn]["text"]},
+                        {"role": "user", "content": BATCH_TURNS[c[0]][2]}]
+        res.update(d.generate_many([("D2", batch_req(hist["D"], 4 * mt), 8)],
+                                   then={"D2": ("P2", batch_req(hist["P"], mt))}))
+        res.update(d.generate_many([("D2r", batch_req(hist["D"], mt), None), ("D~2", batch_req(hist["D~"], mt), None)]))
     finally:
         res["daemon_rc"] = d.close()
     with open(f"{prefix}.jsonl") as f:
@@ -282,13 +301,14 @@ def batch_checks(rows, expect_engine):
     - every request ends in `done`; the aborted ones `aborted`, the others batched
     - the twins' turn 0 are token-exact (identical prompts at once)
     - every turn 1 that finished (P~1, D~1, and the retries P1r, D1r after the
-      aborts) reuses at least its conversation's committed turn 0
+      aborts) reuses at least its conversation's committed turn 0; P2, D~2 and
+      D2r (after D2's resident abort and P2's turn) reuse their committed turn 1
     - a retry with the control's reuse gives the control's tokens and ids"""
     fails, unex, notes = [], [], []
     cached = lambda r: r["done"].get("cached_tokens") or 0
     same = lambda a, b: (a["events"], a["ids"]) == (b["events"], b["ids"])
-    for name in ("P0", "P~0", "D0", "D~0", "P1", "P~1", "D1", "D~1", "P1r", "D1r"):
-        r, aborted = rows[name], name in ("P1", "D1")
+    for name in ("P0", "P~0", "D0", "D~0", "P1", "P~1", "D1", "D~1", "P1r", "D1r", "D2", "P2", "D2r", "D~2"):
+        r, aborted = rows[name], name in ("P1", "D1", "D2")
         if r["type"] != "done":
             fails.append(f"{name} error: {r['done'].get('message')}")
             continue
@@ -300,17 +320,19 @@ def batch_checks(rows, expect_engine):
             unex.append(f"{name} ran on the singleton route, not batched")
     if rows["P1"]["events"]:
         unex.append(f"P1: the abort landed after {len(rows['P1']['events'])} decode events, not in the prompt")
-    if len(rows["D1"]["events"]) > rows["D1"]["max_tokens"] // 2:
-        unex.append(f"D1: the abort landed at {len(rows['D1']['events'])}/{rows['D1']['max_tokens']} events")
+    for name in ("D1", "D2"):
+        if len(rows[name]["events"]) > rows[name]["max_tokens"] // 2:
+            unex.append(f"{name}: the abort landed at {len(rows[name]['events'])}/{rows[name]['max_tokens']} events")
     for a, b in (("P0", "P~0"), ("D0", "D~0")):
         if not same(rows[a], rows[b]):
             fails.append(f"twins {a}/{b} differ at turn 0")
     reuse = {}
-    for turn, prev in (("P~1", "P~0"), ("D~1", "D~0"), ("P1r", "P0"), ("D1r", "D0")):
+    for turn, prev, n in (("P~1", "P~0", 0), ("D~1", "D~0", 0), ("P1r", "P0", 0), ("D1r", "D0", 0),
+                          ("P2", "P1r", 1), ("D~2", "D~1", 1), ("D2r", "D1r", 1)):
         reuse[turn] = [cached(rows[turn]), hist_len(rows[prev])]
         if reuse[turn][0] < reuse[turn][1]:
-            fails.append(f"{turn} reused {reuse[turn][0]} < {reuse[turn][1]} (its committed turn 0)")
-    for retry, ctrl in (("P1r", "P~1"), ("D1r", "D~1")):
+            fails.append(f"{turn} reused {reuse[turn][0]} < {reuse[turn][1]} (its committed turn {n})")
+    for retry, ctrl in (("P1r", "P~1"), ("D1r", "D~1"), ("D2r", "D~2")):
         if cached(rows[retry]) != cached(rows[ctrl]):
             notes.append(f"{retry} reused {cached(rows[retry])}, control {ctrl} {cached(rows[ctrl])}: tokens not compared")
         elif not same(rows[retry], rows[ctrl]):
@@ -807,7 +829,9 @@ def batch_self_test():
         base = {"P0": row(), "P~0": row(), "D0": row(), "D~0": row(),  # turn 0 commits 5 + 2 = 7
                 "P1": row("", finish="aborted"), "D1": row("x" * 8, finish="aborted", mt=256),
                 "P~1": row("cd", cached=7), "D~1": row("ef", cached=7),
-                "P1r": row("cd", cached=7), "D1r": row("ef", cached=7), "daemon_rc": 0}
+                "P1r": row("cd", cached=7), "D1r": row("ef", cached=7),  # turn 1 commits 7 + 5 + 2 = 14
+                "D2": row("x" * 8, finish="aborted", mt=256), "P2": row("gh", cached=14),
+                "D2r": row("ij", cached=14), "D~2": row("ij", cached=14), "daemon_rc": 0}
         return {**base, **over}
     good = batch_checks(rows(), True)
     assert good["ok"] and not good["unexercised"] and not good["notes"], good
@@ -815,7 +839,9 @@ def batch_self_test():
     assert batch_checks(rows(P1r=row("cd", cached=0)), True)["fails"] == ["P1r reused 0 < 7 (its committed turn 0)"]
     assert batch_checks(rows(**{"D~1": row("ef", cached=3)}), True)["fails"] == ["D~1 reused 3 < 7 (its committed turn 0)"]
     assert batch_checks(rows(D1r=row("eX", cached=7)), True)["fails"] == ["D1r tokens differ from D~1 at the same reuse"]
-    more = batch_checks(rows(D1r=row("eX", cached=9)), True)  # more reuse than the control: not compared
+    assert batch_checks(rows(D2r=row("ij", cached=0)), True)["fails"] == ["D2r reused 0 < 14 (its committed turn 1)"]
+    assert batch_checks(rows(D2r=row("iX", cached=14)), True)["fails"] == ["D2r tokens differ from D~2 at the same reuse"]
+    more = batch_checks(rows(D1r=row("eX", cached=9), D2r=row("ij", cached=16)), True)  # more than the control: not compared
     assert more["ok"] and more["notes"]
     assert batch_checks(rows(**{"P~0": row("aX")}), True)["fails"] == ["twins P0/P~0 differ at turn 0"]
     assert not batch_checks(rows(P0=row(loop="legacy")), True)["ok"]

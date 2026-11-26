@@ -666,8 +666,29 @@ impl Driver {
                                 fed,
                                 live.prompt.len(),
                             );
+                        // A finished AR turn the client left rewinds in a lane.
+                        let parked = if live.spec.is_none() {
+                            state
+                                .mesh_family()
+                                .and_then(|family| family.mesh_lanes())
+                                .and_then(|lanes| {
+                                    park_cancelled(
+                                        lanes,
+                                        runner,
+                                        gpus,
+                                        live.tag,
+                                        &live.prompt,
+                                        &live.history,
+                                        &mut None,
+                                    )
+                                })
+                        } else {
+                            None
+                        };
                         let released = if kept {
                             Ok(())
+                        } else if let Some(parked) = parked {
+                            parked
                         } else {
                             match (live.spec.is_some(), speculator.as_deref_mut()) {
                                 (true, Some(drafter)) => reset_drafting(state, gpus, drafter, true),
@@ -950,6 +971,44 @@ fn keep_record(
     }
 }
 
+/// A resident AR request the client cancelled after its prompt ran, every
+/// token of `history` run: its state moves into a lane, which rewinds to its
+/// turn start as a cancelled lane request's does ([`cancel_lane`]), so another
+/// conversation's turn on the resident state does not drop it. `None`: the
+/// state did not move, and the caller rolls it back.
+fn park_cancelled(
+    lanes: &mut dyn MeshLanes,
+    runner: &mut MeshRunner,
+    gpus: &mut Gpus,
+    tag: u64,
+    prompt: &[u32],
+    history: &[u32],
+    request: &mut Option<MeshRequest>,
+) -> Option<Result<(), String>> {
+    // A window store parks AR requests never; a prompt cut short has no history.
+    if !lanes.keeps_records()
+        || lanes.windows()
+        || history.len() < prompt.len()
+        || !make_room(lanes, &mut runner.records)
+    {
+        return None;
+    }
+    // A record never decodes: its seed is never run. The park refuses a state
+    // that does not sit after `history`, before it moves anything.
+    if let Err(error) = lanes.park(gpus, tag, history, &[], 0, 0) {
+        eprintln!("[engine] cancelled conversation not kept in a lane: {error}");
+        return None;
+    }
+    if let Some(request) = request.take() {
+        if let Err(error) = runner.end(request, gpus) {
+            lanes.free_lane(tag);
+            return Some(Err(error));
+        }
+    }
+    cancel_lane(lanes, &mut runner.records, tag, prompt);
+    Some(Ok(()))
+}
+
 /// A cancel's terminal after its release: the engine `aborted` done when the
 /// release was attested, else the singleton's fail-closed error
 /// (`rolled_back: false`, no `done`) and `Err` so the driver stops serving
@@ -1160,7 +1219,7 @@ impl<'a> Ctx<'a> {
             },
             exit => exit,
         };
-        let live = self.lives[idx]
+        let mut live = self.lives[idx]
             .take()
             .expect("an ended request is admitted");
         let released = match place {
@@ -1186,6 +1245,27 @@ impl<'a> Ctx<'a> {
                     }
                     .and_then(|()| self.rollback(live.request))
                 }
+            }
+            Place::Resident if matches!(exit, Exit::Aborted) => {
+                let history = match &self.sched.lanes[idx] {
+                    BatchLane::Running(lane) => lane.conversation_tokens.as_slice(),
+                    _ => &[],
+                };
+                self.state
+                    .mesh_family()
+                    .and_then(|family| family.mesh_lanes())
+                    .and_then(|lanes| {
+                        park_cancelled(
+                            lanes,
+                            self.runner,
+                            self.gpus,
+                            live.tag,
+                            &live.prompt,
+                            history,
+                            &mut live.request,
+                        )
+                    })
+                    .unwrap_or_else(|| self.rollback(live.request.take()))
             }
             Place::Resident => self.rollback(live.request),
             Place::Lane if matches!(exit, Exit::Aborted) => {
