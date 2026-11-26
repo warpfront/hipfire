@@ -447,14 +447,25 @@ impl MeshLanes for Qwen4Bundle {
         // A window lane stops with its last pick unrun, which the singleton's
         // terminal flush runs: a forced one-row window runs it here, so the
         // record continues at the same row a resident turn would.
-        let unrun = self.lanes().and_then(|store| {
-            let lane = store.lane(&epoch)?;
-            let at = lane.state.position;
-            let seed = store.root_seed(&epoch).or(lane.host.pending_seed);
-            (lane.spec.is_some() && at + 1 == tokens.len() && seed == Some(tokens[at]))
-                .then_some(tokens[at])
-        });
-        if let Some(seed) = unrun {
+        let (head, at, seed) = {
+            let store = self.lanes().ok_or("Qwen4 lanes are not staged")?;
+            let lane = store
+                .lane(&epoch)
+                .ok_or_else(|| format!("lane record {tag} disappeared"))?;
+            (
+                lane.spec.as_ref().map(|spec| spec.head.position()),
+                lane.state.position,
+                store.root_seed(&epoch).or(lane.host.pending_seed),
+            )
+        };
+        // A retired lane's head lags with no owed rows: refused before the
+        // forced row, which it could not use.
+        if head.is_some_and(|head| head != at) {
+            return Err(format!(
+                "lane record {tag}: the MTP head is at {head:?}, the trunk at {at}"
+            ));
+        }
+        if let Some(seed) = unrun_seed(head.is_some(), at, seed, tokens) {
             self.windows(gpu, &[(tag, 0)], &[(epoch, vec![seed])])?;
         }
         let lane = self
@@ -640,5 +651,32 @@ impl MeshLanes for Qwen4Bundle {
         if let Err(error) = self.release_lane(&lane_epoch(tag)) {
             eprintln!("[engine] lane {tag} release: {error}");
         }
+    }
+}
+
+/// The unrun last pick of a window lane record at `at` (its pending `seed`)
+/// that holds `tokens`: `Some` only when exactly that one pick is left. An
+/// AR lane, or a lane at or past its tokens, has none.
+fn unrun_seed(window: bool, at: usize, seed: Option<u32>, tokens: &[u32]) -> Option<u32> {
+    let last = *tokens.get(at)?;
+    (window && at + 1 == tokens.len() && seed == Some(last)).then_some(last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unrun_seed;
+
+    #[test]
+    fn only_a_window_lane_one_pick_short_runs_its_seed() {
+        let tokens = [1, 2, 3];
+        assert_eq!(unrun_seed(true, 2, Some(3), &tokens), Some(3));
+        // At or past its tokens (HIPF-591 B1: indexed out of bounds).
+        assert_eq!(unrun_seed(true, 3, Some(3), &tokens), None);
+        assert_eq!(unrun_seed(true, 4, Some(3), &tokens), None);
+        assert_eq!(unrun_seed(false, 3, Some(3), &tokens), None);
+        // AR lane, another seed, or more than one pick short.
+        assert_eq!(unrun_seed(false, 2, Some(3), &tokens), None);
+        assert_eq!(unrun_seed(true, 2, Some(9), &tokens), None);
+        assert_eq!(unrun_seed(true, 1, Some(2), &tokens), None);
     }
 }

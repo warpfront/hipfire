@@ -731,9 +731,9 @@ impl Driver {
                     let kept: &[u32] = if live.invalidated { &[] } else { &live.history };
                     let state = m.state.as_deref_mut().ok_or("the model has no state")?;
                     state.session_commit_live_mesh(gpus, kept);
-                    // A speculative turn keeps no lane record: its follow-up
-                    // continues the live state with the drafter's own state,
-                    // which a lane does not hold.
+                    // A resident speculative turn keeps no lane record: a
+                    // record parks through the AR `park`, which does not move
+                    // the drafter's state (only `park_window` does).
                     if keeps_records && !live.invalidated && live.spec.is_none() {
                         if let Some(lanes) = lanes_of(m) {
                             keep_record(lanes, runner, gpus, live.tag, &live.history);
