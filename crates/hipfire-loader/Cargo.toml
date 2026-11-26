@@ -63,6 +63,15 @@ serde_json.workspace = true
 hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4", features = ["lab"] }
 sha2.workspace = true
 tempfile = "3"
+# inkling_kld (arch-24 paired KLD evaluator): the quantizer's strict
+# NVFP4/MXFP8 source decoders and safetensors reader for the teacher, the
+# saddle-quant HFKLDR v3 / HFKSEQ formats, the batched CPU teacher's threads
+# and the reference mmap.
+hipfire-quantize = { path = "../hipfire-quantize" }
+saddle-quant = { path = "../saddle-quant" }
+rayon.workspace = true
+memmap2.workspace = true
+serde = { version = "1", features = ["derive"] }
 
 # ---------------------------------------------------------------------------
 # Archived research probes.
