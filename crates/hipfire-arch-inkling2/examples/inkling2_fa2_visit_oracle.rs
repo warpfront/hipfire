@@ -40,7 +40,10 @@ fn main() {
     let weights = Inkling2Weights::load(&hfq, &cfg).expect("weights");
     let mut gpu = Gpu::init().expect("gpu init");
     let max_seq = n_tokens + 64;
-    let (gw, gs) = upload(&weights, &cfg, &mut gpu, max_seq).expect("upload");
+    let (gw, mut gs) = upload(&weights, &cfg, &mut gpu, max_seq).expect("upload");
+    // The reference is the scalar kernel: pin the forward to it (FA2 is the
+    // default on gfx1201) so the captured `attn_heads` are scalar output.
+    gs.attn_fa2 = false;
     let mut bundle = Inkling2Bundle {
         config: cfg,
         weights,

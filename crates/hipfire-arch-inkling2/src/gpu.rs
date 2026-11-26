@@ -1017,6 +1017,7 @@ pub struct Inkling2GpuState {
     /// Decode attention route: `false` = the scalar `inkling2_gf_attn_decode_f32`,
     /// `true` = the split-KV FA2 kernel (`Gpu::inkling2_attn_decode_fa2`,
     /// gfx1201 only; it fails closed elsewhere). Same operands either way.
+    /// Defaults to FA2 on gfx1201 and scalar on every other arch.
     pub attn_fa2: bool,
 }
 
@@ -1135,7 +1136,7 @@ impl Inkling2GpuState {
             max_seq,
             kv_bytes,
             conv_bytes,
-            attn_fa2: false,
+            attn_fa2: gpu.arch == "gfx1201",
         })
     }
 
