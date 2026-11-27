@@ -42,6 +42,17 @@ SPEC = re.compile(r"^(tau|cycles|rounds|accepted|mtp_windows|floor_ar_windows|ar
 # Greedy scenarios whose done envelopes feed G-spec (aborted requests excluded).
 GREEDY = ("cold", "multi_turn", "interleaved", "abort_prefill", "abort_decode", "eos_budget", "isolation")
 COLD = "Write one sentence about the sea."
+# Route key `chat_system`: this system message opens every multi-turn, interleaved
+# and batch conversation, so each prompt is longer than the 256-row prefill chunk
+# (a Gemma 4 follow-up reuses the previous prompt rounded down to the chunk).
+CHAT_SYSTEM = "You are a concise assistant. Reference notes, not to be quoted:\n" + "".join(
+    f"Note {i}: the {w} sensor on rack {i % 7} reported {i * 13 % 97} units. "
+    for i, w in enumerate(["thermal", "power", "fan", "humidity"] * 6))
+
+
+def chat_start(route):
+    """The messages a conversation starts with (the route's `chat_system`)."""
+    return [{"role": "system", "content": CHAT_SYSTEM}] if route.get("chat_system") else []
 COUNT = "List the numbers from 1 to 100, one per line, as digits."  # decodes long: aborts land mid-decode
 LONG = (
     "Summarize the following notes in two sentences.\n"
@@ -184,7 +195,7 @@ def run_arm(args, route, arm, out, eos_n=None):
         # cold start: first request on a fresh load
         res["cold"] = [d.generate("cold", greedy(COLD, mt))]
         # multi-turn reuse: each turn resends the history; cached_tokens must match
-        hist, turns = [], []
+        hist, turns = chat_start(route), []
         for k, user in enumerate(["Name three primes.", "Now add them up.",
                                   "Is the sum prime?", "Answer in one word."]):
             hist.append({"role": "user", "content": user})
@@ -196,7 +207,7 @@ def run_arm(args, route, arm, out, eos_n=None):
         res["multi_turn"] = turns
         # two conversations interleaved A1 B1 A2 B2: a turn must reuse its own
         # conversation's prefix with the other one's state live in between (N records)
-        convs = {c: [] for c in "AB"}
+        convs = {c: chat_start(route) for c in "AB"}
         res["interleaved"] = []
         for t, user in enumerate(["Name a {} fruit.", "Why is it {}?"]):
             for c, color in (("A", "red"), ("B", "yellow")):
@@ -268,7 +279,8 @@ def run_batch(args, route, arm, out):
     res = {}
     try:
         res["loaded"] = d.load(route["model"], {**route.get("load", {}), **route.get("batch_load", BATCH_LOAD)})
-        hist = {c: [{"role": "user", "content": BATCH_TURNS[c[0]][0]}] for c in ("P", "P~", "D", "D~")}
+        hist = {c: chat_start(route) + [{"role": "user", "content": BATCH_TURNS[c[0]][0]}]
+                for c in ("P", "P~", "D", "D~")}
         res.update(d.generate_many([(c + "0", batch_req(hist[c], mt), None) for c in hist]))
         for c in hist:
             hist[c] += [{"role": "assistant", "content": res[c + "0"]["text"]},

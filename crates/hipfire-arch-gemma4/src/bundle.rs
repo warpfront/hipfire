@@ -11,20 +11,12 @@
 //! position-indexed and never rewritten below the position, so a snapshot
 //! stores only the rows above its parent.
 //!
-//! Every reuse point is a snapshot boundary whose rows a cold prefill wrote
-//! with the same chunks, so a cached turn is byte-identical to a cold one.
-//! A prefill splits its chunks at each boundary it crosses, and every
-//! boundary depends only on the tokens before it ([`turn_boundaries`]), so
-//! the chunks below a boundary are the same in every prompt with that
-//! prefix. In the first chunk the boundaries are the position after each
-//! end-of-turn token (`<turn|>`), so the next turn of a short conversation
-//! resumes after the last end-of-turn token of its previous prompt. Above
-//! it they are chunk multiples only (a split per message would make a long
-//! history prefill in many small chunks): a long conversation resumes at
-//! its previous prompt rounded down to the chunk. The decoded reply is never
-//! reused: the chat template drops the thinking-off primer
-//! (`<|channel>thought\n<channel|>`) of earlier model turns, so the reply has
-//! other positions in the next prompt.
+//! Every reuse point is a position on the cold prefill chunk grid whose rows
+//! a cold prefill wrote, so a cached turn is byte-identical to a cold one:
+//! a conversation's next turn resumes at the previous prompt rounded down to
+//! the prefill width (the resident snapshot) and recomputes the rest of that
+//! prompt and the decoded reply. Decode and batched prefill write different
+//! KV bits, so the decoded rows are never reused.
 
 mod lanes;
 mod mesh_family;
@@ -34,11 +26,13 @@ use crate::forward;
 use crate::gemma4::{Gemma4State, Gemma4Weights};
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::session_cache::{
-    RowStream, SessionCache, SessionDriver, SessionRoute, SessionState, SnapshotParts, StateLayout,
+    stride_boundaries, RowStream, SessionCache, SessionDriver, SessionRoute, SessionState,
+    SnapshotParts, StateLayout,
 };
 use rdna_compute::Gpu;
 
-/// Snapshot boundary stride in prompt tokens.
+/// Snapshot boundary stride in prompt tokens (a multiple of the 256-row
+/// prefill chunk, so restored prefills keep the cold chunk grid).
 pub const SESSION_STRIDE: usize = 1024;
 
 /// Prefill rows per forward on `gpu_arch` where batched prefill is validated
@@ -55,23 +49,21 @@ pub fn prefill_rows_for_arch(gpu_arch: &str, requested: Option<usize>) -> usize 
         .clamp(1, crate::gemma4::GEMMA4_FORWARD_BATCH_MAX)
 }
 
-/// Snapshot boundaries of `prompt` in `(after, up_to]`, below the prompt end
-/// (the last segment of a prompt runs in prefill-width chunks, which a longer
-/// prompt runs in batch-max chunks): in the first batch-max chunk `C` the
-/// position after each `turn_end` token, then `C` itself, every
-/// [`SESSION_STRIDE`] tokens, and the prompt rounded down to `C`. The
-/// boundaries above `C` are multiples of `C`, the chunk grid there.
-fn turn_boundaries(turn_end: u32, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize> {
-    const C: usize = crate::gemma4::GEMMA4_FORWARD_BATCH_MAX;
-    let grid_end = prompt.len() / C * C;
-    (after + 1..=up_to.min(prompt.len().saturating_sub(1)))
-        .filter(|&p| {
-            (p < C && prompt[p - 1] == turn_end)
-                || p == C
-                || p == grid_end
-                || p % SESSION_STRIDE == 0
-        })
-        .collect()
+/// Snapshot boundaries of `prompt` in `(after, up_to]`: every
+/// [`SESSION_STRIDE`] tokens, plus the prompt length rounded down to the
+/// prefill `width`, the last position a cold prefill of a longer prompt
+/// reaches with whole chunks. A follow-up turn resumes there.
+fn grid_boundaries(width: usize, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize> {
+    let mut boundaries = stride_boundaries(SESSION_STRIDE, prompt, None, after, up_to);
+    let grid_end = prompt.len() / width * width;
+    if grid_end > after && grid_end <= up_to {
+        boundaries.push(grid_end);
+        // A width that does not divide the stride can put the grid end
+        // below the last stride multiple.
+        boundaries.sort_unstable();
+        boundaries.dedup();
+    }
+    boundaries
 }
 
 /// Published Gemma 4 owner (arch_id 13).
@@ -204,34 +196,21 @@ impl Gemma4Bundle {
             if abort() {
                 return Ok(None);
             }
-            let stop = self.segment_end(prompt, pos);
+            let boundary = self.session.as_ref().and_then(SessionDriver::next_boundary);
+            let stop = boundary.unwrap_or(prompt.len()).min(prompt.len());
             if stop == prompt.len() {
-                return self.forward_rows(gpu, &prompt[pos..], pos).map(Some);
+                let logits = self.forward_rows(gpu, &prompt[pos..], pos)?;
+                if boundary == Some(stop) {
+                    self.with_session(|session, bundle| session.at_boundary(gpu, bundle, prompt))
+                        .unwrap_or(Ok(()))?;
+                }
+                return Ok(Some(logits));
             }
             self.forward_rows_silent(gpu, &prompt[pos..stop], pos)?;
-            self.capture_at(gpu, prompt, stop)?;
+            self.with_session(|session, bundle| session.at_boundary(gpu, bundle, &prompt[..stop]))
+                .unwrap_or(Ok(()))?;
             pos = stop;
         }
-    }
-
-    /// End of the prefill segment of `prompt` that starts at `pos`: the next
-    /// snapshot boundary ([`turn_boundaries`]), with or without a session, so
-    /// the chunks never depend on the cache.
-    fn segment_end(&self, prompt: &[u32], pos: usize) -> usize {
-        turn_boundaries(self.eos_tok, prompt, pos, prompt.len())
-            .first()
-            .copied()
-            .unwrap_or(prompt.len())
-    }
-
-    /// Capture the session boundary at `end` of `prompt`, when the session
-    /// armed one there.
-    fn capture_at(&mut self, gpu: &mut Gpu, prompt: &[u32], end: usize) -> Result<(), String> {
-        if self.session.as_ref().and_then(SessionDriver::next_boundary) != Some(end) {
-            return Ok(());
-        }
-        self.with_session(|session, bundle| session.at_boundary(gpu, bundle, &prompt[..end]))
-            .unwrap_or(Ok(()))
     }
 
     /// `tokens` at `[start, start + len)` in prefill chunks; returns the last
@@ -337,7 +316,7 @@ impl SessionState for Gemma4Bundle {
     }
 
     fn snapshot_boundaries(&self, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize> {
-        turn_boundaries(self.eos_tok, prompt, after, up_to)
+        grid_boundaries(self.prefill_rows, prompt, after, up_to)
     }
 
     fn snapshot_parts(
@@ -461,7 +440,7 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
 
 #[cfg(test)]
 mod tests {
-    use super::{prefill_rows_for_arch, turn_boundaries, SESSION_STRIDE};
+    use super::{grid_boundaries, prefill_rows_for_arch, SESSION_STRIDE};
 
     #[test]
     fn validated_arches_default_to_batched_prefill() {
@@ -486,30 +465,26 @@ mod tests {
     }
 
     #[test]
-    fn a_follow_up_has_the_turn_ends_of_its_previous_prompt() {
-        const END: u32 = 106;
-        // <bos> <|turn>user\n U <turn|>\n <|turn>model\n, then the primer.
-        let first = [2, 105, 3, 10, 7, 7, END, 10, 105, 4, 10, 100, 101, 10, 102];
-        assert_eq!(turn_boundaries(END, &first, 0, first.len()), [7]);
-        // The template drops the primer: the reply follows the model header.
-        let mut next = first[..11].to_vec();
-        next.extend([50, 51, 52, END, 10, 105, 3, 10, 8, END, 10, 105, 4, 10]);
-        next.extend(&first[11..]);
-        assert_eq!(turn_boundaries(END, &next, 0, next.len()), [7, 15, 21]);
-        // Nothing at or below `after`, `up_to` included.
-        assert_eq!(turn_boundaries(END, &next, 7, 15), [15]);
-        // Above the first chunk only its end, the stride and the prompt
-        // rounded down to the chunk; never the prompt end.
-        let mut long = vec![7u32; 2 * SESSION_STRIDE];
-        long[100] = END;
-        long[600] = END;
+    fn prompt_end_boundary_is_on_the_prefill_grid() {
+        let prompt = vec![7u32; 1136];
+        // Stride multiple, then the prompt rounded down to the width.
         assert_eq!(
-            turn_boundaries(END, &long, 0, long.len()),
-            [101, 256, SESSION_STRIDE]
+            grid_boundaries(64, &prompt, 0, 1136),
+            vec![SESSION_STRIDE, 1088]
         );
+        assert_eq!(grid_boundaries(256, &prompt, 0, 1136), vec![SESSION_STRIDE]);
+        // Per-token prefill resumes at the prompt end itself.
+        assert_eq!(grid_boundaries(1, &prompt, 1106, 1136), vec![1136]);
+        // Nothing at or below `after`, nothing above `up_to`.
         assert_eq!(
-            turn_boundaries(END, &long[..1300], 0, 1300),
-            [101, 256, SESSION_STRIDE, 1280]
+            grid_boundaries(64, &prompt, 1088, 1136),
+            Vec::<usize>::new()
+        );
+        assert_eq!(grid_boundaries(64, &prompt, 0, 1087), vec![SESSION_STRIDE]);
+        // A width that does not divide the stride stays ascending.
+        assert_eq!(
+            grid_boundaries(100, &prompt[..1050], 0, 1050),
+            vec![1000, SESSION_STRIDE]
         );
     }
 }

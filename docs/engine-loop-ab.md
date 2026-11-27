@@ -82,6 +82,11 @@ own route files: Qwen4 native MTP via `"mtp_mode": "on"`, a DFlash drafter via
   prefix of the previous prompt only, at least legacy's reuse; set it on the
   Gemma 4 routes, whose template re-renders earlier replies (see Batch-path
   cache scenario).
+- `chat_system` (default false): open every multi-turn, interleaved and batch
+  conversation with a long system message (about 600 tokens), so every prompt
+  is longer than the 256-row prefill chunk. Set it on the Gemma 4 routes: a
+  Gemma 4 follow-up reuses only the previous prompt rounded down to the chunk
+  (or a 1024-token stride snapshot), so short prompts reuse nothing (HIPF-598).
 - `perf_decode_gain` (default false): a G-perf decode gain above +2 % is
   `intended` (intended diff 7). Set it only on a Gemma 4 AR route.
 
@@ -163,16 +168,6 @@ These are reported as `intended` and do not fail the run:
    with `perf_decode_gain`, G-perf reports a decode delta above +2 % as
    `intended`. A decode delta below −2 % and a prefill delta outside ±2 %
    still fail.
-8. **Gemma 4 prefill chunks split at turn ends (cross-build only, HIPF-598).**
-   From `7cfe290b6` on, a Gemma 4 prefill ends a chunk after each `<turn|>`
-   in the first 256 prompt tokens, so a follow-up can reuse its prefix. Both
-   loops split the same way, so no A/B diff follows from it, and reuse is
-   byte-identical to a cold prefill (cache on == cache off). Only receipts
-   from builds before `7cfe290b6` are not comparable token for token: 6 of 27
-   A/B requests (`cold`, `multi_turn[2]`, `seeded_repro`, `seeded_sweep[6]`,
-   `isolation`) differ from token 24 or 57 on. No harness rule; it is listed
-   for cross-build comparisons of matrix rows.
-
 Every other difference is a diff.
 
 ## Gates
@@ -332,8 +327,8 @@ keep no records):
 - **reuse** (`batch_reuse` `"prompt"`, Gemma 4): the chat template drops the
   thinking-off primer of earlier model turns, so a reply never sits at its
   decoded positions in the next prompt and no follow-up can reuse its committed
-  turn. Gemma 4 reuses the previous prompt up to its last `<turn|>` in the
-  first 256 tokens, or a snapshot of it on the 256-token grid above (the
+  turn. Gemma 4 reuses the previous prompt rounded down to the 256-row
+  chunk, or a stride snapshot of it (the
   snapshot pool may have dropped the deepest ones: P2 2048 of a 3017-token
   previous prompt, on both loops). The harness has no prompt token ids to
   compute that floor, so every follow-up must reuse more than 0 tokens and at
