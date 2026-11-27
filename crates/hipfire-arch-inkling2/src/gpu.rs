@@ -1028,6 +1028,9 @@ pub struct Inkling2GpuState {
     /// shared by all 48 visits.
     pub fa2_lse: GpuTensor,
     pub fa2_oacc: GpuTensor,
+    /// Activation tier of each blocked-prefill GEMM site
+    /// ([`crate::gpu_prefill::forward_prefill_gpu`]).
+    pub prefill_routes: crate::gpu_prefill::PrefillRoutes,
 }
 
 impl Inkling2GpuState {
@@ -1168,6 +1171,7 @@ impl Inkling2GpuState {
             attn_fa2: gpu.arch == "gfx1201",
             fa2_lse,
             fa2_oacc,
+            prefill_routes: crate::gpu_prefill::PrefillRoutes::F16,
         })
     }
 

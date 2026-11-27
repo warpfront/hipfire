@@ -79,6 +79,7 @@ pub mod hc8_weight;
 pub mod hc_row_fold;
 pub mod head_lanes;
 pub mod inkling2_attention;
+pub mod inkling2_attention_prefill;
 pub mod inkling2_clip;
 pub mod inkling2_control;
 pub mod inkling2_mix;

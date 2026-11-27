@@ -168,7 +168,7 @@ extern "C" __global__ void inkling2_gf_attn_decode_f32(
 }
 "#;
 
-fn ensure_kernels(gpu: &mut Gpu) -> Result<(), String> {
+pub(crate) fn ensure_kernels(gpu: &mut Gpu) -> Result<(), String> {
     gpu.ensure_kernel_public(
         INKLING2_GF_MODULE,
         INKLING2_GF_HIP_SRC,
@@ -224,7 +224,7 @@ fn launch_conv(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_attn(
+pub(crate) fn launch_attn(
     gpu: &mut Gpu,
     q: &GpuTensor,
     k_cache: &[GpuTensor],

@@ -7044,28 +7044,40 @@ pub fn generate_inkling(
 
     let t0 = Instant::now();
 
-    // Prefill: one `forward_token_gpu` step per prompt token (the GPU forward
-    // only does single-token steps). Abort is checked before each token so a
-    // client cancel during a long prompt does not run the full prefill.
+    // Prefill: blocked rows (`forward_prefill_gpu`: gfx1201 typed-XTS loads)
+    // in chunks of `PREFILL_BLOCK_ROWS`, the head on the final row only; other
+    // loads keep one scalar `forward_token_gpu` step per row (chunk of 1).
+    // Abort is checked before each chunk so a client cancel during a long
+    // prompt does not run the full prefill.
     let mut last_logits: Vec<f32> = Vec::new();
     let mut prefill_aborted = false;
     let mut prefill_fail: Option<String> = None;
-    for (i, &tok) in prompt_ids.iter().enumerate() {
+    let chunk = if inkling2::prefill_supported(m.inkling2().unwrap(), gpu) {
+        inkling2::PREFILL_BLOCK_ROWS
+    } else {
+        1
+    };
+    let mut start = 0usize;
+    while start < prompt_ids.len() {
         if check_abort(id) {
             prefill_aborted = true;
             break;
         }
+        let end = (start + chunk).min(prompt_ids.len());
         let step = {
             let b = m.inkling2_mut().unwrap();
-            inkling2::forward_token_gpu(b, gpu, tok, i)
+            let logits = if end == prompt_ids.len() {
+                inkling2::PrefillLogits::Last(&mut last_logits)
+            } else {
+                inkling2::PrefillLogits::None
+            };
+            inkling2::forward_prefill_gpu(b, gpu, &prompt_ids[start..end], start, logits)
         };
-        match step {
-            Ok(logits) => last_logits = logits,
-            Err(e) => {
-                prefill_fail = Some(format!("inkling2 prefill failed: {e}"));
-                break;
-            }
+        if let Err(e) = step {
+            prefill_fail = Some(format!("inkling2 prefill failed: {e}"));
+            break;
         }
+        start = end;
     }
     if let Some(msg) = prefill_fail {
         dense_fail_closed_error(m, gpu, stdout, id, &msg);

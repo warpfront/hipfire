@@ -35,6 +35,7 @@ pub mod slowlink_prefill;
 pub mod sp_layer;
 pub use moe_program::{
     execute_gated_ffn, execute_grouped_moe, grouped_moe_iu4_shape_admits, grouped_moe_site_tiers,
+    grouped_qt44_gemm_prepared, grouped_qt44_gemm_tier, GroupedQt44Tables,
     CastPolicy, CombineOrder, FfnActivation, GatedFfnOp, GroupedMoeGroupedScratch,
     GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy, GroupedMoeProtocol, GroupedMoeRouted,
     GroupedMoeRouter, GroupedMoeScratch, GroupedMoeScratchPlan, GroupedMoeShared,

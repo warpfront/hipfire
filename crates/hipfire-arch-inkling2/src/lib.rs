@@ -18,6 +18,7 @@ pub mod dspark_weights;
 pub mod forward;
 pub mod gpu;
 pub mod gpu_forward;
+pub mod gpu_prefill;
 pub mod oracle;
 pub mod spec_target;
 pub mod weights;
@@ -35,6 +36,10 @@ pub use gpu::{
     INKLING2_KV_DTYPE, SWA_WINDOW_ROWS, VRAM_SLACK_BYTES,
 };
 pub use gpu_forward::{forward_token_gpu, forward_token_gpu_capture, forward_token_gpu_trace};
+pub use gpu_prefill::{
+    forward_prefill_gpu, forward_prefill_gpu_with, prefill_supported, PrefillLogits, PrefillMode,
+    PrefillRoutes, PREFILL_BLOCK_ROWS,
+};
 
 /// The verified Mini config.json metadata shape, shared by tests across modules.
 #[cfg(test)]

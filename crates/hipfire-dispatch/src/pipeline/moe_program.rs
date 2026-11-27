@@ -8312,6 +8312,90 @@ fn grouped_sym_gemm(
     }
 }
 
+/// Expert tables of one grouped qt44 routed-expert GEMM site, laid out by
+/// [`rdna_compute::Gpu::moe_scatter_fused_k8`].
+#[derive(Clone, Copy)]
+pub struct GroupedQt44Tables<'a> {
+    /// `[n_experts]` u64 device pointers to the qt44 expert weights.
+    pub expert_weight_ptrs: &'a GpuTensor,
+    /// i32 `[m_total / 16]`.
+    pub expert_tile_ids: &'a GpuTensor,
+    /// i32 `[n_experts + 1]`, 16-aligned.
+    pub expert_offsets: &'a GpuTensor,
+    /// i32 `[m_total]`, -1 on pad rows.
+    pub sorted_slot_index: &'a GpuTensor,
+}
+
+/// One grouped qt44 routed-expert GEMM over F32 activation rows at an explicit
+/// activation tier, for a caller that owns its own MoE program (scatter,
+/// producers, activation and combine): `F16` runs the weight-only WMMA core on
+/// the F32 rows, the quantized tiers quantize `x [x_src_rows, k]` into the
+/// shared MMQ sidecar and run the grouped symmetric core. Output `y_grouped
+/// [m_total, m]` F32 in grouped order. The caller owns the symmetric-header
+/// admission of the quantized tiers (the cores do not read headers).
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_qt44_gemm_tier(
+    gpu: &mut Gpu,
+    tier: PrefillActTier,
+    t: &GroupedQt44Tables<'_>,
+    x: &GpuTensor,
+    y_grouped: &GpuTensor,
+    m: usize,
+    k: usize,
+    x_row_div: usize,
+    m_total: usize,
+    x_src_rows: usize,
+) -> Result<(), DispatchError> {
+    if tier == PrefillActTier::F16 {
+        return hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
+            t.expert_weight_ptrs,
+            t.expert_tile_ids,
+            t.sorted_slot_index,
+            x,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            x_src_rows,
+        ));
+    }
+    let xq = grouped_sym_quantize(gpu, tier, x, x_src_rows, k)?;
+    grouped_qt44_gemm_prepared(gpu, tier, t, xq, y_grouped, m, k, x_row_div, m_total, x_src_rows)
+}
+
+/// [`grouped_qt44_gemm_tier`] over an already prepared sidecar `xq` of a quantized tier (e.g. the
+/// fused activation+rotate+quantize producer's `block_i8_128` rows).
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_qt44_gemm_prepared(
+    gpu: &mut Gpu,
+    tier: PrefillActTier,
+    t: &GroupedQt44Tables<'_>,
+    xq: *mut std::ffi::c_void,
+    y_grouped: &GpuTensor,
+    m: usize,
+    k: usize,
+    x_row_div: usize,
+    m_total: usize,
+    x_src_rows: usize,
+) -> Result<(), DispatchError> {
+    grouped_sym_gemm(
+        gpu,
+        tier,
+        t.expert_weight_ptrs,
+        t.expert_tile_ids,
+        t.expert_offsets,
+        t.sorted_slot_index,
+        xq,
+        y_grouped,
+        m,
+        k,
+        x_row_div,
+        m_total,
+        x_src_rows,
+    )
+}
+
 /// Execute one grouped MoE layer: FP32 router linear and device-resident
 /// top-k, shared rotated input basis, routed experts on the indexed or the
 /// grouped core, the optional ungated shared expert, and the policy combine.

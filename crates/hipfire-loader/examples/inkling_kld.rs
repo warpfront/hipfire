@@ -117,7 +117,7 @@ const USAGE: &str = "usage:
   inkling_kld captest  --source MODEL.safetensors --model ARTIFACT.hfq --slice TEXT --out-dir DIR
                        [--n-ctx 64] [--chunks 2] [--layers 5,6] [--sliding-window W] [--log-floor F]
   inkling_kld eval     --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq
-                       [--max-chunks N] [--chunks-per-process 1]
+                       [--max-chunks N] [--chunks-per-process 1] [--route ar|prefill]
   inkling_kld pair     --base BASE.kldseq --cand CAND.kldseq [--output OUT.json] [--boot 20000] [--seed 1]";
 
 /// Receipt schema written beside every `.kldseq`.
@@ -2434,6 +2434,16 @@ impl Args {
     }
 }
 
+/// `--route ar` (default: one `forward_token_gpu` per position) or `--route
+/// prefill` (blocked `forward_prefill_gpu` over the window, head on the scored rows).
+fn route_is_prefill(a: &Args) -> Result<bool, String> {
+    match a.0.get("route").map(String::as_str) {
+        None | Some("ar") => Ok(false),
+        Some("prefill") => Ok(true),
+        Some(other) => Err(format!("--route: expected ar|prefill, got {other}")),
+    }
+}
+
 fn artifact_id(path: &Path) -> Result<ArtifactId, String> {
     use std::io::Read;
     let mut file =
@@ -2809,6 +2819,7 @@ fn eval_worker(a: &Args) -> Result<(), String> {
             hipfire_arch_inkling2::ARCH_ID
         ));
     }
+    let prefill = route_is_prefill(a)?;
     let mut results = Vec::new();
     for c in c0..c1 {
         let t0 = Instant::now();
@@ -2819,11 +2830,7 @@ fn eval_worker(a: &Args) -> Result<(), String> {
         b.reset_session_state(&mut gpu)?;
         let mut digest = Sha256::new();
         let (mut klds, mut nll_sum, mut top1) = (Vec::with_capacity(to - from), 0.0f64, 0usize);
-        for (pos, &id) in chunk[..to].iter().enumerate() {
-            let row = hipfire_arch_inkling2::forward_token_gpu(b, &mut gpu, id, pos)?;
-            if pos < from {
-                continue;
-            }
+        let mut score = |pos: usize, row: &[f32]| -> Result<(), String> {
             if row.len() != h.n_vocab {
                 return Err(format!(
                     "candidate vocab {} != reference vocab {}",
@@ -2831,7 +2838,7 @@ fn eval_worker(a: &Args) -> Result<(), String> {
                     h.n_vocab
                 ));
             }
-            for v in &row {
+            for v in row {
                 digest.update(v.to_le_bytes());
             }
             let blk = reference
@@ -2841,14 +2848,38 @@ fn eval_worker(a: &Args) -> Result<(), String> {
                 residual_logprob: blk.residual_logprob,
                 top: blk.top.to_vec(),
             };
-            klds.push(kld_from_block(&blk, &row).map_err(|e| e.to_string())?);
-            nll_sum += nll_of(&row, chunk[pos + 1] as usize).map_err(|e| e.to_string())?;
+            klds.push(kld_from_block(&blk, row).map_err(|e| e.to_string())?);
+            nll_sum += nll_of(row, chunk[pos + 1] as usize).map_err(|e| e.to_string())?;
             let argmax = row
                 .iter()
                 .enumerate()
                 .max_by(|x, y| x.1.total_cmp(y.1))
                 .map(|(i, _)| i as u32);
             top1 += usize::from(argmax == Some(blk.top[0].0));
+            Ok(())
+        };
+        if prefill {
+            // Blocked prefill over [0, score_to), the head on the scored rows.
+            if !hipfire_arch_inkling2::prefill_supported(b, &gpu) {
+                return Err("--route prefill: blocked prefill not supported on this load".into());
+            }
+            hipfire_arch_inkling2::forward_prefill_gpu(
+                b,
+                &mut gpu,
+                &chunk[..to],
+                0,
+                hipfire_arch_inkling2::PrefillLogits::Rows {
+                    from,
+                    sink: &mut score,
+                },
+            )?;
+        } else {
+            for (pos, &id) in chunk[..to].iter().enumerate() {
+                let row = hipfire_arch_inkling2::forward_token_gpu(b, &mut gpu, id, pos)?;
+                if pos >= from {
+                    score(pos, &row)?;
+                }
+            }
         }
         let (mean_kld, p99_kld, mean_nll) = seq_stats(&klds, nll_sum, klds.len());
         eprintln!(
@@ -2915,6 +2946,7 @@ fn eval(a: &Args) -> Result<(), String> {
                 "--chunk-end",
                 &c1.to_string(),
             ])
+            .args(["--route", if route_is_prefill(a)? { "prefill" } else { "ar" }])
             .status()
             .map_err(|e| format!("spawn worker: {e}"))?;
         if !status.success() {
@@ -2976,7 +3008,11 @@ fn eval(a: &Args) -> Result<(), String> {
             "window": h.window, "oracle": h.oracle, "arch": h.arch, "engine_commit": h.engine_commit,
         },
         "evaluator": {"binary": exe_id, "engine_commit": engine_commit()},
-        "route": "hipfire_loader::load_model + reset_session_state + forward_token_gpu per position (product AR n=1, F16 KV)",
+        "route": if route_is_prefill(a)? {
+            "hipfire_loader::load_model + reset_session_state + forward_prefill_gpu over [0, score_to), head on the scored rows (blocked prefill, F16 KV)"
+        } else {
+            "hipfire_loader::load_model + reset_session_state + forward_token_gpu per position (product AR n=1, F16 KV)"
+        },
         "kv_dtype": format!("{:?}", hipfire_arch_inkling2::INKLING2_KV_DTYPE),
         "max_seq": hipfire_arch_inkling2::INKLING2_MAX_CONTEXT,
         "chunks_per_process": per_process,
