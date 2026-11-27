@@ -118,6 +118,9 @@ const USAGE: &str = "usage:
                        [--n-ctx 64] [--chunks 2] [--layers 5,6] [--sliding-window W] [--log-floor F]
   inkling_kld eval     --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq
                        [--max-chunks N] [--chunks-per-process 1] [--route ar|prefill]
+                       [--prefill-routes dense=f16|fp8|a8|a4,experts=f16|fp8|a8|a4]
+  inkling_kld bench    --model CANDIDATE.hfq --ref REF.kldref --output OUT.json [--n 2048]
+                       [--reps 3] [--prefill-routes ...]
   inkling_kld pair     --base BASE.kldseq --cand CAND.kldseq [--output OUT.json] [--boot 20000] [--seed 1]";
 
 /// Receipt schema written beside every `.kldseq`.
@@ -2444,6 +2447,76 @@ fn route_is_prefill(a: &Args) -> Result<bool, String> {
     }
 }
 
+/// `--prefill-routes dense=<tier>,experts=<tier>`: the blocked prefill's activation
+/// tiers for this run, overriding the load's resolved routes (evidence only).
+fn prefill_routes_arg(a: &Args) -> Result<Option<hipfire_arch_inkling2::PrefillRoutes>, String> {
+    a.0.get("prefill-routes")
+        .map(|s| hipfire_arch_inkling2::PrefillRoutes::parse(s))
+        .transpose()
+}
+
+/// Load `model` for scoring on the product loader (Inkling-2 only), pinning the
+/// blocked prefill to `routes` when given. A quantized tier needs every layer's
+/// qt44 halves of that site symmetric (the grouped and dense symmetric cores do
+/// not read headers).
+fn load_inkling(
+    model: &Path,
+    gpu: &mut rdna_compute::Gpu,
+    routes: Option<hipfire_arch_inkling2::PrefillRoutes>,
+) -> Result<hipfire_loader::LoadedModel, String> {
+    let mut m = hipfire_loader::load_model(
+        &model.display().to_string(),
+        hipfire_arch_inkling2::INKLING2_MAX_CONTEXT,
+        None,
+        None,
+        None,
+        None,
+        1,
+        hipfire_runtime::loader_api::SpecLoadCfg::default(),
+        gpu,
+    )?;
+    if m.arch_id != hipfire_arch_inkling2::ARCH_ID {
+        return Err(format!(
+            "model arch {} is not Inkling-2 ({})",
+            m.arch_id,
+            hipfire_arch_inkling2::ARCH_ID
+        ));
+    }
+    if let Some(r) = routes {
+        let b = m
+            .inkling2_mut()
+            .ok_or("loaded model has no Inkling-2 bundle")?;
+        if !hipfire_arch_inkling2::prefill_supported(b, gpu) {
+            return Err("--prefill-routes: blocked prefill not supported on this load".into());
+        }
+        let cap = b
+            .gpu_weights
+            .as_ref()
+            .and_then(|w| w.xts_routes.as_ref())
+            .ok_or("--prefill-routes: no XTS route capability")?;
+        use hipfire_dispatch::pipeline::PrefillActTier;
+        let quant = |t: PrefillActTier| t != PrefillActTier::F16;
+        if quant(r.dense) && cap.dense_symmetric_layers != cap.n_layers {
+            return Err(format!(
+                "--prefill-routes: dense {:?} needs symmetric attention qt44 ({}/{} layers)",
+                r.dense, cap.dense_symmetric_layers, cap.n_layers
+            ));
+        }
+        if quant(r.experts) && cap.expert_symmetric_layers != cap.n_layers {
+            return Err(format!(
+                "--prefill-routes: experts {:?} needs symmetric expert qt44 ({}/{} layers)",
+                r.experts, cap.expert_symmetric_layers, cap.n_layers
+            ));
+        }
+        b.gpu_state
+            .as_mut()
+            .ok_or("loaded model has no Inkling-2 gpu state")?
+            .prefill_routes = r;
+        eprintln!("inkling_kld: blocked prefill routes pinned to {r:?}");
+    }
+    Ok(m)
+}
+
 fn artifact_id(path: &Path) -> Result<ArtifactId, String> {
     use std::io::Read;
     let mut file =
@@ -2800,26 +2873,12 @@ fn eval_worker(a: &Args) -> Result<(), String> {
     let tokens = reference.tokens(&mmap).map_err(|e| e.to_string())?;
     let (from, to) = (h.window.score_from, h.window.score_to);
     let mut gpu = rdna_compute::Gpu::init().map_err(|e| format!("gpu init: {e:?}"))?;
-    let max_seq = hipfire_arch_inkling2::INKLING2_MAX_CONTEXT;
-    let mut m = hipfire_loader::load_model(
-        &model.display().to_string(),
-        max_seq,
-        None,
-        None,
-        None,
-        None,
-        1,
-        hipfire_runtime::loader_api::SpecLoadCfg::default(),
-        &mut gpu,
-    )?;
-    if m.arch_id != hipfire_arch_inkling2::ARCH_ID {
-        return Err(format!(
-            "model arch {} is not Inkling-2 ({})",
-            m.arch_id,
-            hipfire_arch_inkling2::ARCH_ID
-        ));
-    }
+    let routes = prefill_routes_arg(a)?;
     let prefill = route_is_prefill(a)?;
+    if routes.is_some() && !prefill {
+        return Err("--prefill-routes needs --route prefill".into());
+    }
+    let mut m = load_inkling(&model, &mut gpu, routes)?;
     let mut results = Vec::new();
     for c in c0..c1 {
         let t0 = Instant::now();
@@ -2946,7 +3005,20 @@ fn eval(a: &Args) -> Result<(), String> {
                 "--chunk-end",
                 &c1.to_string(),
             ])
-            .args(["--route", if route_is_prefill(a)? { "prefill" } else { "ar" }])
+            .args([
+                "--route",
+                if route_is_prefill(a)? {
+                    "prefill"
+                } else {
+                    "ar"
+                },
+            ])
+            .args(
+                a.0.get("prefill-routes")
+                    .map(|r| ["--prefill-routes", r.as_str()])
+                    .into_iter()
+                    .flatten(),
+            )
             .status()
             .map_err(|e| format!("spawn worker: {e}"))?;
         if !status.success() {
@@ -3014,6 +3086,7 @@ fn eval(a: &Args) -> Result<(), String> {
             "hipfire_loader::load_model + reset_session_state + forward_token_gpu per position (product AR n=1, F16 KV)"
         },
         "kv_dtype": format!("{:?}", hipfire_arch_inkling2::INKLING2_KV_DTYPE),
+        "prefill_routes": prefill_routes_arg(a)?.map(|r| format!("{r:?}")),
         "max_seq": hipfire_arch_inkling2::INKLING2_MAX_CONTEXT,
         "chunks_per_process": per_process,
         "env": env,
@@ -3041,6 +3114,102 @@ fn eval(a: &Args) -> Result<(), String> {
     eprintln!(
         "inkling_kld eval: mean KLD = {mean_kld:.6}  mean NLL = {mean_nll:.6}  PPL = {:.4}  top1 = {top1:.4}  ({scored} tokens) -> {}",
         mean_nll.exp(),
+        output.display()
+    );
+    Ok(())
+}
+
+/// Prompt-prefill speed of the blocked prefill on one load: chunk 0's first `n`
+/// reference tokens from position 0, head on the last row (the generate
+/// contract). One untimed warm-up prefill (kernel compile/cache), then `reps`
+/// timed prefills, each after `reset_session_state`; the last row's logits must
+/// hash identically across every rep.
+fn bench(a: &Args) -> Result<(), String> {
+    let model = a.path("model")?;
+    let ref_path = a.path("ref")?;
+    let output = a.path("output")?;
+    let reps = a.num("reps", 3)?.max(1);
+    let (reference, mmap) = open_ref(&ref_path)?;
+    let h = &reference.header;
+    let n = a.num("n", 2048)?;
+    if n == 0 || n > h.n_ctx {
+        return Err(format!("--n {n}: expected 1..={}", h.n_ctx));
+    }
+    let tokens = reference.tokens(&mmap).map_err(|e| e.to_string())?;
+    let ids = &tokens[..n];
+    let routes = prefill_routes_arg(a)?;
+    let mut gpu = rdna_compute::Gpu::init().map_err(|e| format!("gpu init: {e:?}"))?;
+    let t_load = Instant::now();
+    let mut m = load_inkling(&model, &mut gpu, routes)?;
+    let load_s = t_load.elapsed().as_secs_f64();
+    let b = m
+        .inkling2_mut()
+        .ok_or("loaded model has no Inkling-2 bundle")?;
+    if !hipfire_arch_inkling2::prefill_supported(b, &gpu) {
+        return Err("bench: blocked prefill not supported on this load".into());
+    }
+    let executed = b
+        .gpu_state
+        .as_ref()
+        .map(|s| format!("{:?}", s.prefill_routes));
+    let mut run = |b: &mut hipfire_arch_inkling2::Inkling2Bundle| -> Result<(f64, String), String> {
+        b.reset_session_state(&mut gpu)?;
+        let mut last = Vec::new();
+        let t0 = Instant::now();
+        hipfire_arch_inkling2::forward_prefill_gpu(
+            b,
+            &mut gpu,
+            ids,
+            0,
+            hipfire_arch_inkling2::PrefillLogits::Last(&mut last),
+        )?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        let mut d = Sha256::new();
+        for v in &last {
+            d.update(v.to_le_bytes());
+        }
+        Ok((ms, format!("{:x}", d.finalize())))
+    };
+    let (warm_ms, warm_sha) = run(b)?;
+    let mut ms = Vec::with_capacity(reps);
+    for r in 0..reps {
+        let (t, sha) = run(b)?;
+        if sha != warm_sha {
+            return Err(format!(
+                "bench: rep {r} last-row logits differ from the warm-up's"
+            ));
+        }
+        eprintln!(
+            "  rep {r}: pp{n} {t:.1} ms = {:.1} tok/s",
+            n as f64 * 1e3 / t
+        );
+        ms.push(t);
+    }
+    let mut sorted = ms.clone();
+    sorted.sort_by(f64::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    let receipt = serde_json::json!({
+        "model": artifact_id(&model)?,
+        "reference": artifact_id(&ref_path)?,
+        "evaluator": {"binary": artifact_id(&std::env::current_exe().map_err(|e| e.to_string())?)?,
+                      "engine_commit": engine_commit()},
+        "n": n,
+        "prefill_routes": executed,
+        "load_s": load_s,
+        "warmup_ms": warm_ms,
+        "ms": ms,
+        "median_ms": median,
+        "median_tok_s": n as f64 * 1e3 / median,
+        "last_row_logits_sha256": warm_sha,
+    });
+    std::fs::write(
+        &output,
+        serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())? + "\n",
+    )
+    .map_err(|e| e.to_string())?;
+    eprintln!(
+        "inkling_kld bench: pp{n} median {median:.1} ms = {:.1} tok/s ({executed:?}) -> {}",
+        n as f64 * 1e3 / median,
         output.display()
     );
     Ok(())
@@ -3739,6 +3908,7 @@ fn main() {
         "captest" => captest(&a),
         "eval" => eval(&a),
         "eval-worker" => eval_worker(&a),
+        "bench" => bench(&a),
         "pair" => pair(&a),
         _ => Err(USAGE.to_string()),
     });
