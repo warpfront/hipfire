@@ -797,6 +797,36 @@ def conc_self_test():
     assert spec_unexercised(sn, jab, gated) == []
     assert spec_unexercised(sn, jab, no_k1) == ["G-spec: report-only and no conc k=1 cell"]
     assert spec_unexercised({}, jab, None) == [] and spec_unexercised(sn, {"g_spec": None}, None) == []
+
+    # k>1 lane tau vs a stored engine baseline (HIPF-604): bound -15 %
+    def runs3(loop, tau4, runs=3):
+        a = conc_arm(loop, "noslots", tau=3.0)
+        for key in [f"{wl}/{k}/{n}/0/0" for wl in ("stateless", "multiturn") for k in (1, 4)
+                    for n in range(2, runs + 1)]:
+            a["reqs"][key] = req(tau=3.0, loop=loop)
+        for key, x in a["reqs"].items():
+            if loop == "engine" and key.split("/")[1] == "4":
+                x["done"]["tau"] = tau4
+        return a
+    lt = {"lane_tau": {"bench": bench_params({"runs": 3}),
+                       "arms": {"engine-noslots": {"stateless/4": {"mean": 2.0}, "multiturn/4": {"mean": 2.0}}}}}
+    lane = lambda eng, c=lt: cj(eng=eng, leg=runs3("legacy", 3.0), c={"runs": 3, **c})
+    assert lane(runs3("engine", 1.71))["ok"]
+    assert lane(runs3("engine", 1.69))["fails"] == ["engine-noslots: lane tau 2"]
+    assert lane(runs3("engine", 2.0))["engine"]["engine-noslots"]["lane_tau"]["multiturn/4"]["n"] == [4, 4]
+    no_tau = runs3("engine", 2.0)
+    no_tau["reqs"]["multiturn/4/2/0/0"]["done"].pop("tau")
+    assert lane(no_tau)["fails"] == ["engine-noslots: lane tau 1"]  # every lane request must report tau
+    short = cj(eng=runs3("engine", 1.0, runs=2), leg=runs3("legacy", 3.0, runs=2), c={**lt, "runs": 2})
+    assert short["ok"] and short["unexercised"] == ["engine-noslots: lane tau baseline bench params differ"], short
+    one = lane(runs3("engine", 1.0), {"lane_tau": {**lt["lane_tau"], "arms": {"engine-noslots": {
+        "stateless/4": {"mean": 1.0}}}}})
+    assert one["ok"] and one["unexercised"] == ["engine-noslots: lane tau multiturn/4 not in the baseline"], one
+    assert lane(runs3("engine", 1.0), {"lane_tau": {**lt["lane_tau"], "arms": {}}})["unexercised"] == [
+        "engine-noslots: no lane tau baseline"]
+    assert lane(runs3("engine", 1.0), {**lt, "k": "1,4"})["unexercised"] == [
+        "engine-noslots: lane tau baseline bench params differ"]
+    assert not lane(runs3("engine", 1.0), {})["fails"]  # no lane_tau: k>1 tau report-only
     assert not cj(eng=conc_arm("engine", "noslots", tau=None), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
     # k>1 tau is report-only: lanes accept fewer drafts per window than the singleton ref (HIPF-604/615)
     lanes4 = conc_arm("engine", "noslots", tau=2.9)
@@ -1177,9 +1207,11 @@ def judge_conc(arms, c, expect_engine):
     - cache: each multi-turn follow-up reuses at least the ref arm's `cached_tokens`,
       and at k>1 at least the same request at k=1 (C1), unless the engine logged
       that it refused to continue its lane record (`refused`, refused_followups)
-    - G-spec: mean tau per k=1 cell >= ref - 2 %. k>1 cells are report-only: lane
-      tau measures the lane window policy, which differs between engine lanes and
-      legacy fn-lanes (HIPF-615); the k>1 targets gate a draft loss that costs speed
+    - G-spec: mean tau per k=1 cell >= ref - 2 %. k>1 cells are not judged against
+      ref: lane tau measures the lane window policy, which differs between engine
+      lanes and legacy fn-lanes (HIPF-615)
+    - lane tau (k>1, with `lane_tau`, a stored engine baseline): every request of the
+      cell reports tau, and the mean over its runs is >= the baseline mean - 15 %
     - target (k>1): out tok/s >= target - tol, TTFT p50 and p99 <= target + tol"""
     tol = c.get("tol_pct", 2.0) / 100
     ref = arms.get("-".join(c.get("ref", ["legacy", "noslots"])))
@@ -1244,15 +1276,33 @@ def judge_conc(arms, c, expect_engine):
         if follow and not r["cache_hits"][0]:
             unexercised.append(f"{tag}: no multi-turn follow-up reused a prefix")
         r["g_spec"], r["target"] = {}, {}
-        r["tau"] = {}
+        r["tau"], r["lane_tau"] = {}, {}
+        lt = c.get("lane_tau")
+        base = (lt or {}).get("arms", {}).get(tag)
+        if lt and base is None:
+            unexercised.append(f"{tag}: no lane tau baseline")
+        elif lt and lt.get("bench") != bench_params(c):  # the cell sequence moves lane tau (HIPF-604)
+            unexercised.append(f"{tag}: lane tau baseline bench params differ")
+            base = None
+        mean = lambda t: round(statistics.mean(t), 4) if t else None
         for cell, m in a["cells"].items():
             taus = [[x["done"]["tau"] for k, x in rs.items() if k.startswith(cell + "/") and "tau" in x["done"]]
                     for rs in (reqs, rr)]
+            if base is not None and int(cell.split("/")[1]) > 1:
+                keys = [k for k in reqs if k.startswith(cell + "/")]
+                if cell not in base:
+                    unexercised.append(f"{tag}: lane tau {cell} not in the baseline")
+                else:
+                    # 15 %: clean runs-3 cell means spread up to 3.4 % sd between receipts
+                    # (multiturn/2), ~4.2 % sd against a 2-receipt baseline (HIPF-604)
+                    r["lane_tau"][cell] = {
+                        "mean": mean(taus[0]), "baseline": base[cell]["mean"], "n": [len(taus[0]), len(keys)],
+                        "pass": bool(taus[0]) and len(taus[0]) == len(keys)
+                        and statistics.mean(taus[0]) >= 0.85 * base[cell]["mean"]}
             if taus[1]:
                 ok_ = (len(taus[0]) == len(taus[1])
                        # 2 %: a clean multiturn/1 cell spreads ~2 % per bench run (HIPF-619 S1)
                        and statistics.mean(taus[0]) >= 0.98 * statistics.mean(taus[1]))
-                mean = lambda t: round(statistics.mean(t), 4) if t else None
                 r["tau"][cell] = {"engine_mean": mean(taus[0]), "ref_mean": mean(taus[1]),
                                   "n": [len(taus[0]), len(taus[1])], "pass": ok_}
                 if cell.split("/")[1] == "1":
@@ -1268,11 +1318,49 @@ def judge_conc(arms, c, expect_engine):
                           ("tokens != ref", r["ne_ref"]), ("cached_tokens < ref", r["cache_below_ref"]),
                           ("cached_tokens < C1", r["cache_below_c1"]),
                           ("G-spec", not all(r["g_spec"].values())),
+                          ("lane tau", [k for k, v in r["lane_tau"].items() if not v["pass"]]),
                           ("target", [k for k, v in r["target"].items() if not v])):
             if bad:
                 fails.append(f"{tag}: {name}" + (f" {len(bad)}" if isinstance(bad, list) else ""))
     return {"ok": not fails, "fails": fails, "unexercised": unexercised, "engine": report,
             "reference_c1_ne_cn": reference, "cells": {tag: a["cells"] for tag, a in arms.items()}}
+
+
+def bench_params(c):
+    """The conc settings that move a cell's lane tau: cell order, run count (later runs
+    draft lower than the first), prompts and lengths (HIPF-604)."""
+    return {x: c.get(x) for x in ("k", "runs", "workloads", "args")}
+
+
+def lane_tau_baseline(out, source, receipts):
+    """Write the k>1 lane tau baseline (`conc.lane_tau`, HIPF-604) from conc receipts
+    of one accepted build: per engine arm and k>1 cell, the mean tau over every
+    request of every run, with the receipts' provenance."""
+    taus, src, bench = {}, [], set()
+    for p in receipts:
+        x = json.loads(Path(p).read_text())
+        if x["route"]["conc"].get("runs", 3) < 3:
+            raise SystemExit(f"{p}: lane tau baseline needs runs >= 3")
+        bench.add(json.dumps(bench_params(x["route"]["conc"])))
+        src.append({"receipt": os.path.realpath(p), "daemon_md5": x["daemon"]["md5"],
+                    "hipfire_md5": x["hipfire"]["md5"], "fixture_sha256": x["fixture_sha256"],
+                    "harness_sha256": x["harness"]["sha256"], "verdict": x["verdict"]})
+        for tag, a in x["conc"]["arms"].items():
+            for key, q in a["reqs"].items() if a["loop"] == "engine" else ():
+                wl, k, run = key.split("/")[:3]
+                if int(k) > 1:
+                    if "tau" not in q["done"]:
+                        raise SystemExit(f"{p}: {tag} {key} reports no tau")
+                    taus.setdefault(tag, {}).setdefault(f"{wl}/{k}", {}).setdefault((p, run), []).append(
+                        q["done"]["tau"])
+    if len(bench) != 1 or len({(s["daemon_md5"], s["fixture_sha256"]) for s in src}) != 1:
+        raise SystemExit("lane tau baseline: receipts differ in bench params, daemon or fixture")
+    arms = {tag: {cell: {"mean": round(statistics.mean(t for v in rs.values() for t in v), 4),
+                         "n": sum(map(len, rs.values())), "runs": len(rs),
+                         "run_means": [round(statistics.mean(v), 4) for v in rs.values()]}
+                  for cell, rs in sorted(cells.items())} for tag, cells in taus.items()}
+    Path(out).write_text(json.dumps({"source": source, "bench": json.loads(bench.pop()), "receipts": src,
+                                     "arms": arms}, indent=1) + "\n")
 
 
 def spec_unexercised(route, j, conc):
@@ -1316,13 +1404,22 @@ def main():
     ap.add_argument("--batch", action="store_true", help="also run the batch-path cache scenario")
     ap.add_argument("--batch-only", action="store_true", help="skip the A/B scenarios; run the batch-path scenario")
     ap.add_argument("--hipfire", help="hipfire CLI for --conc (default: next to --daemon)")
+    ap.add_argument("--lane-tau-baseline", nargs="+", metavar="ARG",
+                    help="OUT SOURCE_SHA CONC_RECEIPT...: write a k>1 lane tau baseline and exit")
     args = ap.parse_args()
     if args.self_test:
         return self_test()
+    if args.lane_tau_baseline:
+        if len(args.lane_tau_baseline) < 3:
+            ap.error("--lane-tau-baseline needs OUT SOURCE_SHA CONC_RECEIPT...")
+        return lane_tau_baseline(*args.lane_tau_baseline[:2], args.lane_tau_baseline[2:])
     if not (args.daemon and args.route and args.out):
         ap.error("--daemon, --route and --out are required")
     route = json.loads(Path(args.route).read_text())
     route.setdefault("name", Path(args.route).stem)
+    if isinstance((route.get("conc") or {}).get("lane_tau"), str):  # relative to the route file
+        route["conc"]["lane_tau"] = json.loads(
+            (Path(args.route).parent / os.path.expanduser(route["conc"]["lane_tau"])).read_text())
     conc_on, batch_on = args.conc or args.conc_only, args.batch or args.batch_only
     ab_on = not (args.conc_only or args.batch_only)
     if conc_on and "conc" not in route:

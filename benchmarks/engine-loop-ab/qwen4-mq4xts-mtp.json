@@ -1,0 +1,47 @@
+{
+  "name": "qwen4-mq4xts-mtp",
+  "model": "~/mesh-validation/HIPF-522/fixtures/qwen3.8-flash-next-base.mq4-xts",
+  "load": {
+    "max_seq": 16384,
+    "mtp_mode": "on"
+  },
+  "env": {
+    "HIPFIRE_PLE_FORMAT": "q4"
+  },
+  "max_tokens": 64,
+  "spec_noise": true,
+  "expect_engine": true,
+  "conc": {
+    "k": "1,2,4",
+    "runs": 3,
+    "arms": [
+      [
+        "legacy",
+        "noslots"
+      ],
+      [
+        "engine",
+        "batch"
+      ],
+      [
+        "legacy",
+        "batch"
+      ]
+    ],
+    "target": [
+      "legacy",
+      "batch"
+    ],
+    "args": [
+      "--num-prompts",
+      "16",
+      "--max-tokens",
+      "128",
+      "--max-seq",
+      "16384",
+      "--spec",
+      "mtp"
+    ],
+    "lane_tau": "qwen4-mq4xts-mtp.lane-tau.json"
+  }
+}

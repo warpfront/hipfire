@@ -237,6 +237,13 @@ still hold it after its bench returned.
 - `target`: the arm an engine arm must match at k>1 (Qwen4: legacy fn-lanes;
   Gemma4, which has no batched route: legacy-noslots). Omitted, no
   throughput/TTFT gate.
+- `lane_tau`: a stored engine baseline for the k>1 lane tau gate, as a path
+  relative to the route file. Omitted, k>1 tau is report-only. Write it from
+  the `--conc` receipts (`runs` ≥ 3) of the accepted build:
+  `engine_loop_ab.py --lane-tau-baseline OUT SOURCE_SHA RECEIPT...`. The file
+  records the source SHA, daemon and CLI md5, fixture sha256, the bench
+  params and, per engine arm and k>1 cell, the mean, n and per-run means. The
+  Qwen4 MTP route and its baseline are in `benchmarks/engine-loop-ab/`.
 
 Per cell (workload, k) the receipt reports the median over runs of output
 tok/s (Σ tokens / sample wall), TTFT p50/p99 from `t_send` (a client-side queue
@@ -279,7 +286,19 @@ rows; legacy fn-lanes are not row-exact by default):
   tau measures the lane window policy, and engine lanes and legacy fn-lanes
   split tokens between windows and AR rows differently (−9 to −13 % on
   Qwen4 MTP, HIPF-615), while the singleton `ref` is no lane reference at
-  all (HIPF-604). The k>1 targets gate a draft loss that costs speed
+  all (HIPF-604). The lane tau gate below judges k>1 tau
+- **lane tau** (k>1, with `lane_tau`): every request of the cell reports tau,
+  and the cell mean over its runs is at least the baseline mean − 15 %. On
+  Qwen4 MTP clean runs-3 cell means spread up to 3.4 % sd between receipts
+  (multiturn/2; ~4.2 % sd against a 2-receipt baseline, worst clean ratio
+  0.945); a lane draft mutant that drops lane tau 38–41 % fails every k>1
+  cell (HIPF-604). The gate compares the engine with its own accepted build, not
+  with legacy fn-lanes, whose window policy differs (HIPF-615). A cell not in
+  the baseline, an engine arm with no baseline, or bench params (`k`, `runs`,
+  `workloads`, `args`) that differ from the baseline's mark the run
+  `pass-partial`: the cell order and the run count move lane tau (the first
+  run of a cell drafts higher than the later runs). A change that moves the
+  lane window policy writes a new baseline and records why
 - **target** (k>1): output tok/s at least the target's − `tol_pct`, TTFT p50
   and p99 at most the target's + `tol_pct`
 

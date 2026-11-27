@@ -1,0 +1,92 @@
+{
+ "source": "f43ba473648b4a297f39c29b8a2b3462d444a1b1",
+ "bench": {
+  "k": "1,2,4",
+  "runs": 3,
+  "workloads": null,
+  "args": [
+   "--num-prompts",
+   "16",
+   "--max-tokens",
+   "128",
+   "--max-seq",
+   "16384",
+   "--spec",
+   "mtp"
+  ]
+ },
+ "receipts": [
+  {
+   "receipt": "~/mesh-validation/HIPF-604/runs/b1/qwen4-mq4xts-mtp.conc.json",
+   "daemon_md5": "08e2f189acbcee2c493c9d652cf1a249",
+   "hipfire_md5": "b79f7f20101f87696bbd3a2dfb5aa13d",
+   "fixture_sha256": "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45",
+   "harness_sha256": "4280edf2bb38ef495c7fdb3a19389b990048697a3026c7b496be16c8327676d6",
+   "verdict": "pass"
+  },
+  {
+   "receipt": "~/mesh-validation/HIPF-604/runs/b2/qwen4-mq4xts-mtp.conc.json",
+   "daemon_md5": "08e2f189acbcee2c493c9d652cf1a249",
+   "hipfire_md5": "b79f7f20101f87696bbd3a2dfb5aa13d",
+   "fixture_sha256": "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45",
+   "harness_sha256": "4280edf2bb38ef495c7fdb3a19389b990048697a3026c7b496be16c8327676d6",
+   "verdict": "pass"
+  }
+ ],
+ "arms": {
+  "engine-batch": {
+   "multiturn/2": {
+    "mean": 1.9727,
+    "n": 192,
+    "runs": 6,
+    "run_means": [
+     2.1056,
+     1.8981,
+     1.98,
+     2.0412,
+     1.8534,
+     1.9575
+    ]
+   },
+   "multiturn/4": {
+    "mean": 1.9784,
+    "n": 192,
+    "runs": 6,
+    "run_means": [
+     2.1228,
+     1.9369,
+     1.9656,
+     2.0553,
+     1.8456,
+     1.9441
+    ]
+   },
+   "stateless/2": {
+    "mean": 2.334,
+    "n": 96,
+    "runs": 6,
+    "run_means": [
+     2.2856,
+     2.2319,
+     2.3631,
+     2.44,
+     2.4337,
+     2.2494
+    ]
+   },
+   "stateless/4": {
+    "mean": 2.331,
+    "n": 96,
+    "runs": 6,
+    "run_means": [
+     2.5469,
+     2.2494,
+     2.15,
+     2.2819,
+     2.5387,
+     2.2194
+    ]
+   }
+  }
+ }
+}
