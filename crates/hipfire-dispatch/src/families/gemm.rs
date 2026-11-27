@@ -629,6 +629,9 @@ impl GemmFamily {
                 }
                 hip!(gpu.gemm_bf16_mfma_gfx942(&w.buf.buf, &x.buf, &y.buf, m, k, batch_size))
             }
+            K::GemmBf16XF32Batched => {
+                hip!(gpu.gemm_bf16_xf32_batched(w.buf, x, y, m, k, batch_size))
+            }
             K::GemmQ8_0ResidualWmma => {
                 hip!(gpu.gemm_q8_0_residual_wmma(w.buf, x, y, m, k, batch_size))
             }

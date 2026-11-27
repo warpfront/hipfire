@@ -13,5 +13,6 @@ rayon.workspace = true
 sha2.workspace = true
 half = "2"
 hip-bridge = { path = "../hip-bridge" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 rdna-compute = { path = "../rdna-compute" }

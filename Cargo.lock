@@ -1405,6 +1405,7 @@ version = "0.4.6"
 dependencies = [
  "half",
  "hip-bridge",
+ "hipfire-dispatch",
  "hipfire-runtime",
  "memmap2",
  "rayon",

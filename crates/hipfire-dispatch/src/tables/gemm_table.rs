@@ -182,6 +182,15 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
+    // BF16 weight x F32 activation, F32 out — generic, runs on every arch.
+    registry.register(KernelVariant {
+        key: KernelKey::GemmBf16XF32Batched,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
     // Q8_0 residual WMMA. The base method auto-routes to the gfx12 sibling on
     // RDNA4, so HasWmma is correct (admits RDNA4). The *_gfx12 key is the
     // direct RDNA4-only entry → HasWmmaGfx12.

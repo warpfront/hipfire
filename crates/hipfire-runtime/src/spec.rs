@@ -673,6 +673,40 @@ pub trait SpecTarget {
     ) -> Result<Vec<f32>, String> {
         Err("capture_seed_main_hidden: target does not support DSpark capture".to_string())
     }
+
+    /// [`spec_advance`](Self::spec_advance) (never resetting) that streams
+    /// every processed row's DSpark feature row to the device instead of a
+    /// host `Vec`: the target writes up to `sink.rows_capacity()` consecutive
+    /// rows (`dflash_extract_layers().len() × dflash_streams_per_layer() × dim`
+    /// F32 each, position-major, as
+    /// [`verify_block_capture_gpu`](Self::verify_block_capture_gpu)) into
+    /// `sink.chunk()`, then calls `sink.on_rows(gpu, start, rows)` before
+    /// reusing the chunk. Rows arrive in order and contiguously from
+    /// `start_pos`, covering every token of `tokens` on `Ready`; an abort
+    /// delivers no row past the abort point. The committed DSpark binding
+    /// ([`crate::dspark_core::DsparkCommittedBody`]) uses it for prefill and
+    /// forced advance. Default: unsupported.
+    fn spec_advance_taps_gpu(
+        &mut self,
+        _gpu: &mut Gpu,
+        _tokens: &[u32],
+        _start_pos: usize,
+        _abort: &dyn Fn() -> bool,
+        _sink: &mut dyn SpecTapSink,
+    ) -> Result<SpecAdvance, String> {
+        Err("spec_advance_taps_gpu: target does not stream DSpark taps".to_string())
+    }
+}
+
+/// Device destination of [`SpecTarget::spec_advance_taps_gpu`].
+pub trait SpecTapSink {
+    /// The chunk the target writes feature rows into, row 0 first.
+    fn chunk(&self) -> &GpuTensor;
+    /// Rows the chunk holds.
+    fn rows_capacity(&self) -> usize;
+    /// Consume chunk rows `[0, rows)`, the rows of positions
+    /// `[start, start + rows)`.
+    fn on_rows(&mut self, gpu: &mut Gpu, start: usize, rows: usize) -> Result<(), String>;
 }
 
 /// RAII borrow of the spec-decode target as `&mut dyn SpecTarget`, dispatched

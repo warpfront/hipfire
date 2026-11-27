@@ -2,10 +2,21 @@
 //! chain, qwen3 dense transformer) is the only arch-specific seam — see
 //! [`DsparkBody`]. Everything else (main_proj ingest, markov head, confidence
 //! head, window orchestration) lives here.
+//!
+//! Two proposal bindings share the one [`DsparkDrafter`] window loop, selected
+//! at build time:
+//! * legacy ([`build_dspark_speculator`]): seed bootstrap + last-verify
+//!   multi-slot context, `main_proj` ingest, shared [`run_heads`] scoring
+//!   (Qwen3, DeepSeek V4);
+//! * committed context ([`build_dspark_committed_speculator`]): the body owns
+//!   its persistent context projections over EVERY committed target row
+//!   (streamed from prefill, forced advance and each window's consumed rows),
+//!   the fixed fill-in block and its own scoring ([`DsparkCommittedBody`];
+//!   Inkling-2-Mini).
 use crate::dspark_block_controller::WindowCost;
 use crate::spec::{
-    accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecGrammar, SpecRequestConfig,
-    SpecScratch, SpecTarget, Speculator,
+    accept_greedy_prefix, terminal_prefix_replay, MtpDrafter, MtpSpeculator, MtpWindow,
+    SpecGrammar, SpecRequestConfig, SpecScratch, SpecTapSink, SpecTarget, Speculator,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -301,6 +312,79 @@ pub struct DraftResult {
     /// only if a future consumer needs them — it costs a `[block, vocab]` d2h.
     pub logits: Vec<f32>,
     pub confidence: Vec<f32>,
+}
+
+/// The target taps a committed-context body consumes for every committed row,
+/// in row order. `taps` are target-defined capture ids (Inkling-2-Mini: the
+/// streams entering visits 5, 23 and 41 of the looped schedule, then 48 = the
+/// final normalized state); a feature row is `taps.len() × dim` F32.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DsparkTapSchema {
+    pub taps: Vec<usize>,
+    pub dim: usize,
+}
+
+impl DsparkTapSchema {
+    /// F32 values per committed row.
+    pub fn row_floats(&self) -> usize {
+        self.taps.len() * self.dim
+    }
+}
+
+/// The committed-context proposal binding: the body keeps its own context
+/// projections for every committed target row `[0, committed_len)`, drafts a
+/// fixed `block_size` fill-in block for an anchor at `committed_len`, and
+/// scores it itself. The shared [`DsparkDrafter`] still owns verify,
+/// acceptance, EOS, the emit budget and target commit; it streams the taps of
+/// every row the target consumes (prefill, forced advance, the anchor plus the
+/// accepted drafts of each window, never the unconsumed bonus/replacement)
+/// into [`Self::ingest_committed`] in position order.
+pub trait DsparkCommittedBody {
+    fn tap_schema(&self) -> &DsparkTapSchema;
+    /// Rows of the drafted block (anchor + fill-in), independent of `k`.
+    fn block_size(&self) -> usize;
+    /// Maximum proposals per window (`block_size - 1` for a fill-in block).
+    fn proposal_capacity(&self) -> usize;
+    /// Committed rows ingested so far; the next anchor sits at this position.
+    fn committed_len(&self) -> usize;
+    /// Exclusive bound on the absolute positions a drafted block may occupy.
+    /// A window whose block would cross it runs as a true AR step (`k = 0`).
+    fn position_capacity(&self) -> usize;
+    /// Append committed rows `[start, start + rows)`. `taps` holds
+    /// `rows × tap_schema().row_floats()` F32 (position-major, tap order)
+    /// before any draft rounding. `start` must equal [`Self::committed_len`].
+    fn ingest_committed(
+        &mut self,
+        gpu: &mut Gpu,
+        taps: &GpuTensor,
+        start: usize,
+        rows: usize,
+    ) -> Result<(), String>;
+    /// Drop committed rows `[len, committed_len)` (a terminal-prefix repair
+    /// keeps only a prefix of the last window's rows). At most one window
+    /// (`block_size` rows) may be dropped.
+    fn truncate_committed(&mut self, gpu: &mut Gpu, len: usize) -> Result<(), String>;
+    /// Run the draft tower for anchor `seed` at `position == committed_len()`,
+    /// writing the normalized block hidden `[block_size, dim]` into `x_head`.
+    fn draft_block(
+        &mut self,
+        gpu: &mut Gpu,
+        seed: u32,
+        position: usize,
+        x_head: &GpuTensor,
+    ) -> Result<(), String>;
+    /// Score fill-in rows `1..=k` of `x_head`: `tokens.len() == k`, no
+    /// confidence.
+    fn score_block(
+        &mut self,
+        gpu: &mut Gpu,
+        x_head: &GpuTensor,
+        seed: u32,
+        k: usize,
+    ) -> Result<DraftResult, String>;
+    /// Forget every committed row (cold start, reset).
+    fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String>;
+    fn free(self: Box<Self>, gpu: &mut Gpu);
 }
 
 // ── private helpers (ported from hipfire-arch-deepseek4::forward) ────────────
@@ -1056,9 +1140,10 @@ fn upload_f32(gpu: &mut Gpu, v: &[f32]) -> Result<GpuTensor, String> {
     Ok(t)
 }
 
-/// Generic DSpark drafter: window orchestration over any [`DsparkBody`].
+/// Generic DSpark drafter: window orchestration over either proposal binding
+/// ([`DsparkBinding`]).
 ///
-/// ## Context bookkeeping (Stage 2+)
+/// ## Legacy context bookkeeping (Stage 2+)
 ///
 /// After each verify+accept window, the multi-slot context for the NEXT window
 /// is the verify-forward's accepted-prefix hidden at the target's extract layers
@@ -1074,13 +1159,14 @@ fn upload_f32(gpu: &mut Gpu, v: &[f32]) -> Result<GpuTensor, String> {
 /// `capture_seed_main_hidden` (matching `_init_context`), giving `ctx_len=1`.
 /// After the first window the loop uses the verify hidden directly and skips
 /// `capture_seed_main_hidden` entirely.
+///
+/// ## Committed-context binding
+///
+/// See [`DsparkCommittedBody`]: no seed bootstrap and no multi-slot cache;
+/// every consumed target row's taps go to the body, which must hold exactly
+/// the rows before each window's anchor.
 pub struct DsparkDrafter {
-    body: Box<dyn DsparkBody>,
-    weights: DsparkWeights,
-    /// Per-stage final norm fed to [`run_heads`].
-    stage_norm: GpuTensor,
-    /// lm-head weight fed to [`run_heads`].
-    lm_head: GpuTensor,
+    binding: DsparkBinding,
     conf_threshold: f32,
     block: usize,
     ctx_capacity: usize,
@@ -1124,6 +1210,233 @@ pub struct DsparkDrafter {
     block_controller: crate::dspark_block_controller::BlockController,
 }
 
+/// The proposal binding a [`DsparkDrafter`] drives, fixed at build time.
+enum DsparkBinding {
+    /// Seed bootstrap + multi-slot context + shared [`run_heads`].
+    Legacy(LegacyBinding),
+    /// Persistent committed context + body-owned scoring.
+    Committed(CommittedBinding),
+}
+
+struct LegacyBinding {
+    body: Box<dyn DsparkBody>,
+    weights: DsparkWeights,
+    /// Per-stage final norm fed to [`run_heads`].
+    stage_norm: GpuTensor,
+    /// lm-head weight fed to [`run_heads`].
+    lm_head: GpuTensor,
+}
+
+struct CommittedBinding {
+    body: Box<dyn DsparkCommittedBody>,
+    /// `(window_start, seed)` of the last window, retained for
+    /// [`MtpDrafter::mtp_repair_terminal_prefix`] until the next step, advance,
+    /// prefill or reset.
+    last_window: Option<(usize, u32)>,
+    /// Device chunk the target streams prefill / forced-advance taps into.
+    tap_chunk: Option<GpuTensor>,
+}
+
+/// Rows per prefill / forced-advance tap chunk of the committed binding.
+const COMMITTED_TAP_CHUNK_ROWS: usize = 256;
+
+/// [`SpecTapSink`] feeding a committed body.
+struct CommittedTapSink<'a> {
+    body: &'a mut dyn DsparkCommittedBody,
+    chunk: &'a GpuTensor,
+    rows_capacity: usize,
+}
+
+impl SpecTapSink for CommittedTapSink<'_> {
+    fn chunk(&self) -> &GpuTensor {
+        self.chunk
+    }
+
+    fn rows_capacity(&self) -> usize {
+        self.rows_capacity
+    }
+
+    fn on_rows(&mut self, gpu: &mut Gpu, start: usize, rows: usize) -> Result<(), String> {
+        if rows > self.rows_capacity {
+            return Err(format!(
+                "dspark committed tap sink: {rows} rows exceed the {}-row chunk",
+                self.rows_capacity
+            ));
+        }
+        self.body.ingest_committed(gpu, self.chunk, start, rows)
+    }
+}
+
+impl CommittedBinding {
+    /// Stream the target's rows for `tokens` at `start_pos` into the body.
+    fn advance(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        tokens: &[u32],
+        start_pos: usize,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<crate::spec::SpecAdvance, String> {
+        if self.body.committed_len() != start_pos {
+            return Err(format!(
+                "dspark committed binding: target advance from {start_pos} but the draft holds {} committed rows (a gap cannot be re-bootstrapped from a seed)",
+                self.body.committed_len()
+            ));
+        }
+        let row_floats = self.body.tap_schema().row_floats();
+        if self.tap_chunk.is_none() {
+            self.tap_chunk = Some(
+                gpu.alloc_tensor(&[COMMITTED_TAP_CHUNK_ROWS * row_floats], DType::F32)
+                    .map_err(|e| format!("dspark committed binding: alloc tap chunk: {e:?}"))?,
+            );
+        }
+        let mut sink = CommittedTapSink {
+            body: self.body.as_mut(),
+            chunk: self.tap_chunk.as_ref().expect("allocated above"),
+            rows_capacity: COMMITTED_TAP_CHUNK_ROWS,
+        };
+        let out = target.spec_advance_taps_gpu(gpu, tokens, start_pos, abort, &mut sink)?;
+        if matches!(out, crate::spec::SpecAdvance::Ready { .. })
+            && self.body.committed_len() != start_pos + tokens.len()
+        {
+            return Err(format!(
+                "dspark committed binding: target delivered taps through {} for an advance to {}",
+                self.body.committed_len(),
+                start_pos + tokens.len()
+            ));
+        }
+        Ok(out)
+    }
+}
+
+impl DsparkDrafter {
+    /// One window of the committed-context binding: draft from the body's
+    /// committed rows `[0, position)`, verify `[seed, drafts..]`, commit the
+    /// accepted prefix, then ingest exactly the consumed rows (seed + accepted
+    /// drafts) captured by that verify.
+    fn committed_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        k: usize,
+        eos: u32,
+    ) -> Result<MtpWindow, String> {
+        let DsparkBinding::Committed(c) = &mut self.binding else {
+            return Err("DsparkDrafter::committed_step on the legacy binding".into());
+        };
+        c.last_window = None;
+        // State oracle: the draft context is exactly the committed rows before
+        // the anchor. Anything else (a skipped ingest, an ingested bonus row,
+        // the anchor's own row) is a wiring bug, never a degraded proposal.
+        if c.body.committed_len() != position {
+            return Err(format!(
+                "dspark committed binding: anchor at {position} but the draft holds {} committed rows",
+                c.body.committed_len()
+            ));
+        }
+        let block_rows = c.body.block_size();
+        // A block crossing the draft's position capacity runs as true AR.
+        let k = if position + block_rows > c.body.position_capacity() {
+            0
+        } else {
+            k.min(c.body.proposal_capacity())
+        };
+        let schema = c.body.tap_schema().clone();
+        let row_floats = schema.row_floats();
+
+        let drafts: Vec<u32> = if k == 0 {
+            Vec::new()
+        } else {
+            let x_head = gpu
+                .alloc_tensor(&[block_rows, schema.dim], DType::F32)
+                .map_err(|e| format!("DsparkDrafter: alloc x_head: {e:?}"))?;
+            let t_draft = self.profiler.sync_start(gpu);
+            let drafted = c.body.draft_block(gpu, seed, position, &x_head);
+            self.profiler.sync_end(gpu, t_draft, 1);
+            let t_heads = self.profiler.sync_start(gpu);
+            let scored = drafted.and_then(|()| c.body.score_block(gpu, &x_head, seed, k));
+            self.profiler.sync_end(gpu, t_heads, 2);
+            let _ = gpu.free_tensor(x_head);
+            let tokens = scored?.tokens;
+            if tokens.len() != k {
+                return Err(format!(
+                    "dspark committed body scored {} proposals for k={k}",
+                    tokens.len()
+                ));
+            }
+            tokens
+        };
+
+        let verify_tokens: Vec<u32> = std::iter::once(seed)
+            .chain(drafts.iter().copied())
+            .collect();
+        let n_verify = verify_tokens.len();
+        let max_rows = c.body.proposal_capacity() + 1;
+        if self.verify_scratch.is_none() {
+            self.verify_scratch = Some(target.new_spec_scratch(gpu, max_rows)?);
+        }
+        let capture_floats = max_rows * row_floats;
+        if self
+            .verify_capture_dev
+            .as_ref()
+            .is_none_or(|dev| dev.numel() < capture_floats)
+        {
+            if let Some(old) = self.verify_capture_dev.take() {
+                let _ = gpu.free_tensor(old);
+            }
+            self.verify_capture_dev = Some(
+                gpu.alloc_tensor(&[capture_floats], DType::F32)
+                    .map_err(|e| format!("DsparkDrafter: alloc committed capture: {e:?}"))?,
+            );
+        }
+        let scratch = self.verify_scratch.as_mut().expect("allocated above");
+        let capture = self.verify_capture_dev.as_ref().expect("allocated above");
+        let t_verify = self.profiler.sync_start(gpu);
+        let (target_pick, captured) = target.verify_block_capture_gpu(
+            gpu,
+            &verify_tokens,
+            position,
+            scratch.as_mut(),
+            capture,
+        )?;
+        self.profiler.sync_end(gpu, t_verify, 3);
+        if target_pick.len() < n_verify {
+            target.abandon_verify(gpu, scratch.as_mut())?;
+            return Err(format!(
+                "dspark committed binding: verify returned {} picks for {n_verify} rows",
+                target_pick.len()
+            ));
+        }
+        if !captured {
+            target.abandon_verify(gpu, scratch.as_mut())?;
+            return Err("dspark committed binding: the target captured no taps".into());
+        }
+        let t_rest = self.profiler.sync_start(gpu);
+        let acc = accept_greedy_prefix(&drafts, &target_pick, Some(eos));
+        target.commit_prefix(
+            gpu,
+            &verify_tokens,
+            acc.accepted,
+            position,
+            scratch.as_mut(),
+        )?;
+        // Consumed rows: the anchor plus every accepted draft (an accepted EOS
+        // included). The bonus/replacement is emitted but not yet forwarded.
+        c.body
+            .ingest_committed(gpu, capture, position, acc.accepted + 1)?;
+        c.last_window = Some((position, seed));
+        self.profiler.sync_end(gpu, t_rest, 4);
+        self.profiler.end_window();
+        Ok(MtpWindow {
+            committed: acc.committed,
+            accepted: acc.accepted,
+            drafts_generated: drafts.len(),
+        })
+    }
+}
+
 impl MtpDrafter for DsparkDrafter {
     fn name(&self) -> &'static str {
         "dspark"
@@ -1139,13 +1452,38 @@ impl MtpDrafter for DsparkDrafter {
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<crate::spec::PrefillOutcome, String> {
+        if let DsparkBinding::Committed(c) = &mut self.binding {
+            c.last_window = None;
+            if !cache_hit {
+                target.reset_recurrent(gpu)?;
+                c.body.reset(gpu)?;
+            }
+            if fill_tokens.is_empty() {
+                return Err("DsparkDrafter::mtp_prefill: fill_tokens is empty".into());
+            }
+            return match c.advance(gpu, target, fill_tokens, start_pos, abort)? {
+                crate::spec::SpecAdvance::Ready { last_argmax, .. } => {
+                    Ok(crate::spec::PrefillOutcome::Ready {
+                        first_token: last_argmax,
+                    })
+                }
+                crate::spec::SpecAdvance::Aborted => {
+                    // The target reset itself; so does the draft context.
+                    c.body.reset(gpu)?;
+                    Ok(crate::spec::PrefillOutcome::Aborted)
+                }
+            };
+        }
+        let DsparkBinding::Legacy(lg) = &mut self.binding else {
+            unreachable!("committed binding returned above")
+        };
         if !cache_hit {
             target.reset_recurrent(gpu)?;
             // A cold prefill starts a new conversation: body draft rings (DeepSeek
             // `dspark_swa_k`) still hold the previous request's main_kv, and the
             // next draft attends them, so greedy output followed daemon history
             // (HIPF-257). Same clean slate as a fresh daemon or a cold retry.
-            self.body.reset_for_retry(gpu);
+            lg.body.reset_for_retry(gpu);
         }
         // Invalidate multi-slot context: mtp_step re-bootstraps for the first seed.
         // As in the deepseek4 drafter, we do NOT warm the DSpark stage rings
@@ -1196,7 +1534,13 @@ impl MtpDrafter for DsparkDrafter {
         // wired for the generic drafter (no arch-specific grammar type to
         // downcast to) — ignore silently; post-hoc emission-layer grammar applies.
 
-        let layers = self.weights.cfg.target_layer_ids.clone();
+        if matches!(self.binding, DsparkBinding::Committed(_)) {
+            return self.committed_step(gpu, target, position, seed, k, eos);
+        }
+        let DsparkBinding::Legacy(lg) = &mut self.binding else {
+            unreachable!("committed binding returned above")
+        };
+        let layers = lg.weights.cfg.target_layer_ids.clone();
         let n_targets = layers.len();
         // Adaptive block may shrink below the caller's k, but MUST NOT exceed it:
         // per-call k from MtpSpeculator is the remaining max_emit budget.
@@ -1205,12 +1549,12 @@ impl MtpDrafter for DsparkDrafter {
         let block = if k == 0 {
             0
         } else {
-            self.weights.cfg.block_size.min(effective_k).max(1)
+            lg.weights.cfg.block_size.min(effective_k).max(1)
         };
-        let vocab = self.lm_head.shape[0];
+        let vocab = lg.lm_head.shape[0];
         let hidden = {
             // Infer hidden from stage_norm shape (it's [hidden]).
-            self.stage_norm.shape[0]
+            lg.stage_norm.shape[0]
         };
 
         // ── 1. Bootstrap or reuse ctx from previous verify ──────────────────
@@ -1305,9 +1649,9 @@ impl MtpDrafter for DsparkDrafter {
                 .alloc_tensor(&[block, hidden], DType::F32)
                 .map_err(|e| format!("DsparkDrafter: alloc x_head: {e:?}"))?;
             let t_draft = self.profiler.sync_start(gpu);
-            self.body.draft_block(
+            lg.body.draft_block(
                 gpu,
-                &self.weights,
+                &lg.weights,
                 main_hidden,
                 &ctx_positions,
                 seed,
@@ -1320,9 +1664,9 @@ impl MtpDrafter for DsparkDrafter {
             let t_heads = self.profiler.sync_start(gpu);
             let draft = run_heads(
                 gpu,
-                &self.weights,
-                &self.stage_norm,
-                &self.lm_head,
+                &lg.weights,
+                &lg.stage_norm,
+                &lg.lm_head,
                 &x_head_out,
                 seed,
                 block,
@@ -1622,6 +1966,17 @@ impl MtpDrafter for DsparkDrafter {
         if tokens.is_empty() {
             return Ok(true);
         }
+        if let DsparkBinding::Committed(c) = &mut self.binding {
+            // Forced rows are real committed rows: stream their taps into the
+            // draft context (never re-bootstrap a gap from the next seed).
+            c.last_window = None;
+            if let crate::spec::SpecAdvance::Aborted =
+                c.advance(gpu, target, tokens, start_pos, abort)?
+            {
+                c.body.reset(gpu)?;
+            }
+            return Ok(true);
+        }
         if !self.persistent_verify_context_scratch {
             if let Some(dev) = self.main_hidden_dev.take() {
                 let _ = gpu.free_tensor(dev);
@@ -1634,6 +1989,40 @@ impl MtpDrafter for DsparkDrafter {
         }
     }
 
+    fn mtp_repair_terminal_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window_start: usize,
+        window_seed: u32,
+        consumed: &[u32],
+    ) -> Result<bool, String> {
+        let DsparkBinding::Committed(c) = &mut self.binding else {
+            return Ok(false);
+        };
+        let Some(saved) = c.last_window.take() else {
+            return Ok(false);
+        };
+        if saved != (window_start, window_seed) {
+            return Err(format!(
+                "dspark committed terminal repair window mismatch (saved pos={} seed={}, requested pos={window_start} seed={window_seed})",
+                saved.0, saved.1
+            ));
+        }
+        let Some(scratch) = self.verify_scratch.as_mut() else {
+            return Ok(false);
+        };
+        let replay = terminal_prefix_replay(window_seed, consumed);
+        if !target.repair_committed_prefix(gpu, scratch.as_mut(), window_start, &replay)? {
+            return Ok(false);
+        }
+        // The window's ingested rows are `[window_start, window_start + accepted + 1)`;
+        // the repaired target keeps the replayed prefix of them.
+        c.body
+            .truncate_committed(gpu, window_start + replay.len())?;
+        Ok(true)
+    }
+
     fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         // Clear multi-slot context so the next prefill re-bootstraps.
         if !self.persistent_verify_context_scratch {
@@ -1642,9 +2031,18 @@ impl MtpDrafter for DsparkDrafter {
             }
         }
         self.ctx_positions.clear();
-        // Body-owned draft rings / scratch (e.g. DeepSeek dspark_swa_k) must
-        // not survive cold reset — otherwise retry sees prior-window KV.
-        self.body.reset_for_retry(gpu);
+        match &mut self.binding {
+            // Body-owned draft rings / scratch (e.g. DeepSeek dspark_swa_k) must
+            // not survive cold reset — otherwise retry sees prior-window KV.
+            DsparkBinding::Legacy(lg) => lg.body.reset_for_retry(gpu),
+            DsparkBinding::Committed(c) => {
+                c.last_window = None;
+                if let Some(scratch) = self.verify_scratch.as_mut() {
+                    scratch.clear();
+                }
+                c.body.reset(gpu)?;
+            }
+        }
         Ok(())
     }
 
@@ -1658,7 +2056,15 @@ impl MtpDrafter for DsparkDrafter {
         if let Some(scratch) = self.verify_scratch {
             scratch.free(gpu);
         }
-        self.body.free(gpu);
+        match self.binding {
+            DsparkBinding::Legacy(lg) => lg.body.free(gpu),
+            DsparkBinding::Committed(c) => {
+                if let Some(chunk) = c.tap_chunk {
+                    let _ = gpu.free_tensor(chunk);
+                }
+                c.body.free(gpu);
+            }
+        }
     }
 
     fn k(&self) -> usize {
@@ -1725,10 +2131,12 @@ pub fn build_dspark_speculator(
         window_cost,
     );
     Box::new(MtpSpeculator::new(DsparkDrafter {
-        body,
-        weights,
-        stage_norm,
-        lm_head,
+        binding: DsparkBinding::Legacy(LegacyBinding {
+            body,
+            weights,
+            stage_norm,
+            lm_head,
+        }),
         conf_threshold,
         supports_temp,
         temp: 0.0,
@@ -1746,4 +2154,59 @@ pub fn build_dspark_speculator(
         profiler: DsparkProfiler::new(),
         block_controller,
     }))
+}
+
+/// Build the generic DSpark speculator over a committed-context body
+/// ([`DsparkCommittedBody`]): fixed full-width proposals (`k` is clamped only
+/// by the caller's emit budget and the body's position capacity), greedy
+/// verify, no confidence cutoff and no timed width hill-climb. The target must
+/// implement [`SpecTarget::spec_advance_taps_gpu`] and capture the body's
+/// [`DsparkTapSchema`] rows in [`SpecTarget::verify_block_capture_gpu`].
+pub fn build_dspark_committed_speculator(
+    body: Box<dyn DsparkCommittedBody>,
+    ctx_capacity: usize,
+) -> Box<dyn Speculator> {
+    Box::new(MtpSpeculator::new(new_dspark_committed_drafter(
+        body,
+        ctx_capacity,
+    )))
+}
+
+/// The [`DsparkDrafter`] behind [`build_dspark_committed_speculator`], for
+/// callers (oracles) that drive [`MtpDrafter`] windows directly.
+pub fn new_dspark_committed_drafter(
+    body: Box<dyn DsparkCommittedBody>,
+    ctx_capacity: usize,
+) -> DsparkDrafter {
+    let block = body.proposal_capacity();
+    DsparkDrafter {
+        binding: DsparkBinding::Committed(CommittedBinding {
+            body,
+            last_window: None,
+            tap_chunk: None,
+        }),
+        conf_threshold: 0.0,
+        supports_temp: false,
+        temp: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        cactus: 0.0,
+        rng_state: 0x13579BDF,
+        block,
+        ctx_capacity,
+        main_hidden_dev: None,
+        verify_capture_dev: None,
+        verify_scratch: None,
+        persistent_verify_context_scratch: true,
+        ctx_positions: Vec::new(),
+        profiler: DsparkProfiler::new(),
+        // Never consulted by the committed binding (fixed width).
+        block_controller: crate::dspark_block_controller::BlockController::new(
+            block.max(1),
+            1,
+            block.max(1),
+            0.18,
+            WindowCost::Fixed { ratio: 1.0 },
+        ),
+    }
 }

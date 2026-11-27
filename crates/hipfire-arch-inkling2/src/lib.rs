@@ -13,11 +13,13 @@ pub mod arch;
 pub mod arch_model;
 pub mod carrier;
 pub mod config;
+pub mod dspark_body;
 pub mod dspark_weights;
 pub mod forward;
 pub mod gpu;
 pub mod gpu_forward;
 pub mod oracle;
+pub mod spec_target;
 pub mod weights;
 
 pub use arch::Inkling2;

@@ -394,6 +394,11 @@ pub enum KernelKey {
     // model to F32 would land on `GemmF32Batched`, a warp-per-output-element
     // dot product with no data reuse, at a fraction of MFMA throughput.
     GemmBf16Mfma,
+    // BF16 weight x F32 activation -> F32 (`Gpu::gemm_bf16_xf32_batched`,
+    // kernels/src/gemm_bf16_xf32_batched.hip): exact BF16 widening, the
+    // `gemm_f32_batched` per-output arithmetic, every arch. The Inkling-2
+    // DSpark draft's projections (raw BF16 sidecar weights, F32 activations).
+    GemmBf16XF32Batched,
     GemmQ8_0ResidualWmma,
     GemmQ8_0ResidualWmmaGfx12,
     GemmHfq4G256Dp4a,
