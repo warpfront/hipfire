@@ -94,29 +94,20 @@ impl Qwen4Bundle {
         self.session_publish_captures();
         // A lane takes its turn's resident snapshot along (an MTP lane's
         // holds its head too): its rows move into the lane, so a cancel can
-        // rewind the lane to it.
-        let mark = self.session.as_mut().and_then(|s| s.take_mark(prompt));
+        // rewind the lane to it. Marks of lanes released elsewhere (poisoned
+        // steps) go first.
+        let held: Vec<u64> = self.lanes().map_or_else(Vec::new, |store| {
+            store.epochs().iter().map(|e| e.request_tag).collect()
+        });
+        if let Some(session) = self.session.as_mut() {
+            session.mark_lane(tag, prompt, &held);
+        }
         if let Err(error) = self.commit_promotion(gpu, &epoch) {
             let _ = self.release_lane(&epoch);
-            if let Some(mark) = mark {
-                self.discard_lane_mark(mark);
+            if let Some(session) = self.session.as_mut() {
+                session.drop_lane_mark(tag);
             }
             return Err(format!("lane promotion: {error}"));
-        }
-        if let Some(mark) = mark {
-            // Marks of lanes released elsewhere (poisoned steps) go first.
-            let stale: Vec<u64> = self
-                .lane_marks
-                .iter()
-                .map(|&(t, _)| t)
-                .filter(|&t| self.lanes().and_then(|s| s.lane(&lane_epoch(t))).is_none())
-                .collect();
-            for t in stale {
-                if let Some(old) = self.take_lane_mark(t) {
-                    self.discard_lane_mark(old);
-                }
-            }
-            self.lane_marks.push((tag, mark));
         }
         if remaining > 0 {
             self.lane_executor()
@@ -124,17 +115,6 @@ impl Qwen4Bundle {
                 .map_ahead_decode(gpu, &epoch, remaining);
         }
         Ok(())
-    }
-
-    fn take_lane_mark(&mut self, tag: u64) -> Option<LiveMark> {
-        let at = self.lane_marks.iter().position(|(t, _)| *t == tag)?;
-        Some(self.lane_marks.swap_remove(at).1)
-    }
-
-    fn discard_lane_mark(&mut self, mark: LiveMark) {
-        if let Some(session) = self.session.as_mut() {
-            session.discard_mark(mark);
-        }
     }
 
     /// [`MeshLanes::step_windows`] with emitter-forced advances
@@ -478,14 +458,10 @@ impl MeshLanes for Qwen4Bundle {
     ) -> Result<()> {
         let gpu = device(gpus)?;
         let epoch = lane_epoch(tag);
-        if self.session.is_none() {
-            return Err("no session cache: a lane record cannot continue live".into());
-        }
-        let marked = self
-            .lane_marks
-            .iter()
-            .find(|(t, _)| *t == tag)
-            .map(|(_, mark)| mark.position());
+        let session = self
+            .session
+            .as_ref()
+            .ok_or("no session cache: a lane record cannot continue live")?;
         // A window lane stops with its last pick unrun, which the singleton's
         // terminal flush runs: a forced one-row window runs it here, so the
         // record continues at the same row a resident turn would.
@@ -504,17 +480,9 @@ impl MeshLanes for Qwen4Bundle {
                 store.root_seed(&epoch).or(lane.host.pending_seed),
             )
         };
-        // Every row a lane ran is a committed pick: a position inside
-        // `tokens` holds exactly that prefix; past it, a window ran beyond
-        // its stop, or a cancelled lane rewinds to its mark of `tokens` (the
+        // A cancelled lane past its tokens rewinds to its mark of them (the
         // mark restores the head too: nothing of the lane's head is kept).
-        let rewind = at > tokens.len() && marked == Some(tokens.len());
-        if at > tokens.len() && !rewind {
-            return Err(format!(
-                "lane record {tag} sits at {at}, past its {} tokens",
-                tokens.len()
-            ));
-        }
+        let rewind = session.lane_rewinds(tag, at, tokens)?;
         if !rewind {
             // A retired lane's head lags by exactly its owed rows; a lane
             // without owed-row storage cannot catch up and is refused before
@@ -588,23 +556,13 @@ impl MeshLanes for Qwen4Bundle {
         } else {
             SessionRoute::Ar
         };
-        match self.take_lane_mark(tag) {
-            Some(mark) if rewind => {
-                let mut session = self.session.take().ok_or("a lane mark without a session")?;
-                let restored = session.restore_mark(gpu, self, mark, tokens);
-                self.session = Some(session);
-                restored?;
-            }
-            mark => {
-                if let Some(mark) = mark {
-                    self.discard_lane_mark(mark);
-                }
-                if let Some(session) = self.session.as_mut() {
-                    session.adopt_live(&tokens[..position], route);
-                }
-            }
-        }
-        Ok(())
+        let mut session = self
+            .session
+            .take()
+            .ok_or("a lane record without a session")?;
+        let continued = session.continue_lane(gpu, self, tag, tokens, position, route, rewind);
+        self.session = Some(session);
+        continued
     }
 
     fn step_lanes(&mut self, gpus: &mut Gpus, rows: &[(u64, u32, bool)]) -> Result<Vec<DecodeOut>> {
@@ -724,8 +682,8 @@ impl MeshLanes for Qwen4Bundle {
     }
 
     fn free_lane(&mut self, tag: u64) {
-        if let Some(mark) = self.take_lane_mark(tag) {
-            self.discard_lane_mark(mark);
+        if let Some(session) = self.session.as_mut() {
+            session.drop_lane_mark(tag);
         }
         if let Err(error) = self.release_lane(&lane_epoch(tag)) {
             eprintln!("[engine] lane {tag} release: {error}");
@@ -733,10 +691,7 @@ impl MeshLanes for Qwen4Bundle {
     }
 
     fn rewind_point(&self, tag: u64) -> Option<usize> {
-        self.lane_marks
-            .iter()
-            .find(|(t, _)| *t == tag)
-            .map(|(_, mark)| mark.position())
+        self.session.as_ref()?.lane_mark(tag)
     }
 }
 

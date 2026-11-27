@@ -481,14 +481,14 @@ struct Resident {
 
 /// A resident snapshot taken out of the cache with the state whose rows back
 /// it ([`SessionDriver::take_mark`]).
-pub struct LiveMark {
+struct LiveMark {
     resident: Resident,
     route: SessionRoute,
 }
 
 impl LiveMark {
     /// Tokens the marked state holds.
-    pub fn position(&self) -> usize {
+    fn position(&self) -> usize {
         self.resident.key.1 as usize
     }
 }
@@ -3876,6 +3876,9 @@ pub struct SessionDriver {
     parked: Option<LiveRecord>,
     /// One-shot `through` bound for the next [`Self::begin`].
     write_limit: Option<usize>,
+    /// Each engine lane's turn-start mark ([`Self::mark_lane`]): a cancelled
+    /// lane rewinds to it.
+    lane_marks: Vec<(u64, LiveMark)>,
 }
 
 impl SessionDriver {
@@ -3886,6 +3889,7 @@ impl SessionDriver {
             turn: None,
             parked: None,
             write_limit: None,
+            lane_marks: Vec::new(),
         }
     }
 
@@ -4182,7 +4186,8 @@ impl SessionDriver {
             && cache.turn.is_none()
             && cache.disk.is_none()
             && self.live.is_none()
-            && self.turn.is_none();
+            && self.turn.is_none()
+            && self.lane_marks.is_empty();
         if !fresh {
             return Err(
                 "session cache: load epoch can only be bound on a fresh driver".to_string(),
@@ -4337,7 +4342,7 @@ impl SessionDriver {
     /// its `prompt` out of the cache, before its state moves elsewhere (a
     /// lane): the rows that back it move along, so [`Self::restore_mark`] can
     /// rewind that state to the mark. `None` when the turn holds none.
-    pub fn take_mark(&mut self, prompt: &[u32]) -> Option<LiveMark> {
+    fn take_mark(&mut self, prompt: &[u32]) -> Option<LiveMark> {
         let route = self.turn.as_ref()?.1;
         let cache = &mut self.cache;
         let backs = |r: &Option<Resident>| {
@@ -4360,14 +4365,14 @@ impl SessionDriver {
     }
 
     /// Free a mark [`Self::take_mark`] took (at the next turn's start).
-    pub fn discard_mark(&mut self, mark: LiveMark) {
+    fn discard_mark(&mut self, mark: LiveMark) {
         self.cache.release_bufs.push(mark.resident.buf);
     }
 
     /// The owners hold the state the mark was taken from, rows included:
     /// rewind it to the mark and keep it as the live state of `tokens` (the
     /// mark's prefix), the mark again its resident snapshot.
-    pub fn restore_mark(
+    fn restore_mark(
         &mut self,
         gpu: &mut Gpu,
         state: &mut dyn SessionState,
@@ -4400,8 +4405,103 @@ impl SessionDriver {
         }
     }
 
-    /// Drop every snapshot, pending ones included, and the live state.
+    /// The request in flight moves into engine lane `tag` (its state leaves
+    /// the owners): its turn's mark of `prompt` goes along, so a cancel can
+    /// rewind the lane to it ([`Self::lane_rewinds`]). Marks of lanes not in
+    /// `held` (released without [`Self::drop_lane_mark`]) are freed first.
+    pub fn mark_lane(&mut self, tag: u64, prompt: &[u32], held: &[u64]) {
+        let (kept, stale): (Vec<_>, Vec<_>) = std::mem::take(&mut self.lane_marks)
+            .into_iter()
+            .partition(|(t, _)| held.contains(t));
+        self.lane_marks = kept;
+        for (_, mark) in stale {
+            self.discard_mark(mark);
+        }
+        if let Some(mark) = self.take_mark(prompt) {
+            self.lane_marks.push((tag, mark));
+        }
+    }
+
+    /// Tokens lane `tag`'s mark holds: the position a cancelled request's
+    /// lane rewinds to ([`crate::mesh_family::MeshLanes::rewind_point`]).
+    pub fn lane_mark(&self, tag: u64) -> Option<usize> {
+        self.lane_marks
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, mark)| mark.position())
+    }
+
+    /// Free lane `tag`'s mark (the lane is freed).
+    pub fn drop_lane_mark(&mut self, tag: u64) {
+        if let Some(at) = self.lane_marks.iter().position(|(t, _)| *t == tag) {
+            let (_, mark) = self.lane_marks.swap_remove(at);
+            self.discard_mark(mark);
+        }
+    }
+
+    /// Whether lane `tag`, which ran `at` rows, continues as the record of
+    /// `tokens` by a rewind to its mark. Every row a lane ran is a committed
+    /// pick, so a lane inside `tokens` holds exactly that prefix; a lane past
+    /// them (a cancel ran rows beyond its turn start) rewinds when its mark
+    /// holds exactly `tokens`, else it cannot continue (`Err`).
+    pub fn lane_rewinds(&self, tag: u64, at: usize, tokens: &[u32]) -> Result<bool, String> {
+        if at <= tokens.len() {
+            return Ok(false);
+        }
+        if self.lane_mark(tag) == Some(tokens.len()) {
+            return Ok(true);
+        }
+        Err(format!(
+            "lane record {tag} sits at {at}, past its {} tokens",
+            tokens.len()
+        ))
+    }
+
+    /// The owners now hold lane `tag`'s state: with `rewind`
+    /// ([`Self::lane_rewinds`]) rewind it to the lane's mark, the live state
+    /// of `tokens`; else keep its first `position` rows of `tokens` as the
+    /// live state on `route` ([`Self::adopt_live`]). The mark is used up.
+    #[allow(clippy::too_many_arguments)]
+    pub fn continue_lane(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        tag: u64,
+        tokens: &[u32],
+        position: usize,
+        route: SessionRoute,
+        rewind: bool,
+    ) -> Result<(), String> {
+        let mark = self
+            .lane_marks
+            .iter()
+            .position(|(t, _)| *t == tag)
+            .map(|at| self.lane_marks.swap_remove(at).1);
+        match mark {
+            Some(mark) if rewind => self.restore_mark(gpu, state, mark, tokens),
+            None if rewind => Err(format!("lane record {tag} lost its mark")),
+            mark => {
+                if let Some(mark) = mark {
+                    self.discard_mark(mark);
+                }
+                let held = tokens.get(..position).ok_or_else(|| {
+                    format!(
+                        "lane record {tag} sits at {position}, past its {} tokens",
+                        tokens.len()
+                    )
+                })?;
+                self.adopt_live(held, route);
+                Ok(())
+            }
+        }
+    }
+
+    /// Drop every snapshot, pending ones included, every lane mark and the
+    /// live state.
     pub fn clear(&mut self, gpu: &mut Gpu) {
+        for (_, mark) in std::mem::take(&mut self.lane_marks) {
+            self.discard_mark(mark);
+        }
         self.live = None;
         self.turn = None;
         self.parked = None;
@@ -9059,10 +9159,10 @@ mod tests {
         assert!(cache.plan_device_blocker().is_none());
     }
 
-    /// HIPF-599 (Loki, throwaway): a lane mark taken from a live continuation
+    /// HIPF-599 / HIPF-598: a lane mark taken from a live continuation
     /// rewinds the state it was taken with, after decode rows past it.
     #[test]
-    fn loki_lane_mark_rewinds_to_the_turn_start() {
+    fn a_lane_mark_rewinds_to_the_turn_start() {
         let Ok(mut gpu) = Gpu::init() else {
             eprintln!("skip: session cache tests require a GPU");
             return;
@@ -9096,16 +9196,23 @@ mod tests {
             .unwrap());
         toy.advance(gpu, &b);
         // The park: the mark leaves with the state, the reset drops the rest.
-        let mark = driver.take_mark(&b).expect("a live turn holds its start");
-        assert_eq!(mark.position(), a.len());
+        driver.mark_lane(7, &b, &[]);
+        assert_eq!(driver.lane_mark(7), Some(a.len()));
         driver.forget_live();
         let mut decoded = b.clone();
         decoded.extend(prompt(3, 7));
         toy.advance(gpu, &decoded);
-        // A mark of other tokens is refused.
-        let other = driver.take_mark(&b);
-        assert!(other.is_none());
-        driver.restore_mark(gpu, &mut toy, mark, &a).unwrap();
+        // The turn held one mark: another lane's park takes none.
+        driver.mark_lane(8, &b, &[7]);
+        assert_eq!(driver.lane_mark(8), None);
+        // A lane past its tokens rewinds only to a mark of exactly them.
+        assert!(driver.lane_rewinds(7, decoded.len(), &b).is_err());
+        assert_eq!(driver.lane_rewinds(7, a.len(), &a), Ok(false));
+        assert_eq!(driver.lane_rewinds(7, decoded.len(), &a), Ok(true));
+        driver
+            .continue_lane(gpu, &mut toy, 7, &a, a.len(), SessionRoute::Ar, true)
+            .unwrap();
+        assert_eq!(driver.lane_mark(7), None);
         assert_eq!(toy.position, a.len());
         assert_eq!(toy.bytes(gpu), (fixed_of(&a), rows_of(&a)));
         assert_eq!(driver.plan(&toy, &b, SessionRoute::Ar), a.len());
