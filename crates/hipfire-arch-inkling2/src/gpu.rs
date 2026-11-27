@@ -32,6 +32,9 @@
 use crate::config::Inkling2Config;
 use crate::weights::Inkling2Weights;
 use hipfire_runtime::llama::WeightTensor;
+use rdna_compute::inkling2_attention::{
+    INKLING2_ATTN_HEADS, INKLING2_ATTN_HEAD_DIM, INKLING2_ATTN_MAX_SPLITS,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ── Constants (brief 03 reads the KV dtype + conv width) ─────────────────
@@ -1019,6 +1022,12 @@ pub struct Inkling2GpuState {
     /// gfx1201 only; it fails closed elsewhere). Same operands either way.
     /// Defaults to FA2 on gfx1201 and scalar on every other arch.
     pub attn_fa2: bool,
+    /// FA2 partition scratch, `lse [MAX_SPLITS,24]` and `oacc [MAX_SPLITS,24,128]`
+    /// F32 (~400 KB), allocated once per state so a visit does no HIP
+    /// alloc/free for it. Visits run in order on one stream, so one pair is
+    /// shared by all 48 visits.
+    pub fa2_lse: GpuTensor,
+    pub fa2_oacc: GpuTensor,
 }
 
 impl Inkling2GpuState {
@@ -1125,6 +1134,26 @@ impl Inkling2GpuState {
                 }
             }
         }
+        let (s, h, d) = (
+            INKLING2_ATTN_MAX_SPLITS,
+            INKLING2_ATTN_HEADS,
+            INKLING2_ATTN_HEAD_DIM,
+        );
+        let fa2_lse = match gpu.zeros(&[s, h], DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                free_partial(&mut k_cache, &mut v_cache, &mut conv, gpu);
+                return Err(format!("inkling2: FA2 lse scratch alloc: {e:?}"));
+            }
+        };
+        let fa2_oacc = match gpu.zeros(&[s, h, d], DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(fa2_lse);
+                free_partial(&mut k_cache, &mut v_cache, &mut conv, gpu);
+                return Err(format!("inkling2: FA2 oacc scratch alloc: {e:?}"));
+            }
+        };
         Ok(Self {
             k_cache,
             v_cache,
@@ -1137,6 +1166,8 @@ impl Inkling2GpuState {
             kv_bytes,
             conv_bytes,
             attn_fa2: gpu.arch == "gfx1201",
+            fa2_lse,
+            fa2_oacc,
         })
     }
 
@@ -1174,6 +1205,8 @@ impl Inkling2GpuState {
         for t in self.conv {
             let _ = gpu.free_tensor(t);
         }
+        let _ = gpu.free_tensor(self.fa2_lse);
+        let _ = gpu.free_tensor(self.fa2_oacc);
     }
 }
 

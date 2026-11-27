@@ -7,6 +7,10 @@
   KV head planes, SWA ring slots and biased scores (relative bias minus
   sink, unchanged clamp) as the scalar kernel, feeds Q and P to the WMMA as
   hi/lo f16 pairs, and adds the sink once at the merge. The GPU forward
-  selects it through `Inkling2GpuState::attn_fa2` (default off). Replay on
-  R9700: 29x combined attention at 2K context, max |FA2 - scalar| 8.0e-6
-  under a beta-calibrated budget of 3.5e-5, planted faults caught.
+  selects it through `Inkling2GpuState::attn_fa2`, on by default on gfx1201
+  and off on every other arch (scalar kernel unchanged and still reachable
+  by clearing the field). Partition scratch is allocated once per state, so
+  a visit makes no extra HIP alloc/free. FA2 is not bitwise-equal to the
+  scalar kernel. Replay on R9700: 29x combined attention at 2K context, max
+  |FA2 - scalar| 8.0e-6 under a beta-calibrated budget of 3.5e-5, planted
+  faults caught.

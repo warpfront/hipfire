@@ -1112,10 +1112,8 @@ fn run_visit(
     let attn_heads = step!(at(gpu, &mut tmp, &[eattn], "attn_heads"), "alloc");
     if gs.attn_fa2 {
         // Split-KV FA2 (gfx1201): same q / KV / biased scores / ring slots;
-        // partition scratch is a visit temp like every other intermediate.
+        // partition scratch is the state's persistent `fa2_lse` / `fa2_oacc`.
         let splits = inkling2_attn_fa2_splits(n_kv);
-        let lse = step!(at(gpu, &mut tmp, &[splits, nh], "fa2_lse"), "alloc");
-        let oacc = step!(at(gpu, &mut tmp, &[splits, nh, hd], "fa2_oacc"), "alloc");
         let qv = step!(view2(&tmp[q], nh, hd), "view");
         step!(
             hip(
@@ -1125,8 +1123,8 @@ fn run_visit(
                     &gs.v_cache[visit],
                     &tmp[rel_bias],
                     &tmp[si],
-                    &tmp[lse],
-                    &tmp[oacc],
+                    &gs.fa2_lse,
+                    &gs.fa2_oacc,
                     &tmp[attn_heads],
                     n_kv,
                     splits
