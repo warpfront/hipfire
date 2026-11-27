@@ -1356,10 +1356,20 @@ impl HfqFile {
             metadata_json = read_hfq_metadata_overlay(&mmap, cumulative_offset)?;
         }
         if mq4v2_symmetric {
+            // Inkling-2-Mini (arch 24) `qt44-padded-awq-v1` keeps the incumbent
+            // AFFINE qt44 embedding byte-for-byte (a host row lookup, never an
+            // activation GEMM), so the marker's sampler must not read it: sample
+            // the next qt44 tensors instead. Every other file is unchanged.
+            let inkling2_xts_layout = arch_id == 24
+                && serde_json::from_str::<serde_json::Value>(&metadata_json)
+                    .ok()
+                    .and_then(|m| m.get("hipfire_inkling2_mq4_layout").cloned())
+                    .is_some_and(|v| v == serde_json::json!("qt44-padded-awq-v1"));
             let mut sampled_groups = 0usize;
             for tensor in tensors
                 .iter()
                 .filter(|tensor| tensor.quant_type == 44)
+                .filter(|tensor| !(inkling2_xts_layout && tensor.name == "model.llm.embed.weight"))
                 .take(4)
             {
                 let groups = tensor.data_size / 136;
@@ -5457,5 +5467,92 @@ mod mq3v2_symmetric_tests {
             !f.mq3v2_symmetric(),
             "asymmetric ladder base must report marker=false"
         );
+    }
+}
+
+// ─── mq4v2.symmetric sampler vs the Inkling-2 `qt44-padded-awq-v1` embed ────
+
+#[cfg(test)]
+mod mq4v2_symmetric_inkling_xts_tests {
+    use super::hfq_test_fixture::write_min_hfq_with_meta;
+    use super::*;
+
+    /// One 136-byte qt44 group with equal halves; `symmetric` picks z = f16(-8d)
+    /// versus an affine z = 1.0 (the incumbent embedding).
+    fn qt44_group(symmetric: bool) -> [u8; 136] {
+        let mut g = [0u8; 136];
+        let d = half::f16::from_f32(0.25);
+        let z = if symmetric {
+            half::f16::from_f32(-8.0 * d.to_f32())
+        } else {
+            half::f16::from_f32(1.0)
+        };
+        for half_idx in 0..2 {
+            g[half_idx * 4..half_idx * 4 + 2].copy_from_slice(&d.to_bits().to_le_bytes());
+            g[half_idx * 4 + 2..half_idx * 4 + 4].copy_from_slice(&z.to_bits().to_le_bytes());
+        }
+        g
+    }
+
+    const XTS_META: &[u8] =
+        br#"{"mq4v2.symmetric":1,"hipfire_inkling2_mq4_layout":"qt44-padded-awq-v1"}"#;
+    const PLAIN_META: &[u8] = br#"{"mq4v2.symmetric":1}"#;
+
+    fn open_with(arch_id: u32, meta: &[u8], with_sym: bool) -> Result<HfqFile, String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.hfq");
+        let affine = qt44_group(false);
+        let sym = qt44_group(true);
+        let mut tensors: Vec<(&str, u8, &[u32], &[u8])> =
+            vec![("model.llm.embed.weight", 44, &[1, 256], &affine)];
+        if with_sym {
+            for name in ["a.weight", "b.weight"] {
+                tensors.push((name, 44, &[1, 256], &sym));
+            }
+        }
+        write_min_hfq_with_meta(&path, arch_id, meta, &tensors);
+        HfqFile::open(&path).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn arch24_xts_layout_opens_with_affine_embed_first() {
+        let f = open_with(24, XTS_META, true).expect("arch-24 XTS file must open");
+        assert!(f.mq4v2_symmetric());
+    }
+
+    #[test]
+    fn arch24_without_layout_key_still_fails_on_affine_embed() {
+        let err = open_with(24, PLAIN_META, true).err().expect("must fail");
+        assert!(err.contains("model.llm.embed.weight"), "{err}");
+    }
+
+    #[test]
+    fn non_arch24_file_with_layout_key_is_unchanged() {
+        let err = open_with(9, XTS_META, true).err().expect("must fail");
+        assert!(err.contains("model.llm.embed.weight"), "{err}");
+    }
+
+    #[test]
+    fn arch24_xts_embed_only_has_nothing_to_sample() {
+        let err = open_with(24, XTS_META, false).err().expect("must fail");
+        assert!(err.contains("no qt=44 groups"), "{err}");
+    }
+
+    #[test]
+    fn arch24_xts_still_rejects_an_asymmetric_non_embed_tensor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.hfq");
+        let affine = qt44_group(false);
+        write_min_hfq_with_meta(
+            &path,
+            24,
+            XTS_META,
+            &[
+                ("model.llm.embed.weight", 44, &[1, 256], &affine),
+                ("w.weight", 44, &[1, 256], &affine),
+            ],
+        );
+        let err = HfqFile::open(&path).err().expect("must fail").to_string();
+        assert!(err.contains("w.weight"), "{err}");
     }
 }
