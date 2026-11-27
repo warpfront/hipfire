@@ -514,7 +514,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--golden-bin")
-    ap.add_argument("--work", default=str(Path(__file__).resolve().parents[2] / "h2" / "selftest"))
+    ap.add_argument("--work", default=str(Path(__file__).resolve().parents[3] / "h2" / "selftest"))
     ap.add_argument("--template")
     ap.add_argument("--src-dir")
     ap.add_argument("--source-st", help="source model.safetensors (bf16 attention) for the template parity test")

@@ -53,6 +53,7 @@ use crate::gpu::{
     Inkling2GpuWeights, Inkling2XtsLayer, INKLING2_CONV_WIDTH,
 };
 use hip_bridge::{DeviceBuffer, KernargBlob};
+use hipfire_dispatch::pipeline::run_uniform_moe_down_expanded;
 use hipfire_runtime::llama::{rotate_x_mq_for, weight_gemv};
 use rdna_compute::ffn_activation::{
     CombineOrder, FfnActivation, FfnActivationRows, FfnAwq, MoeCombine, MoeRouterTopK, RouterKind,
@@ -475,7 +476,9 @@ pub(crate) fn xts_expert_stage(
     )
     .map_err(|e2| format!("inkling2 gpu fwd: xts producer: {e2:?}"))?;
     let gu = at(gpu, tmp, &[k_top, 2 * inter], "xts_gate_up")?;
-    gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+    run_uniform_moe_down_expanded(
+        gpu,
+        DType::MQ4G256V2,
         &xl.gu_ptrs,
         &tmp[topk_idx],
         &tmp[rows],
@@ -517,7 +520,9 @@ pub(crate) fn xts_expert_stage(
     gpu.rotate_x_mq_batched(&tmp[act], &tmp[rot], phys, k_top)
         .map_err(|e2| format!("inkling2 gpu fwd: xts act rotate: {e2:?}"))?;
     let down_exp = at(gpu, tmp, &[k_top, e], "xts_down_exp")?;
-    gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+    run_uniform_moe_down_expanded(
+        gpu,
+        DType::MQ4G256V2,
         &xl.down_ptrs,
         &tmp[topk_idx],
         &tmp[rot],

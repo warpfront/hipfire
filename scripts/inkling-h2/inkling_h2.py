@@ -810,7 +810,7 @@ def sha256_file(path, block=16 << 20):
 
 
 def hfq_index(path):
-    tools = Path(__file__).resolve().parents[1] / "tools"
+    tools = Path(__file__).resolve().parents[2] / "tools"
     for cand in (tools, Path("/home/kaden/qcal/release-0.5.0/inkling/xts/tools")):
         if (cand / "hfq_census.py").exists():
             sys.path.insert(0, str(cand))
