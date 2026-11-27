@@ -15267,6 +15267,8 @@ extern "C" __global__ void NAMED(int* p) {}
                 flags.deepseek4_wo_q8_wmma = Some(false);
                 // A compiler-free archive serves the same closed route from its pack.
                 flags.no_device_compiler = true;
+                // HIPF-500: the Qwen4 lane commit fill selects no kernel of the route.
+                flags.qwen4_lane_commit_fill = false;
             }
             let mut input = RouteKernelInput {
                 arch: "gfx1201",

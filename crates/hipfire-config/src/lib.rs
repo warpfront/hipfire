@@ -3523,7 +3523,7 @@ pub static FIELDS: &[ConfigField] = &[
         Kernel,
         true,
         "HIPFIRE_QWEN4_LANE_COMMIT_FILL",
-        "Qwen4 lane commit fill (one batched decode-fill Append per lane for a window's kept drafts): auto (default) is on exact gfx1201 only; true / false force it."
+        "Qwen4 lane commit fill (one batched decode-fill Append per lane for a window's kept drafts): auto (default) is on exact gfx1201 only; false turns it off; true cannot enable it on other archs."
     ),
     process_bool_field!(
         "attention.qwen4_qsa_wmma_gather",

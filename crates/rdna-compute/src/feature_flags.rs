@@ -164,7 +164,8 @@ pub struct FeatureFlags {
     pub qwen4_lane_prepare_async: bool,
     /// Lane commit fill (`HIPFIRE_QWEN4_LANE_COMMIT_FILL`, default on for exact gfx1201, `0` is
     /// the kill switch): a lane step's prepare rebuilds a window's kept drafts with one batched
-    /// decode-fill Append per lane instead of one `mtp_append_token` per row, bytes identical.
+    /// decode-fill Append per lane instead of one `mtp_append_token` per row. Head rows are not
+    /// byte-equal to the per-row Append under the lane WMMA arm; they feed proposals only.
     pub qwen4_lane_commit_fill: bool,
     /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`),
     /// default on for exact gfx1201, `0` is the kill switch: the foreign experts'
@@ -3547,6 +3548,29 @@ mod tests {
             assert!(!off.qwen4_lane_prepare_async_enabled(), "{arch}");
             let on = FeatureFlags::from_lookup(arch, with("1"));
             assert_eq!(on.qwen4_lane_prepare_async_enabled(), exact, "{arch}");
+        }
+    }
+
+    /// The lane commit fill is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn qwen4_lane_commit_fill_is_default_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |key: &str| -> std::result::Result<String, ()> {
+                if key == "HIPFIRE_QWEN4_LANE_COMMIT_FILL" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_lane_commit_fill_enabled(), exact, "{arch}");
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_lane_commit_fill_enabled(), "{arch}");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(on.qwen4_lane_commit_fill_enabled(), exact, "{arch}");
         }
     }
 
