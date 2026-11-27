@@ -796,6 +796,9 @@ def conc_self_test():
     assert cj(eng=conc_arm("engine", "noslots", cached=9), c={})["ok"]
     unex = cj(eng=conc_arm("engine", "noslots", cached=0), leg=conc_arm("legacy", "noslots", cached=0), c={})
     assert unex["ok"] and unex["unexercised"]
+    zero = cj(eng=conc_arm("engine", "noslots", cached=0), leg=conc_arm("legacy", "noslots", cached=0),
+              c={"require_reuse": True})
+    assert zero["fails"] == ["engine-noslots: follow-up reused 0 2"], zero["fails"]
     assert not cj(eng=conc_arm("engine", "noslots", tau=2.9), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
     assert cj(eng=conc_arm("engine", "noslots", tau=2.98), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
     # k=1 bound is 2 % (HIPF-619 S1)
@@ -1055,7 +1058,9 @@ def run_perf(args, route, out):
 # `hipfire bench --concurrency` per (loop, backend) arm, the daemon behind a wire
 # tap: the bench JSON gives the timing, the tapped wire every request's tokens,
 # token ids and done envelope.
-TAP = '#!/usr/bin/env bash\n"$TAP_DAEMON" "$@" | tee -a "$TAP_OUT"\nexit "${PIPESTATUS[0]}"\n'
+# the tap also keeps the requests the bench sent (`<wire>.in`): what reached the daemon, not config
+TAP = ('#!/usr/bin/env bash\ntee -a "$TAP_OUT.in" | "$TAP_DAEMON" "$@" | tee -a "$TAP_OUT"\n'
+       'exit "${PIPESTATUS[1]}"\n')
 WORKLOADS = ("stateless", "multiturn")  # bench's order for `--workload both`
 
 
@@ -1190,6 +1195,7 @@ def run_conc(args, route, out):
         base = out / f"{route['name']}.conc.{loop}-{backend}"
         wire = Path(f"{base}.wire.jsonl")
         wire.write_text("")
+        Path(f"{wire}.in").write_text("")
         env = {**arm_env(route, loop), "HIPFIRE_DAEMON_BIN": str(tap),
                "TAP_DAEMON": os.path.realpath(args.daemon), "TAP_OUT": str(wire)}
         cmd = [args.hipfire, "bench", route["model"], "--concurrency", ",".join(map(str, points)),
@@ -1295,7 +1301,12 @@ def judge_conc(arms, c, expect_engine):
         r["refusals_unmapped"] = a.get("refusals_unmapped", [])
         r["cache_hits"] = [sum(cached(reqs[k]) > 0 for k in follow), sum(cached(rr.get(k)) > 0 for k in follow),
                            len(follow)]
-        if follow and not r["cache_hits"][0]:
+        # `require_reuse` (a route whose follow-ups share a long prefix with their own first
+        # turn, HIPF-632): a follow-up that reuses nothing fails instead of going unexercised
+        r["reused_none"] = sorted(k for k in follow if k not in refused and not cached(reqs[k]))
+        if c.get("require_reuse") and not follow:
+            fails.append(f"{tag}: require_reuse without multi-turn follow-ups")
+        elif follow and not r["cache_hits"][0] and not c.get("require_reuse"):
             unexercised.append(f"{tag}: no multi-turn follow-up reused a prefix")
         r["g_spec"], r["target"] = {}, {}
         r["tau"], r["lane_tau"] = {}, {}
@@ -1339,6 +1350,7 @@ def judge_conc(arms, c, expect_engine):
         for name, bad in (("errors", r["errors"]), ("loop", loop_bad), ("C1 != CN", r["c1_ne_cn"]),
                           ("tokens != ref", r["ne_ref"]), ("cached_tokens < ref", r["cache_below_ref"]),
                           ("cached_tokens < C1", r["cache_below_c1"]),
+                          ("follow-up reused 0", c.get("require_reuse") and r["reused_none"]),
                           ("G-spec", not all(r["g_spec"].values())),
                           ("lane tau", [k for k, v in r["lane_tau"].items() if not v["pass"]]),
                           ("target", [k for k, v in r["target"].items() if not v])):

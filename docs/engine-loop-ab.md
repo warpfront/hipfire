@@ -37,9 +37,10 @@ without the A/B scenarios. Outputs in `--out`:
   the host state and every arm's raw results.
 - `<route>.<arm>.jsonl` / `.stderr`: each daemon's raw stdout and stderr
   (`<route>.batch.<arm>.*` for the batch scenario).
-- `<route>.conc.<loop>-<backend>.{json,log,wire.jsonl}`: each concurrency arm's
-  bench JSON, bench stderr (with the daemon's stderr) and the tapped daemon
-  stdout.
+- `<route>.conc.<loop>-<backend>.{json,log,wire.jsonl,wire.jsonl.in}`: each
+  concurrency arm's bench JSON, bench stderr (with the daemon's stderr), the
+  tapped daemon stdout and the tapped requests the bench sent (`.in`: check a
+  prompt there, not in the configuration).
 - `EVIDENCE.md`: one row per run, with the harness sha256, daemon md5, fixture
   sha256, exact command, receipt path, result and disposition.
 
@@ -247,6 +248,12 @@ still hold it after its bench returned.
   records the source SHA, daemon and CLI md5, fixture sha256, the bench
   params and, per engine arm and k>1 cell, the mean, n and per-run means. The
   Qwen4 MTP route and its baseline are in `benchmarks/engine-loop-ab/`.
+- `require_reuse`: every multi-turn follow-up must reuse a prefix (a refused
+  lane record still exempts it); a follow-up that reuses 0 fails the run instead of
+  marking it `pass-partial`. For a route whose conversations open with a long
+  prefix of their own, e.g. a `--bench-shape betterbench --bb-corpus` corpus
+  whose system messages are longer than 256 tokens (Gemma 4 records 256-token
+  boundaries, HIPF-632).
 
 Per cell (workload, k) the receipt reports the median over runs of output
 tok/s (Σ tokens / sample wall), TTFT p50/p99 from `t_send` (a client-side queue
@@ -282,7 +289,7 @@ rows; legacy fn-lanes are not row-exact by default):
   mapping needs every request on the wire batched (a singleton request takes
   no tag); otherwise the tags are listed as `refusals_unmapped` and exempt
   nothing. No follow-up with a prefix hit on the engine marks the run
-  `pass-partial`
+  `pass-partial` (fails it with `require_reuse`)
 - **G-spec:** mean tau per k=1 cell at least the `ref` cell's − 2 % (a
   clean multiturn/1 cell spreads ~2 % per bench run, HIPF-619; use `runs` ≥ 3). k>1
   cells are report-only (`tau` in the receipt: both means, n, pass): at k>1
