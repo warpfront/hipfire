@@ -6152,7 +6152,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "gemm_f16_wmma_mb8_gfx12",
             kernels::GEMM_F16_WMMA_MB8_GFX12_SRC,
-            ["gemm_f16_wmma_mb8_gfx12"]
+            ["gemm_f16_wmma_mb8_gfx12", "gemm_f16_wmma_n16_gfx12"]
         );
         add!(
             "gemm_hfq6g256_moe_grouped_wmma_gfx12",

@@ -89,3 +89,101 @@ extern "C" __global__ void gemm_f16_wmma_mb8_gfx12(
         }
     }
 }
+
+// N <= 16 sister of gemm_f16_wmma_mb8_gfx12 (one WMMA column tile; the F16
+// GEMV / small-batch lm_head shape behind `Gpu::gemm_f16_batched_lmhead`).
+//
+// Bit-identical to gemm_f16_wmma_mb8_gfx12 for 1 <= N <= 16: there grid.y is 1
+// and the only accumulator ever stored is acc[0] (the nb >= 1 tiles cover
+// columns >= 16 and are never written). This kernel issues the SAME
+// wmma_f32_16x16x16_f16 chain into that accumulator: same per-lane operand
+// mapping (lane_m = A row / B column, k_grp = K half), A taken bit for bit
+// from W, B rounded F32 -> F16 by the same conversion, zero operands for rows
+// >= M / columns >= N, ascending k0, zero-initialised, same stores.
+//
+// It differs only in scheduling: the seven dead column tiles are gone, and
+// each lane fetches its operands as 16-byte vectors N16_UNROLL steps ahead of
+// the chain (the mb8 body issues 8 scalar F16 loads per step and waits on them
+// before each WMMA: ~93 us for M=128, K=2304, N=1 on gfx1201).
+//
+// Requires K % 16 == 0 and 16-byte aligned W / X (launcher-checked).
+// Grid: (ceil(M / 16), 1, 1). Block: 32 threads.
+
+#ifndef N16_UNROLL
+#define N16_UNROLL 16
+#endif
+
+typedef unsigned int u32x4_t __attribute__((ext_vector_type(4)));
+typedef float        f32x4_t __attribute__((ext_vector_type(4)));
+
+__launch_bounds__(32)
+extern "C" __global__ void gemm_f16_wmma_n16_gfx12(
+    const _Float16* __restrict__ W,   // [M, K] row-major F16 (weights)
+    const float*    __restrict__ X,   // [N, K] row-major F32 (input), N <= 16
+    float*          __restrict__ Y,   // [N, M] row-major F32 (transposed output)
+    int M, int K, int N
+) {
+    const int row_start = blockIdx.x * 16;
+    const int tid = threadIdx.x;
+    const int lane_m = tid & 15;
+    const int k_grp = tid >> 4;
+
+    if (row_start >= M) return;
+
+    const bool a_in = row_start + lane_m < M;
+    const bool b_in = lane_m < N;
+    // One 16-byte A vector (8 F16) and two 16-byte X vectors (8 F32) per lane
+    // per 16-wide K step; step s sits at +2*s / +4*s vectors.
+    const u32x4_t* __restrict__ wa = reinterpret_cast<const u32x4_t*>(
+        W + (long long)(a_in ? row_start + lane_m : row_start) * K + k_grp * 8);
+    const f32x4_t* __restrict__ xb = reinterpret_cast<const f32x4_t*>(
+        X + (long long)(b_in ? lane_m : 0) * K + k_grp * 8);
+
+    float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+#define N16_STEP(av, xlo, xhi) do { \
+        const half8_t a_reg = __builtin_bit_cast(half8_t, (av)); \
+        half8_t b_reg; \
+        b_reg[0] = (_Float16)(xlo).x; b_reg[1] = (_Float16)(xlo).y; \
+        b_reg[2] = (_Float16)(xlo).z; b_reg[3] = (_Float16)(xlo).w; \
+        b_reg[4] = (_Float16)(xhi).x; b_reg[5] = (_Float16)(xhi).y; \
+        b_reg[6] = (_Float16)(xhi).z; b_reg[7] = (_Float16)(xhi).w; \
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_reg, acc); \
+    } while (0)
+
+    const u32x4_t z4 = {0u, 0u, 0u, 0u};
+    const f32x4_t zf = {0.0f, 0.0f, 0.0f, 0.0f};
+    const int steps = K >> 4;
+    int s = 0;
+    for (; s + N16_UNROLL <= steps; s += N16_UNROLL) {
+        u32x4_t av[N16_UNROLL];
+        f32x4_t xlo[N16_UNROLL], xhi[N16_UNROLL];
+        #pragma unroll
+        for (int u = 0; u < N16_UNROLL; u++) {
+            av[u] = a_in ? wa[2 * (s + u)] : z4;
+            xlo[u] = b_in ? xb[4 * (s + u)] : zf;
+            xhi[u] = b_in ? xb[4 * (s + u) + 1] : zf;
+        }
+        #pragma unroll
+        for (int u = 0; u < N16_UNROLL; u++) {
+            N16_STEP(av[u], xlo[u], xhi[u]);
+        }
+    }
+    for (; s < steps; s++) {
+        const u32x4_t av = a_in ? wa[2 * s] : z4;
+        const f32x4_t xlo = b_in ? xb[4 * s] : zf;
+        const f32x4_t xhi = b_in ? xb[4 * s + 1] : zf;
+        N16_STEP(av, xlo, xhi);
+    }
+#undef N16_STEP
+
+    if (b_in) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const int out_row = row_start + 8 * k_grp + j;
+            if (out_row < M) {
+                Y[(long long)lane_m * M + out_row] = acc[j];
+            }
+        }
+    }
+}

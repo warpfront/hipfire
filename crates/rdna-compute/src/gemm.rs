@@ -23855,6 +23855,11 @@ impl Gpu {
             // rewrite and corrupted the ds4 DSA compressor projections on
             // gfx1201, breaking EP tool-calling. The kernel is fixed now,
             // but WMMA remains the right path here for perf.)
+            // 1..=16 rows (the GEMV shape) take its bit-identical one-column-
+            // tile sister.
+            if self.gemm_f16_wmma_n16_admitted(w_f16, x, m, k, batch_size) {
+                return self.gemm_f16_wmma_n16_gfx12(w_f16, x, y, m, k, batch_size);
+            }
             return self.gemm_f16_wmma_mb8(w_f16, x, y, m, k, batch_size);
         }
         if !self.arch_caps.has_wmma_w32() {
@@ -28917,6 +28922,86 @@ impl Gpu {
             self,
             kernel_name,
             [grid_m, grid_n, 1],
+            [32, 1, 1],
+            0,
+            params; wp, xp, yp, mi, ki, ni
+        )
+    }
+
+    /// Whether [`Self::gemm_f16_wmma_n16_gfx12`] can serve the shape: gfx12
+    /// WMMA, `1..=16` activation rows, `k % 16 == 0`, 16-byte aligned operands,
+    /// full extents.
+    pub fn gemm_f16_wmma_n16_admitted(
+        &self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        self.arch_caps.has_wmma_w32_gfx12()
+            && (1..=16).contains(&n)
+            && m > 0
+            && k > 0
+            && k % 16 == 0
+            && i32::try_from(m).is_ok()
+            && i32::try_from(k).is_ok()
+            && m.checked_mul(k).is_some_and(|e| w.buf.size() >= e * 2)
+            && n.checked_mul(k).is_some_and(|e| x.buf.size() >= e * 4)
+            && (w.buf.as_ptr() as usize) % 16 == 0
+            && (x.buf.as_ptr() as usize) % 16 == 0
+    }
+
+    /// One-column-tile sister of [`Self::gemm_f16_wmma_mb8`] on gfx12 for
+    /// `1..=16` rows (see [`Self::gemm_f16_wmma_n16_admitted`]): the same
+    /// `wmma_f32_16x16x16_f16` chain on the same operands (X rounded to F16),
+    /// so `Y` is bit-identical to `gemm_f16_wmma_mb8`; the dead column tiles
+    /// are dropped and the operands fetched as 16-byte vectors ahead of the
+    /// chain. Grid `[ceil(m / 16)]`, block `[32]`.
+    pub fn gemm_f16_wmma_n16_gfx12(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.gemm_f16_wmma_n16_admitted(w, x, m, k, n) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_f16_wmma_n16_gfx12: shape m={m} k={k} n={n} not admitted on {} \
+                     (needs gfx12 WMMA, 1..=16 rows, k % 16 == 0, 16-byte aligned operands)",
+                    self.arch
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f16_wmma_mb8_gfx12",
+            kernels::GEMM_F16_WMMA_MB8_GFX12_SRC,
+            "gemm_f16_wmma_n16_gfx12",
+        )?;
+        let mut wp = w.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid_m = m.div_ceil(16) as u32;
+        launch_params_blob!(
+            self,
+            "gemm_f16_wmma_n16_gfx12",
+            [grid_m, 1, 1],
             [32, 1, 1],
             0,
             params; wp, xp, yp, mi, ki, ni
