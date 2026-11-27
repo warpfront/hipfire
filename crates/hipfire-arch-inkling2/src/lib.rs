@@ -34,7 +34,10 @@ pub use gpu::{
     Inkling2GpuWeights, VramSummary, DOWN_K_LOGICAL, DOWN_K_PADDED, INKLING2_CONV_WIDTH,
     INKLING2_KV_DTYPE, SWA_WINDOW_ROWS, VRAM_SLACK_BYTES,
 };
-pub use gpu_forward::{forward_token_gpu, forward_token_gpu_capture, forward_token_gpu_trace};
+pub use gpu_forward::{
+    forward_token_gpu, forward_token_gpu_capture, forward_token_gpu_trace,
+    prefill_prompt_gpu_blocked,
+};
 
 /// The verified Mini config.json metadata shape, shared by tests across modules.
 #[cfg(test)]
