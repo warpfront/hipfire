@@ -366,6 +366,8 @@ A separate, optional Flash-Next EP2 sidecar, `<model file name>.ep.hot-units` (t
 | `deepseek-v4-flash:mq2lloyd` | `deepseek-v4-flash-0731.mq2lloyd` | 86.2 | 96 | Previous default (MQ2-Lloyd), retained; KV `f32`; DSpark sidecar |
 | `deepseek-v4-flash-preview` | `deepseek-v4-flash.mq2lloyd` | 82 | 96 | Prior preview package, retained under an explicit preview identity; declares MTP and DSpark sidecars. Same tensor census as `deepseek-v4-flash:mq2lloyd` but a different file (`nwoolmer/hipfire-deepseek-v4-flash`, sha256 `ab8a8900…` vs 0731 `521c9687…`), so it is not an alias |
 | `minimax-m2.7` | `MiniMax-M2.7.mq2` | 79.2 | 96 | arch_id=10 Mixtral-style MoE |
+| `inkling2:mini-mq4-xts` | `inkling2-mini.mq4-xts` | 14.44 | 16 | Inkling-2-Mini arch_id=24, MQ4V2 XT symmetric (H2 GPTQ + AWQ, F16 routers); **default Inkling** (`inkling2`, `inkling2:mini`); paired KLD vs the RTN on gfx1201: WT2 0.0202 vs 0.0328, code24 0.0144 vs 0.0229; text-only, single-stream, speculation off |
+| `inkling2:mini-mq4` | `inkling2-mini-mq4.hfq` | 13.93 | 16 | Inkling-2-Mini uniform MQ4 RTN by Raufaser (`Raufaser/Inkling-2-Mini-hipfire-MQ4`), the first Inkling-2 artifact |
 | `north-mini-code` | `north-mini-code.mq4.hfq` | 16 | 24 | Cohere2-MoE arch_id=12; registry `sampling` block is **inert metadata** today |
 | `vibethinker:3b` | `vibethinker-3b.mq4.hfq` | 1.82 | 3.5 | Qwen2 MQ4 |
 | `vibethinker:3b-mq6` | `vibethinker-3b.mq6.hfq` | 2.51 | 5.0 | Qwen2 MQ6 |
@@ -702,6 +704,7 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `ornith` / `ornith-1.5` / `ornith1.5` / `ornith1.5:35b-a3b` | `ornith-1.5:35b-a3b` |
 | `ornith-1.5:fast` / `ornith-1.5:35b-a3b-fast` | `ornith-1.5:35b-a3b-mq4r` |
 | `qwen3.8` / `qwen3.8:latest` / `qwen3.8:27b` | `qwen3.8:27b-mq4-xts` |
+| `inkling2` / `inkling2:mini` | `inkling2:mini-mq4-xts` |
 | `qwen3.8:fast` / `qwen3.8:27b-fast` | `qwen3.8:27b-mq4-xt` |
 | `qwen3.8:draft` / `qwen3.8:27b-draft` | `qwen3.8:27b-draft-mq4` |
 | `muse-glimmer:latest` / `muse-glimmer:quality` / `muse-glimmer:30b` | `muse-glimmer` |
@@ -744,6 +747,7 @@ Runtime dispatch uses HFQ `arch_id` ([`architecture-ids.md`](architecture-ids.md
 | Muse Glimmer (dense text) | 14 | `hipfire-arch-muse-glimmer` | `muse-glimmer`, `muse-glimmer:fast` (draft: arch 23) |
 | Maple-Preview (ternary MoE) | 15 | `hipfire-arch-maple` | `maple-preview` |
 | Qwen3.8-Flash-Next / Qwen4 experimental | 16 | `hipfire-arch-qwen4` | `qwen3.8:flash-next*` |
+| Inkling-2-Mini (looped MoE) | 24 | `hipfire-arch-inkling2` | `inkling2:mini`, `inkling2:mini-mq4` |
 | FLUX.1 MMDiT | 40 | `hipfire-arch-diffusion` | `flux.schnell:1`, `flux.dev:1` |
 
 **Dense LFM2.5 is supported on arch_id 11.** The LFM config parser treats `num_experts == 0` as dense SwiGLU on every layer (`crates/hipfire-arch-lfm2moe/src/config.rs`). Do **not** claim dense LFM is unsupported.

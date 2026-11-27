@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://github.com/warpfront/hipfire/releases"><img alt="Release v0.4.6" src="https://img.shields.io/badge/release-v0.4.6-24292f?style=flat-square" /></a>
   <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.4.6-f04b24?style=flat-square" /></a>
-  <a href="docs/MODELS.md"><img alt="94 curated registry entries" src="https://img.shields.io/badge/registry-94%20curated%20entries-ff8a1f?style=flat-square" /></a>
+  <a href="docs/MODELS.md"><img alt="98 curated registry entries" src="https://img.shields.io/badge/registry-98%20curated%20entries-ff8a1f?style=flat-square" /></a>
   <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
 </p>
 
@@ -248,8 +248,8 @@ not current product baselines.
 
 ## Models
 
-The bundled registry (`registry/v1.json`) contains 94 curated entries
-(models, quant variants and draft sidecars) and 85 aliases. Run
+The bundled registry (`registry/v1.json`) contains 98 curated entries
+(models, quant variants and draft sidecars) and 94 aliases. Run
 `hipfire list -r` for the live list.
 
 | Family | Pull tags |
@@ -266,6 +266,7 @@ The bundled registry (`registry/v1.json`) contains 94 curated entries
 | DeepSeek V4 Flash | `deepseek-v4-flash` |
 | MiniMax-M2.7 | `minimax-m2.7` |
 | North-Mini-Code-1.0 | `north-mini-code` |
+| Inkling-2-Mini | `inkling2:mini` = `inkling2:mini-mq4-xts` (default), `inkling2:mini-mq4` (Raufaser's RTN) |
 | Carnice (Hermes tool calls) | `carnice:9b`, `carnice:27b`, `-mq6` variants |
 | Qwopus | `qwopus:4b`, `9b`, `27b`, `-mq6` variants, `qwopus3.6:27b-coder` |
 | LFM2.5 | `lfm2.5:350m`, `1.2b`, `1.2b-thinking`, `8b-a1b` |
