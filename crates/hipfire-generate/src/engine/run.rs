@@ -19,7 +19,7 @@ use hipfire_engine::emit::{emit_active_attempt_error, stage_terminal_tool_calls}
 use hipfire_engine::terminal::{await_client_terminal_commit, ClientTerminalDecision};
 use hipfire_loader::{AsstTurnCache, LoadedModel};
 use hipfire_runtime::device_mesh::DeviceMesh;
-use hipfire_runtime::mesh_family::{MeshFamily, MeshRunner};
+use hipfire_runtime::mesh_family::MeshRunner;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::sampler::SamplerConfig;
 use hipfire_runtime::session_cache::SessionRoute;
@@ -222,7 +222,7 @@ impl Job<'_> {
             .mesh_family()
             .expect("the family admitted this request above");
         let mut rollback = |emitter: &mut dyn ProtocolEmit,
-                            family: &mut dyn MeshFamily,
+                            state: &mut dyn hipfire_runtime::arch_model::ArchModel,
                             runner: &mut MeshRunner,
                             gpus: &mut Gpus,
                             error: Option<String>,
@@ -230,7 +230,16 @@ impl Job<'_> {
             *spec_deferred_seed = None;
             emitter.clear_history();
             asst_turn_cache.clear();
-            let epilogue = match runner.reset(family, gpus) {
+            // A client cancel keeps the snapshots the prompt already captured
+            // (a failure drops them with the state), as the speculative one.
+            if error.is_none() {
+                state.session_commit_live_mesh(gpus, &[]);
+            }
+            let reset = match state.mesh_family() {
+                Some(family) => runner.reset(family, gpus),
+                None => Err("the model declares no engine family".into()),
+            };
+            let epilogue = match reset {
                 Ok(()) => RollbackEpilogue {
                     rolled_back: true,
                     context: None,
@@ -258,7 +267,7 @@ impl Job<'_> {
         let mesh_request = match runner.begin(&*family, gpus) {
             Ok(mesh_request) => mesh_request,
             Err(error) => {
-                rollback(&mut *emitter, family, runner, gpus, Some(error), 0);
+                rollback(&mut *emitter, &mut *state, runner, gpus, Some(error), 0);
                 return Outcome::Served;
             }
         };
@@ -291,13 +300,20 @@ impl Job<'_> {
         let finish = match exit {
             Exit::Finished(finish) => finish,
             Exit::Aborted => {
-                rollback(&mut *emitter, family, runner, gpus, None, run.generated());
+                rollback(
+                    &mut *emitter,
+                    &mut *state,
+                    runner,
+                    gpus,
+                    None,
+                    run.generated(),
+                );
                 return Outcome::Served;
             }
             Exit::Failed(error) => {
                 rollback(
                     &mut *emitter,
-                    family,
+                    &mut *state,
                     runner,
                     gpus,
                     Some(error),
@@ -311,7 +327,7 @@ impl Job<'_> {
             Err(error) => {
                 rollback(
                     &mut *emitter,
-                    family,
+                    &mut *state,
                     runner,
                     gpus,
                     Some(error),
@@ -336,7 +352,14 @@ impl Job<'_> {
         stage_terminal_tool_calls(&mut done, finish_reason, &tool_calls);
         if await_client_terminal_commit(emitter.out(), id, &done) != ClientTerminalDecision::Commit
         {
-            rollback(&mut *emitter, family, runner, gpus, None, run.generated());
+            rollback(
+                &mut *emitter,
+                &mut *state,
+                runner,
+                gpus,
+                None,
+                run.generated(),
+            );
             return Outcome::Served;
         }
         state.session_commit_live_mesh(gpus, emitter.history());

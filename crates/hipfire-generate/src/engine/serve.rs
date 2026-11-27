@@ -693,7 +693,12 @@ impl Driver {
                             match (live.spec.is_some(), speculator.as_deref_mut()) {
                                 (true, Some(drafter)) => reset_drafting(state, gpus, drafter, true),
                                 (true, None) => Err("the drafter did not come back".into()),
-                                (false, _) => Ok(()),
+                                // The turn's prompt snapshots stay published,
+                                // as `reset_drafting` keeps a speculative one's.
+                                (false, _) => {
+                                    state.session_commit_live_mesh(gpus, &[]);
+                                    Ok(())
+                                }
                             }
                             .and_then(|()| {
                                 rollback(
@@ -1265,7 +1270,12 @@ impl<'a> Ctx<'a> {
                             &mut live.request,
                         )
                     })
-                    .unwrap_or_else(|| self.rollback(live.request.take()))
+                    .unwrap_or_else(|| {
+                        // A client cancel keeps the snapshots its prompt
+                        // captured, as `reset_drafting` does.
+                        self.state.session_commit_live_mesh(self.gpus, &[]);
+                        self.rollback(live.request.take())
+                    })
             }
             Place::Resident => self.rollback(live.request),
             Place::Lane if matches!(exit, Exit::Aborted) => {
