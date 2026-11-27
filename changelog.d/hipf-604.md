@@ -1,3 +1,3 @@
 ### Fixes: engine_loop_ab G-spec
 
-- **`scripts/engine_loop_ab.py` G-spec no longer fails on MTP noise or on a singleton reference.** On a `spec_noise` route the A/B run repeats the legacy arm (`--spec-reps`, default 2) and bounds the engine tau by the lowest legacy run − 1 %. Concurrency cells at k>1 take their tau reference from the `legacy-batch` arm (lanes vs lanes) instead of the serialized `ref` arm.
+- **`scripts/engine_loop_ab.py` G-spec no longer fails on MTP tau noise or lane window policy.** On a `spec_noise` route the A/B G-spec is report-only; the concurrency k=1 cells gate tau. Concurrency k>1 cells report tau (both means and n) without gating it; the k>1 throughput/TTFT targets gate a draft loss.
