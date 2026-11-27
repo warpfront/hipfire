@@ -196,7 +196,10 @@ A run passes when all of these hold:
   report-only: its ~150 windows spread ~1 % sd run to run on one binary
   (HIPF-474, HIPF-615), so a 1 % bound cannot tell a clean engine from a
   ~3 % regression. Run `--conc` there; its k=1 cells (500+ windows each) gate
-  tau.
+  tau. A `spec_noise` A/B run without a conc k=1 G-spec cell is
+  `pass-partial` (unexercised `G-spec`). Set `spec_noise` only on routes whose
+  counters really differ between same-binary runs (Qwen4 MTP), not EAGLE or
+  DFlash2.
 - **G-perf** (`--perf`): fresh loads, interleaved legacy/engine,
   `--perf-reps` (3) per arm. The run takes the median prefill and decode
   tok/s. Both deltas must be within ±2 % (see intended diff 7). Each rep
@@ -276,7 +279,8 @@ rows; legacy fn-lanes are not row-exact by default):
   no tag); otherwise the tags are listed as `refusals_unmapped` and exempt
   nothing. No follow-up with a prefix hit on the engine marks the run
   `pass-partial`
-- **G-spec:** mean tau per k=1 cell at least the `ref` cell's − 1 %. k>1
+- **G-spec:** mean tau per k=1 cell at least the `ref` cell's − 2 % (a
+  clean multiturn/1 cell spreads ~2 % per bench run, HIPF-619; use `runs` ≥ 3). k>1
   cells are report-only (`tau` in the receipt: both means, n, pass): at k>1
   tau measures the lane window policy, and engine lanes and legacy fn-lanes
   split tokens between windows and AR rows differently (−9 to −13 % on

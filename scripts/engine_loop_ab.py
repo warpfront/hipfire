@@ -675,6 +675,8 @@ def self_test():
     assert not ok(arm(tau=0.5))  # exact spec counters
     assert not ok(arm(tau=None), route={"spec_noise": True})
     assert ok(arm(tau=0.5), route={"spec_noise": True})  # report-only; conc k=1 gates tau (HIPF-615)
+    assert judge({"legacy": arm(), "engine": arm(tau=0.985)}, {}, 0.35)["g_spec"] is False  # 1 % A/B bound
+    assert judge({"legacy": arm(), "engine": arm(tau=0.995)}, {}, 0.35)["g_spec"] is True
     assert not ok(arm(loop="legacy"), route={"expect_engine": True})  # silent fallback
     assert not ok(arm(loop="bogus"))
     assert not ok(arm(), leg=arm(loop="engine"))
@@ -1152,7 +1154,7 @@ def judge_conc(arms, c, expect_engine):
     - cache: each multi-turn follow-up reuses at least the ref arm's `cached_tokens`,
       and at k>1 at least the same request at k=1 (C1), unless the engine logged
       that it refused to continue its lane record (`refused`, refused_followups)
-    - G-spec: mean tau per k=1 cell >= ref - 1 %. k>1 cells are report-only: lane
+    - G-spec: mean tau per k=1 cell >= ref - 2 %. k>1 cells are report-only: lane
       tau measures the lane window policy, which differs between engine lanes and
       legacy fn-lanes (HIPF-615); the k>1 targets gate a draft loss that costs speed
     - target (k>1): out tok/s >= target - tol, TTFT p50 and p99 <= target + tol"""
@@ -1225,7 +1227,8 @@ def judge_conc(arms, c, expect_engine):
                     for rs in (reqs, rr)]
             if taus[1]:
                 ok_ = (len(taus[0]) == len(taus[1])
-                       and statistics.mean(taus[0]) >= 0.99 * statistics.mean(taus[1]))
+                       # 2 %: a clean multiturn/1 cell spreads ~2 % per bench run (HIPF-619 S1)
+                       and statistics.mean(taus[0]) >= 0.98 * statistics.mean(taus[1]))
                 mean = lambda t: round(statistics.mean(t), 4) if t else None
                 r["tau"][cell] = {"engine_mean": mean(taus[0]), "ref_mean": mean(taus[1]),
                                   "n": [len(taus[0]), len(taus[1])], "pass": ok_}
@@ -1329,6 +1332,10 @@ def main():
         arms = run_conc(args, route, out)
         conc = judge_conc(arms, route["conc"], route.get("expect_engine", False))
         unex += conc["unexercised"]
+    # a report-only A/B G-spec must not pass silently: some conc k=1 cell has to gate tau (HIPF-619 B1)
+    if ab_on and route.get("spec_noise") and j["g_spec"] is not None and not (
+            conc and any(c["g_spec"] for c in conc["engine"].values())):
+        unex.append("G-spec: report-only and no conc k=1 cell")
         summary.append("conc=" + ("pass" if conc["ok"] else "FAIL: " + "; ".join(conc["fails"])))
     batch = None
     if batch_on:
