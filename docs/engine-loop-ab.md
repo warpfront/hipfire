@@ -126,8 +126,7 @@ exactly by default. With `"spec_noise": true` a differing value is a
 `spec-stat` note and only G-spec judges it. On Qwen4 native MTP these counters
 differ between two **legacy** processes even when the tokens are identical,
 with or without the AR floor (HIPF-474). A counter present on one arm only is
-a diff in both modes. [INFERENCE] The DFlash `dflash_*` fields come from the
-wall-clock profit guard and may need `spec_noise` on DFlash routes.
+a diff in both modes.
 
 ## Intended diffs (whitelist)
 

@@ -774,6 +774,17 @@ def conc_self_test():
     assert unex["ok"] and unex["unexercised"]
     assert not cj(eng=conc_arm("engine", "noslots", tau=2.9), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
     assert cj(eng=conc_arm("engine", "noslots", tau=2.98), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
+    # k=1 bound is 2 % (HIPF-619 S1)
+    assert not cj(eng=conc_arm("engine", "noslots", tau=2.93), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
+    assert cj(eng=conc_arm("engine", "noslots", tau=2.95), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
+    # report-only A/B G-spec needs a gating conc k=1 cell (HIPF-619 B1, HIPF-624 S1)
+    sn, jab = {"spec_noise": True}, {"g_spec": True}
+    gated = cj(eng=conc_arm("engine", "noslots", tau=3.0), leg=conc_arm("legacy", "noslots", tau=3.0), c={})
+    no_k1 = {"engine": {"engine-noslots": {"g_spec": {}}}}
+    assert spec_unexercised(sn, jab, None) == ["G-spec: report-only and no conc k=1 cell"]
+    assert spec_unexercised(sn, jab, gated) == []
+    assert spec_unexercised(sn, jab, no_k1) == ["G-spec: report-only and no conc k=1 cell"]
+    assert spec_unexercised({}, jab, None) == [] and spec_unexercised(sn, {"g_spec": None}, None) == []
     assert not cj(eng=conc_arm("engine", "noslots", tau=None), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
     # k>1 tau is report-only: lanes accept fewer drafts per window than the singleton ref (HIPF-604/615)
     lanes4 = conc_arm("engine", "noslots", tau=2.9)
@@ -1252,6 +1263,15 @@ def judge_conc(arms, c, expect_engine):
             "reference_c1_ne_cn": reference, "cells": {tag: a["cells"] for tag, a in arms.items()}}
 
 
+def spec_unexercised(route, j, conc):
+    """A report-only A/B G-spec (spec_noise) must not pass silently: some conc k=1
+    cell has to gate tau (Loki HIPF-619 B1). conc is None without --conc."""
+    if route.get("spec_noise") and j["g_spec"] is not None and not (
+            conc and any(c["g_spec"] for c in conc["engine"].values())):
+        return ["G-spec: report-only and no conc k=1 cell"]
+    return []
+
+
 def sha256_cached(path, out):
     """Fixture sha256, cached on (path, size, mtime) because the files are large."""
     st = os.stat(path)
@@ -1332,11 +1352,9 @@ def main():
         arms = run_conc(args, route, out)
         conc = judge_conc(arms, route["conc"], route.get("expect_engine", False))
         unex += conc["unexercised"]
-    # a report-only A/B G-spec must not pass silently: some conc k=1 cell has to gate tau (HIPF-619 B1)
-    if ab_on and route.get("spec_noise") and j["g_spec"] is not None and not (
-            conc and any(c["g_spec"] for c in conc["engine"].values())):
-        unex.append("G-spec: report-only and no conc k=1 cell")
         summary.append("conc=" + ("pass" if conc["ok"] else "FAIL: " + "; ".join(conc["fails"])))
+    if ab_on:
+        unex += spec_unexercised(route, j, conc)
     batch = None
     if batch_on:
         brows = {arm: run_batch(args, route, arm, out) for arm in ARMS}
