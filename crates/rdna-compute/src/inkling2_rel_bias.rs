@@ -16,8 +16,8 @@
 //! is Q head `h`'s `n_rel` dims, exactly the `rc[h * n_rel..]` rows
 //! `forward.rs` builds from `wr_du` and the `inkling2_l2_clip_rows_f32`
 //! output — no transpose), `table: [n_rel, n_extent]`, `sink: [n_heads]`,
-//! `distances: [n_kv]` with every entry `< n_extent` on the CPU path.
-//! Returns `[n_heads, n_kv]`.
+//! `distances: [n_kv]` (any `dist >= 0`; entries `>= n_extent` yield the
+//! zero term). Returns `[n_heads, n_kv]`.
 //!
 //! Order note: the sink term is distance-independent, so subtracting it after
 //! the distance gather is exactly the oracle's sink-subtract-before-gather
@@ -32,12 +32,14 @@
 /// Each thread gathers its distance column across the `n_rel` (16) table
 /// rows against its head's `rel` row, then subtracts `sink[h]`. `rel` is
 /// head-major (`rel[h * n_rel + r]`, matching `forward.rs`'s `rc` rows).
-/// Out-of-extent distances clamp to the last table column in-shader
-/// (`d >= n_extent` only happens at `pos >= 1024`); upstream zeroes that
-/// term instead (see brief 04) — the clamp-vs-zero choice is documented
-/// here because briefs 03/05 need `n_kv > 1` from day one. The CPU
-/// reference below fails closed (panics) instead: shader and reference
-/// agree on every in-extent distance.
+/// Out-of-extent distances contribute a ZERO term in-shader
+/// (`d0 < 0 || d0 >= n_extent` only happens at `pos >= 1024`): upstream
+/// (`inkling2.cpp:357-360`, `llama-kv-cache.cpp:2017-2018`) pads the table
+/// with one extra ZERO column at index `n_extent` and maps every
+/// `distance >= extent` to it, so the term is `0.0 - sink[h]`, NOT a clamp
+/// to `n_extent - 1` (identical for `pos < 1024`, correct past it).
+/// The CPU reference below implements the same zero-term rule, so shader
+/// and reference agree on every distance.
 pub const INKLING2_REL_BIAS_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 // out[h * n_kv + k] = sum_r table[r * n_extent + d] * rel[h * n_rel + r] - sink[h]
@@ -58,10 +60,13 @@ extern "C" __global__ void inkling2_rel_bias_gather_f32(
         const int h = t / n_kv;
         const int k = t % n_kv;
         const int d0 = dist[k];
-        const int d = d0 < n_extent ? d0 : n_extent - 1;
+        // Upstream zero-term past rel_extent (NOT a clamp): d0 < 0 and
+        // d0 >= n_extent both yield 0.0, then sink[h] is subtracted below.
         float v = 0.0f;
-        for (int r = 0; r < n_rel; ++r) {
-            v += table[r * n_extent + d] * rel[h * n_rel + r];
+        if (d0 >= 0 && d0 < n_extent) {
+            for (int r = 0; r < n_rel; ++r) {
+                v += table[r * n_extent + d0] * rel[h * n_rel + r];
+            }
         }
         out[t] = v - sink[h];
     }
@@ -72,9 +77,10 @@ extern "C" __global__ void inkling2_rel_bias_gather_f32(
 ///
 /// `rel` is `[n_heads, n_rel]` row-major (row `h` = head `h`'s dims).
 ///
-/// Panics on an out-of-range distance (fail closed: a bad distance must
-/// refuse the load, never wrap into the table). The HIP kernel clamps
-/// instead — see [`INKLING2_REL_BIAS_HIP_SRC`].
+/// Out-of-extent distances contribute a ZERO term (`0.0 - sink[h]`), matching
+/// upstream (`inkling2.cpp:357-360`) and `forward.rs::rel_bias_for_dist`.
+/// `usize` distances cannot be negative; negative `i32` device distances map
+/// to the same zero term in-shader.
 pub fn inkling2_rel_bias_f32(
     rel: &[f32],
     table: &[f32],
@@ -93,10 +99,13 @@ pub fn inkling2_rel_bias_f32(
     let mut out = vec![0.0f32; n_heads * n_kv];
     for h in 0..n_heads {
         for (k, &d) in distances.iter().enumerate() {
-            assert!(d < n_extent, "relative distance {d} out of range");
+            // Upstream zero-term past rel_extent (NOT a clamp to the last
+            // column): identical for pos < 1024, correct past it.
             let mut v = 0.0f32;
-            for r in 0..n_rel {
-                v += table[r * n_extent + d] * rel[h * n_rel + r];
+            if d < n_extent {
+                for r in 0..n_rel {
+                    v += table[r * n_extent + d] * rel[h * n_rel + r];
+                }
             }
             out[h * n_kv + k] = v - sink[h];
         }
@@ -139,11 +148,12 @@ mod tests {
         let n_kv = distances.len();
         let mut out = vec![0.0f32; n_heads * n_kv];
         for (k, &d) in distances.iter().enumerate() {
-            assert!(d < n_extent);
             for h in 0..n_heads {
                 let mut v = 0.0f32;
-                for r in 0..n_rel {
-                    v += table[r * n_extent + d] * rel[h * n_rel + r];
+                if d < n_extent {
+                    for r in 0..n_rel {
+                        v += table[r * n_extent + d] * rel[h * n_rel + r];
+                    }
                 }
                 out[h * n_kv + k] = v - sink[h];
             }
@@ -237,10 +247,48 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "out of range")]
-    fn out_of_range_distance_fails_closed() {
-        let table = vec![0.0f32; 2 * 4];
-        inkling2_rel_bias_f32(&[1.0, 2.0], &table, &[0.0], &[4], 2, 1, 4);
+    fn out_of_extent_distance_gives_zero_term_minus_sink() {
+        // Upstream rule: dist >= n_extent yields 0.0 - sink (NOT a clamp to
+        // the last column, which here would read 2*3.0 + 4*6.0 = 30).
+        let table = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let out = inkling2_rel_bias_f32(&[2.0, 4.0], &table, &[0.5], &[3], 2, 1, 3);
+        assert_eq!(out, vec![-0.5]);
+        let out = inkling2_rel_bias_f32(&[2.0, 4.0], &table, &[0.5], &[9999], 2, 1, 3);
+        assert_eq!(out, vec![-0.5]);
+    }
+
+    #[test]
+    fn rollover_1023_vs_1024_against_cpu_reference() {
+        // The 1023/1024 boundary: d=1023 gathers the last table column,
+        // d=1024+ yields the zero term (0.0 - sink). The CPU reference and
+        // the naive transcription must agree bit-exactly on both sides.
+        // (No fold_emulation on this base: the in-kernel fold it transcribes
+        // does not exist here; the GPU rollover gate below covers the
+        // shader against this same reference.)
+        let (n_rel, n_heads, n_extent) = (16usize, 4usize, 1024usize);
+        let mut s = 0x1023_1024_9abc_def0u64;
+        let rel = rand_vec(&mut s, n_rel * n_heads, -1.0, 1.0);
+        let table = rand_vec(&mut s, n_rel * n_extent, -0.5, 0.5);
+        let sink = rand_vec(&mut s, n_heads, -1.0, 1.0);
+        let dists = vec![1022usize, 1023, 1024, 1025, 2048, 65534];
+        let got = inkling2_rel_bias_f32(&rel, &table, &sink, &dists, n_rel, n_heads, n_extent);
+        let want = naive_rel_bias(&rel, &table, &sink, &dists, n_rel, n_heads, n_extent);
+        assert_eq!(got.len(), want.len());
+        for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(a == b, "reference moved bit {i}: {a} vs {b}");
+        }
+        // Rollover shape: d=1023 is a real gather, d>=1024 is exactly -sink.
+        for h in 0..n_heads {
+            let base = h * dists.len();
+            let mut v1023 = 0.0f32;
+            for r in 0..n_rel {
+                v1023 += table[r * n_extent + 1023] * rel[h * n_rel + r];
+            }
+            assert_eq!(got[base + 1], v1023 - sink[h]);
+            for &k in &[2usize, 3, 4, 5] {
+                assert_eq!(got[base + k], -sink[h]);
+            }
+        }
     }
 }
 
@@ -444,5 +492,42 @@ mod gpu_tests {
         );
         eprintln!("rel_bias randomized max abs diff: {d}");
         assert!(d <= 1e-5, "randomized diff {d}");
+    }
+
+    /// Gate: the shader implements the upstream zero-term rule at the
+    /// 1023/1024 rollover, not a clamp to the last table column:
+    /// d=1023 must gather column 1023, d>=1024 must equal -sink exactly.
+    /// Same distances/straddle as the CPU rollover test; the CPU reference
+    /// above is the oracle (it already encodes the zero-term rule, and
+    /// `forward.rs::rel_bias_for_dist` agrees). Bar: max abs diff <= 1e-5.
+    #[test]
+    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    fn gpu_rollover_1023_1024_matches_cpu_reference() {
+        let mut gpu = match crate::gpu_test::init() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skip: no usable GPU ({e:?})");
+                return;
+            }
+        };
+        assert_eq!(gpu.arch, "gfx1100");
+        let (n_rel, n_heads, n_extent) = (16usize, 24usize, 1024usize);
+        let mut s = 0x1023_1024_9abc_def0u64;
+        let rel: Vec<f32> = (0..n_rel * n_heads)
+            .map(|_| rng_f32(&mut s, -1.0, 1.0))
+            .collect();
+        let table: Vec<f32> = (0..n_rel * n_extent)
+            .map(|_| rng_f32(&mut s, -0.5, 0.5))
+            .collect();
+        let sink: Vec<f32> = (0..n_heads).map(|_| rng_f32(&mut s, -1.0, 1.0)).collect();
+        // Rollover straddle: last two in-extent columns, then the zero-term
+        // band (1024, 1025, 2048, 4096). d=1023 must gather; d>=1024 must
+        // equal -sink exactly.
+        let distances: Vec<usize> = vec![0, 1022, 1023, 1024, 1025, 2048, 4096];
+        let d = run_case(
+            &mut gpu, &rel, &table, &sink, &distances, n_rel, n_heads, n_extent,
+        );
+        eprintln!("rel_bias rollover max abs diff: {d}");
+        assert!(d <= 1e-5, "rollover diff {d}");
     }
 }
