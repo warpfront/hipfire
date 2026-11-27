@@ -13249,7 +13249,7 @@ impl Carrier for Inkling2Carrier {
             hipfire_config::load_summary::note(
                 hipfire_config::load_summary::Facet::ContextFit,
                 format!(
-                    "executable {position_limit}: the GPU forward refuses full-attention log scaling from position {position_limit}"
+                    "executable {position_limit}: the GPU forward supports full-attention tau only through position {position_limit}"
                 ),
             );
         }

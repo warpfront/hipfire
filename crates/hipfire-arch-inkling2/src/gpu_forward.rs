@@ -773,6 +773,21 @@ fn gpu_control(
 }
 
 // ---------------------------------------------------------------------------
+/// Full-layer tau decision for one GPU visit (`oracle::tau` parity).
+/// `None` means t is 1 within epsilon and no scaling launch is needed.
+fn full_layer_tau(pos: usize, floor: usize, alpha: f32) -> Result<Option<f32>, String> {
+    let t = crate::oracle::tau(pos, floor, alpha);
+    if (t - 1.0).abs() <= crate::config::GPU_UNIT_TAU_TOLERANCE {
+        return Ok(None);
+    }
+    if !t.is_finite() || t <= 0.0 || t > crate::config::GPU_MAX_FULL_TAU {
+        return Err(format!(
+            "inkling2 gpu fwd: full-layer tau {t} at pos {pos} out of range"
+        ));
+    }
+    Ok(Some(t))
+}
+
 // One attention+MoE visit on the GPU
 // ---------------------------------------------------------------------------
 
@@ -2648,6 +2663,8 @@ fn visit_pre(
     let nkv = cfg.n_head_kv;
     let hd = cfg.head_dim;
     let ekv = nkv * hd;
+    let eattn = nh * hd;
+    let erel = nh * cfg.n_rel;
     let eps = cfg.rms_norm_eps;
     let swa = cfg.swa_layers[phys];
     macro_rules! step {
@@ -2772,14 +2789,36 @@ fn visit_pre(
             "v norm"
         );
     }
-    // Full-layer tau: exactly 1.0 below `log_floor`; fail closed beyond
-    // instead of silently dropping it. Generate admission refuses requests
-    // that would reach this through `Inkling2Config::gpu_position_limit`.
-    if !swa && !cfg.gpu_full_tau_supported(pos) {
-        return Err(format!(
-            "inkling2 gpu fwd: full-layer tau {} at pos {pos} unimplemented",
-            cfg.full_attention_tau(pos)
-        ));
+    // Capture the clipped, unscaled values so CPU/GPU component parity keeps
+    // the same meaning at every position. Scaled values get separate keys.
+    step!(cap_put(cap, gpu, "qc", q), "capture");
+    step!(cap_put(cap, gpu, "rc", r), "capture");
+    // Full-layer tau multiplies clipped Q and R by oracle::tau. SWA is
+    // untouched; below the floor no launch fires. The documented kill switch
+    // is for the GPU-vs-GPU gate arm only.
+    if !swa && hipfire_config::developer_var("HIPFIRE_INKLING2_TAU_OFF").as_deref() != Ok("1") {
+        match full_layer_tau(pos, cfg.log_floor, cfg.log_alpha) {
+            Ok(None) => {}
+            Ok(Some(t)) => {
+                let scq = step!(
+                    hip(gpu.upload_f32(&vec![t; eattn], &[eattn]), "tau scale"),
+                    "tau scale"
+                );
+                tmp.push(scq);
+                let siq = tmp.len() - 1;
+                step!(gpu.mul_f32(q, &tmp[siq], q), "q tau");
+                let scr = step!(
+                    hip(gpu.upload_f32(&vec![t; erel], &[erel]), "tau scale"),
+                    "tau scale"
+                );
+                tmp.push(scr);
+                let sir = tmp.len() - 1;
+                step!(gpu.mul_f32(r, &tmp[sir], r), "r tau");
+                step!(cap_put(cap, gpu, "qc_scaled", q), "capture");
+                step!(cap_put(cap, gpu, "rc_scaled", r), "capture");
+            }
+            Err(e) => return Err(e),
+        }
     }
     // Sinks.
     step!(gpu.gemv_f32(&layer.sink, qi, sinks_out), "sink");
@@ -2810,10 +2849,8 @@ fn visit_pre(
         launch_build_slots_dists(gpu, &gs.pos_dev, &gs.slots_dev, &gs.dists_dev, rows),
         "slots kernel"
     );
-    step!(cap_put(cap, gpu, "qc", q), "capture");
     step!(cap_put(cap, gpu, "kc", &tmp[k_conv]), "capture");
     step!(cap_put(cap, gpu, "vc", &tmp[vc]), "capture");
-    step!(cap_put(cap, gpu, "rc", r), "capture");
     step!(cap_put(cap, gpu, "sinks", sinks_out), "capture");
     // D1: one batched KV-write launch per visit (grid (8, 2)) replaces 16
     // per-head launches. F16 keeps the (_Float16) cast bit-identically.
@@ -4614,7 +4651,7 @@ mod tests {
     // View-cut bounds gates (upstream #1192): the reuse pool best-fit may
     // hand a LARGER buffer to an exact-size request. The view takes the
     // logical prefix; a short buffer fails closed instead of panicking.
-    use super::{sub_buf, view2};
+    use super::{full_layer_tau, sub_buf, view2};
     use hip_bridge::DeviceBuffer;
     use rdna_compute::{DType, GpuTensor};
 
@@ -4680,5 +4717,35 @@ mod tests {
         assert!(sub_buf(&t, 0, 101, "t").is_err());
         assert!(sub_buf(&t, 37, 64, "t").is_err());
         assert!(sub_buf(&t, usize::MAX, 1, "t").is_err());
+    }
+
+    #[test]
+    fn tau_skips_scaling_below_floor() {
+        for pos in [0, 1, 4096, 8191] {
+            assert_eq!(full_layer_tau(pos, 8192, 0.1), Ok(None), "pos {pos}");
+        }
+    }
+
+    #[test]
+    fn tau_matches_oracle_past_floor() {
+        for pos in [8192, 8193, 16383, 24800, 100_000] {
+            let got = full_layer_tau(pos, 8192, 0.1)
+                .expect("scales")
+                .expect("some");
+            let want = 1.0 + 0.1 * (((pos + 1) as f64 / 8192.0).max(1.0)).ln();
+            assert!(
+                (got as f64 - want).abs() < 1e-6,
+                "pos {pos}: {got} vs {want}"
+            );
+        }
+        let first = full_layer_tau(8192, 8192, 0.1).unwrap().unwrap();
+        assert!((first - 1.0000122).abs() < 1e-6, "{first}");
+    }
+
+    #[test]
+    fn tau_absurd_stays_fail_closed() {
+        assert!(full_layer_tau(9000, 8192, f32::NAN).is_err());
+        assert!(full_layer_tau(200_000_000, 8192, 0.1).is_err());
+        assert!(full_layer_tau(200_000_000, 8192, -1.0).is_err());
     }
 }

@@ -6672,7 +6672,7 @@ fn inkling_context_refusal(
             format!("shorten the prompt below {position_limit} tokens")
         };
         return Some(format!(
-            "prompt exceeds executable context: prompt={prompt} + max_tokens={max_tokens} > position_limit={position_limit} (the inkling2 GPU forward implements full-attention log scaling only below position {position_limit}, whatever max_seq; capacity={capacity}) — {action}"
+            "prompt exceeds executable context: prompt={prompt} + max_tokens={max_tokens} > position_limit={position_limit} (the inkling2 GPU forward supports full-attention tau only through position {position_limit}, whatever max_seq; capacity={capacity}) — {action}"
         ));
     }
     (needed > capacity).then(|| {
@@ -6690,6 +6690,11 @@ mod inkling_context_refusal_tests {
         assert_eq!(inkling_context_refusal(4000, 96, 4096, 8192), None);
         assert_eq!(inkling_context_refusal(8064, 128, 8448, 8192), None);
         assert_eq!(inkling_context_refusal(1, 0, 1, 8192), None);
+    }
+
+    #[test]
+    fn admits_request_crossing_tau_floor() {
+        assert_eq!(inkling_context_refusal(8065, 128, 8448, 32768), None);
     }
 
     #[test]
@@ -6998,9 +7003,9 @@ pub fn generate_inkling(
     let eos_tok = m.inkling2().unwrap().eos_tok;
     // Admission before any state change: the KV row budget lives in the GPU
     // session state (sized from `max_seq` at load; full visits fail closed
-    // past it), and the GPU forward refuses full-attention visits past the
-    // config's unit-τ range independently of capacity. Refuse here, with
-    // counts, instead of partway through prefill or decode.
+    // past it), and the GPU forward refuses unsupported full-attention tau
+    // independently of capacity. Refuse here, with counts, instead of
+    // partway through prefill or decode.
     let (cap, position_limit) = {
         let b = m.inkling2().unwrap();
         let cap = b.gpu_state.as_ref().map(|s| s.max_seq).unwrap_or(m.max_seq);
