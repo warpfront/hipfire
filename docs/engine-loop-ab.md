@@ -83,8 +83,11 @@ own route files: Qwen4 native MTP via `"mtp_mode": "on"`, a DFlash drafter via
   Gemma 4 routes, whose template re-renders earlier replies (see Batch-path
   cache scenario).
 - `chat_system` (default false): open every multi-turn, interleaved and batch
-  conversation with a long system message (about 600 tokens), so every prompt
-  is longer than the 256-row prefill chunk. Set it on the Gemma 4 routes: a
+  conversation, and both abort scenarios, with a long system message (about
+  430 tokens) whose first line names the conversation, so every prompt is
+  longer than the 256-row prefill chunk and a first-chunk reuse comes only from
+  the same conversation. `--conc` does not use it yet: the bench prompts stay
+  short, so the Gemma 4 conc cache rows reuse 0 tokens. Set it on the Gemma 4 routes: a
   Gemma 4 follow-up reuses only the previous prompt rounded down to the chunk
   (or a 1024-token stride snapshot), so short prompts reuse nothing (HIPF-598).
 - `perf_decode_gain` (default false): a G-perf decode gain above +2 % is

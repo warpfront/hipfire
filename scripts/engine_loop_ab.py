@@ -50,9 +50,21 @@ CHAT_SYSTEM = "You are a concise assistant. Reference notes, not to be quoted:\n
     for i, w in enumerate(["thermal", "power", "fan", "humidity"] * 6))
 
 
-def chat_start(route):
-    """The messages a conversation starts with (the route's `chat_system`)."""
-    return [{"role": "system", "content": CHAT_SYSTEM}] if route.get("chat_system") else []
+def chat_start(route, conv):
+    """The messages conversation `conv` starts with (the route's `chat_system`). The
+    first line names the conversation, so a reuse inside the first prefill chunk
+    comes only from the same conversation (twins share a name)."""
+    if not route.get("chat_system"):
+        return []
+    return [{"role": "system", "content": f"Conversation {conv}.\n{CHAT_SYSTEM}"}]
+
+
+def chat_turn(route, conv, user, max_tokens, **kw):
+    """A greedy request of one user turn, opened by `chat_start` on a `chat_system` route."""
+    if not route.get("chat_system"):
+        return greedy(user, max_tokens, **kw)
+    msgs = chat_start(route, conv) + [{"role": "user", "content": user}]
+    return greedy(user, max_tokens, messages=msgs, thinking_enabled=False, **kw)
 COUNT = "List the numbers from 1 to 100, one per line, as digits."  # decodes long: aborts land mid-decode
 LONG = (
     "Summarize the following notes in two sentences.\n"
@@ -195,7 +207,7 @@ def run_arm(args, route, arm, out, eos_n=None):
         # cold start: first request on a fresh load
         res["cold"] = [d.generate("cold", greedy(COLD, mt))]
         # multi-turn reuse: each turn resends the history; cached_tokens must match
-        hist, turns = chat_start(route), []
+        hist, turns = chat_start(route, "M"), []
         for k, user in enumerate(["Name three primes.", "Now add them up.",
                                   "Is the sum prime?", "Answer in one word."]):
             hist.append({"role": "user", "content": user})
@@ -207,7 +219,7 @@ def run_arm(args, route, arm, out, eos_n=None):
         res["multi_turn"] = turns
         # two conversations interleaved A1 B1 A2 B2: a turn must reuse its own
         # conversation's prefix with the other one's state live in between (N records)
-        convs = {c: chat_start(route) for c in "AB"}
+        convs = {c: chat_start(route, c) for c in "AB"}
         res["interleaved"] = []
         for t, user in enumerate(["Name a {} fruit.", "Why is it {}?"]):
             for c, color in (("A", "red"), ("B", "yellow")):
@@ -218,11 +230,11 @@ def run_arm(args, route, arm, out, eos_n=None):
                 res["interleaved"].append(r)
         # abort mid-prefill (long prompt, abort queued behind the request), then the
         # same prompt again: a partially prefilled prefix must not be reused wrongly
-        res["abort_prefill"] = [d.generate("ap", greedy(LONG, mt), abort_now=True),
-                                d.generate("ap-next", greedy(LONG, mt))]
+        res["abort_prefill"] = [d.generate("ap", chat_turn(route, "AP", LONG, mt), abort_now=True),
+                                d.generate("ap-next", chat_turn(route, "AP", LONG, mt))]
         # abort mid-decode after 8 tokens, then the same prompt again (prefix reuse)
-        res["abort_decode"] = [d.generate("ad", greedy(COUNT, 4 * mt), abort_at_token=8),
-                               d.generate("ad-next", greedy(COUNT, mt))]
+        res["abort_decode"] = [d.generate("ad", chat_turn(route, "AD", COUNT, 4 * mt), abort_at_token=8),
+                               d.generate("ad-next", chat_turn(route, "AD", COUNT, mt))]
         # stop on the last budget token: probe the natural length, then rerun with
         # the budget ending exactly at the EOS (both tokens-counting conventions).
         # Both arms rerun at the legacy n: the engine does not count EOS, so its own
@@ -279,7 +291,7 @@ def run_batch(args, route, arm, out):
     res = {}
     try:
         res["loaded"] = d.load(route["model"], {**route.get("load", {}), **route.get("batch_load", BATCH_LOAD)})
-        hist = {c: chat_start(route) + [{"role": "user", "content": BATCH_TURNS[c[0]][0]}]
+        hist = {c: chat_start(route, c[0]) + [{"role": "user", "content": BATCH_TURNS[c[0]][0]}]
                 for c in ("P", "P~", "D", "D~")}
         res.update(d.generate_many([(c + "0", batch_req(hist[c], mt), None) for c in hist]))
         for c in hist:
