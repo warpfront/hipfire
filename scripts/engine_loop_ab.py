@@ -799,6 +799,22 @@ def conc_self_test():
     zero = cj(eng=conc_arm("engine", "noslots", cached=0), leg=conc_arm("legacy", "noslots", cached=0),
               c={"require_reuse": True})
     assert zero["fails"] == ["engine-noslots: follow-up reused 0 2"], zero["fails"]
+    # spec: an AR fallback (no spec, or no window) fails; require_overlap: a serialized k>1 cell fails (HIPF-633)
+    def spec_arm(loop, spec="gemma4_eagle", rounds=3, rejected=0):
+        a = conc_arm(loop, "noslots")
+        for x in a["reqs"].values():
+            x["done"].update(spec=spec, rounds=rounds)
+        for m in a["cells"].values():
+            m.update(samples=1, overlap_rejected=rejected)
+        return a
+    eagle = {"spec": "gemma4_eagle", "require_overlap": True}
+    sj = lambda eng, c=eagle: cj(eng=eng, leg=spec_arm("legacy"), batch=spec_arm("legacy"), c=c)
+    assert sj(spec_arm("engine"))["ok"], sj(spec_arm("engine"))
+    assert not sj(spec_arm("engine", spec=None))["ok"]
+    assert not sj(spec_arm("engine", rounds=0))["ok"]
+    ser = sj(spec_arm("engine", rejected=1))
+    assert ser["fails"] == ["engine-noslots: serialized ['multiturn/4', 'stateless/4']"], ser["fails"]
+    assert sj(spec_arm("engine", rejected=1), {"spec": "gemma4_eagle"})["ok"]
     assert not cj(eng=conc_arm("engine", "noslots", tau=2.9), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
     assert cj(eng=conc_arm("engine", "noslots", tau=2.98), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
     # k=1 bound is 2 % (HIPF-619 S1)
@@ -1058,9 +1074,20 @@ def run_perf(args, route, out):
 # `hipfire bench --concurrency` per (loop, backend) arm, the daemon behind a wire
 # tap: the bench JSON gives the timing, the tapped wire every request's tokens,
 # token ids and done envelope.
-# the tap also keeps the requests the bench sent (`<wire>.in`): what reached the daemon, not config
-TAP = ('#!/usr/bin/env bash\ntee -a "$TAP_OUT.in" | "$TAP_DAEMON" "$@" | tee -a "$TAP_OUT"\n'
-       'exit "${PIPESTATUS[1]}"\n')
+# the tap also keeps the requests the bench sent (`<wire>.in`): what reached the daemon, not config.
+# `TAP_LOAD` (the route's `conc.load`) is merged into every `load` request's params: the bench has no
+# knob for e.g. the Gemma 4 EAGLE drafter (HIPF-633)
+TAP_FILTER = ('import json, os, sys\np = json.loads(os.environ.get("TAP_LOAD") or "{}")\n'
+              'for line in sys.stdin:\n'
+              '    m = None\n'
+              '    if p:\n'
+              '        try:\n            m = json.loads(line)\n        except ValueError:\n            pass\n'
+              '    if isinstance(m, dict) and m.get("type") == "load":\n'
+              '        m["params"] = {**(m.get("params") or {}), **p}\n'
+              '        line = json.dumps(m) + "\\n"\n'
+              '    sys.stdout.write(line)\n    sys.stdout.flush()\n')
+TAP = ('#!/usr/bin/env bash\npython3 -u -c "$TAP_FILTER" | tee -a "$TAP_OUT.in" | "$TAP_DAEMON" "$@" '
+       '| tee -a "$TAP_OUT"\nexit "${PIPESTATUS[2]}"\n')
 WORKLOADS = ("stateless", "multiturn")  # bench's order for `--workload both`
 
 
@@ -1174,7 +1201,7 @@ def cell_metrics(cell):
                 v = pctl(xs, p / 100)
                 row[f"{name}_p{p}_ms"] = None if v is None else 1000 * v
         rows.append(row)
-    m = {"status": cell["status"], "samples": len(rows)}
+    m = {"status": cell["status"], "samples": len(rows), "overlap_rejected": len(cell["rejected_samples"])}
     for key in ("out_tok_s", "ttft_p50_ms", "ttft_p99_ms", "tpot_p50_ms", "tpot_p99_ms", "decode_concurrency"):
         xs = [r[key] for r in rows if r[key] is not None]
         m[key] = round(statistics.median(xs), 2) if xs else None
@@ -1196,7 +1223,9 @@ def run_conc(args, route, out):
         wire = Path(f"{base}.wire.jsonl")
         wire.write_text("")
         Path(f"{wire}.in").write_text("")
-        env = {**arm_env(route, loop), "HIPFIRE_DAEMON_BIN": str(tap),
+        env = {**arm_env(route, loop), "HIPFIRE_DAEMON_BIN": str(tap), "TAP_FILTER": TAP_FILTER,
+               "TAP_LOAD": json.dumps({k: os.path.expanduser(v) if isinstance(v, str) else v
+                                       for k, v in c.get("load", {}).items()}),
                "TAP_DAEMON": os.path.realpath(args.daemon), "TAP_OUT": str(wire)}
         cmd = [args.hipfire, "bench", route["model"], "--concurrency", ",".join(map(str, points)),
                "--backend", backend, "--workload", workloads[0] if len(workloads) == 1 else "both",
@@ -1250,6 +1279,12 @@ def judge_conc(arms, c, expect_engine):
     for tag, a in arms.items():
         if a["rc"] != 0 or not a["cells"] or not a["reqs"]:
             fails.append(f"{tag}: bench rc {a['rc']}, {len(a['cells'])} cells, {len(a['reqs'])} requests")
+        # `spec`: every request of every arm ran that speculator with at least one window;
+        # an AR fallback is not a spec row (HIPF-633)
+        not_spec = sorted(k for k, x in a["reqs"].items() if c.get("spec") and (
+            x["done"].get("spec") != c["spec"] or not x["done"].get("rounds")))
+        if not_spec:
+            fails.append(f"{tag}: not {c['spec']} {len(not_spec)} (first {not_spec[0]})")
     same = lambda x, y: x is not None and y is not None and (x["events"], x["ids"]) == (y["events"], y["ids"])
     cached = lambda x: (x or {"done": {}})["done"].get("cached_tokens") or 0
     at = lambda key, k: "/".join([key.split("/")[0], str(k), *key.split("/")[2:]])
@@ -1308,6 +1343,15 @@ def judge_conc(arms, c, expect_engine):
             fails.append(f"{tag}: require_reuse without multi-turn follow-ups")
         elif follow and not r["cache_hits"][0] and not c.get("require_reuse"):
             unexercised.append(f"{tag}: no multi-turn follow-up reused a prefix")
+        # `require_overlap`: a k>1 cell with an overlap-rejected (serialized) sample fails;
+        # the bench reports such a cell `ok` on a serialized_by_design backend (HIPF-633)
+        r["serialized"] = sorted(cell for cell, m in a["cells"].items() if int(cell.split("/")[1]) > 1
+                                 and (m.get("overlap_rejected") or not m.get("samples")))
+        if c.get("require_overlap") and r["serialized"]:
+            fails.append(f"{tag}: serialized {r['serialized']}")
+        r["max_active_lanes"] = {cell: max((x["done"].get("continuous_batch", {}).get("max_active_lanes") or 0
+                                            for k, x in reqs.items() if k.startswith(cell + "/")), default=None)
+                                 for cell in a["cells"]}
         r["g_spec"], r["target"] = {}, {}
         r["tau"], r["lane_tau"] = {}, {}
         lt = c.get("lane_tau")

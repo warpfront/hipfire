@@ -254,6 +254,20 @@ still hold it after its bench returned.
   prefix of their own, e.g. a `--bench-shape betterbench --bb-corpus` corpus
   whose system messages are longer than 256 tokens (Gemma 4 records 256-token
   boundaries, HIPF-632).
+- `load`: params merged into every `load` request the bench sends, by the wire
+  tap (the requests on `<wire>.in` show them; a leading `~` in a string value
+  is expanded). For a load knob the bench lacks, e.g. the Gemma 4 EAGLE
+  drafter: `{"drafter": "<path>.hfq", "spec": 3}` (HIPF-633). The Gemma 4
+  EAGLE route is `benchmarks/engine-loop-ab/gemma4-26b-eagle.json`; run it
+  with `--conc-only` (its top-level `load.drafter` is sent unexpanded).
+- `spec`: the `done.spec` every request of every arm must report, with at least
+  one window (`rounds` > 0). An AR fallback fails the run instead of counting
+  as a spec row (e.g. `"gemma4_eagle"`, HIPF-633).
+- `require_overlap`: a k>1 engine cell with an overlap-rejected sample (the
+  bench's serialization check) fails. Without it the cell is listed as
+  `serialized` only: the bench reports a cell `ok` when its backend is
+  serialized by design. The receipt also lists `max_active_lanes` per cell
+  (the most lanes any request's `continuous_batch` saw).
 
 Per cell (workload, k) the receipt reports the median over runs of output
 tok/s (Σ tokens / sample wall), TTFT p50/p99 from `t_send` (a client-side queue

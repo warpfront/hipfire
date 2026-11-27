@@ -1,0 +1,53 @@
+{
+ "model": "~/mesh-validation/HIPF-522/fixtures/gemma-4-26b-a4b-it.mq4",
+ "load": {
+  "max_seq": 8192,
+  "drafter": "~/mesh-validation/HIPF-522/fixtures/gemma4-26b-a4b-assistant.q8f16.hfq",
+  "spec": 3
+ },
+ "env": {
+  "HIPFIRE_GEMMA4_EAGLE": "1"
+ },
+ "max_tokens": 64,
+ "expect_engine": true,
+ "batch_reuse": "prompt",
+ "name": "gemma4-26b-eagle",
+ "conc": {
+  "k": "1,2,4",
+  "runs": 3,
+  "arms": [
+   [
+    "legacy",
+    "noslots"
+   ],
+   [
+    "engine",
+    "noslots"
+   ],
+   [
+    "engine",
+    "batch"
+   ]
+  ],
+  "target": [
+   "legacy",
+   "noslots"
+  ],
+  "spec": "gemma4_eagle",
+  "require_overlap": true,
+  "load": {
+   "drafter": "~/mesh-validation/HIPF-522/fixtures/gemma4-26b-a4b-assistant.q8f16.hfq",
+   "spec": 3
+  },
+  "args": [
+   "--num-prompts",
+   "16",
+   "--max-tokens",
+   "128",
+   "--max-seq",
+   "8192",
+   "--spec",
+   "off"
+  ]
+ }
+}
