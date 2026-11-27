@@ -50,7 +50,7 @@ use crate::arch_model::Inkling2Bundle;
 use crate::config::Inkling2Config;
 use crate::gpu::{
     swa_gather_map, swa_slot, Inkling2Controller, Inkling2GpuLayer, Inkling2GpuState,
-    Inkling2GpuWeights, INKLING2_CONV_WIDTH,
+    Inkling2GpuWeights, Inkling2XtsLayer, INKLING2_CONV_WIDTH,
 };
 use hip_bridge::{DeviceBuffer, KernargBlob};
 use hipfire_runtime::llama::{rotate_x_mq_for, weight_gemv};
@@ -433,6 +433,104 @@ fn cap_put(
         m.insert(key.to_string(), dl(gpu, t)?);
     }
     Ok(())
+}
+
+/// Routed-expert stage of a typed-XTS (`qt44-padded-awq-v1`) layer for one row
+/// (scalar decode): returns the `tmp` index of `down_exp [top_k, n_embd]`.
+///
+/// 1. `rotate_x_mq_awq_topk`: `rows[r] = FWHT256(ffn_normed / S_gu[e_r])` (exact f32
+///    divide; with `S == 1` bitwise `rotate_x_mq` of the shared row);
+/// 2. gate_up through the qt44 expanded GEMV with per-rank rows (`m = 2*inter`,
+///    `k = n_embd`) -> `[top_k, 2*inter]` rows `[gate | up]`;
+/// 3. SiTU (gate offset 0, up offset `inter`, ld `2*inter`, logical `inter`, physical
+///    `down_k_physical`) with the per-expert down AWQ divide (`row_expert` = route ids);
+/// 4. `rotate_x_mq_batched` over the physical width;
+/// 5. down through the same expanded GEMV (`m = n_embd`, `k = down_k_physical`).
+///
+/// No D2H of route ids, no host expert loop, no per-token table rebuild: the
+/// pointer tables live on the layer. Failure leaves `tmp` for the caller to free.
+pub(crate) fn xts_expert_stage(
+    gpu: &mut Gpu,
+    cfg: &Inkling2Config,
+    xl: &Inkling2XtsLayer,
+    tmp: &mut Vec<GpuTensor>,
+    ffn_normed: usize,
+    topk_idx: usize,
+    cap: &mut Option<HashMap<String, Vec<f32>>>,
+) -> Result<usize, String> {
+    let e = cfg.n_embd;
+    let inter = cfg.inter;
+    let phys = crate::weights::xts_down_dims(cfg).1;
+    let k_top = cfg.n_expert_used;
+    let n_exp = cfg.n_experts;
+    let rows = at(gpu, tmp, &[k_top, e], "xts_x_rot")?;
+    gpu.rotate_x_mq_awq_topk(
+        &tmp[ffn_normed],
+        &xl.gu_awq_ptrs,
+        &tmp[topk_idx],
+        &tmp[rows],
+        e,
+        k_top,
+        n_exp,
+    )
+    .map_err(|e2| format!("inkling2 gpu fwd: xts producer: {e2:?}"))?;
+    let gu = at(gpu, tmp, &[k_top, 2 * inter], "xts_gate_up")?;
+    gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+        &xl.gu_ptrs,
+        &tmp[topk_idx],
+        &tmp[rows],
+        &tmp[gu],
+        2 * inter,
+        e,
+        k_top,
+        1,
+    )
+    .map_err(|e2| format!("inkling2 gpu fwd: xts gate_up: {e2:?}"))?;
+    cap_put(cap, gpu, "gate_up", &tmp[gu])?;
+    let act = at(gpu, tmp, &[k_top, phys], "xts_act")?;
+    gpu.ffn_activation_rows_f32(&FfnActivationRows {
+        activation: FfnActivation::Situ {
+            gate_beta: cfg.situ_beta,
+            value_beta: cfg.situ_linear_beta,
+        },
+        gate: &tmp[gu],
+        gate_offset: 0,
+        gate_ld: 2 * inter,
+        up: &tmp[gu],
+        up_offset: inter,
+        up_ld: 2 * inter,
+        out: &tmp[act],
+        rows: k_top,
+        logical_n: inter,
+        phys_n: phys,
+        round_inputs: false,
+        round_output: false,
+        awq: FfnAwq::PerExpert {
+            table: &xl.down_awq_ptrs,
+            row_expert: &tmp[topk_idx],
+            n_experts: n_exp,
+        },
+    })
+    .map_err(|e2| format!("inkling2 gpu fwd: xts situ: {e2:?}"))?;
+    cap_put(cap, gpu, "act", &tmp[act])?;
+    let rot = at(gpu, tmp, &[k_top, phys], "xts_rot")?;
+    gpu.rotate_x_mq_batched(&tmp[act], &tmp[rot], phys, k_top)
+        .map_err(|e2| format!("inkling2 gpu fwd: xts act rotate: {e2:?}"))?;
+    let down_exp = at(gpu, tmp, &[k_top, e], "xts_down_exp")?;
+    gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+        &xl.down_ptrs,
+        &tmp[topk_idx],
+        &tmp[rot],
+        &tmp[down_exp],
+        e,
+        phys,
+        k_top,
+        1,
+    )
+    .map_err(|e2| format!("inkling2 gpu fwd: xts down: {e2:?}"))?;
+    cap_put(cap, gpu, "down_exp", &tmp[down_exp])?;
+    cap_put(cap, gpu, "rot_b", &tmp[rot])?;
+    Ok(down_exp)
 }
 
 /// AttnRes-style mix over `bank_rows + cur` with a `[qr, e]` query.
@@ -1153,120 +1251,131 @@ fn run_visit(
     );
     step!(cap_put(cap, gpu, "topk_idx", &tmp[topk_idx]), "capture");
     step!(cap_put(cap, gpu, "topk_w", &tmp[topk_w]), "capture");
-    // Expert pointer tables (per-expert buffers; rebuilt per visit —
-    // 2 KiB of H2D, no lifetime questions).
-    let gu_bytes: Vec<u8> = layer
-        .experts
-        .iter()
-        .flat_map(|x| (x.gate_up.buf.buf.as_ptr() as u64).to_ne_bytes())
-        .collect();
-    let dn_bytes: Vec<u8> = layer
-        .experts
-        .iter()
-        .flat_map(|x| (x.down.buf.buf.as_ptr() as u64).to_ne_bytes())
-        .collect();
-    let ptr_gu = step!(at(gpu, &mut tmp, &[2 * cfg.n_experts], "ptr_gu"), "alloc");
-    let ptr_dn = step!(at(gpu, &mut tmp, &[2 * cfg.n_experts], "ptr_dn"), "alloc");
-    step!(
-        gpu.hip.memcpy_htod(&tmp[ptr_gu].buf, &gu_bytes),
-        "gu ptr table"
-    );
-    step!(
-        gpu.hip.memcpy_htod(&tmp[ptr_dn].buf, &dn_bytes),
-        "dn ptr table"
-    );
-    // Rotate, gate_up (batched), SiTU, rotate, down (batched expanded).
-    let ffn_x_rot = step!(at(gpu, &mut tmp, &[e], "ffn_x_rot"), "alloc");
-    step!(
-        rotate_x_mq_for(
-            gpu,
-            &layer.experts[0].gate_up,
-            &tmp[ffn_normed],
-            &tmp[ffn_x_rot],
-            e
-        ),
-        "ffn rotate"
-    );
-    step!(cap_put(cap, gpu, "ffn_x_rot", &tmp[ffn_x_rot]), "capture");
-    let inter = cfg.inter;
-    let gate_b = step!(
-        at(gpu, &mut tmp, &[cfg.n_expert_used, inter], "gate_b"),
-        "alloc"
-    );
-    let up_b = step!(
-        at(gpu, &mut tmp, &[cfg.n_expert_used, inter], "up_b"),
-        "alloc"
-    );
-    step!(
-        gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-            &tmp[ptr_gu],
-            &tmp[topk_idx],
-            &tmp[ffn_x_rot],
-            &tmp[gate_b],
-            &tmp[up_b],
-            2 * inter,
-            e,
-            cfg.n_expert_used,
-            1
-        ),
-        "gate_up"
-    );
-    step!(cap_put(cap, gpu, "gate_b", &tmp[gate_b]), "capture");
-    step!(cap_put(cap, gpu, "up_b", &tmp[up_b]), "capture");
-    let act = step!(
-        at(gpu, &mut tmp, &[cfg.n_expert_used, 1280], "act"),
-        "alloc"
-    );
-    step!(
-        gpu.ffn_activation_rows_f32(&FfnActivationRows {
-            activation: FfnActivation::Situ {
-                gate_beta: cfg.situ_beta,
-                value_beta: cfg.situ_linear_beta
-            },
-            gate: &tmp[gate_b],
-            gate_offset: 0,
-            gate_ld: inter,
-            up: &tmp[up_b],
-            up_offset: 0,
-            up_ld: inter,
-            out: &tmp[act],
-            rows: cfg.n_expert_used,
-            logical_n: inter,
-            phys_n: 1280,
-            round_inputs: false,
-            round_output: false,
-            awq: FfnAwq::None,
-        }),
-        "situ"
-    );
-    step!(cap_put(cap, gpu, "act", &tmp[act]), "capture");
-    let rot = step!(
-        at(gpu, &mut tmp, &[cfg.n_expert_used, 1280], "rot"),
-        "alloc"
-    );
-    step!(
-        gpu.rotate_x_mq_batched(&tmp[act], &tmp[rot], 1280, cfg.n_expert_used),
-        "act rotate"
-    );
-    let down_exp = step!(
-        at(gpu, &mut tmp, &[cfg.n_expert_used, e], "down_exp"),
-        "alloc"
-    );
-    step!(
-        gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
-            &tmp[ptr_dn],
-            &tmp[topk_idx],
-            &tmp[rot],
-            &tmp[down_exp],
-            e,
-            1280,
-            cfg.n_expert_used,
-            1
-        ),
-        "down"
-    );
-    step!(cap_put(cap, gpu, "down_exp", &tmp[down_exp]), "capture");
-    step!(cap_put(cap, gpu, "rot_b", &tmp[rot]), "capture");
+    // Typed XTS layout: one indexed AWQ+FWHT producer, qt44 expanded GEMVs, all
+    // tables built at load and owned by the layer. Legacy layers (`xts == None`)
+    // take the unchanged branch below.
+    let down_exp = if let Some(xl) = layer.xts.as_ref() {
+        step!(
+            xts_expert_stage(gpu, cfg, xl, &mut tmp, ffn_normed, topk_idx, cap),
+            "xts experts"
+        )
+    } else {
+        // Expert pointer tables (per-expert buffers; rebuilt per visit —
+        // 2 KiB of H2D, no lifetime questions).
+        let gu_bytes: Vec<u8> = layer
+            .experts
+            .iter()
+            .flat_map(|x| (x.gate_up.buf.buf.as_ptr() as u64).to_ne_bytes())
+            .collect();
+        let dn_bytes: Vec<u8> = layer
+            .experts
+            .iter()
+            .flat_map(|x| (x.down.buf.buf.as_ptr() as u64).to_ne_bytes())
+            .collect();
+        let ptr_gu = step!(at(gpu, &mut tmp, &[2 * cfg.n_experts], "ptr_gu"), "alloc");
+        let ptr_dn = step!(at(gpu, &mut tmp, &[2 * cfg.n_experts], "ptr_dn"), "alloc");
+        step!(
+            gpu.hip.memcpy_htod(&tmp[ptr_gu].buf, &gu_bytes),
+            "gu ptr table"
+        );
+        step!(
+            gpu.hip.memcpy_htod(&tmp[ptr_dn].buf, &dn_bytes),
+            "dn ptr table"
+        );
+        // Rotate, gate_up (batched), SiTU, rotate, down (batched expanded).
+        let ffn_x_rot = step!(at(gpu, &mut tmp, &[e], "ffn_x_rot"), "alloc");
+        step!(
+            rotate_x_mq_for(
+                gpu,
+                &layer.experts[0].gate_up,
+                &tmp[ffn_normed],
+                &tmp[ffn_x_rot],
+                e
+            ),
+            "ffn rotate"
+        );
+        step!(cap_put(cap, gpu, "ffn_x_rot", &tmp[ffn_x_rot]), "capture");
+        let inter = cfg.inter;
+        let gate_b = step!(
+            at(gpu, &mut tmp, &[cfg.n_expert_used, inter], "gate_b"),
+            "alloc"
+        );
+        let up_b = step!(
+            at(gpu, &mut tmp, &[cfg.n_expert_used, inter], "up_b"),
+            "alloc"
+        );
+        step!(
+            gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+                &tmp[ptr_gu],
+                &tmp[topk_idx],
+                &tmp[ffn_x_rot],
+                &tmp[gate_b],
+                &tmp[up_b],
+                2 * inter,
+                e,
+                cfg.n_expert_used,
+                1
+            ),
+            "gate_up"
+        );
+        step!(cap_put(cap, gpu, "gate_b", &tmp[gate_b]), "capture");
+        step!(cap_put(cap, gpu, "up_b", &tmp[up_b]), "capture");
+        let act = step!(
+            at(gpu, &mut tmp, &[cfg.n_expert_used, 1280], "act"),
+            "alloc"
+        );
+        step!(
+            gpu.ffn_activation_rows_f32(&FfnActivationRows {
+                activation: FfnActivation::Situ {
+                    gate_beta: cfg.situ_beta,
+                    value_beta: cfg.situ_linear_beta
+                },
+                gate: &tmp[gate_b],
+                gate_offset: 0,
+                gate_ld: inter,
+                up: &tmp[up_b],
+                up_offset: 0,
+                up_ld: inter,
+                out: &tmp[act],
+                rows: cfg.n_expert_used,
+                logical_n: inter,
+                phys_n: 1280,
+                round_inputs: false,
+                round_output: false,
+                awq: FfnAwq::None,
+            }),
+            "situ"
+        );
+        step!(cap_put(cap, gpu, "act", &tmp[act]), "capture");
+        let rot = step!(
+            at(gpu, &mut tmp, &[cfg.n_expert_used, 1280], "rot"),
+            "alloc"
+        );
+        step!(
+            gpu.rotate_x_mq_batched(&tmp[act], &tmp[rot], 1280, cfg.n_expert_used),
+            "act rotate"
+        );
+        let down_exp = step!(
+            at(gpu, &mut tmp, &[cfg.n_expert_used, e], "down_exp"),
+            "alloc"
+        );
+        step!(
+            gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+                &tmp[ptr_dn],
+                &tmp[topk_idx],
+                &tmp[rot],
+                &tmp[down_exp],
+                e,
+                1280,
+                cfg.n_expert_used,
+                1
+            ),
+            "down"
+        );
+        step!(cap_put(cap, gpu, "down_exp", &tmp[down_exp]), "capture");
+        step!(cap_put(cap, gpu, "rot_b", &tmp[rot]), "capture");
+        down_exp
+    };
     let moe_raw = step!(at(gpu, &mut tmp, &[e], "moe_raw"), "alloc");
     step!(
         gpu.ffn_moe_combine_f32(&MoeCombine {

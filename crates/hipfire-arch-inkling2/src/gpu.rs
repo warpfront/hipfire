@@ -462,6 +462,16 @@ impl LoadTx {
         }
     }
 
+    /// Mutable access to a still-pending weight (typed-XTS sidecar attach).
+    fn weight_mut(&mut self, slot: usize) -> Result<&mut WeightTensor, String> {
+        match self.owners.get_mut(slot) {
+            Some(Some(PendingOwner::Weight(w))) => Ok(w),
+            _ => Err(format!(
+                "inkling2: load slot {slot} is not a pending weight"
+            )),
+        }
+    }
+
     fn commit(&mut self) {
         self.committed = true;
         self.owners.clear();
@@ -515,6 +525,42 @@ impl Inkling2Expert {
     }
 }
 
+/// Typed-layout (`qt44-padded-awq-v1`) decode tables of one physical layer,
+/// built ONCE at load and owned by the layer (freed with it, on unload and on
+/// a failed load). Legacy layers carry `None`.
+///
+/// The per-expert F32 AWQ vectors live packed in two row-major tensors
+/// (`gu_awq` `[n_experts, n_embd]`, `down_awq` `[n_experts, down_k_physical]`,
+/// the down tail exactly 1.0); the pointer tables are `n_experts` `u64`s of raw
+/// device addresses, in the form the indexed launchers expect.
+pub struct Inkling2XtsLayer {
+    pub gu_awq: GpuTensor,
+    pub down_awq: GpuTensor,
+    /// entry e -> expert e's `[2*inter, n_embd]` qt44 gate_up buffer.
+    pub gu_ptrs: GpuTensor,
+    /// entry e -> expert e's `[n_embd, down_k_physical]` qt44 down buffer.
+    pub down_ptrs: GpuTensor,
+    /// entry e -> row e of `gu_awq` (`F32[n_embd]`).
+    pub gu_awq_ptrs: GpuTensor,
+    /// entry e -> row e of `down_awq` (`F32[down_k_physical]`).
+    pub down_awq_ptrs: GpuTensor,
+}
+
+impl Inkling2XtsLayer {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        for t in [
+            self.gu_awq,
+            self.down_awq,
+            self.gu_ptrs,
+            self.down_ptrs,
+            self.gu_awq_ptrs,
+            self.down_awq_ptrs,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
 pub struct Inkling2GpuLayer {
     pub wq: WeightTensor,
     pub wk: WeightTensor,
@@ -546,6 +592,8 @@ pub struct Inkling2GpuLayer {
     pub router: WeightTensor,           // [n_experts, n_embd]
     pub router_bias: Option<GpuTensor>, // [n_experts] F32
     pub experts: Vec<Inkling2Expert>,   // n_experts
+    /// `Some` iff the file is the typed XTS layout; see [`Inkling2XtsLayer`].
+    pub xts: Option<Inkling2XtsLayer>,
 }
 
 impl Inkling2GpuLayer {
@@ -594,6 +642,9 @@ impl Inkling2GpuLayer {
         }
         for e in self.experts {
             e.free_gpu(gpu);
+        }
+        if let Some(x) = self.xts {
+            x.free_gpu(gpu);
         }
     }
 }
@@ -684,6 +735,225 @@ impl VramSummary {
     }
 }
 
+/// Whether one Qwen-class activation-quantized route is usable by a typed-XTS
+/// load, as resolved from the existing config/flag readers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum XtsRouteState {
+    /// Capability holds (flags, device, symmetric verdict).
+    Admitted,
+    /// Capability does not hold and nothing forced it: informational.
+    NotAdmitted(String),
+    /// The user explicitly forced the route and it cannot run.
+    Refused(String),
+}
+
+impl XtsRouteState {
+    pub fn is_admitted(&self) -> bool {
+        matches!(self, Self::Admitted)
+    }
+}
+
+/// Raw knob/device facts [`resolve_xts_routes`] decides from (pure data so the
+/// resolution is CPU-testable). Every value comes from the existing readers:
+/// `FeatureFlags` (`kernel.iu4_prefill` / `HIPFIRE_IU4_PREFILL`,
+/// `HIPFIRE_A8_PREFILL` / `kernel.gfx11_a8_prefill`, `HIPFIRE_QWEN4_MOE_EP_A8`),
+/// `Gpu::moe_sym_iu4_requested` and `hipfire_config::developer_typed_bool`
+/// (`developer.moe_sym_iu4` / `HIPFIRE_MOE_SYM_IU4`), `Gpu::qwen4_moe_down_a8_requested`.
+#[derive(Clone, Debug)]
+pub struct XtsRouteInputs {
+    pub arch: String,
+    /// `kernel.iu4_prefill` as set (`None` = unset).
+    pub iu4_prefill_flag: Option<bool>,
+    /// `FeatureFlags::iu4_prefill_enabled`: on unless killed, on an arch with an IU4 consumer.
+    pub iu4_prefill_enabled: bool,
+    /// `developer.moe_sym_iu4` as set (`None` = unset).
+    pub moe_sym_iu4_flag: Option<bool>,
+    /// `Gpu::moe_sym_iu4_requested`: not killed and the device has the symmetric IU4 MoE objects.
+    pub moe_sym_iu4_requested: bool,
+    /// `FeatureFlags::a8_prefill_enabled` (opt-in, arch scoped).
+    pub a8_prefill_enabled: bool,
+    /// Either raw A8 opt-in set (`a8_prefill` / `gfx11_a8_prefill`).
+    pub a8_prefill_forced: bool,
+    /// `Gpu::qwen4_moe_down_a8_requested`.
+    pub qwen4_down_a8_requested: bool,
+    /// `HIPFIRE_QWEN4_MOE_EP_A8`.
+    pub qwen4_ep_a8: Option<bool>,
+}
+
+/// Route-capability record of a typed-XTS load: exposed on
+/// [`Inkling2GpuWeights::xts_route_capability`] for a future blocked
+/// (multi-row) forward. The scalar decode forward executes none of these
+/// routes; a state here is capability, not execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XtsRouteCapability {
+    pub n_layers: usize,
+    /// Layers whose attention qt44 halves are all symmetric.
+    pub dense_symmetric_layers: usize,
+    /// Layers whose routed-expert qt44 halves are all symmetric.
+    pub expert_symmetric_layers: usize,
+    /// Layers symmetric in both (24/24 expected).
+    pub symmetric_layers: usize,
+    /// The standalone unembed is symmetric.
+    pub unembed_symmetric: bool,
+    pub awq_sidecars: usize,
+    pub down_k_logical: usize,
+    pub down_k_physical: usize,
+    /// `kernel.iu4_prefill` W4A4 dense/expert prefill.
+    pub iu4_prefill: XtsRouteState,
+    /// `developer.moe_sym_iu4` symmetric IU4 grouped routed-expert prefill.
+    pub moe_sym_iu4: XtsRouteState,
+    /// A8 expert route family (`HIPFIRE_A8_PREFILL`, `kernel.gfx11_a8_prefill`,
+    /// `HIPFIRE_QWEN4_MOE_DOWN_A8`, `HIPFIRE_QWEN4_MOE_EP_A8`).
+    pub moe_a8: XtsRouteState,
+}
+
+impl XtsRouteCapability {
+    /// The one load line (stderr). Routes are listed as admitted by capability;
+    /// an explicitly forced route that cannot run is reported as refused.
+    pub fn load_line(&self) -> String {
+        let routes = [
+            ("iu4_prefill", &self.iu4_prefill),
+            ("moe_sym_iu4", &self.moe_sym_iu4),
+            ("moe_a8", &self.moe_a8),
+        ];
+        let admitted: Vec<&str> = routes
+            .iter()
+            .filter(|(_, s)| s.is_admitted())
+            .map(|(n, _)| *n)
+            .collect();
+        let refused: Vec<String> = routes
+            .iter()
+            .filter_map(|(n, s)| match s {
+                XtsRouteState::Refused(why) => Some(format!("{n} ({why})")),
+                _ => None,
+            })
+            .collect();
+        format!(
+            "inkling2 xts: symmetric {}/{} layers (dense+experts), awq {} sidecars; \
+             routes admitted by capability: {}; {}executing: scalar decode (no multi-row consumer yet)",
+            self.symmetric_layers,
+            self.n_layers,
+            self.awq_sidecars,
+            if admitted.is_empty() {
+                "none".to_string()
+            } else {
+                admitted.join(", ")
+            },
+            if refused.is_empty() {
+                String::new()
+            } else {
+                format!("refused (forced, cannot run): {}; ", refused.join(", "))
+            },
+        )
+    }
+}
+
+/// Pure route resolution behind [`XtsRouteCapability`]. `dense_all` / `experts_all`:
+/// every layer's dense / routed-expert qt44 halves verified symmetric.
+/// `moe_geometry_ok`: top-k <= 8, hidden % 256 == 0 and intermediate % 128 == 0.
+pub fn resolve_xts_routes(
+    dense_all: bool,
+    experts_all: bool,
+    moe_geometry_ok: bool,
+    f: &XtsRouteInputs,
+) -> (XtsRouteState, XtsRouteState, XtsRouteState) {
+    let pick = |capable: bool, forced: bool, why: String| {
+        if capable {
+            XtsRouteState::Admitted
+        } else if forced {
+            XtsRouteState::Refused(why)
+        } else {
+            XtsRouteState::NotAdmitted(why)
+        }
+    };
+    let sym_all = dense_all && experts_all;
+    let iu4 = pick(
+        sym_all && f.iu4_prefill_enabled,
+        f.iu4_prefill_flag == Some(true),
+        if !sym_all {
+            "not every layer's dense+expert qt44 is symmetric".to_string()
+        } else if f.iu4_prefill_flag == Some(false) {
+            "kernel.iu4_prefill=false".to_string()
+        } else {
+            format!("no W4A4 consumer on {}", f.arch)
+        },
+    );
+    let moe_sym = pick(
+        experts_all && f.moe_sym_iu4_requested && moe_geometry_ok,
+        f.moe_sym_iu4_flag == Some(true),
+        if !experts_all {
+            "routed experts not verified symmetric".to_string()
+        } else if f.moe_sym_iu4_flag == Some(false) || f.iu4_prefill_flag == Some(false) {
+            "killed by HIPFIRE_MOE_SYM_IU4=0 / HIPFIRE_IU4_PREFILL=0".to_string()
+        } else if !f.moe_sym_iu4_requested {
+            format!("{} lacks the symmetric IU4 MoE objects", f.arch)
+        } else {
+            "expert geometry outside top-k<=8, hidden%256==0, intermediate%128==0".to_string()
+        },
+    );
+    let qwen4_forced = f.qwen4_down_a8_requested || f.qwen4_ep_a8 == Some(true);
+    let a8 = pick(
+        experts_all && f.a8_prefill_enabled,
+        f.a8_prefill_forced || qwen4_forced,
+        if !experts_all {
+            "routed experts not verified symmetric".to_string()
+        } else if f.a8_prefill_forced {
+            format!("A8 prefill opt-in set but {} has no A8 consumer", f.arch)
+        } else if qwen4_forced {
+            "Qwen4 expert-parallel A8 knobs have no Inkling consumer".to_string()
+        } else {
+            "A8 prefill is opt-in (HIPFIRE_A8_PREFILL / kernel.gfx11_a8_prefill)".to_string()
+        },
+    );
+    (iu4, moe_sym, a8)
+}
+
+/// Build the route-capability record of a certified XTS load from the device's
+/// existing flag readers.
+fn xts_route_capability(
+    cert: &crate::weights::XtsCertificate,
+    cfg: &Inkling2Config,
+    gpu: &Gpu,
+) -> XtsRouteCapability {
+    let inputs = XtsRouteInputs {
+        arch: gpu.arch.clone(),
+        iu4_prefill_flag: gpu.flags.iu4_prefill,
+        iu4_prefill_enabled: gpu.flags.iu4_prefill_enabled(),
+        moe_sym_iu4_flag: hipfire_config::developer_typed_bool("HIPFIRE_MOE_SYM_IU4"),
+        moe_sym_iu4_requested: gpu.moe_sym_iu4_requested(),
+        a8_prefill_enabled: gpu.flags.a8_prefill_enabled(),
+        a8_prefill_forced: gpu.flags.a8_prefill || gpu.flags.gfx11_a8_prefill,
+        qwen4_down_a8_requested: gpu.qwen4_moe_down_a8_requested(),
+        qwen4_ep_a8: gpu.flags.qwen4_moe_ep_a8,
+    };
+    let dense = cert.layers.iter().filter(|l| l.dense_symmetric).count();
+    let experts = cert.layers.iter().filter(|l| l.experts_symmetric).count();
+    let n = cert.layers.len();
+    let geometry_ok = cfg.n_expert_used <= 8 && cfg.n_embd % 256 == 0 && cfg.inter % 128 == 0;
+    let (iu4_prefill, moe_sym_iu4, moe_a8) =
+        resolve_xts_routes(dense == n, experts == n, geometry_ok, &inputs);
+    XtsRouteCapability {
+        n_layers: n,
+        dense_symmetric_layers: dense,
+        expert_symmetric_layers: experts,
+        symmetric_layers: cert.symmetric_layers(),
+        unembed_symmetric: cert.unembed_symmetric,
+        awq_sidecars: cert.awq_sidecars,
+        down_k_logical: cert.down_k_logical,
+        down_k_physical: cert.down_k_physical,
+        iu4_prefill,
+        moe_sym_iu4,
+        moe_a8,
+    }
+}
+
+impl Inkling2GpuWeights {
+    /// The typed-XTS route-capability record, `None` for the legacy layout.
+    pub fn xts_route_capability(&self) -> Option<&XtsRouteCapability> {
+        self.xts_routes.as_ref()
+    }
+}
+
 pub struct Inkling2GpuWeights {
     pub layers: Vec<Inkling2GpuLayer>,
     pub unembed: WeightTensor,
@@ -696,6 +966,13 @@ pub struct Inkling2GpuWeights {
     pub cross_pass: Vec<GpuTensor>,
     pub embed_packed: EmbedPacked,
     pub summary: VramSummary,
+    /// Route-capability record of a typed-XTS load (`None` for the legacy layout).
+    pub xts_routes: Option<XtsRouteCapability>,
+    /// `Some(previous)` when this typed-XTS load set the device flag
+    /// `Gpu::mq4v2_symmetric` (after certifying every qt44 attention / expert /
+    /// unembed header); `free_gpu` restores it. `None` for the legacy layout,
+    /// which never touches the flag.
+    pub mq4v2_symmetric_prev: Option<bool>,
 }
 
 impl Inkling2GpuWeights {
@@ -709,6 +986,9 @@ impl Inkling2GpuWeights {
         let _ = gpu.free_tensor(self.output_query);
         for t in self.cross_pass {
             let _ = gpu.free_tensor(t);
+        }
+        if let Some(prev) = self.mq4v2_symmetric_prev {
+            gpu.mq4v2_symmetric = prev;
         }
         drop(self.embed_packed);
     }
@@ -933,6 +1213,205 @@ impl Drop for SlabScope {
     }
 }
 
+/// Sets the device flag `Gpu::mq4v2_symmetric` for a certified typed-XTS load
+/// and restores the previous value unless [`Self::keep`] disarms it (failure path).
+struct SymFlagGuard {
+    gpu: *mut Gpu,
+    prev: bool,
+    armed: bool,
+}
+
+impl SymFlagGuard {
+    fn set(gpu: &mut Gpu) -> Self {
+        let prev = gpu.mq4v2_symmetric;
+        gpu.mq4v2_symmetric = true;
+        Self {
+            gpu,
+            prev,
+            armed: true,
+        }
+    }
+
+    /// The load committed: leave the flag set, hand back the value to restore on unload.
+    fn keep(&mut self) -> bool {
+        self.armed = false;
+        self.prev
+    }
+}
+
+impl Drop for SymFlagGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            unsafe { (*self.gpu).mq4v2_symmetric = self.prev };
+        }
+    }
+}
+
+// ── Typed layout `qt44-padded-awq-v1` upload ──────────────────────────────
+// Everything below is reached only when `Inkling2Config::mq4_layout` is the
+// typed layout (`weights.xts` certified at `Inkling2Weights::load`).
+
+/// Transaction slots of one XTS layer's decode tables (see [`Inkling2XtsLayer`]).
+struct XtsTableSlots {
+    gu_awq: usize,
+    down_awq: usize,
+    gu_ptrs: usize,
+    down_ptrs: usize,
+    gu_awq_ptrs: usize,
+    down_awq_ptrs: usize,
+}
+
+/// F16 `[k]` sidecar of `weight_name` widened to F32 (exact).
+fn xts_sidecar_f32(
+    weights: &Inkling2Weights,
+    weight_name: &str,
+    k: usize,
+) -> Result<Vec<f32>, String> {
+    let sn = crate::weights::awq_sidecar_name(weight_name);
+    let t = raw(weights, &sn)?;
+    if t.info.quant_type != 1 || t.data.len() != 2 * k {
+        return Err(format!(
+            "inkling2 xts: {sn} must be F16 [{k}] (qt {} / {} bytes)",
+            t.info.quant_type,
+            t.data.len()
+        ));
+    }
+    Ok(t.data
+        .chunks_exact(2)
+        .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+        .collect())
+}
+
+/// Attach the weight's F32 `[k]` AWQ sidecar as `WeightTensor::awq_scale`, so
+/// `weight_gemv` divides x by it before the FWHT.
+fn xts_attach_awq(
+    tx: &mut LoadTx,
+    weights: &Inkling2Weights,
+    slot: usize,
+    weight_name: &str,
+    k: usize,
+    bytes: &mut u64,
+    tensors: &mut usize,
+) -> Result<(), String> {
+    let s = xts_sidecar_f32(weights, weight_name, k)?;
+    let g = unsafe { &mut *tx.gpu };
+    let t = g
+        .upload_f32(&s, &[k])
+        .map_err(|e| format!("inkling2: upload sidecar of {weight_name}: {e:?}"))?;
+    match tx.weight_mut(slot) {
+        Ok(w) => w.awq_scale = Some(t),
+        Err(e) => {
+            let g = unsafe { &mut *tx.gpu };
+            let _ = g.free_tensor(t);
+            return Err(e);
+        }
+    }
+    *bytes += (4 * k) as u64;
+    *tensors += 1;
+    Ok(())
+}
+
+/// Upload one XTS layer's routed experts directly (qt44 gate_up `[2*inter, e]`,
+/// qt44 down `[e, phys]` row stride 680 B, NO repack) plus the per-expert F32
+/// AWQ vectors and the four device pointer tables, all held by `tx`.
+/// Returns the `(gate_up, down)` weight slots and the table slots.
+fn xts_upload_layer(
+    tx: &mut LoadTx,
+    weights: &Inkling2Weights,
+    cfg: &Inkling2Config,
+    il: usize,
+    bytes: &mut u64,
+    tensors: &mut usize,
+) -> Result<(Vec<(usize, usize)>, XtsTableSlots), String> {
+    let e = cfg.n_embd;
+    let (_, phys) = crate::weights::xts_down_dims(cfg);
+    let n = cfg.n_experts;
+    let p = format!("model.llm.layers.{il}.");
+    let mut slots = Vec::with_capacity(n);
+    let mut gu_ptrs: Vec<u8> = Vec::with_capacity(8 * n);
+    let mut dn_ptrs: Vec<u8> = Vec::with_capacity(8 * n);
+    let mut gu_awq: Vec<f32> = Vec::with_capacity(n * e);
+    let mut dn_awq: Vec<f32> = Vec::with_capacity(n * phys);
+    for ex in 0..n {
+        let gname = format!("{p}mlp.experts.{ex}.gate_up_proj.weight");
+        let dname = format!("{p}mlp.experts.{ex}.down_proj.weight");
+        for (name, m, k) in [(&gname, 2 * cfg.inter, e), (&dname, e, phys)] {
+            let t = raw(weights, name)?;
+            let shape: Vec<usize> = t.info.shape.iter().map(|&d| d as usize).collect();
+            if t.info.quant_type != 44 || shape != [m, k] {
+                return Err(format!(
+                    "inkling2 xts: {name} must be qt44 [{m}, {k}], got qt={} {shape:?}",
+                    t.info.quant_type
+                ));
+            }
+        }
+        let gt = raw(weights, &gname)?;
+        let g = unsafe { &mut *tx.gpu };
+        let (gate_up, gb) = wt_from_raw(g, &gname, 44, &gt.data, 2 * cfg.inter, e)?;
+        *bytes += gb;
+        *tensors += 1;
+        gu_ptrs.extend_from_slice(&(gate_up.buf.buf.as_ptr() as u64).to_ne_bytes());
+        let gs = tx.hold_weight(gate_up);
+        let dt = raw(weights, &dname)?;
+        let g = unsafe { &mut *tx.gpu };
+        let (down, db) = wt_from_raw(g, &dname, 44, &dt.data, e, phys)?;
+        *bytes += db;
+        *tensors += 1;
+        dn_ptrs.extend_from_slice(&(down.buf.buf.as_ptr() as u64).to_ne_bytes());
+        let ds = tx.hold_weight(down);
+        slots.push((gs, ds));
+        gu_awq.extend_from_slice(&xts_sidecar_f32(weights, &gname, e)?);
+        dn_awq.extend_from_slice(&xts_sidecar_f32(weights, &dname, phys)?);
+    }
+    let g = unsafe { &mut *tx.gpu };
+    let gu_awq_t = g
+        .upload_f32(&gu_awq, &[n, e])
+        .map_err(|e2| format!("inkling2: upload layer {il} gate_up AWQ: {e2:?}"))?;
+    *bytes += (4 * gu_awq.len()) as u64;
+    *tensors += 1;
+    let gu_awq_base = gu_awq_t.buf.as_ptr() as u64;
+    let gu_awq_slot = tx.hold_tensor(gu_awq_t);
+    let g = unsafe { &mut *tx.gpu };
+    let dn_awq_t = g
+        .upload_f32(&dn_awq, &[n, phys])
+        .map_err(|e2| format!("inkling2: upload layer {il} down AWQ: {e2:?}"))?;
+    *bytes += (4 * dn_awq.len()) as u64;
+    *tensors += 1;
+    let dn_awq_base = dn_awq_t.buf.as_ptr() as u64;
+    let dn_awq_slot = tx.hold_tensor(dn_awq_t);
+    let row_ptrs = |base: u64, row_bytes: usize| -> Vec<u8> {
+        (0..n)
+            .flat_map(|ex| (base + (ex * row_bytes) as u64).to_ne_bytes())
+            .collect()
+    };
+    let gu_awq_ptrs = row_ptrs(gu_awq_base, 4 * e);
+    let dn_awq_ptrs = row_ptrs(dn_awq_base, 4 * phys);
+    let mut table = |tx: &mut LoadTx, data: &[u8]| -> Result<usize, String> {
+        let g = unsafe { &mut *tx.gpu };
+        let t = g
+            .upload_raw(data, &[data.len()])
+            .map_err(|e2| format!("inkling2: upload layer {il} pointer table: {e2:?}"))?;
+        *bytes += data.len() as u64;
+        *tensors += 1;
+        Ok(tx.hold_tensor(t))
+    };
+    let gu_ptrs_slot = table(tx, &gu_ptrs)?;
+    let down_ptrs_slot = table(tx, &dn_ptrs)?;
+    let gu_awq_ptrs_slot = table(tx, &gu_awq_ptrs)?;
+    let down_awq_ptrs_slot = table(tx, &dn_awq_ptrs)?;
+    Ok((
+        slots,
+        XtsTableSlots {
+            gu_awq: gu_awq_slot,
+            down_awq: dn_awq_slot,
+            gu_ptrs: gu_ptrs_slot,
+            down_ptrs: down_ptrs_slot,
+            gu_awq_ptrs: gu_awq_ptrs_slot,
+            down_awq_ptrs: down_awq_ptrs_slot,
+        },
+    ))
+}
+
 /// Transaction slots for one layer: every allocated tensor is held by the tx
 /// until the whole load commits, so a mid-load failure frees all of them.
 struct LayerSlots {
@@ -963,6 +1442,8 @@ struct LayerSlots {
     router: usize,
     router_bias: Option<usize>,
     experts: Vec<(usize, usize)>,
+    /// Typed-XTS decode-table slots (`None` for the legacy layout).
+    xts: Option<XtsTableSlots>,
 }
 
 /// Upload the full weight set + allocate per-visit state. `max_seq` comes
@@ -1072,6 +1553,22 @@ pub fn upload(
     // NOTE: each `let g = ...` shadows the previous borrow, which ends at
     // the `up_*` call that consumes it.
     let mut layer_slots = Vec::with_capacity(cfg.n_phys);
+    let xts = cfg.mq4_layout.is_xts();
+    if xts && weights.xts.is_none() {
+        return Err(
+            "inkling2: typed XTS layout without a load-time certificate (Inkling2Weights::load certifies it)"
+                .into(),
+        );
+    }
+    // Certified (`weights.xts`): every qt44 attention / expert / unembed header
+    // was verified symmetric on the host, so the device-level symmetric
+    // contract the Qwen-class integer routes key on holds for this file. The
+    // embedding is exempt (affine, a host row lookup, never an activation GEMM).
+    let mut sym_flag = if xts {
+        Some(SymFlagGuard::set(gpu))
+    } else {
+        None
+    };
     for il in 0..cfg.n_phys {
         let p = format!("model.llm.layers.{il}.");
         let swa = *cfg
@@ -1085,6 +1582,7 @@ pub fn upload(
         // `Inkling2Weights` is not Sync (f32 cache), so stage owned blobs
         // first; the rayon jobs then only touch Sync data.
         let down_names: Vec<String> = (0..cfg.n_experts)
+            .filter(|_| !xts)
             .map(|ex| nm(&format!("mlp.experts.{ex}.down_proj.weight")))
             .collect();
         let mut down_src: Vec<(String, u8, Vec<u8>)> = Vec::with_capacity(cfg.n_experts);
@@ -1119,6 +1617,28 @@ pub fn upload(
         let wgate = tx.hold_weight(acc.wt(g, weights, &nm("attn.gate_attn.weight"), eattn, e)?);
         let g = unsafe { &mut *tx.gpu };
         let wo = tx.hold_weight(acc.wt(g, weights, &nm("attn.wo_ud.weight"), e, eattn)?);
+        if xts {
+            // Typed layout: each attention weight carries its F32 AWQ sidecar,
+            // so `weight_gemv` divides x by it before the FWHT.
+            for (slot, stem, k) in [
+                (wq, "attn.wq_du.weight", e),
+                (wk, "attn.wk_dv.weight", e),
+                (wv, "attn.wv_dv.weight", e),
+                (wr, "attn.wr_du.weight", e),
+                (wgate, "attn.gate_attn.weight", e),
+                (wo, "attn.wo_ud.weight", eattn),
+            ] {
+                xts_attach_awq(
+                    &mut tx,
+                    weights,
+                    slot,
+                    &nm(stem),
+                    k,
+                    &mut acc.bytes,
+                    &mut acc.tensors,
+                )?;
+            }
+        }
         let g = unsafe { &mut *tx.gpu };
         let sink =
             tx.hold_tensor(acc.f32t(g, weights, &nm("attn.attn_sink_proj.weight"), &[nh, e])?);
@@ -1257,6 +1777,14 @@ pub fn upload(
         };
 
         let mut experts = Vec::with_capacity(cfg.n_experts);
+        let xts_slots = if xts {
+            let (slots, tables) =
+                xts_upload_layer(&mut tx, weights, cfg, il, &mut acc.bytes, &mut acc.tensors)?;
+            experts.extend(slots);
+            Some(tables)
+        } else {
+            None
+        };
         for (ex, down_blob) in down_blobs.into_iter().enumerate() {
             let gname = nm(&format!("mlp.experts.{ex}.gate_up_proj.weight"));
             let gt = raw(weights, &gname)?;
@@ -1318,6 +1846,7 @@ pub fn upload(
             router,
             router_bias,
             experts,
+            xts: xts_slots,
         });
     }
 
@@ -1441,6 +1970,17 @@ pub fn upload(
             router: take_w(&mut tx, s.router)?,
             router_bias: take_opt_t(&mut tx, s.router_bias)?,
             experts,
+            xts: match s.xts {
+                Some(x) => Some(Inkling2XtsLayer {
+                    gu_awq: take_t(&mut tx, x.gu_awq)?,
+                    down_awq: take_t(&mut tx, x.down_awq)?,
+                    gu_ptrs: take_t(&mut tx, x.gu_ptrs)?,
+                    down_ptrs: take_t(&mut tx, x.down_ptrs)?,
+                    gu_awq_ptrs: take_t(&mut tx, x.gu_awq_ptrs)?,
+                    down_awq_ptrs: take_t(&mut tx, x.down_awq_ptrs)?,
+                }),
+                None => None,
+            },
         });
     }
     let unembed = take_w(&mut tx, unembed)?;
@@ -1452,6 +1992,7 @@ pub fn upload(
         cross_pass.push(take_t(&mut tx, slot)?);
     }
     tx.commit();
+    let mq4v2_symmetric_prev = sym_flag.as_mut().map(SymFlagGuard::keep);
 
     let kv_bytes = state.kv_bytes;
     let conv_bytes = state.conv_bytes;
@@ -1465,6 +2006,10 @@ pub fn upload(
         full_visits,
         swa_visits,
     };
+    let xts_routes = weights
+        .xts
+        .as_ref()
+        .map(|cert| xts_route_capability(cert, cfg, &*gpu));
     Ok((
         Inkling2GpuWeights {
             layers,
@@ -1475,6 +2020,8 @@ pub fn upload(
             cross_pass,
             embed_packed,
             summary,
+            xts_routes,
+            mq4v2_symmetric_prev,
         },
         state,
     ))
@@ -1801,5 +2348,417 @@ mod tests {
         eprintln!("repack fidelity: max err {err}, pad tail {tail}, range {range}");
         assert!(err <= range / 15.0 + 1e-3, "repack err {err} range {range}");
         assert!(tail <= range / 15.0 + 1e-3, "pad tail {tail}");
+    }
+}
+
+#[cfg(test)]
+mod xts_gpu_tests {
+    use super::*;
+    use crate::weights::xts_tests::{build, f16_vec, put, sym_qt44, tiny_cfg, weights_with};
+    use crate::weights::{certify_xts, AWQ_SIDECAR_SUFFIX};
+
+    fn inputs(arch: &str) -> XtsRouteInputs {
+        XtsRouteInputs {
+            arch: arch.to_string(),
+            iu4_prefill_flag: None,
+            iu4_prefill_enabled: true,
+            moe_sym_iu4_flag: None,
+            moe_sym_iu4_requested: true,
+            a8_prefill_enabled: false,
+            a8_prefill_forced: false,
+            qwen4_down_a8_requested: false,
+            qwen4_ep_a8: None,
+        }
+    }
+
+    #[test]
+    fn route_resolution_truth_table() {
+        use XtsRouteState::*;
+        // Capable device, defaults: W4A4 and symmetric-IU4 by capability; A8 is opt-in.
+        let f = inputs("gfx1201");
+        let (iu4, sym, a8) = resolve_xts_routes(true, true, true, &f);
+        assert_eq!((iu4, sym), (Admitted, Admitted));
+        assert!(matches!(a8, NotAdmitted(_)));
+
+        // Explicit kill of the shared switch: nothing admitted, nothing refused (not forced).
+        let mut k = inputs("gfx1201");
+        k.iu4_prefill_flag = Some(false);
+        k.iu4_prefill_enabled = false;
+        k.moe_sym_iu4_requested = false;
+        let (iu4, sym, _) = resolve_xts_routes(true, true, true, &k);
+        assert!(matches!(&iu4, NotAdmitted(w) if w.contains("kernel.iu4_prefill=false")));
+        assert!(matches!(&sym, NotAdmitted(w) if w.contains("killed")));
+
+        // Forced on an arch with no consumer: refused, never admitted.
+        let mut forced = inputs("gfx1030");
+        forced.iu4_prefill_flag = Some(true);
+        forced.iu4_prefill_enabled = false;
+        forced.moe_sym_iu4_flag = Some(true);
+        forced.moe_sym_iu4_requested = false;
+        let (iu4, sym, _) = resolve_xts_routes(true, true, true, &forced);
+        assert!(matches!(&iu4, Refused(w) if w.contains("gfx1030")));
+        assert!(matches!(&sym, Refused(w) if w.contains("gfx1030")));
+
+        // Forced A8 knobs: an enabled A8 prefill is admitted; a Qwen4-only knob is refused.
+        let mut a8f = inputs("gfx1201");
+        a8f.a8_prefill_enabled = true;
+        a8f.a8_prefill_forced = true;
+        assert_eq!(resolve_xts_routes(true, true, true, &a8f).2, Admitted);
+        let mut q4 = inputs("gfx1201");
+        q4.qwen4_ep_a8 = Some(true);
+        assert!(
+            matches!(&resolve_xts_routes(true, true, true, &q4).2, Refused(w) if w.contains("Qwen4"))
+        );
+        let mut a8_arch = inputs("gfx1100");
+        a8_arch.a8_prefill_forced = true; // set, but not enabled on this arch
+        assert!(matches!(
+            &resolve_xts_routes(true, true, true, &a8_arch).2,
+            Refused(w) if w.contains("no A8 consumer")
+        ));
+
+        // A layer that is not symmetric admits nothing; geometry gates only the MoE route.
+        let (iu4, sym, a8) = resolve_xts_routes(true, false, true, &f);
+        assert!(matches!(iu4, NotAdmitted(_)) && matches!(sym, NotAdmitted(_)));
+        assert!(matches!(a8, NotAdmitted(_)));
+        let (iu4, sym, _) = resolve_xts_routes(true, true, false, &f);
+        assert_eq!(iu4, Admitted);
+        assert!(matches!(&sym, NotAdmitted(w) if w.contains("geometry")));
+    }
+
+    fn cap(iu4: XtsRouteState, sym: XtsRouteState, a8: XtsRouteState) -> XtsRouteCapability {
+        XtsRouteCapability {
+            n_layers: 24,
+            dense_symmetric_layers: 24,
+            expert_symmetric_layers: 24,
+            symmetric_layers: 24,
+            unembed_symmetric: true,
+            awq_sidecars: 6288,
+            down_k_logical: 1152,
+            down_k_physical: 1280,
+            iu4_prefill: iu4,
+            moe_sym_iu4: sym,
+            moe_a8: a8,
+        }
+    }
+
+    #[test]
+    fn load_line_names_admitted_and_refused_routes() {
+        use XtsRouteState::*;
+        let all = cap(Admitted, Admitted, Admitted).load_line();
+        assert_eq!(
+            all,
+            "inkling2 xts: symmetric 24/24 layers (dense+experts), awq 6288 sidecars; \
+             routes admitted by capability: iu4_prefill, moe_sym_iu4, moe_a8; \
+             executing: scalar decode (no multi-row consumer yet)"
+        );
+        let some = cap(
+            Admitted,
+            NotAdmitted("n/a".into()),
+            Refused("Qwen4 expert-parallel A8 knobs have no Inkling consumer".into()),
+        )
+        .load_line();
+        assert!(
+            some.contains("routes admitted by capability: iu4_prefill; "),
+            "{some}"
+        );
+        assert!(
+            some.contains("refused (forced, cannot run): moe_a8 (Qwen4 expert-parallel A8 knobs"),
+            "{some}"
+        );
+        assert!(
+            some.ends_with("executing: scalar decode (no multi-row consumer yet)"),
+            "{some}"
+        );
+        let none = cap(
+            NotAdmitted("a".into()),
+            NotAdmitted("b".into()),
+            NotAdmitted("c".into()),
+        )
+        .load_line();
+        assert!(
+            none.contains("routes admitted by capability: none; executing"),
+            "{none}"
+        );
+    }
+
+    /// Non-unit, per-(expert, column) sidecars so a wrong table / wrong divide shows.
+    fn vary_expert_sidecars(
+        map: &mut std::collections::HashMap<String, crate::weights::RawTensor>,
+        inter: usize,
+    ) {
+        for (name, t) in map.iter_mut() {
+            if !(name.contains(".mlp.experts.") && name.ends_with(AWQ_SIDECAR_SUFFIX)) {
+                continue;
+            }
+            let k = t.data.len() / 2;
+            let live = if name.contains("down_proj") { inter } else { k };
+            let salt = name.len();
+            for i in 0..k {
+                let v = if i < live {
+                    0.5 + ((i * 13 + salt * 7) % 11) as f32 * 0.25
+                } else {
+                    1.0
+                };
+                t.data[2 * i..2 * i + 2]
+                    .copy_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn xts_expert_stage_matches_cpu_f32_reference_hw() {
+        stage_matches_cpu(tiny_cfg());
+    }
+
+    /// Production widths: hidden 2304 (gate_up K), SiTU 1152 -> physical 1280 (down K).
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn xts_expert_stage_matches_cpu_f32_reference_mini_widths_hw() {
+        let mut cfg = tiny_cfg();
+        cfg.n_embd = 2304;
+        cfg.inter = 1152;
+        cfg.n_phys = 1;
+        stage_matches_cpu(cfg);
+    }
+
+    fn stage_matches_cpu(cfg: Inkling2Config) {
+        let mut map = build(&cfg);
+        vary_expert_sidecars(&mut map, cfg.inter);
+        let cert = certify_xts(&map, &cfg).unwrap();
+        let w = weights_with(map, Some(cert));
+        let e = cfg.n_embd;
+        let inter = cfg.inter;
+        let mut gpu = Gpu::init().expect("GPU required");
+
+        let mut tx = LoadTx::new(&mut gpu);
+        let (mut bytes, mut nt) = (0u64, 0usize);
+        let (slots, tabs) =
+            xts_upload_layer(&mut tx, &w, &cfg, 0, &mut bytes, &mut nt).expect("xts upload");
+        let mut weights_held = Vec::new();
+        for (g, d) in slots {
+            weights_held.push(tx.take_weight(g).unwrap());
+            weights_held.push(tx.take_weight(d).unwrap());
+        }
+        let xl = Inkling2XtsLayer {
+            gu_awq: tx.take_tensor(tabs.gu_awq).unwrap(),
+            down_awq: tx.take_tensor(tabs.down_awq).unwrap(),
+            gu_ptrs: tx.take_tensor(tabs.gu_ptrs).unwrap(),
+            down_ptrs: tx.take_tensor(tabs.down_ptrs).unwrap(),
+            gu_awq_ptrs: tx.take_tensor(tabs.gu_awq_ptrs).unwrap(),
+            down_awq_ptrs: tx.take_tensor(tabs.down_awq_ptrs).unwrap(),
+        };
+        tx.commit();
+        assert!(bytes > 0 && nt > 0);
+
+        let mut s = 0x1234_5678u32;
+        let x: Vec<f32> = (0..e)
+            .map(|_| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                (s >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+            })
+            .collect();
+        // Repeated experts and one unrouted (-1) slot.
+        let ids: [i32; 8] = [0, 1, 1, 0, 1, -1, 0, 1];
+        let xt = gpu.upload_f32(&x, &[e]).unwrap();
+        let idt = gpu.alloc_tensor(&[8], DType::F32).unwrap();
+        let idb: Vec<u8> = ids.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        gpu.hip.memcpy_htod(&idt.buf, &idb).unwrap();
+        let mut tmp = vec![xt, idt];
+        let mut capture = None;
+        let di =
+            crate::gpu_forward::xts_expert_stage(&mut gpu, &cfg, &xl, &mut tmp, 0, 1, &mut capture)
+                .expect("xts stage");
+        let got = gpu.download_f32(&tmp[di]).unwrap();
+        assert_eq!(got.len(), 8 * e);
+
+        let matvec = |m: &[f32], rows: usize, cols: usize, v: &[f32]| -> Vec<f32> {
+            (0..rows)
+                .map(|r| {
+                    m[r * cols..(r + 1) * cols]
+                        .iter()
+                        .zip(v)
+                        .map(|(a, b)| a * b)
+                        .sum()
+                })
+                .collect()
+        };
+        let mut worst = 0.0f32;
+        let mut peak = 0.0f32;
+        for (r, &id) in ids.iter().enumerate() {
+            let row = &got[r * e..(r + 1) * e];
+            if id < 0 {
+                assert!(
+                    row.iter().all(|&v| v == 0.0),
+                    "unrouted rank {r} must be zero"
+                );
+                continue;
+            }
+            let p = "model.llm.layers.0.mlp.experts";
+            let (_, wgu) = w.f32(&format!("{p}.{id}.gate_up_proj.weight")).unwrap();
+            let (dshape, wd) = w.f32(&format!("{p}.{id}.down_proj.weight")).unwrap();
+            assert_eq!(dshape, vec![e, inter]);
+            let gu = matvec(&wgu, 2 * inter, e, &x);
+            let act: Vec<f32> = (0..inter)
+                .map(|j| {
+                    crate::oracle::situ(gu[j], gu[inter + j], cfg.situ_beta, cfg.situ_linear_beta)
+                })
+                .collect();
+            let want = matvec(&wd, e, inter, &act);
+            for (a, b) in row.iter().zip(&want) {
+                worst = worst.max((a - b).abs());
+                peak = peak.max(b.abs());
+            }
+        }
+        assert!(
+            peak > 0.0,
+            "reference is all zero: the test would be vacuous"
+        );
+        assert!(
+            worst <= 2e-3 * peak,
+            "xts stage vs CPU f32 reference: max abs err {worst}, peak {peak}"
+        );
+
+        for t in tmp {
+            let _ = gpu.free_tensor(t);
+        }
+        xl.free_gpu(&mut gpu);
+        for wt in weights_held {
+            wt.free_all(&mut gpu);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn xts_upload_failure_unwinds_cleanly_hw() {
+        let cfg = tiny_cfg();
+        let mut map = build(&cfg);
+        // Expert 1's down sidecar goes missing after expert 0 already uploaded.
+        map.remove(&crate::weights::awq_sidecar_name(
+            "model.llm.layers.0.mlp.experts.1.down_proj.weight",
+        ));
+        let w = weights_with(map, None);
+        let mut gpu = Gpu::init().expect("GPU required");
+        {
+            let mut tx = LoadTx::new(&mut gpu);
+            let (mut bytes, mut nt) = (0u64, 0usize);
+            let err = xts_upload_layer(&mut tx, &w, &cfg, 0, &mut bytes, &mut nt)
+                .err()
+                .expect("must fail");
+            assert!(
+                err.contains("missing") && err.contains("awq_scale"),
+                "{err}"
+            );
+            // tx drops here uncommitted and frees everything it held.
+        }
+        let t = gpu
+            .alloc_tensor(&[16], DType::F32)
+            .expect("device still usable");
+        let _ = gpu.free_tensor(t);
+    }
+
+    /// An attention-shaped qt44 weight with a non-unit F32 sidecar attached by the
+    /// loader's own `xts_attach_awq` runs through `weight_gemv` (x / S before the
+    /// FWHT) and equals the CPU `deq(W) / S` matvec; the F16 router goes through the
+    /// existing F16 GEMV dispatch of `weight_gemv`.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn xts_dense_awq_gemv_and_f16_router_match_cpu_hw() {
+        use hipfire_runtime::llama::weight_gemv;
+        let (m, k) = (128usize, 2304usize);
+        let name = "model.llm.layers.0.attn.wk_dv.weight";
+        let w_bytes = sym_qt44(m, k, 5);
+        // Multiples of 1/8: exact in F16, so the F32 vector is the sidecar bit for bit.
+        let s: Vec<f32> = (0..k).map(|i| 0.5 + (i % 9) as f32 * 0.375).collect();
+        let mut map = std::collections::HashMap::new();
+        put(&mut map, name, 44, &[m, k], w_bytes.clone());
+        put(
+            &mut map,
+            &crate::weights::awq_sidecar_name(name),
+            1,
+            &[k],
+            f16_vec(&s),
+        );
+        let w = weights_with(map, None);
+        let mut gpu = Gpu::init().expect("GPU required");
+
+        let mut x_state = 0x9e37_79b9u32;
+        let mut rnd = move || {
+            x_state = x_state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (x_state >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+        };
+        let x: Vec<f32> = (0..k).map(|_| rnd()).collect();
+        let xt = gpu.upload_f32(&x, &[k]).unwrap();
+
+        // Dense qt44 + sidecar.
+        let mut tx = LoadTx::new(&mut gpu);
+        let t = raw(&w, name).unwrap();
+        let (wt, _) = wt_from_raw(&mut gpu, name, 44, &t.data, m, k).unwrap();
+        let slot = tx.hold_weight(wt);
+        let (mut b, mut n) = (0u64, 0usize);
+        xts_attach_awq(&mut tx, &w, slot, name, k, &mut b, &mut n).unwrap();
+        let wt = tx.take_weight(slot).unwrap();
+        tx.commit();
+        assert!(wt.awq_scale.is_some() && n == 1 && b == 4 * k as u64);
+        let yt = gpu.alloc_tensor(&[m], DType::F32).unwrap();
+        weight_gemv(&mut gpu, &wt, &xt, &yt).unwrap();
+        let got = gpu.download_f32(&yt).unwrap();
+        let base = hipfire_runtime::weight_backend::dequantize_weight_to_f32(44, &w_bytes, m * k);
+        let want: Vec<f32> = (0..m)
+            .map(|r| (0..k).map(|c| base[r * k + c] / s[c] * x[c]).sum())
+            .collect();
+        let peak = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let worst = got
+            .iter()
+            .zip(&want)
+            .fold(0.0f32, |a, (g, r)| a.max((g - r).abs()));
+        eprintln!("dense awq gemv: worst {worst} peak {peak}");
+        assert!(
+            peak > 0.0 && worst <= 2e-3 * peak,
+            "awq gemv: worst {worst} peak {peak}"
+        );
+        // Without the sidecar the result must differ (the divide is observable).
+        let plain_want: Vec<f32> = (0..m)
+            .map(|r| (0..k).map(|c| base[r * k + c] * x[c]).sum())
+            .collect();
+        let gap = plain_want
+            .iter()
+            .zip(&want)
+            .fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
+        assert!(
+            gap > 10.0 * worst,
+            "sidecar not observable: gap {gap} vs worst {worst}"
+        );
+        wt.free_all(&mut gpu);
+        let _ = gpu.free_tensor(yt);
+
+        // F16 router [128, 2304] through the F16 GEMV dispatch.
+        let rvals: Vec<f32> = (0..128 * k).map(|_| rnd() * 0.5).collect();
+        let rbytes = f16_vec(&rvals);
+        let (router, _) = wt_from_raw(&mut gpu, "router", 1, &rbytes, 128, k).unwrap();
+        assert_eq!(router.gpu_dtype, DType::F16);
+        let ry = gpu.alloc_tensor(&[128], DType::F32).unwrap();
+        weight_gemv(&mut gpu, &router, &xt, &ry).unwrap();
+        let rgot = gpu.download_f32(&ry).unwrap();
+        let rdec: Vec<f32> = rbytes
+            .chunks_exact(2)
+            .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect();
+        let rwant: Vec<f32> = (0..128)
+            .map(|r| (0..k).map(|c| rdec[r * k + c] * x[c]).sum())
+            .collect();
+        let rpeak = rwant.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let rworst = rgot
+            .iter()
+            .zip(&rwant)
+            .fold(0.0f32, |a, (g, r)| a.max((g - r).abs()));
+        eprintln!("f16 router gemv: worst {rworst} peak {rpeak}");
+        assert!(
+            rpeak > 0.0 && rworst <= 5e-3 * rpeak,
+            "router: worst {rworst} peak {rpeak}"
+        );
+        router.free_all(&mut gpu);
+        let _ = gpu.free_tensor(ry);
+        let _ = gpu.free_tensor(xt);
     }
 }

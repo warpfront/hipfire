@@ -13,6 +13,41 @@ pub const MTP_SIDECAR_ARCH_ID: u32 = 25;
 /// Upstream `LLAMA_MAX_LAYERS` (llama-hparams.h at the merge commit).
 pub const LLAMA_MAX_LAYERS: usize = 512;
 
+/// Top-level HFQ metadata key carrying the typed MQ4 layout hint.
+pub const MQ4_LAYOUT_KEY: &str = "hipfire_inkling2_mq4_layout";
+/// The only non-legacy layout value: symmetric qt44 + F16 AWQ sidecars + padded routed down.
+pub const MQ4_LAYOUT_XTS: &str = "qt44-padded-awq-v1";
+
+/// Typed weight layout of an Inkling-2-Mini HFQ. The metadata value is a hint
+/// that the loader certifies against the exact tensor census; it is never
+/// inferred from tensor formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mq4Layout {
+    /// Key absent: the shipped RTN artifact (qt13 experts, flat down, qt44 routers).
+    Legacy,
+    /// `qt44-padded-awq-v1`: see `xts/CONTRACT.md`.
+    Qt44PaddedAwqV1,
+}
+
+impl Mq4Layout {
+    /// Read the typed hint from the top level of the HFQ metadata JSON: absent
+    /// is [`Mq4Layout::Legacy`], the known tag is the XTS layout, anything else
+    /// (unknown string, non-string value) is a clean load error.
+    pub fn from_metadata(meta: &serde_json::Value) -> Result<Self, String> {
+        match meta.get(MQ4_LAYOUT_KEY) {
+            None => Ok(Self::Legacy),
+            Some(serde_json::Value::String(s)) if s == MQ4_LAYOUT_XTS => Ok(Self::Qt44PaddedAwqV1),
+            Some(other) => Err(format!(
+                "inkling2: unknown {MQ4_LAYOUT_KEY} {other} (supported: absent, \"{MQ4_LAYOUT_XTS}\")"
+            )),
+        }
+    }
+
+    pub fn is_xts(self) -> bool {
+        self == Self::Qt44PaddedAwqV1
+    }
+}
+
 /// Verified Mini geometry from the live `config.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopConfig {
@@ -141,6 +176,8 @@ pub struct Inkling2Config {
     pub eos_token: u32,
     pub swa_layers: Vec<bool>,
     pub loop_cfg: LoopConfig,
+    /// Typed layout hint from the HFQ metadata (`Legacy` when the key is absent).
+    pub mq4_layout: Mq4Layout,
 }
 
 impl Inkling2Config {
@@ -212,6 +249,7 @@ impl Inkling2Config {
             eos_token: cfg["eos_token_id"].as_u64().ok_or("missing eos_token_id")? as u32,
             swa_layers,
             loop_cfg,
+            mq4_layout: Mq4Layout::from_metadata(&meta)?,
         })
     }
 

@@ -59,6 +59,10 @@ pub fn load_inkling2_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Inkli
                 }
             }
             eprintln!("  {summary}");
+            // Typed XTS layout only: one capability line (legacy prints nothing new).
+            if let Some(routes) = gpu_weights.xts_route_capability() {
+                eprintln!("  {}", routes.load_line());
+            }
             Ok(Inkling2Bundle {
                 eos_tok: config.eos_token,
                 config,
