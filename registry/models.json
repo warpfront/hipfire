@@ -2086,9 +2086,31 @@
       },
       "sha256": "8fa2093744a69d67b553875bcc1695fd039665938bcddaa29072005639fc2a4e",
       "size_bytes": 822227584
+    },
+    "inkling2:mini-mq4-xts": {
+      "repo": "hipfire-models/inkling2-mini",
+      "file": "inkling2-mini.mq4-xts",
+      "size_gb": 14.44,
+      "min_vram_gb": 16,
+      "desc": "Inkling-2-Mini (`thinkingmachines/Inkling-2-Mini`, arch 24), MQ4V2 XT, symmetric (qt44; H2 per-expert Hessian GPTQ + AWQ, F16 routers); the default Inkling tier (`inkling2`, `inkling2:mini`). Paired KLD against the source NVFP4/MXFP8 teacher, 24x2048 chunks (gfx1201): WT2 0.0202 vs 0.0328, code24 0.0144 vs 0.0229 for the RTN `inkling2:mini-mq4` (-38% / -37%, every chunk lower). R9700 vs the RTN: decode +6.6% at 128 / +2.8% at 2K context, prefill +3.1%. Text-only; single-stream greedy, speculation off. Minimum build: beta 04d8ecc6a5 (the mq4-xts loader).",
+      "recommended_settings": {
+        "temperature": 1.0
+      }
+    },
+    "inkling2:mini-mq4": {
+      "repo": "Raufaser/Inkling-2-Mini-hipfire-MQ4",
+      "file": "inkling2-mini-mq4.hfq",
+      "size_gb": 13.93,
+      "min_vram_gb": 16,
+      "desc": "Inkling-2-Mini (arch 24) uniform MQ4 RTN (MQ4G256V2 dense, MQ4G256 experts), the first Inkling-2 artifact, by Raufaser. Superseded as the default by `inkling2:mini-mq4-xts` (WT2 KLD 0.0328 vs 0.0202 on gfx1201). Text-only; single-stream greedy, speculation off.",
+      "recommended_settings": {
+        "temperature": 1.0
+      }
     }
   },
   "aliases": {
+    "inkling2": "inkling2:mini-mq4-xts",
+    "inkling2:mini": "inkling2:mini-mq4-xts",
     "bonsai": "bonsai:27b-tq2",
     "ornith": "ornith-1.5:35b-a3b",
     "ornith-1.5": "ornith-1.5:35b-a3b",

@@ -290,6 +290,7 @@ def log(msg: str) -> None:
 #   16 = Qwen4 experimental / Qwen3.8-Flash-Next
 #   20 = DFlash drafter sidecar (crates/hipfire-quantize/src/bin/dflash_convert.rs)
 #   23 = Muse Glimmer DFlash drafter (muse_glimmer_assistant)
+#   24 = Inkling-2-Mini (looped MoE)
 #   26 = LFM3 family (text / VL / audio / omni variants)
 def arch_id_for(tag: str, entry: dict) -> int | None:
     file = entry.get("file", "")
@@ -301,6 +302,10 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 23 if "dflash" in file else 14
     if "dflash" in file:
         return 20
+    # Inkling-2-Mini (`thinkingmachines/Inkling-2-Mini`), the looped
+    # 24-physical/48-visit MoE carrier.
+    if family == "inkling2":
+        return 24
     # Prism ML Bonsai = behaviour-preserving transform of Qwen3.6-27B,
     # architecture unchanged (dense qwen35).
     if family == "bonsai":
