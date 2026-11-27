@@ -116,7 +116,9 @@ if echo "$CHANGED" | grep -qE "$PP_HOTSPOT"; then
     PP_TOUCHED=1
 fi
 
-if ! echo "$CHANGED" | grep -qE "$HOTSPOT"; then
+# Data files (benchmarks/, *.json) hold no daemon code. Names such as
+# qwen4-mq4xts-mtp.lane-tau.json match `mq4` but must not start the GPU gates.
+if ! echo "$CHANGED" | grep -vE '^benchmarks/|\.json$' | grep -qE "$HOTSPOT"; then
     exit 0
 fi
 
