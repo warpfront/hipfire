@@ -17,7 +17,7 @@ use hipfire_arch_lfm3_omni::{
     CodecConfig, CodecStreamingCache, DepthRng,
 };
 use hipfire_loader::load_model;
-use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
+use hipfire_runtime::loader_api::SpecLoadCfg;
 use hipfire_runtime::safetensors_source::SafetensorsSource;
 use rdna_compute::Gpu;
 
@@ -52,7 +52,6 @@ fn main() {
         None,
         None,
         None,
-        &CaskConfig::default(),
         1,
         SpecLoadCfg::default(),
         &mut gpu,

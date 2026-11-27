@@ -11,7 +11,7 @@ use hipfire_arch_lfm3_omni::{
     omni_generate, omni_stream_prefill, omni_stream_step, DepthRng, MIXED_START_TOKEN,
 };
 use hipfire_loader::load_model;
-use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
+use hipfire_runtime::loader_api::SpecLoadCfg;
 use rdna_compute::Gpu;
 
 fn build_prompt(model: &hipfire_loader::LoadedModel, prompt: &str) -> Vec<u32> {
@@ -44,7 +44,6 @@ fn main() {
         None,
         None,
         None,
-        &CaskConfig::default(),
         1,
         SpecLoadCfg::default(),
         &mut gpu,
@@ -96,7 +95,6 @@ fn main() {
         None,
         None,
         None,
-        &CaskConfig::default(),
         1,
         SpecLoadCfg::default(),
         &mut gpu,
@@ -164,7 +162,6 @@ fn main() {
         None,
         None,
         None,
-        &CaskConfig::default(),
         1,
         SpecLoadCfg::default(),
         &mut gpu,

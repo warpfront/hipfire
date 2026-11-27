@@ -1,0 +1,3 @@
+### Fixes: LFM3 loader examples compile again
+
+- **Fixed (HIPF-618): the five `hipfire-loader` examples from the LFM3 merge (`asr_stream_smoke`, `codec_smoke`, `depth_smoke`, `omni_stream_equiv`, `omni_tts`) compile again.** The merge `c67382a20f` brought in call sites that were written before `0c208697b0` removed CASK. They still imported `hipfire_runtime::loader_api::CaskConfig` and passed it to `load_model`, so `cargo check --workspace --all-targets` failed on `beta` with `E0432` and `E0061`. The examples now call `load_model` with the nine arguments of the current signature. No runtime code changed.

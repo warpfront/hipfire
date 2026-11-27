@@ -16,7 +16,7 @@
 //! Usage: `asr_stream_smoke [audio_hfq] [chunk_samples]`
 
 use hipfire_loader::load_model;
-use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
+use hipfire_runtime::loader_api::SpecLoadCfg;
 use rdna_compute::Gpu;
 
 fn main() {
@@ -40,7 +40,6 @@ fn main() {
         None,
         None,
         None,
-        &CaskConfig::default(),
         1,
         SpecLoadCfg::default(),
         &mut gpu,
