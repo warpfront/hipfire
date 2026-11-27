@@ -67,9 +67,12 @@ pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
 /// bump — see [`Gpu::is_uma`], the only consumer.
 pub(crate) const HIP_DEVICE_ATTRIBUTE_INTEGRATED: i32 = 16;
 
-/// Process-wide host→device upload counter, read through [`Gpu::htod_uploads`].
-/// Diagnostics only: a per-call constant upload in a hot loop is invisible in a
-/// kernel budget but shows up here.
+/// Process-wide host→device copy counter, read through [`Gpu::htod_uploads`].
+/// Counts every synchronous H2D path: `upload_f32`, `upload_f16_bits`,
+/// `upload_raw`, `full_f32`/`fill_f32` constant fills, and the sync branch of
+/// `memcpy_htod_auto`. Async (graph-capture) and host-mapped offload uploads
+/// are not counted. Diagnostics only: a per-call constant upload in a hot
+/// loop is invisible in a kernel budget but shows up here.
 static HTOD_UPLOADS: AtomicUsize = AtomicUsize::new(0);
 
 // ── MQ*-GL ("global Lloyd") format constants ────────────────────────────
@@ -4374,6 +4377,7 @@ impl Gpu {
                 .expect("capture mode requires an active stream");
             self.hip.memcpy_htod_async(dst, src, stream)
         } else {
+            HTOD_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.hip.memcpy_htod(dst, src)
         }
     }
@@ -9219,6 +9223,7 @@ impl Gpu {
     /// the reference inits to `float("-inf")` so unfilled pool slots get zero
     /// softmax weight).
     pub fn full_f32(&mut self, shape: &[usize], value: f32) -> HipResult<GpuTensor> {
+        HTOD_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bind_thread()?;
         self.alloc_then_init(shape, DType::F32, |hip, _stream, tensor| {
             let data = vec![value; tensor.numel()];
@@ -9231,6 +9236,7 @@ impl Gpu {
     /// In-place constant fill of an existing F32 tensor (sync htod).
     #[track_caller]
     pub fn fill_f32(&mut self, tensor: &GpuTensor, value: f32) -> HipResult<()> {
+        HTOD_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bind_thread()?;
         let data = vec![value; tensor.numel()];
         let bytes =
@@ -9602,6 +9608,7 @@ impl Gpu {
     /// `upload_raw` calls still malloc fresh and never reclaim those slots
     /// (the pool-backed twin lives in hipfire-runtime weight fulfillment).
     pub fn upload_raw(&self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+        HTOD_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.upload_raw_with_copy(data, shape, HipRuntime::memcpy_htod)
     }
 
@@ -10122,9 +10129,10 @@ impl Gpu {
         self.hip.free(owner)
     }
 
-    /// Host→device `upload_f32` calls since process start. A hot loop that
-    /// re-uploads a constant vector every call shows up here; a loop that
-    /// uploads once and caches does not.
+    /// Host→device copies since process start: `upload_f32`/`upload_f16_bits`/
+    /// `upload_raw`, `full_f32`/`fill_f32` fills, and the sync branch of
+    /// `memcpy_htod_auto`. A hot loop that re-uploads a constant vector every
+    /// call shows up here; a loop that uploads once and caches does not.
     pub fn htod_uploads() -> usize {
         HTOD_UPLOADS.load(std::sync::atomic::Ordering::Relaxed)
     }

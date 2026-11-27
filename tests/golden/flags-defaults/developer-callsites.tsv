@@ -330,6 +330,7 @@ developer_callsite	*	HIPFIRE_HC_CTRL_T1024#developer_bool=false
 developer_callsite	*	HIPFIRE_HIPCC#developer_var_os=filter.map
 developer_callsite	*	HIPFIRE_HIP_WAIT#developer_var=-
 developer_callsite	*	HIPFIRE_IMG_PROFILE#developer_var=is_ok_and
+developer_callsite	*	HIPFIRE_INKLING2_TAU_OFF#developer_var=as_deref.!=Ok("1")
 developer_callsite	*	HIPFIRE_JIT_JOBS#developer_var=ok
 developer_callsite	*	HIPFIRE_JIT_JOBS#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_KV_V#developer_var=ok

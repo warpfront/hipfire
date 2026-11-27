@@ -151,6 +151,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_KV_ADAPTIVE` | off unless set / param | Loader/CLI |
 | `HIPFIRE_KV_V` | **developer-only** V-axis override (e.g. `lloyd2`/`lloyd3`/`lloyd4`); **lower precedence** than an authored `--kv-v` or `memory.kv_v` | Qwen carrier (`developer_var`); not a second user config plane — prefer CLI/TOML |
 | `HIPFIRE_ATTN_FLASH` | from `flash_mode` (`auto`/`always`/`never`) | CLI → daemon |
+| `HIPFIRE_INKLING2_TAU_OFF` | unset; `1` disables full-layer Q/R tau scaling (developer gate arm) | `developer_var`; Inkling-2-Mini GPU forward. Unset runs the production tau path. |
 | `HIPFIRE_YARN_FACTOR` | unset = checkpoint `rope_parameters`; `>1` YaRN factor over the original context; `1` disables | `attention.yarn_factor`; `RuntimeConfig` → `hipfire_runtime::rope` (Qwen4) |
 | `HIPFIRE_NORMALIZE_PROMPT` | on unless `0`/`false`/`off`/`no` | `RuntimeConfig` |
 | `HIPFIRE_PROMPT_TOKEN_HEAT=1` | dump BPE heat | RuntimeConfig |
@@ -1239,7 +1240,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1710
+**Count:** 1711
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1941,7 +1942,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GPU_TOPK` | crates/saddle-lab/examples/infer_qwen35.rs | harness |
 | `HIPFIRE_GQA_CHUNK` | crates/rdna-compute/src/attention.rs | developer |
 | `HIPFIRE_GQA_FUSED` | crates/hipfire-arch-qwen2/src/qwen2.rs, crates/hipfire-dispatch/src/families/kv_tier.rs | developer |
-| `HIPFIRE_GRAPH` | benchmarks/scripts/bench_pp_gfx906.sh, crates/hipfire-arch-inkling2/tests/gpu_parity.rs | experimental |
+| `HIPFIRE_GRAPH` | benchmarks/scripts/bench_pp_gfx906.sh, crates/hipfire-arch-inkling2/tests/d1_gates.rs | experimental |
 | `HIPFIRE_GRAPH_PREFILL` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs | harness |
 | `HIPFIRE_GRID_TOKFAST` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GTT_CEILING_GIB` | scripts/run-bounded.sh | harness |
@@ -1981,7 +1982,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_HIPCC` | crates/hipfire-cli/src/main.rs, crates/hipfire-cli/src/setup.rs | developer |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | .agents/skills/hipfire-autoheal/triage.sh, benchmarks/scripts/mq4v2_k5120_gfx1201_validate.sh | experimental |
 | `HIPFIRE_HIP_WAIT` | crates/rdna-compute/src/dispatch.rs | developer |
-| `HIPFIRE_HOME` | benchmarks/scripts/mq4v2_k5120_gfx1201_validate.sh, crates/hipfire-arch-inkling2/tests/gpu_parity.rs | stable |
+| `HIPFIRE_HOME` | benchmarks/scripts/mq4v2_k5120_gfx1201_validate.sh, crates/hipfire-arch-inkling2/tests/d1_gates.rs | stable |
 | `HIPFIRE_HOST` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_HOST_SITE_LEDGER` | crates/hip-bridge/src/site_ledger.rs | developer |
 | `HIPFIRE_HOST_TIMING` | crates/hipfire-generate/src/qwen.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs | developer |
@@ -1989,6 +1990,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_IMAGE` | scripts/container-gate.sh | harness |
 | `HIPFIRE_IMAGE_DECODE` | crates/hipfire-arch-qwen35-vl/src/image.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_IMG_PROFILE` | crates/hipfire-arch-diffusion/src/flux_gpu.rs, crates/hipfire-arch-diffusion/src/pipeline.rs | developer |
+| `HIPFIRE_INKLING2_TAU_OFF` | crates/hipfire-arch-inkling2/src/gpu_forward.rs, crates/hipfire-arch-inkling2/src/gpu_forward.rs | developer |
 | `HIPFIRE_INSTALL_REF` | scripts/install.sh, scripts/test_install_revision.py | harness |
 | `HIPFIRE_ISA_MODULE` | crates/hipfire-runtime/examples/tmp_iu4_gfx12_v3_oracle.rs | harness |
 | `HIPFIRE_ISA_SYMBOL_SUFFIX` | crates/hipfire-runtime/examples/tmp_iu4_gfx12_v3_oracle.rs | harness |

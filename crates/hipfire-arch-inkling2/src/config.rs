@@ -259,11 +259,11 @@ impl Inkling2Config {
         crate::oracle::tau(pos, self.log_floor, self.log_alpha)
     }
 
-    /// Whether the GPU forward executes a full-attention visit at `pos`: it
-    /// implements only unit τ and refuses the step otherwise (a NaN τ from a
-    /// degenerate config refuses too).
+    /// Whether the GPU forward executes a full-attention visit at `pos`.
+    /// Supported τ is finite, positive and at most [`GPU_MAX_FULL_TAU`].
     pub fn gpu_full_tau_supported(&self, pos: usize) -> bool {
-        (self.full_attention_tau(pos) - 1.0).abs() <= GPU_UNIT_TAU_TOLERANCE
+        let t = self.full_attention_tau(pos);
+        t.is_finite() && t > 0.0 && t <= GPU_MAX_FULL_TAU
     }
 
     /// Positions the GPU forward can execute below `bound`: the first
@@ -282,7 +282,9 @@ impl Inkling2Config {
 }
 
 /// Largest |τ − 1| the GPU forward treats as unit full-attention scaling.
-const GPU_UNIT_TAU_TOLERANCE: f32 = 1e-7;
+pub(crate) const GPU_UNIT_TAU_TOLERANCE: f32 = 1e-7;
+/// Largest full-attention τ admitted by the GPU forward.
+pub(crate) const GPU_MAX_FULL_TAU: f32 = 2.0;
 
 #[cfg(test)]
 mod tests {
@@ -404,21 +406,27 @@ mod tests {
     }
 
     #[test]
-    fn gpu_position_limit_is_the_first_non_unit_tau_position() {
+    fn gpu_position_limit_admits_supported_tau_scaling() {
         let mut cfg = Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
-        // Mini: floor 8192, alpha 0.1 — positions 0..=8191 run, 8192 refuses.
+        // Mini: floor 8192, alpha 0.1 — τ is implemented past the floor and
+        // remains below the supported bound across the 32768-position range.
         assert!(cfg.gpu_full_tau_supported(8191));
-        assert!(!cfg.gpu_full_tau_supported(8192));
+        assert!(cfg.gpu_full_tau_supported(8192));
         assert_eq!(cfg.full_attention_tau(8191), 1.0);
-        assert_eq!(cfg.gpu_position_limit(32768), 8192);
-        // A smaller bound (KV capacity) is never exceeded.
+        assert_eq!(cfg.gpu_position_limit(32768), 32768);
         assert_eq!(cfg.gpu_position_limit(8192), 8192);
         assert_eq!(cfg.gpu_position_limit(4096), 4096);
         // Tracks the config, not a constant.
         cfg.log_floor = 1000;
-        assert_eq!(cfg.gpu_position_limit(32768), 1000);
-        // alpha so small that f32 τ rounds to 1 for a few rows past floor.
+        assert_eq!(cfg.gpu_position_limit(32768), 32768);
+        // A tiny alpha still rounds τ near 1, but is supported either way.
         cfg.log_alpha = 1e-5;
+        assert_eq!(cfg.gpu_position_limit(32768), 32768);
+        // Degenerate τ still refuses at the first unsupported position.
+        cfg.log_alpha = f32::NAN;
+        assert!(!cfg.gpu_full_tau_supported(1000));
+        assert_eq!(cfg.gpu_position_limit(32768), 1000);
+        cfg.log_alpha = -1.0;
         let limit = cfg.gpu_position_limit(32768);
         assert!(limit > 1000 && limit < 32768, "{limit}");
         assert!(!cfg.gpu_full_tau_supported(limit));
