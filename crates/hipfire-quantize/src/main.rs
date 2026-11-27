@@ -22,6 +22,7 @@ mod gguf_input;
 mod hc8;
 mod hfq;
 mod inkling2_dspark;
+mod inkling2_xts;
 mod lloyd_gpu;
 mod maple;
 mod model_filter;

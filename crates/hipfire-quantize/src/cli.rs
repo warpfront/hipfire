@@ -308,6 +308,13 @@ pub(crate) struct QuantizeArgs {
     #[arg(long)]
     pub mq4v2_symmetric: bool,
 
+    /// Inkling-2-Mini (arch 24) only: keep the 24 router matrices `mlp.gate.weight` as F16
+    /// from the source instead of the legacy qt44 encoding. Builds the `A_R` ablation control
+    /// (the shipped RTN layout with only the routers replaced); every other tensor is
+    /// unchanged. Already implied by `--tier xt --mq4v2-symmetric` (the XTS layout).
+    #[arg(long)]
+    pub inkling2_f16_router: bool,
+
     /// Raon-1-mini only: write attention-class projections with K % 256 == 0 (RDA q/k/v/g/o,
     /// MLA q_a/kv_a/kv_b/g/o) as MQ8G256 (qt14, FWHT256 sign seeds 42/1042) from the BF16
     /// source instead of Q8F16. Records recipe `raon-...-mq8g256-attn/v1`; default unchanged.
@@ -583,6 +590,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("imatrix", &[Main]),
     ("awq_alpha", &[Main]),
     ("mq4v2_symmetric", &[Raon, Main]),
+    ("inkling2_f16_router", &[Main]),
     ("raon_attn_mq8", &[Raon]),
     ("hessian_dir", &[Main]),
     ("tier_ratio", &[Main]),

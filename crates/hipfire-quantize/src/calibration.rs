@@ -137,6 +137,18 @@ pub(crate) fn validate_mqn_final_code_record(
     expected_source_sha: &str,
     expected_qt: u8,
 ) -> Result<(), String> {
+    validate_mqn_final_code_record_ex(record, expected_source_sha, expected_qt, false)
+}
+
+/// [`validate_mqn_final_code_record`]; `symmetric_zero_scale` additionally
+/// accepts the symmetric grid's mid code 8 (not only 0) in zero-scale halves,
+/// where every code reconstructs the same zero.
+pub(crate) fn validate_mqn_final_code_record_ex(
+    record: &Mq4v2FinalCodeRecord<'_>,
+    expected_source_sha: &str,
+    expected_qt: u8,
+    symmetric_zero_scale: bool,
+) -> Result<(), String> {
     if record.name.is_empty() {
         return Err("final-code record has an empty tensor name".to_string());
     }
@@ -244,7 +256,7 @@ pub(crate) fn validate_mqn_final_code_record(
             if f16_bits_at(record.d_z_f16, scale_index) == 0
                 && record.codes_u8[group * 256 + half * 128..group * 256 + (half + 1) * 128]
                     .iter()
-                    .any(|&code| code != 0)
+                    .any(|&code| code != 0 && !(symmetric_zero_scale && code == 8))
             {
                 return Err(format!(
                     "{}: group {group} half {half} has zero scale with nonzero codes",
@@ -293,6 +305,15 @@ pub(crate) fn load_mqn_final_code_record(
     path: &Path,
     expected_source_sha: &str,
     expected_qt: u8,
+) -> Result<MappedMq4v2FinalCodeRecord, String> {
+    load_mqn_final_code_record_ex(path, expected_source_sha, expected_qt, false)
+}
+
+fn load_mqn_final_code_record_ex(
+    path: &Path,
+    expected_source_sha: &str,
+    expected_qt: u8,
+    symmetric_zero_scale: bool,
 ) -> Result<MappedMq4v2FinalCodeRecord, String> {
     let file = File::open(path)
         .map_err(|error| format!("open final-code record {}: {error}", path.display()))?;
@@ -384,7 +405,12 @@ pub(crate) fn load_mqn_final_code_record(
         codes_range,
         mmap,
     };
-    validate_mqn_final_code_record(&mapped.as_record(), expected_source_sha, expected_qt)?;
+    validate_mqn_final_code_record_ex(
+        &mapped.as_record(),
+        expected_source_sha,
+        expected_qt,
+        symmetric_zero_scale,
+    )?;
     Ok(mapped)
 }
 
@@ -392,6 +418,15 @@ pub(crate) fn load_mqn_final_code_records(
     path: &Path,
     expected_source_sha: &str,
     expected_qt: u8,
+) -> Result<Vec<MappedMq4v2FinalCodeRecord>, String> {
+    load_mqn_final_code_records_ex(path, expected_source_sha, expected_qt, false)
+}
+
+fn load_mqn_final_code_records_ex(
+    path: &Path,
+    expected_source_sha: &str,
+    expected_qt: u8,
+    symmetric_zero_scale: bool,
 ) -> Result<Vec<MappedMq4v2FinalCodeRecord>, String> {
     let mut paths = if path.is_dir() {
         std::fs::read_dir(path)
@@ -419,7 +454,12 @@ pub(crate) fn load_mqn_final_code_records(
     let mut records = Vec::with_capacity(paths.len());
     let mut names = HashSet::with_capacity(paths.len());
     for record_path in paths {
-        let record = load_mqn_final_code_record(&record_path, expected_source_sha, expected_qt)?;
+        let record = load_mqn_final_code_record_ex(
+            &record_path,
+            expected_source_sha,
+            expected_qt,
+            symmetric_zero_scale,
+        )?;
         let name = record.as_record().name.to_string();
         if !names.insert(name.clone()) {
             return Err(format!("duplicate MQ4V2 final-code record for `{name}`"));
@@ -434,6 +474,15 @@ pub(crate) fn load_mq4v2_final_code_records(
     expected_source_sha: &str,
 ) -> Result<Vec<MappedMq4v2FinalCodeRecord>, String> {
     load_mqn_final_code_records(path, expected_source_sha, MQ4V2_FINAL_CODE_QTYPE)
+}
+
+/// [`load_mq4v2_final_code_records`] for a symmetric (XTS) source: zero-scale
+/// halves may carry code 8 as well as 0.
+pub(crate) fn load_mq4v2_symmetric_final_code_records(
+    path: &Path,
+    expected_source_sha: &str,
+) -> Result<Vec<MappedMq4v2FinalCodeRecord>, String> {
+    load_mqn_final_code_records_ex(path, expected_source_sha, MQ4V2_FINAL_CODE_QTYPE, true)
 }
 
 /// Shared runtime producer whose inverse-AWQ scale must be identical.

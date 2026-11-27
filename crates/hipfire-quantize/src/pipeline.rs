@@ -264,7 +264,7 @@ fn quantize_mq3g256v2_selected(
     }
 }
 
-fn awq_sidecar_name(weight_name: &str) -> String {
+pub(crate) fn awq_sidecar_name(weight_name: &str) -> String {
     match weight_name.strip_suffix(".weight") {
         Some(stem) => format!("{stem}.awq_scale.weight"),
         None => format!("{weight_name}.awq_scale.weight"),
@@ -274,7 +274,17 @@ fn awq_sidecar_name(weight_name: &str) -> String {
 fn validate_mq4v2_xt_source(
     source: &RuntimeHfqFile,
     by_name: &HashMap<&str, &HfqTensorInfo>,
+    xts_layout: &crate::inkling2_xts::Layout,
 ) -> Result<(), String> {
+    // Inkling-2-Mini (arch 24) XTS: its own type map (qt44 embed/unembed without
+    // sidecars, F16 routers, padded down); the Qwen checks below stay untouched.
+    if source.arch_id == crate::inkling2_xts::ARCH_ID {
+        return crate::inkling2_xts::validate_template(
+            xts_layout,
+            &source.metadata_json,
+            source.tensors(),
+        );
+    }
     let metadata: serde_json::Value = serde_json::from_str(&source.metadata_json)
         .map_err(|error| format!("input HFQ metadata is invalid JSON: {error}"))?;
     if metadata
@@ -354,9 +364,8 @@ fn validate_mq4v2_xt_source(
     Ok(())
 }
 
-fn same_hfq_manifest(left: &RuntimeHfqFile, right: &RuntimeHfqFile) -> bool {
+fn same_hfq_tensor_index(left: &RuntimeHfqFile, right: &RuntimeHfqFile) -> bool {
     left.arch_id == right.arch_id
-        && left.metadata_json == right.metadata_json
         && left.tensors().len() == right.tensors().len()
         && left
             .tensors()
@@ -372,10 +381,28 @@ fn same_hfq_manifest(left: &RuntimeHfqFile, right: &RuntimeHfqFile) -> bool {
             })
 }
 
+fn same_hfq_manifest(left: &RuntimeHfqFile, right: &RuntimeHfqFile) -> bool {
+    left.metadata_json == right.metadata_json && same_hfq_tensor_index(left, right)
+}
+
 pub(crate) fn export_mq4v2_final_codes(
     input: &Path,
     records_path: &Path,
     output: &Path,
+) -> Result<(usize, String), String> {
+    export_mq4v2_final_codes_with(
+        input,
+        records_path,
+        output,
+        &crate::inkling2_xts::Layout::mini(),
+    )
+}
+
+pub(crate) fn export_mq4v2_final_codes_with(
+    input: &Path,
+    records_path: &Path,
+    output: &Path,
+    xts_layout: &crate::inkling2_xts::Layout,
 ) -> Result<(usize, String), String> {
     if !input.is_file() {
         return Err(format!(
@@ -402,15 +429,46 @@ pub(crate) fn export_mq4v2_final_codes(
         .iter()
         .map(|tensor| (tensor.name.as_str(), tensor))
         .collect();
-    validate_mq4v2_xt_source(&source, &by_name)?;
+    validate_mq4v2_xt_source(&source, &by_name, xts_layout)?;
+    let xts = source.arch_id == crate::inkling2_xts::ARCH_ID;
 
-    let records = load_mq4v2_final_code_records(records_path, &source_sha)?;
+    let records = if xts {
+        load_mq4v2_symmetric_final_code_records(records_path, &source_sha)?
+    } else {
+        load_mq4v2_final_code_records(records_path, &source_sha)?
+    };
     let selected_by_name: HashMap<&str, usize> = records
         .iter()
         .enumerate()
         .map(|(index, mapped)| (mapped.as_record().name, index))
         .collect();
     let mut selected_groups: HashMap<String, Vec<u8>> = HashMap::new();
+    let group_of = |name: &str| -> Option<String> {
+        if xts {
+            crate::inkling2_xts::shared_scale_group(name)
+        } else {
+            mq4v2_shared_scale_group(name)
+        }
+    };
+    if xts {
+        // Exactly the calibrated tensors: refuse missing/extra records, then the
+        // symmetric-grid and padded-tail contracts per record.
+        crate::inkling2_xts::check_record_set(
+            xts_layout,
+            records.iter().map(|mapped| mapped.as_record().name),
+        )?;
+        for mapped in &records {
+            let record = mapped.as_record();
+            crate::inkling2_xts::check_record(
+                xts_layout,
+                record.name,
+                record.m,
+                record.k,
+                record.s_f16,
+                record.d_z_f16,
+            )?;
+        }
+    }
 
     for mapped in &records {
         let record = mapped.as_record();
@@ -466,7 +524,7 @@ pub(crate) fn export_mq4v2_final_codes(
                 record.name
             ));
         }
-        if let Some(group) = mq4v2_shared_scale_group(record.name) {
+        if let Some(group) = group_of(record.name) {
             match selected_groups.get(&group) {
                 Some(scales) if scales.as_slice() != record.s_f16 => {
                     return Err(format!(
@@ -487,7 +545,7 @@ pub(crate) fn export_mq4v2_final_codes(
     for (group, expected_scales) in &selected_groups {
         for tensor in source.tensors().iter().filter(|tensor| {
             tensor.quant_type == MQ4V2_FINAL_CODE_QTYPE
-                && mq4v2_shared_scale_group(&tensor.name).as_deref() == Some(group.as_str())
+                && group_of(&tensor.name).as_deref() == Some(group.as_str())
         }) {
             let effective_scales = if let Some(index) = selected_by_name.get(tensor.name.as_str()) {
                 records[*index].as_record().s_f16
@@ -511,6 +569,23 @@ pub(crate) fn export_mq4v2_final_codes(
             }
         }
     }
+    // Arch 24: the manifest advances to the H2 artifact (record-set hash); the
+    // longer metadata is absorbed by the 4096-aligned slack before the data section.
+    let xts_metadata = if xts {
+        let record_files: Vec<(String, PathBuf)> = records
+            .iter()
+            .map(|mapped| (mapped.as_record().name.to_string(), mapped.path.clone()))
+            .collect();
+        let record_set_sha = crate::inkling2_xts::record_set_sha256(&record_files)?;
+        Some(crate::inkling2_xts::import_metadata(
+            &source.metadata_json,
+            &source_sha,
+            &record_set_sha,
+            records.len(),
+        )?)
+    } else {
+        None
+    };
 
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     if !parent.is_dir() {
@@ -547,9 +622,17 @@ pub(crate) fn export_mq4v2_final_codes(
             .map_err(|error| format!("open temporary HFQ {}: {error}", temporary.display()))?;
         for mapped in &records {
             let record = mapped.as_record();
-            let packed =
+            let packed = if xts {
+                crate::inkling2_xts::pack_final_codes(
+                    record.m,
+                    record.k,
+                    record.d_z_f16,
+                    record.codes_u8,
+                )
+            } else {
                 pack_mq4g256v2_from_f16_grid(record.m, record.k, record.d_z_f16, record.codes_u8)
-                    .map_err(|error| format!("{}: {error}", record.name))?;
+            }
+            .map_err(|error| format!("{}: {error}", record.name))?;
             let tensor = by_name[record.name];
             if packed.len() != tensor.data_size {
                 return Err(format!(
@@ -569,13 +652,22 @@ pub(crate) fn export_mq4v2_final_codes(
                 .and_then(|_| file.write_all(record.s_f16))
                 .map_err(|error| format!("write AWQ scales for {}: {error}", record.name))?;
         }
+        if let Some(metadata) = &xts_metadata {
+            crate::inkling2_xts::rewrite_front_matter(&mut file, &source, metadata)?;
+        }
         file.sync_all()
             .map_err(|error| format!("sync temporary HFQ {}: {error}", temporary.display()))?;
         drop(file);
 
         let rewritten = RuntimeHfqFile::open_with_reap_plan(&temporary, None)
             .map_err(|error| format!("reopen temporary HFQ {}: {error}", temporary.display()))?;
-        if !same_hfq_manifest(&source, &rewritten) {
+        let unchanged = match &xts_metadata {
+            Some(metadata) => {
+                &rewritten.metadata_json == metadata && same_hfq_tensor_index(&source, &rewritten)
+            }
+            None => same_hfq_manifest(&source, &rewritten),
+        };
+        if !unchanged {
             return Err(
                 "final-code export changed the XT tensor type map, index, metadata, or offsets"
                     .to_string(),
@@ -2412,6 +2504,31 @@ pub(crate) fn run() {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
     let is_moe = arch_id == 6;
+    // Inkling-2-Mini recipes: the XTS layout (B) and the F16-router control (A_R).
+    // Both are no-ops for every other invocation.
+    let inkling2_recipe = crate::inkling2_xts::resolve_recipe(
+        &args,
+        arch_id,
+        product_tier == Some(crate::model_filter::ProductTier::Xt),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("error: {error}");
+        std::process::exit(2);
+    });
+    let inkling2_xts = inkling2_recipe.xts;
+    let inkling2_f16_router = inkling2_recipe.f16_router;
+    let inkling2_layout = crate::inkling2_xts::Layout::mini();
+    if inkling2_xts {
+        eprintln!(
+            "Inkling-2 XTS layout {}: symmetric qt44 attention/experts, padded down {}->{}, \
+             unit AWQ sidecars, F16 routers, affine embed",
+            crate::inkling2_xts::LAYOUT_NAME,
+            inkling2_layout.inter,
+            inkling2_layout.down_k_phys
+        );
+    } else if inkling2_f16_router {
+        eprintln!("Inkling-2: routers kept F16 from the source (A_R control)");
+    }
 
     // Load the imatrix now that the checkpoint's config is available: the
     // grouped-V-head (GatedDeltaNet) out_proj re-index is geometry-driven, so
@@ -3511,6 +3628,35 @@ pub(crate) fn run() {
                 .strip_suffix(".experts.w13_weight")
                 .or_else(|| name.strip_suffix(".experts.w2_weight"))
                 .unwrap_or_else(|| panic!("unexpected inkling2 expert name {name}"));
+            if inkling2_xts {
+                // XTS layout: symmetric qt44 experts, down zero-padded 1152->1280
+                // before the FWHT, one all-ones F16 sidecar per tensor.
+                let tensors = crate::inkling2_xts::encode_experts(
+                    &inkling2_layout,
+                    base,
+                    &f32_all,
+                    experts,
+                    rows,
+                    cols,
+                    is_w13,
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("inkling2 xts: {error}");
+                    std::process::exit(2);
+                });
+                hfq_tensors.extend(tensors);
+                total_params += (experts * per_expert) as u64 - n_elements as u64;
+                quantized_params += (experts * per_expert) as u64;
+                eprintln!(
+                    "  {:>8}: {} -> {} per-expert qt44 symmetric{}",
+                    if is_nvfp4 { "NVFP4" } else { "MXFP8" },
+                    name,
+                    experts,
+                    if is_w13 { "" } else { " (padded K 1152->1280)" }
+                );
+                st_files[*file_idx].drop_tensor_pages(name);
+                continue;
+            }
             let signs1 = gen_fwht_signs(42, 256);
             let signs2 = gen_fwht_signs(1042, 256);
             for e in 0..experts {
@@ -3552,6 +3698,57 @@ pub(crate) fn run() {
             );
             st_files[*file_idx].drop_tensor_pages(name);
             continue;
+        }
+
+        // ── Inkling-2 XTS (arch 24): calibrated attention + token IO ─────────────
+        // Attention: symmetric qt44 + unit sidecar. Embed: the incumbent affine
+        // encoder (the global symmetric flag and the xt tier's embed lift must
+        // not touch it). Unembed: symmetric qt44 RTN, no sidecar.
+        if inkling2_xts {
+            let attn_k = crate::inkling2_xts::attn_site_k(&inkling2_layout, name);
+            let embed = crate::inkling2_xts::is_embed(name);
+            let unembed = crate::inkling2_xts::is_unembed(name);
+            if attn_k.is_some() || embed || unembed {
+                if meta.shape.len() != 2 || attn_k.is_some_and(|k| k != meta.shape[1]) {
+                    eprintln!("inkling2 xts: unexpected shape {:?} for {name}", meta.shape);
+                    std::process::exit(2);
+                }
+                let (rows, k) = (meta.shape[0], meta.shape[1]);
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name,
+                    raw_data,
+                    meta,
+                    &fp8_scale_for,
+                    &st_files,
+                );
+                let tensors = if attn_k.is_some() {
+                    crate::inkling2_xts::encode_attn(name, &f32_data, rows, k)
+                } else if embed {
+                    Ok(crate::inkling2_xts::encode_embed(name, &f32_data, rows, k))
+                } else {
+                    crate::inkling2_xts::encode_unembed(name, &f32_data, rows, k)
+                }
+                .unwrap_or_else(|error| {
+                    eprintln!("inkling2 xts: {error}");
+                    std::process::exit(2);
+                });
+                quantized_params += n_elements as u64;
+                eprintln!(
+                    "  {:>8}: {} {:?} ({} elements){}",
+                    "XTS-qt44",
+                    name,
+                    meta.shape,
+                    n_elements,
+                    if embed {
+                        " [affine, copied encoder]"
+                    } else {
+                        ""
+                    }
+                );
+                hfq_tensors.extend(tensors);
+                st_files[*file_idx].drop_tensor_pages(name);
+                continue;
+            }
         }
 
         if use_deepseek4_mq2rxt_overlay {
@@ -4318,6 +4515,7 @@ pub(crate) fn run() {
             && should_quantize(name);
         if (use_deepseek4_source_precision && is_deepseek4_keep_f16(name)
             || is_inkling2_keep_f16(name)
+            || (inkling2_f16_router && crate::inkling2_xts::is_router(name))
             || keep_f16_mtp)
             && n_elements >= 32
         {
@@ -4587,6 +4785,32 @@ pub(crate) fn run() {
         }
     }
 
+    // Inkling-2 XTS: certify the exact census before anything is written
+    // (6,288 qt44+sidecar pairs, qt44 embed/unembed, F16 routers, 13,078 tensors).
+    if inkling2_xts {
+        let entries: Vec<crate::inkling2_xts::Entry<'_>> = hfq_tensors
+            .iter()
+            .map(crate::inkling2_xts::Entry::from)
+            .collect();
+        if let Err(error) = crate::inkling2_xts::check_template(&inkling2_layout, &entries) {
+            eprintln!("error: inkling2 xts census: {error}; refusing to write");
+            std::process::exit(2);
+        }
+        if hfq_tensors.len() != crate::inkling2_xts::MINI_TOTAL_TENSORS {
+            eprintln!(
+                "error: inkling2 xts census: {} tensors, expected {}; refusing to write",
+                hfq_tensors.len(),
+                crate::inkling2_xts::MINI_TOTAL_TENSORS
+            );
+            std::process::exit(2);
+        }
+        eprintln!(
+            "  Inkling-2 XTS census OK: {} tensors, {} AWQ sidecars",
+            hfq_tensors.len(),
+            inkling2_layout.sidecars()
+        );
+    }
+
     // ── Deterministic recipe census/metadata ─────────────────────────────
     {
         use std::collections::BTreeMap;
@@ -4629,6 +4853,9 @@ pub(crate) fn run() {
                 );
             }
             obj.insert("hipfire_base_format".to_string(), format.to_string().into());
+            if inkling2_xts {
+                crate::inkling2_xts::stamp_metadata(obj, &inkling2_layout);
+            }
             // Explicit route identity: the runtime selects the MQ4R / MQ4RS
             // retained-Redline SKU from this key (0.5.0 removed the file
             // extension). The claim is the recipe `--no-q8-router` documents:
@@ -4738,6 +4965,15 @@ pub(crate) fn run() {
                 std::process::exit(2);
             }
         }
+    }
+
+    if inkling2_xts {
+        // Room for the final-code import's longer manifest (see reserve_front_slack).
+        metadata_json = crate::inkling2_xts::reserve_front_slack(&metadata_json, &hfq_tensors)
+            .unwrap_or_else(|error| {
+                eprintln!("error: inkling2 xts metadata: {error}");
+                std::process::exit(2);
+            });
     }
 
     // Write .hfq file
