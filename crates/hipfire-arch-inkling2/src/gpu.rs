@@ -781,12 +781,68 @@ pub struct XtsRouteInputs {
     pub qwen4_down_a8_requested: bool,
     /// `HIPFIRE_QWEN4_MOE_EP_A8`.
     pub qwen4_ep_a8: Option<bool>,
+    /// `kernel.gfx12_mq4v2_fp8_resid` (`HIPFIRE_GFX12_MQ4V2_FP8_RESID`): the
+    /// `kernel.iu4_prefill=false` dense arm is FP8 when on, F16 when off.
+    pub fp8_resid: bool,
+    /// `ArchCaps::is_gfx1201`: the device the blocked prefill's kernels exist for.
+    pub blocked_prefill_device: bool,
 }
 
-/// Route-capability record of a typed-XTS load: exposed on
-/// [`Inkling2GpuWeights::xts_route_capability`] for a future blocked
-/// (multi-row) forward. The scalar decode forward executes none of these
-/// routes; a state here is capability, not execution.
+/// Blocked-prefill activation tiers from the existing Qwen knobs. An explicitly
+/// set knob keeps its Qwen meaning: the A8 opt-in (`HIPFIRE_A8_PREFILL`) runs A8
+/// dense and experts; `kernel.iu4_prefill=true` runs A4 dense and, unless
+/// `developer.moe_sym_iu4=false`, A4 experts; `kernel.iu4_prefill=false` runs
+/// the FP8 residual dense arm (F16 with `HIPFIRE_GFX12_MQ4V2_FP8_RESID=0`) and
+/// the weight-only experts; `developer.moe_sym_iu4` alone sets the experts.
+/// Unset knobs take `defaults`, the evidence-chosen Inkling routes. `None`
+/// when the blocked prefill does not run on this load (not gfx1201); a tier
+/// whose symmetric-weight capability does not hold resolves to F16.
+pub fn resolve_prefill_routes(
+    dense_all: bool,
+    experts_all: bool,
+    f: &XtsRouteInputs,
+    defaults: crate::gpu_prefill::PrefillRoutes,
+) -> Option<crate::gpu_prefill::PrefillRoutes> {
+    use hipfire_dispatch::pipeline::PrefillActTier as T;
+    if !f.blocked_prefill_device {
+        return None;
+    }
+    let mut dense = defaults.dense;
+    let mut experts = defaults.experts;
+    if f.a8_prefill_forced {
+        dense = T::A8;
+        experts = T::A8;
+    } else {
+        match f.iu4_prefill_flag {
+            Some(true) => {
+                dense = T::A4;
+                experts = T::A4;
+            }
+            Some(false) => {
+                dense = if f.fp8_resid { T::Fp8 } else { T::F16 };
+                experts = T::F16;
+            }
+            None => {}
+        }
+        match f.moe_sym_iu4_flag {
+            Some(true) if f.iu4_prefill_flag != Some(false) => experts = T::A4,
+            Some(false) if experts == T::A4 => experts = T::F16,
+            _ => {}
+        }
+    }
+    if !dense_all {
+        dense = T::F16;
+    }
+    if !experts_all {
+        experts = T::F16;
+    }
+    Some(crate::gpu_prefill::PrefillRoutes { dense, experts })
+}
+
+/// Route-capability record of a typed-XTS load, exposed on
+/// [`Inkling2GpuWeights::xts_route_capability`]. The scalar decode executes
+/// none of the activation routes; the blocked prefill
+/// ([`crate::gpu_prefill::forward_prefill_gpu`]) executes [`Self::prefill`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XtsRouteCapability {
     pub n_layers: usize,
@@ -808,6 +864,9 @@ pub struct XtsRouteCapability {
     /// A8 expert route family (`HIPFIRE_A8_PREFILL`, `kernel.gfx11_a8_prefill`,
     /// `HIPFIRE_QWEN4_MOE_DOWN_A8`, `HIPFIRE_QWEN4_MOE_EP_A8`).
     pub moe_a8: XtsRouteState,
+    /// Activation tiers the blocked prefill executes (`None`: no blocked prefill
+    /// on this device, the prompt runs the scalar loop).
+    pub prefill: Option<crate::gpu_prefill::PrefillRoutes>,
 }
 
 impl XtsRouteCapability {
@@ -831,9 +890,16 @@ impl XtsRouteCapability {
                 _ => None,
             })
             .collect();
+        let executing = match &self.prefill {
+            Some(r) => format!(
+                "blocked prefill dense={:?} experts={:?}, scalar decode",
+                r.dense, r.experts
+            ),
+            None => "scalar prefill + decode (no blocked prefill on this device)".to_string(),
+        };
         format!(
             "inkling2 xts: symmetric {}/{} layers (dense+experts), awq {} sidecars; \
-             routes admitted by capability: {}; {}executing: scalar decode (no multi-row consumer yet)",
+             routes admitted by capability: {}; {}executing: {executing}",
             self.symmetric_layers,
             self.n_layers,
             self.awq_sidecars,
@@ -928,6 +994,8 @@ fn xts_route_capability(
         a8_prefill_forced: gpu.flags.a8_prefill || gpu.flags.gfx11_a8_prefill,
         qwen4_down_a8_requested: gpu.qwen4_moe_down_a8_requested(),
         qwen4_ep_a8: gpu.flags.qwen4_moe_ep_a8,
+        fp8_resid: gpu.flags.gfx12_mq4v2_fp8_resid,
+        blocked_prefill_device: gpu.arch_caps.is_gfx1201(),
     };
     let dense = cert.layers.iter().filter(|l| l.dense_symmetric).count();
     let experts = cert.layers.iter().filter(|l| l.experts_symmetric).count();
@@ -947,6 +1015,12 @@ fn xts_route_capability(
         iu4_prefill,
         moe_sym_iu4,
         moe_a8,
+        prefill: resolve_prefill_routes(
+            dense == n,
+            experts == n && geometry_ok,
+            &inputs,
+            crate::gpu_prefill::PREFILL_ROUTES_DEFAULT,
+        ),
     }
 }
 
@@ -2053,6 +2127,10 @@ pub fn upload(
         .xts
         .as_ref()
         .map(|cert| xts_route_capability(cert, cfg, &*gpu));
+    let mut state = state;
+    if let Some(r) = xts_routes.as_ref().and_then(|c| c.prefill) {
+        state.prefill_routes = r;
+    }
     Ok((
         Inkling2GpuWeights {
             layers,
@@ -2411,7 +2489,60 @@ mod xts_gpu_tests {
             a8_prefill_forced: false,
             qwen4_down_a8_requested: false,
             qwen4_ep_a8: None,
+            fp8_resid: true,
+            blocked_prefill_device: arch == "gfx1201",
         }
+    }
+
+    #[test]
+    fn prefill_routes_follow_the_qwen_knobs() {
+        use crate::gpu_prefill::PrefillRoutes;
+        use hipfire_dispatch::pipeline::PrefillActTier::*;
+        let d = PrefillRoutes {
+            dense: Fp8,
+            experts: A8,
+        };
+        let r = |f: &XtsRouteInputs| resolve_prefill_routes(true, true, f, d).unwrap();
+        let rt = |dense, experts| PrefillRoutes { dense, experts };
+        // Unset knobs take the defaults; off gfx1201 there is no blocked prefill.
+        assert_eq!(r(&inputs("gfx1201")), d);
+        assert_eq!(
+            resolve_prefill_routes(true, true, &inputs("gfx1100"), d),
+            None
+        );
+        // kernel.iu4_prefill=true: A4 both; developer.moe_sym_iu4=false keeps the experts off A4.
+        let mut f = inputs("gfx1201");
+        f.iu4_prefill_flag = Some(true);
+        assert_eq!(r(&f), rt(A4, A4));
+        f.moe_sym_iu4_flag = Some(false);
+        assert_eq!(r(&f), rt(A4, F16));
+        // kernel.iu4_prefill=false: the FP8 residual arm (F16 when it is off), weight-only experts,
+        // and the IU4 kill wins over a forced developer.moe_sym_iu4.
+        let mut f = inputs("gfx1201");
+        f.iu4_prefill_flag = Some(false);
+        f.moe_sym_iu4_flag = Some(true);
+        assert_eq!(r(&f), rt(Fp8, F16));
+        f.fp8_resid = false;
+        assert_eq!(r(&f), rt(F16, F16));
+        // developer.moe_sym_iu4 alone moves only the experts.
+        let mut f = inputs("gfx1201");
+        f.moe_sym_iu4_flag = Some(true);
+        assert_eq!(r(&f), rt(Fp8, A4));
+        // The A8 opt-in takes precedence over everything.
+        let mut f = inputs("gfx1201");
+        f.a8_prefill_forced = true;
+        f.iu4_prefill_flag = Some(true);
+        assert_eq!(r(&f), rt(A8, A8));
+        // A side without verified symmetric weights stays F16.
+        let f = inputs("gfx1201");
+        assert_eq!(
+            resolve_prefill_routes(false, true, &f, d),
+            Some(rt(F16, A8))
+        );
+        assert_eq!(
+            resolve_prefill_routes(true, false, &f, d),
+            Some(rt(Fp8, F16))
+        );
     }
 
     #[test]
@@ -2481,6 +2612,7 @@ mod xts_gpu_tests {
             iu4_prefill: iu4,
             moe_sym_iu4: sym,
             moe_a8: a8,
+            prefill: Some(crate::gpu_prefill::PrefillRoutes::F16),
         }
     }
 
@@ -2492,14 +2624,15 @@ mod xts_gpu_tests {
             all,
             "inkling2 xts: symmetric 24/24 layers (dense+experts), awq 6288 sidecars; \
              routes admitted by capability: iu4_prefill, moe_sym_iu4, moe_a8; \
-             executing: scalar decode (no multi-row consumer yet)"
+             executing: blocked prefill dense=F16 experts=F16, scalar decode"
         );
-        let some = cap(
+        let mut some = cap(
             Admitted,
             NotAdmitted("n/a".into()),
             Refused("Qwen4 expert-parallel A8 knobs have no Inkling consumer".into()),
-        )
-        .load_line();
+        );
+        some.prefill = None;
+        let some = some.load_line();
         assert!(
             some.contains("routes admitted by capability: iu4_prefill; "),
             "{some}"
@@ -2509,7 +2642,9 @@ mod xts_gpu_tests {
             "{some}"
         );
         assert!(
-            some.ends_with("executing: scalar decode (no multi-row consumer yet)"),
+            some.ends_with(
+                "executing: scalar prefill + decode (no blocked prefill on this device)"
+            ),
             "{some}"
         );
         let none = cap(

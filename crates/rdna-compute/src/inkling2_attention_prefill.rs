@@ -315,7 +315,7 @@ impl Gpu {
             INKLING2_ATTN_PREFILL_REL,
         );
         let bad = |m: String| Err(HipError::new(0, &format!("inkling2_attn_prefill_fa2: {m}")));
-        if self.arch != "gfx1201" {
+        if !self.arch_caps.is_gfx1201() {
             return bad(format!("gfx1201 only, not {}", self.arch));
         }
         if a.k_cache.len() != kvh || a.v_cache.len() != kvh {
@@ -418,7 +418,12 @@ impl Gpu {
                 b.push_ptr(rel_ptr);
                 b.push_ptr(sink_ptr);
                 b.push_ptr(table_ptr);
-                for p in kc.0.iter().chain(vc.0.iter()).chain(ks.0.iter()).chain(vs.0.iter()) {
+                for p in
+                    kc.0.iter()
+                        .chain(vc.0.iter())
+                        .chain(ks.0.iter())
+                        .chain(vs.0.iter())
+                {
                     b.push_ptr(*p);
                 }
                 b.push_ptr(out_ptr);

@@ -8361,7 +8361,9 @@ pub fn grouped_qt44_gemm_tier(
         ));
     }
     let xq = grouped_sym_quantize(gpu, tier, x, x_src_rows, k)?;
-    grouped_qt44_gemm_prepared(gpu, tier, t, xq, y_grouped, m, k, x_row_div, m_total, x_src_rows)
+    grouped_qt44_gemm_prepared(
+        gpu, tier, t, xq, y_grouped, m, k, x_row_div, m_total, x_src_rows,
+    )
 }
 
 /// [`grouped_qt44_gemm_tier`] over an already prepared sidecar `xq` of a quantized tier (e.g. the

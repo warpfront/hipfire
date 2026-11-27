@@ -49,7 +49,9 @@ fn tokens() -> Vec<u32> {
     let mut s = 0x1234_5678_9abc_def0u64;
     (0..N_TOK)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 33) % 199_000) as u32 + 100
         })
         .collect()
@@ -124,7 +126,8 @@ fn snapshot(b: &Inkling2Bundle, gpu: &Gpu, arm: &mut Arm) {
             }
         }
         arm.kv.push(bytes);
-        arm.conv.push(gpu.download_f32(&gs.conv[v]).expect("conv download"));
+        arm.conv
+            .push(gpu.download_f32(&gs.conv[v]).expect("conv download"));
     }
     arm.tags = gs.visit_pos_tags.clone();
     arm.caps = gs.visit_cap.clone();
@@ -200,8 +203,12 @@ fn run_prefill(
     arm.logits = probe_logits;
     arm.argmax = argmaxes;
     for &p in &PROBES {
-        arm.visits
-            .push(trace.iter().map(|v| v[p * e..(p + 1) * e].to_vec()).collect());
+        arm.visits.push(
+            trace
+                .iter()
+                .map(|v| v[p * e..(p + 1) * e].to_vec())
+                .collect(),
+        );
     }
     drop(trace);
     snapshot(b, gpu, &mut arm);
@@ -372,7 +379,10 @@ fn report(scalar: &Arm, got: &Arm, label: &str, fails: &mut Vec<String>) {
 fn blocked_prefill_oracle() {
     let mut gpu = Gpu::init().expect("gpu init");
     let mut b = load(&mut gpu);
-    assert!(prefill_supported(&b, &gpu), "blocked prefill not supported on this load");
+    assert!(
+        prefill_supported(&b, &gpu),
+        "blocked prefill not supported on this load"
+    );
     let toks = tokens();
 
     let mut scalar = run_scalar(&mut b, &mut gpu, &toks);
@@ -393,10 +403,15 @@ fn blocked_prefill_oracle() {
 
     let mut exact = run_prefill(&mut b, &mut gpu, &toks, PrefillMode::ROW_EXACT, EXACT_BLOCK);
     decode(&mut b, &mut gpu, &cont, &mut exact);
-    eprintln!("row-exact prefill: {:.1}s (block {EXACT_BLOCK})", exact.seconds);
+    eprintln!(
+        "row-exact prefill: {:.1}s (block {EXACT_BLOCK})",
+        exact.seconds
+    );
     let exact_fail = exact_mismatch(&scalar, &exact);
     match &exact_fail {
-        None => eprintln!("row-exact: BITWISE equal to the scalar loop (visits, logits, KV, conv, tags, decode)"),
+        None => eprintln!(
+            "row-exact: BITWISE equal to the scalar loop (visits, logits, KV, conv, tags, decode)"
+        ),
         Some(m) => eprintln!("row-exact: MISMATCH {m}"),
     }
 

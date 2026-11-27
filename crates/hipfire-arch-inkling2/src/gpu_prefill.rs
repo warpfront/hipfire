@@ -47,13 +47,14 @@ use hipfire_dispatch::families::gemm::{GemmFamily, GemmParams};
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::moe::{grouped_moe_m_total_bound, MOE_GROUPED_BLOCK_M};
 use hipfire_dispatch::pipeline::{
-    grouped_qt44_gemm_tier, run_uniform_moe_down_expanded, GroupedQt44Tables, PrefillActTier,
+    grouped_qt44_gemm_prepared, grouped_qt44_gemm_tier, run_uniform_moe_down_expanded,
+    GroupedQt44Tables, PrefillActTier,
 };
 use hipfire_dispatch::types::KernelKey;
 use hipfire_runtime::llama::{weight_gemm, weight_gemv, WeightTensor};
 use rdna_compute::ffn_activation::{
-    CombineOrder, FfnActivation, FfnActivationGrouped, FfnActivationRows, FfnAwq, MoeCombine,
-    MoeRouterTopK, RouterKind,
+    CombineOrder, FfnActivation, FfnActivationGrouped, FfnActivationGroupedI8, FfnActivationRows,
+    FfnAwq, MoeCombine, MoeRouterTopK, RouterKind,
 };
 use rdna_compute::inkling2_attention::inkling2_attn_fa2_splits;
 use rdna_compute::inkling2_attention_prefill::{Inkling2PrefillAttn, INKLING2_ATTN_PREFILL_REL};
@@ -529,7 +530,34 @@ impl PrefillRoutes {
         dense: PrefillActTier::F16,
         experts: PrefillActTier::F16,
     };
+
+    /// Evidence spelling `dense=<tier>,experts=<tier>` with tiers `f16|fp8|a8|a4`
+    /// (developer tools only; the product resolves routes from the Qwen knobs).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let tier = |v: &str| match v {
+            "f16" => Ok(PrefillActTier::F16),
+            "fp8" => Ok(PrefillActTier::Fp8),
+            "a8" => Ok(PrefillActTier::A8),
+            "a4" => Ok(PrefillActTier::A4),
+            other => Err(format!(
+                "prefill route tier {other}: expected f16|fp8|a8|a4"
+            )),
+        };
+        let mut r = Self::F16;
+        for kv in s.split(',').filter(|kv| !kv.is_empty()) {
+            match kv.split_once('=') {
+                Some(("dense", v)) => r.dense = tier(v)?,
+                Some(("experts", v)) => r.experts = tier(v)?,
+                _ => return Err(format!("prefill routes: bad entry {kv}")),
+            }
+        }
+        Ok(r)
+    }
 }
+
+/// Routes the blocked prefill runs when no Qwen activation knob is set
+/// ([`crate::gpu::resolve_prefill_routes`]).
+pub const PREFILL_ROUTES_DEFAULT: PrefillRoutes = PrefillRoutes::F16;
 
 /// Whether [`forward_prefill_gpu`] runs the blocked path for this load: gfx1201,
 /// typed-XTS layout (symmetric qt44 + AWQ sidecars, F16 router), Mini geometry.
@@ -538,9 +566,9 @@ pub fn prefill_supported(bundle: &Inkling2Bundle, gpu: &Gpu) -> bool {
     let Some(gw) = bundle.gpu_weights.as_ref() else {
         return false;
     };
-    gpu.arch == "gfx1201"
+    gpu.arch_caps.is_gfx1201()
         && bundle.gpu_state.is_some()
-        && gw.xts_routes.is_some()
+        && gw.xts_routes.as_ref().is_some_and(|c| c.prefill.is_some())
         && !gw.layers.is_empty()
         && gw
             .layers
@@ -635,8 +663,11 @@ pub fn forward_prefill_gpu_with(
     if block_rows == 0 {
         return Err("inkling2 prefill: block_rows must be > 0".into());
     }
-    if (mode.gemm || mode.grouped || mode.blocked_attn) && gpu.arch != "gfx1201" {
-        return Err(format!("inkling2 prefill: blocked sites are gfx1201 only, not {}", gpu.arch));
+    if (mode.gemm || mode.grouped || mode.blocked_attn) && !gpu.arch_caps.is_gfx1201() {
+        return Err(format!(
+            "inkling2 prefill: blocked sites are gfx1201 only, not {}",
+            gpu.arch
+        ));
     }
     let cfg = bundle.config.clone();
     let gw = bundle
@@ -663,7 +694,23 @@ pub fn forward_prefill_gpu_with(
     ensure_kernels(gpu)?;
     ensure_pf_kernels(gpu)?;
     let saved = pin_dense_route(gpu, routes.dense);
-    let r = prefill_blocks(gpu, &cfg, gw, gs, ids, start_pos, &mut logits, mode, routes, block_rows, trace);
+    // Ordinary prefill intent: the quantized dense arms admit every block row
+    // count (a 1..63-row tail keeps its route instead of falling to F16).
+    let ordinary = gpu.ordinary_prefill_enter();
+    let r = prefill_blocks(
+        gpu,
+        &cfg,
+        gw,
+        gs,
+        ids,
+        start_pos,
+        &mut logits,
+        mode,
+        routes,
+        block_rows,
+        trace,
+    );
+    gpu.ordinary_prefill_exit(ordinary);
     gpu.flags = saved;
     r
 }
@@ -761,7 +808,13 @@ struct Arena {
 }
 
 impl Arena {
-    fn alloc(&mut self, gpu: &mut Gpu, shape: &[usize], dtype: DType, what: &str) -> Result<T, String> {
+    fn alloc(
+        &mut self,
+        gpu: &mut Gpu,
+        shape: &[usize],
+        dtype: DType,
+        what: &str,
+    ) -> Result<T, String> {
         let t = gpu
             .alloc_tensor(shape, dtype)
             .map_err(|e| format!("inkling2 prefill: alloc {what}: {e:?}"))?;
@@ -776,10 +829,14 @@ impl Arena {
         T(self.ts.len() - 1)
     }
     fn get(&self, i: T) -> &GpuTensor {
-        self.ts[i.0].as_ref().expect("inkling2 prefill: arena slot taken")
+        self.ts[i.0]
+            .as_ref()
+            .expect("inkling2 prefill: arena slot taken")
     }
     fn take(&mut self, i: T) -> GpuTensor {
-        self.ts[i.0].take().expect("inkling2 prefill: arena slot taken")
+        self.ts[i.0]
+            .take()
+            .expect("inkling2 prefill: arena slot taken")
     }
     fn free(self, gpu: &mut Gpu) {
         for t in self.ts.into_iter().flatten() {
@@ -863,7 +920,14 @@ fn conv_rows(
     b.push_f32(inv_scale);
     b.push_i32(rows as i32);
     let gx = grid_u32(channels.div_ceil(256), "conv")?;
-    launch(gpu, "ink_pf_conv_rows_f32", [gx, grid_u32(rows, "conv")?, 1], [256, 1, 1], 0, b)?;
+    launch(
+        gpu,
+        "ink_pf_conv_rows_f32",
+        [gx, grid_u32(rows, "conv")?, 1],
+        [256, 1, 1],
+        0,
+        b,
+    )?;
     let mut s = KernargBlob::new();
     s.push_ptr(ptr(cur));
     s.push_i32(channels as i32);
@@ -889,7 +953,10 @@ fn mix_rows(
     eps: f32,
 ) -> Result<(), String> {
     if !(1..=6).contains(&states.len()) {
-        return Err(format!("inkling2 prefill: mix states {} exceeds 6", states.len()));
+        return Err(format!(
+            "inkling2 prefill: mix states {} exceeds 6",
+            states.len()
+        ));
     }
     if query.buf.size() < qr * e * 4 || out.buf.size() < qr * rows * e * 4 {
         return Err("inkling2 prefill: mix operand too small".into());
@@ -1016,9 +1083,39 @@ fn control_rows(
             b,
         )?;
     }
-    gemv_rows(gpu, &ctrl.down, ar.get(gate), 2 * e, ar.get(g), rank, rank, 2 * e, rows)?;
-    gemv_rows(gpu, &ctrl.gain, ar.get(g), rank, ar.get(gain), e, e, rank, rows)?;
-    gemv_rows(gpu, &ctrl.forget, ar.get(g), rank, ar.get(forget), e, e, rank, rows)?;
+    gemv_rows(
+        gpu,
+        &ctrl.down,
+        ar.get(gate),
+        2 * e,
+        ar.get(g),
+        rank,
+        rank,
+        2 * e,
+        rows,
+    )?;
+    gemv_rows(
+        gpu,
+        &ctrl.gain,
+        ar.get(g),
+        rank,
+        ar.get(gain),
+        e,
+        e,
+        rank,
+        rows,
+    )?;
+    gemv_rows(
+        gpu,
+        &ctrl.forget,
+        ar.get(g),
+        rank,
+        ar.get(forget),
+        e,
+        e,
+        rank,
+        rows,
+    )?;
     hip(
         gpu.inkling2_control_blend_gpu_f32(
             cur,
@@ -1179,13 +1276,14 @@ fn visit_body(
     let bases: Option<[GpuTensor; 3]> = if phys == 0 {
         None
     } else {
-        let aq = layer
-            .attn_query
-            .as_ref()
-            .ok_or_else(|| format!("inkling2 prefill: visit {visit} phys {phys} missing attn_query"))?;
+        let aq = layer.attn_query.as_ref().ok_or_else(|| {
+            format!("inkling2 prefill: visit {visit} phys {phys} missing attn_query")
+        })?;
         let total = aq.buf.size() / 4;
         if total % e != 0 {
-            return Err(format!("inkling2 prefill: attn_query len {total} not a multiple of {e}"));
+            return Err(format!(
+                "inkling2 prefill: attn_query len {total} not a multiple of {e}"
+            ));
         }
         let qr = if total / e >= 3 { 3 } else { 1 };
         let mixed = ar.f32(gpu, qr * ne, "attn_mix")?;
@@ -1193,9 +1291,17 @@ fn visit_body(
         mix_rows(gpu, &states, aq, ar.get(mixed), n, e, qr, eps)?;
         let m = ar.get(mixed);
         Some(if qr >= 3 {
-            [view(m, 0, &[n, e])?, view(m, ne, &[n, e])?, view(m, 2 * ne, &[n, e])?]
+            [
+                view(m, 0, &[n, e])?,
+                view(m, ne, &[n, e])?,
+                view(m, 2 * ne, &[n, e])?,
+            ]
         } else {
-            [view(m, 0, &[n, e])?, view(m, 0, &[n, e])?, view(m, 0, &[n, e])?]
+            [
+                view(m, 0, &[n, e])?,
+                view(m, 0, &[n, e])?,
+                view(m, 0, &[n, e])?,
+            ]
         })
     };
     // Loop messages (pass > 0): control each input.
@@ -1203,7 +1309,10 @@ fn visit_body(
     let (qc0, kc0, vc0): (GpuTensor, GpuTensor, GpuTensor) = match (&msgs, &bases) {
         (Some((bank, prev_out, cross, ctrls)), Some([bq, bk, bv])) => {
             if cross.buf.size() / 4 < 4 * e {
-                return Err(format!("inkling2 prefill: cross len {} < 4*{e}", cross.buf.size() / 4));
+                return Err(format!(
+                    "inkling2 prefill: cross len {} < 4*{e}",
+                    cross.buf.size() / 4
+                ));
             }
             let msg = ar.f32(gpu, 4 * ne, "msg_mix")?;
             let states: Vec<&GpuTensor> = bank.iter().chain(std::iter::once(*prev_out)).collect();
@@ -1222,7 +1331,11 @@ fn visit_body(
             (q, k, v)
         }
         (Some(_), None) => return Err("inkling2 prefill: phys 0 has no base".into()),
-        (None, None) => (view(x, 0, &[n, e])?, view(x, 0, &[n, e])?, view(x, 0, &[n, e])?),
+        (None, None) => (
+            view(x, 0, &[n, e])?,
+            view(x, 0, &[n, e])?,
+            view(x, 0, &[n, e])?,
+        ),
         (None, Some([bq, bk, bv])) => (bq.clone_view(), bk.clone_view(), bv.clone_view()),
     };
     // Norms: SWA applies attn_norm to all three inputs; full layers the three
@@ -1234,22 +1347,30 @@ fn visit_body(
             .ok_or("inkling2 prefill: SWA layer missing attn_norm")?;
         (an, an, an)
     } else {
-        match (&layer.q_input_norm, &layer.k_input_norm, &layer.v_input_norm) {
+        match (
+            &layer.q_input_norm,
+            &layer.k_input_norm,
+            &layer.v_input_norm,
+        ) {
             (Some(a), Some(b), Some(cc)) => (a, b, cc),
             _ => return Err("inkling2 prefill: full layer missing input norms".into()),
         }
     };
     let mut normed: Vec<(*mut c_void, *mut c_void, T)> = Vec::new();
-    let mut norm_of = |gpu: &mut Gpu, ar: &mut Arena, src: &GpuTensor, w: &GpuTensor| -> Result<T, String> {
-        let key = (src.buf.as_ptr(), w.buf.as_ptr());
-        if let Some(&(_, _, t)) = normed.iter().find(|(a, b, _)| (*a, *b) == key) {
-            return Ok(t);
-        }
-        let out = ar.f32(gpu, ne, "inp_norm")?;
-        hip(gpu.rmsnorm_batched(src, w, ar.get(out), n, e, eps), "input norm")?;
-        normed.push((key.0, key.1, out));
-        Ok(out)
-    };
+    let mut norm_of =
+        |gpu: &mut Gpu, ar: &mut Arena, src: &GpuTensor, w: &GpuTensor| -> Result<T, String> {
+            let key = (src.buf.as_ptr(), w.buf.as_ptr());
+            if let Some(&(_, _, t)) = normed.iter().find(|(a, b, _)| (*a, *b) == key) {
+                return Ok(t);
+            }
+            let out = ar.f32(gpu, ne, "inp_norm")?;
+            hip(
+                gpu.rmsnorm_batched(src, w, ar.get(out), n, e, eps),
+                "input norm",
+            )?;
+            normed.push((key.0, key.1, out));
+            Ok(out)
+        };
     let qi = norm_of(gpu, ar, &qc0, wq_n)?;
     let ki = norm_of(gpu, ar, &kc0, wk_n)?;
     let vi = norm_of(gpu, ar, &vc0, wv_n)?;
@@ -1269,8 +1390,34 @@ fn visit_body(
     let conv_state = &gs.conv[visit];
     if swa {
         let s = 1.0 / 5.0f32.sqrt();
-        conv_rows(gpu, ar.get(k_raw), &layer.k_conv, None, conv_state, ar.get(k_conv), 0, ekv, 0, hd, s, n)?;
-        conv_rows(gpu, ar.get(v_raw), &layer.v_conv, None, conv_state, ar.get(v_conv), ekv, ekv, 0, hd, s, n)?;
+        conv_rows(
+            gpu,
+            ar.get(k_raw),
+            &layer.k_conv,
+            None,
+            conv_state,
+            ar.get(k_conv),
+            0,
+            ekv,
+            0,
+            hd,
+            s,
+            n,
+        )?;
+        conv_rows(
+            gpu,
+            ar.get(v_raw),
+            &layer.v_conv,
+            None,
+            conv_state,
+            ar.get(v_conv),
+            ekv,
+            ekv,
+            0,
+            hd,
+            s,
+            n,
+        )?;
     } else {
         let (kp, vp) = match (&layer.k_proj, &layer.v_proj) {
             (Some(a), Some(b)) => (a, b),
@@ -1282,13 +1429,55 @@ fn visit_body(
         gemv_rows(gpu, kp, ar.get(ki), e, ar.get(dk), dw, dw, e, n)?;
         gemv_rows(gpu, vp, ar.get(vi), e, ar.get(dv), dw, dw, e, n)?;
         let s = 1.0 / 3.0;
-        conv_rows(gpu, ar.get(k_raw), &layer.k_conv, Some((ar.get(dk), dw)), conv_state, ar.get(k_conv), 0, ekv, nkv, hd, s, n)?;
-        conv_rows(gpu, ar.get(v_raw), &layer.v_conv, Some((ar.get(dv), dw)), conv_state, ar.get(v_conv), ekv, ekv, nkv, hd, s, n)?;
+        conv_rows(
+            gpu,
+            ar.get(k_raw),
+            &layer.k_conv,
+            Some((ar.get(dk), dw)),
+            conv_state,
+            ar.get(k_conv),
+            0,
+            ekv,
+            nkv,
+            hd,
+            s,
+            n,
+        )?;
+        conv_rows(
+            gpu,
+            ar.get(v_raw),
+            &layer.v_conv,
+            Some((ar.get(dv), dw)),
+            conv_state,
+            ar.get(v_conv),
+            ekv,
+            ekv,
+            nkv,
+            hd,
+            s,
+            n,
+        )?;
     }
     // Clips + V head-norm.
-    clip_rows(gpu, ar.get(q), Some(&layer.q_clip), n * nh, hd, nh, cfg.qk_clip)?;
+    clip_rows(
+        gpu,
+        ar.get(q),
+        Some(&layer.q_clip),
+        n * nh,
+        hd,
+        nh,
+        cfg.qk_clip,
+    )?;
     clip_rows(gpu, ar.get(k_conv), None, n * nkv, hd, 1, cfg.qk_clip)?;
-    clip_rows(gpu, ar.get(r), Some(&layer.rel_clip), n * nh, cfg.n_rel, nh, cfg.rel_clip)?;
+    clip_rows(
+        gpu,
+        ar.get(r),
+        Some(&layer.rel_clip),
+        n * nh,
+        cfg.n_rel,
+        nh,
+        cfg.rel_clip,
+    )?;
     let vc = ar.f32(gpu, n * ekv, "vc")?;
     hip(
         gpu.inkling2_rmsnorm_nogamma_f32(ar.get(v_conv), ar.get(vc), n * nkv, hd, eps),
@@ -1315,15 +1504,22 @@ fn visit_body(
     }
     let attn_heads = ar.f32(gpu, n * eattn, "attn_heads")?;
     if c.mode.blocked_attn {
-        attn_blocked(gpu, cfg, layer, gs, ar, visit, swa, p, n, q, r, sinks, k_conv, vc, attn_heads)?;
+        attn_blocked(
+            gpu, cfg, layer, gs, ar, visit, swa, p, n, q, r, sinks, k_conv, vc, attn_heads,
+        )?;
     } else {
-        attn_row_exact(gpu, cfg, layer, gs, ar, visit, swa, p, n, q, r, sinks, k_conv, vc, attn_heads)?;
+        attn_row_exact(
+            gpu, cfg, layer, gs, ar, visit, swa, p, n, q, r, sinks, k_conv, vc, attn_heads,
+        )?;
     }
     // Output gate + projection + post conv.
     let gate = ar.f32(gpu, n * eattn, "gate")?;
     linear(gpu, &layer.wgate, ar.get(qi), ar.get(gate), n, gemm)?;
     hip(gpu.sigmoid_f32(ar.get(gate)), "gate sigmoid")?;
-    hip(gpu.mul_f32(ar.get(attn_heads), ar.get(gate), ar.get(attn_heads)), "gate mul")?;
+    hip(
+        gpu.mul_f32(ar.get(attn_heads), ar.get(gate), ar.get(attn_heads)),
+        "gate mul",
+    )?;
     let wo_out = ar.f32(gpu, ne, "wo_out")?;
     linear(gpu, &layer.wo, ar.get(attn_heads), ar.get(wo_out), n, gemm)?;
     let attn_res = ar.f32(gpu, ne, "attn_res")?;
@@ -1353,12 +1549,18 @@ fn visit_body(
         attn_res
     } else {
         let cur = ar.f32(gpu, ne, "cur")?;
-        hip(gpu.add_f32(&view(x, 0, &[ne])?, ar.get(attn_res), ar.get(cur)), "attn residual")?;
+        hip(
+            gpu.add_f32(&view(x, 0, &[ne])?, ar.get(attn_res), ar.get(cur)),
+            "attn residual",
+        )?;
         cur
     };
     // --- MoE: mix over blocks + push + cur, control (pass > 0), norm ---
     if layer.mlp_query.buf.size() / 4 != e {
-        return Err(format!("inkling2 prefill: mlp_query len {} != {e}", layer.mlp_query.buf.size() / 4));
+        return Err(format!(
+            "inkling2 prefill: mlp_query len {} != {e}",
+            layer.mlp_query.buf.size() / 4
+        ));
     }
     let ffn_mixed = ar.f32(gpu, ne, "ffn_mix")?;
     {
@@ -1367,7 +1569,16 @@ fn visit_body(
             states.push(ar.get(pi));
         }
         states.push(ar.get(cur));
-        mix_rows(gpu, &states, &layer.mlp_query, ar.get(ffn_mixed), n, e, 1, eps)?;
+        mix_rows(
+            gpu,
+            &states,
+            &layer.mlp_query,
+            ar.get(ffn_mixed),
+            n,
+            e,
+            1,
+            eps,
+        )?;
     }
     let ffn_in = match (&msgs, mids) {
         (Some((_, _, _, ctrls)), Some(m)) => {
@@ -1379,14 +1590,28 @@ fn visit_body(
     };
     let ffn_normed = ar.f32(gpu, ne, "ffn_normed")?;
     hip(
-        gpu.rmsnorm_batched(&view(ar.get(ffn_in), 0, &[n, e])?, &layer.mlp_norm, ar.get(ffn_normed), n, e, eps),
+        gpu.rmsnorm_batched(
+            &view(ar.get(ffn_in), 0, &[n, e])?,
+            &layer.mlp_norm,
+            ar.get(ffn_normed),
+            n,
+            e,
+            eps,
+        ),
         "ffn norm",
     )?;
     // Router + top-8.
     let n_exp = cfg.n_experts;
     let k_top = cfg.n_expert_used;
     let router_logits = ar.f32(gpu, n * n_exp, "router_logits")?;
-    router_rows(gpu, &layer.router, &view(ar.get(ffn_normed), 0, &[n, e])?, ar.get(router_logits), n, gemm)?;
+    router_rows(
+        gpu,
+        &layer.router,
+        &view(ar.get(ffn_normed), 0, &[n, e])?,
+        ar.get(router_logits),
+        n,
+        gemm,
+    )?;
     let topk_idx = ar.f32(gpu, n * k_top, "topk_idx")?;
     let topk_w = ar.f32(gpu, n * k_top, "topk_w")?;
     hip(
@@ -1423,7 +1648,10 @@ fn visit_body(
         n,
     )?;
     let visit_out = ar.f32(gpu, ne, "visit_out")?;
-    hip(gpu.add_f32(ar.get(cur), ar.get(moe_conv), ar.get(visit_out)), "moe residual")?;
+    hip(
+        gpu.add_f32(ar.get(cur), ar.get(moe_conv), ar.get(visit_out)),
+        "moe residual",
+    )?;
     Ok((visit_out, push))
 }
 
@@ -1500,18 +1728,23 @@ fn attn_row_exact(
         for h in 0..nkv {
             let src_k = view(ar.get(k_conv), i * ekv + h * hd, &[hd])?;
             let dst_k = gs.k_cache[visit][h].sub_offset(wpos * hd, hd);
-            hip(gpu.convert_f32_to_f16_into(&src_k, &dst_k, hd), "k cache write")?;
+            hip(
+                gpu.convert_f32_to_f16_into(&src_k, &dst_k, hd),
+                "k cache write",
+            )?;
             let src_v = view(ar.get(vc), i * ekv + h * hd, &[hd])?;
             let dst_v = gs.v_cache[visit][h].sub_offset(wpos * hd, hd);
-            hip(gpu.convert_f32_to_f16_into(&src_v, &dst_v, hd), "v cache write")?;
+            hip(
+                gpu.convert_f32_to_f16_into(&src_v, &dst_v, hd),
+                "v cache write",
+            )?;
         }
         gs.visit_cap[visit] = pos + 1;
         let qv = view(ar.get(q), i * eattn, &[nh, hd])?;
         let out = view(ar.get(attn_heads), i * eattn, &[eattn])?;
         if gs.attn_fa2 {
             let splits = inkling2_attn_fa2_splits(n_kv);
-            let lse = ar.f32(gpu, splits * nh, "fa2_lse")?;
-            let oacc = ar.f32(gpu, splits * nh * hd, "fa2_oacc")?;
+            // The state's persistent partition scratch, as the decode visit uses it.
             hip(
                 gpu.inkling2_attn_decode_fa2(
                     &qv,
@@ -1519,8 +1752,8 @@ fn attn_row_exact(
                     &gs.v_cache[visit],
                     ar.get(rel_bias),
                     ar.get(si),
-                    ar.get(lse),
-                    ar.get(oacc),
+                    &gs.fa2_lse,
+                    &gs.fa2_oacc,
                     &out,
                     n_kv,
                     splits,
@@ -1636,7 +1869,11 @@ fn attn_blocked(
     launch(
         gpu,
         "ink_pf_kv_commit_f16",
-        [grid_u32(((n - first) * nkv * hd).div_ceil(256), "kv commit")?, 1, 1],
+        [
+            grid_u32(((n - first) * nkv * hd).div_ceil(256), "kv commit")?,
+            1,
+            1,
+        ],
         [256, 1, 1],
         0,
         b,
@@ -1678,8 +1915,20 @@ fn experts_rows(
     // Per-slot producer: row s = FWHT256(ffn_normed[s / 8] / S_gu[ids[s]]).
     let x_rot = ar.alloc(gpu, &[slots, e], DType::F32, "xts_x_rot")?;
     hip(gpu.ensure_mq_signs(), "mq signs")?;
-    let s1 = gpu.scratch.mq_signs1.as_ref().ok_or("inkling2 prefill: no mq signs")?.buf.as_ptr();
-    let s2 = gpu.scratch.mq_signs2.as_ref().ok_or("inkling2 prefill: no mq signs")?.buf.as_ptr();
+    let s1 = gpu
+        .scratch
+        .mq_signs1
+        .as_ref()
+        .ok_or("inkling2 prefill: no mq signs")?
+        .buf
+        .as_ptr();
+    let s2 = gpu
+        .scratch
+        .mq_signs2
+        .as_ref()
+        .ok_or("inkling2 prefill: no mq signs")?
+        .buf
+        .as_ptr();
     let mut b = KernargBlob::new();
     b.push_ptr(ptr(ar.get(ffn_normed)));
     b.push_ptr(ptr(ar.get(x_rot)));
@@ -1698,7 +1947,8 @@ fn experts_rows(
         0,
         b,
     )?;
-    gpu.scratch.invalidate_x_caches_for(ar.get(x_rot).buf.as_ptr());
+    gpu.scratch
+        .invalidate_x_caches_for(ar.get(x_rot).buf.as_ptr());
     let situ = FfnActivation::Situ {
         gate_beta: cfg.situ_beta,
         value_beta: cfg.situ_linear_beta,
@@ -1744,7 +1994,10 @@ fn experts_rows(
                 "situ",
             )?;
             let rot = ar.f32(gpu, slots * phys, "xts_rot")?;
-            hip(gpu.rotate_x_mq_batched(ar.get(act), ar.get(rot), phys, slots), "act rotate")?;
+            hip(
+                gpu.rotate_x_mq_batched(ar.get(act), ar.get(rot), phys, slots),
+                "act rotate",
+            )?;
             let down = ar.f32(gpu, slots * e, "xts_down")?;
             run_uniform_moe_down_expanded(
                 gpu,
@@ -1804,47 +2057,108 @@ fn experts_rows(
                 slots,
             )
             .map_err(|e2| format!("inkling2 prefill: grouped gate_up: {e2}"))?;
-            let act = ar.alloc(gpu, &[slots, phys], DType::F32, "moe_act")?;
-            hip(
-                gpu.ffn_activation_grouped_f32(&FfnActivationGrouped {
-                    activation: situ,
-                    y_grouped: ar.get(y_gu),
-                    sorted_slot_index: ar.get(sorted),
-                    expert_tile_ids: ar.get(tiles),
-                    out: ar.get(act),
-                    m_total,
-                    block_m: MOE_GROUPED_BLOCK_M,
-                    logical_n: inter,
-                    phys_n: phys,
-                    round_inputs: false,
-                    round_output: false,
-                    awq_table: Some(&xl.down_awq_ptrs),
-                    n_experts: n_exp,
-                }),
-                "grouped situ",
-            )?;
-            let rot = ar.alloc(gpu, &[slots, phys], DType::F32, "moe_rot")?;
-            hip(gpu.rotate_x_mq_batched(ar.get(act), ar.get(rot), phys, slots), "act rotate")?;
             let y_dn = ar.f32(gpu, m_total * e, "moe_y_dn")?;
+            let fused =
+                tier == PrefillActTier::A8 && gpu.flags.gfx12_producer_quant_fused_enabled();
+            let planes = if fused {
+                None
+            } else {
+                let act = ar.alloc(gpu, &[slots, phys], DType::F32, "moe_act")?;
+                let rot = ar.alloc(gpu, &[slots, phys], DType::F32, "moe_rot")?;
+                Some((act, rot))
+            };
             let dn_tables = GroupedQt44Tables {
                 expert_weight_ptrs: &xl.down_ptrs,
                 expert_tile_ids: ar.get(tiles),
                 expert_offsets: ar.get(offsets),
                 sorted_slot_index: ar.get(sorted),
             };
-            grouped_qt44_gemm_tier(
-                gpu,
-                tier,
-                &dn_tables,
-                ar.get(rot),
-                ar.get(y_dn),
-                e,
-                phys,
-                1,
-                m_total,
-                slots,
-            )
-            .map_err(|e2| format!("inkling2 prefill: grouped down: {e2}"))?;
+            match planes {
+                None => {
+                    // SiTU + down AWQ + pad + FWHT + block_i8_128 in one launch (bitwise the
+                    // three-stage chain + `ensure_int8_mmq_x`), straight into the A8 sidecar.
+                    let reservation = hip(gpu.reserve_int8_mmq(phys, slots), "int8 reserve")?;
+                    let prepared = hip(
+                        gpu.ffn_activation_grouped_rotate_i8_f32(
+                            &FfnActivationGroupedI8 {
+                                activation: situ,
+                                y_grouped: ar.get(y_gu),
+                                sorted_slot_index: ar.get(sorted),
+                                expert_tile_ids: ar.get(tiles),
+                                x_out: None,
+                                m_total,
+                                block_m: MOE_GROUPED_BLOCK_M,
+                                logical_n: inter,
+                                phys_n: phys,
+                                total_slots: slots,
+                                round_inputs: false,
+                                round_output: false,
+                                awq_table: Some(&xl.down_awq_ptrs),
+                                n_experts: n_exp,
+                            },
+                            reservation,
+                        ),
+                        "grouped situ i8",
+                    )?;
+                    let xq = hip(
+                        gpu.int8_mmq_prepared_ptr(&prepared, phys, slots),
+                        "int8 prepared",
+                    )?;
+                    grouped_qt44_gemm_prepared(
+                        gpu,
+                        tier,
+                        &dn_tables,
+                        xq,
+                        ar.get(y_dn),
+                        e,
+                        phys,
+                        1,
+                        m_total,
+                        slots,
+                    )
+                    .map_err(|e2| format!("inkling2 prefill: grouped down: {e2}"))?;
+                }
+                Some((act, rot)) => {
+                    hip(
+                        gpu.ffn_activation_grouped_f32(&FfnActivationGrouped {
+                            activation: situ,
+                            y_grouped: ar.get(y_gu),
+                            sorted_slot_index: ar.get(sorted),
+                            expert_tile_ids: ar.get(tiles),
+                            out: ar.get(act),
+                            m_total,
+                            block_m: MOE_GROUPED_BLOCK_M,
+                            logical_n: inter,
+                            phys_n: phys,
+                            round_inputs: false,
+                            round_output: false,
+                            awq_table: Some(&xl.down_awq_ptrs),
+                            n_experts: n_exp,
+                        }),
+                        "grouped situ",
+                    )?;
+                    // rot allocated above
+                    hip(
+                        gpu.rotate_x_mq_batched(ar.get(act), ar.get(rot), phys, slots),
+                        "act rotate",
+                    )?;
+                    gpu.scratch
+                        .invalidate_x_caches_for(ar.get(rot).buf.as_ptr());
+                    grouped_qt44_gemm_tier(
+                        gpu,
+                        tier,
+                        &dn_tables,
+                        ar.get(rot),
+                        ar.get(y_dn),
+                        e,
+                        phys,
+                        1,
+                        m_total,
+                        slots,
+                    )
+                    .map_err(|e2| format!("inkling2 prefill: grouped down: {e2}"))?;
+                }
+            }
             combine(gpu, cfg, ar, y_dn, Some(inv), topk_idx, topk_w, moe_raw, n)
         }
     }
@@ -1948,7 +2262,9 @@ fn step(
             }
             let Some(ctrls) = gw.layers[phys].controllers.as_ref() else {
                 let _ = gpu.free_tensor(x);
-                return Err(format!("inkling2 prefill: core layer {phys} missing controllers"));
+                return Err(format!(
+                    "inkling2 prefill: core layer {phys} missing controllers"
+                ));
             };
             Some((
                 &o.prev_blocks[skip..],
@@ -1959,7 +2275,17 @@ fn step(
         }
         None => None,
     };
-    let vo = match run_visit_rows(gpu, c, &gw.layers[phys], &x, &o.blocks, visit, phys, msgs, gs) {
+    let vo = match run_visit_rows(
+        gpu,
+        c,
+        &gw.layers[phys],
+        &x,
+        &o.blocks,
+        visit,
+        phys,
+        msgs,
+        gs,
+    ) {
         Ok(v) => v,
         Err(e) => {
             let _ = gpu.free_tensor(x);
@@ -1971,7 +2297,10 @@ fn step(
         o.blocks.push(p);
     }
     if let Some(t) = trace.as_mut() {
-        let row = hip(gpu.download_f32(&view(&vo.visit_out, 0, &[c.rows * cfg.n_embd])?), "trace")?;
+        let row = hip(
+            gpu.download_f32(&view(&vo.visit_out, 0, &[c.rows * cfg.n_embd])?),
+            "trace",
+        )?;
         t[visit].extend_from_slice(&row);
     }
     o.x = Some(vo.visit_out);
@@ -1995,11 +2324,18 @@ fn drive_block(
     let e = cfg.n_embd;
     let ne = n * e;
     if gw.layers.len() != cfg.n_phys {
-        return Err(format!("inkling2 prefill: {} layers != n_phys {}", gw.layers.len(), cfg.n_phys));
+        return Err(format!(
+            "inkling2 prefill: {} layers != n_phys {}",
+            gw.layers.len(),
+            cfg.n_phys
+        ));
     }
     let core_len = cfg.loop_cfg.core_end - cfg.loop_cfg.core_start;
     if gw.cross_pass.len() != core_len {
-        return Err(format!("inkling2 prefill: {} cross_pass != core_len {core_len}", gw.cross_pass.len()));
+        return Err(format!(
+            "inkling2 prefill: {} cross_pass != core_len {core_len}",
+            gw.cross_pass.len()
+        ));
     }
     // Embed: host row decode, one upload, batched token RMSNorm.
     let mut rows_h = Vec::with_capacity(ne);
@@ -2070,7 +2406,10 @@ fn drive_block(
         visit += 1;
     }
     if visit != cfg.loop_cfg.n_slot() {
-        return Err(format!("inkling2 prefill: visit count {visit} != {}", cfg.loop_cfg.n_slot()));
+        return Err(format!(
+            "inkling2 prefill: visit count {visit} != {}",
+            cfg.loop_cfg.n_slot()
+        ));
     }
     let heads = head_rows(gpu, c, o, head)?;
     gs.seq_pos = c.p + n;
@@ -2099,7 +2438,10 @@ fn head_rows(
         return Ok(Vec::new());
     }
     if gw.output_query.buf.size() / 4 != e {
-        return Err(format!("inkling2 prefill: output_query len {} != {e}", gw.output_query.buf.size() / 4));
+        return Err(format!(
+            "inkling2 prefill: output_query len {} != {e}",
+            gw.output_query.buf.size() / 4
+        ));
     }
     let x = o.x.as_ref().ok_or("inkling2 prefill: missing x")?;
     let mut ar = Arena::default();
@@ -2110,10 +2452,26 @@ fn head_rows(
         }
         let refs: Vec<&GpuTensor> = states.iter().collect();
         let mixed = ar.f32(gpu, rows * e, "final_mix")?;
-        mix_rows(gpu, &refs, &gw.output_query, ar.get(mixed), rows, e, 1, cfg.rms_norm_eps)?;
+        mix_rows(
+            gpu,
+            &refs,
+            &gw.output_query,
+            ar.get(mixed),
+            rows,
+            e,
+            1,
+            cfg.rms_norm_eps,
+        )?;
         let hidden = ar.f32(gpu, rows * e, "hidden")?;
         hip(
-            gpu.rmsnorm_batched(&view(ar.get(mixed), 0, &[rows, e])?, &gw.norm, ar.get(hidden), rows, e, cfg.rms_norm_eps),
+            gpu.rmsnorm_batched(
+                &view(ar.get(mixed), 0, &[rows, e])?,
+                &gw.norm,
+                ar.get(hidden),
+                rows,
+                e,
+                cfg.rms_norm_eps,
+            ),
             "final norm",
         )?;
         let vocab = cfg.vocab_size;
@@ -2125,8 +2483,14 @@ fn head_rows(
             let logits = ar.f32(gpu, take * vocab, "logits")?;
             let hv = view(ar.get(hidden), done * e, &[take, e])?;
             linear(gpu, &gw.unembed, &hv, ar.get(logits), take, c.mode.gemm)?;
-            hip(gpu.logit_softcap_f32(ar.get(logits), take * vocab, cfg.softcap), "softcap")?;
-            let host = hip(gpu.download_f32(&view(ar.get(logits), 0, &[take * vocab])?), "logits download")?;
+            hip(
+                gpu.logit_softcap_f32(ar.get(logits), take * vocab, cfg.softcap),
+                "softcap",
+            )?;
+            let host = hip(
+                gpu.download_f32(&view(ar.get(logits), 0, &[take * vocab])?),
+                "logits download",
+            )?;
             for i in 0..take {
                 let row = &host[i * vocab..i * vocab + cfg.unpadded_vocab_size];
                 out.push((c.p + r0 + done + i, row.to_vec()));
