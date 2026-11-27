@@ -1411,6 +1411,7 @@ dependencies = [
  "rdna-compute",
  "safetensors",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1927,6 +1928,7 @@ dependencies = [
  "faer",
  "half",
  "hip-bridge",
+ "hipfire-arch-inkling2",
  "hipfire-arch-qwen4",
  "hipfire-config",
  "hipfire-reap",

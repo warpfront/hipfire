@@ -10,6 +10,7 @@ serde_json.workspace = true
 safetensors.workspace = true
 memmap2.workspace = true
 rayon.workspace = true
+sha2.workspace = true
 half = "2"
 hip-bridge = { path = "../hip-bridge" }
 hipfire-runtime = { path = "../hipfire-runtime" }

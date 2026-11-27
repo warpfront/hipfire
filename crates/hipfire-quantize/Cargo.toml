@@ -30,6 +30,7 @@ libc = "0.2"
 hipfire-reap = { path = "../hipfire-reap" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
 hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4" }
+hipfire-arch-inkling2 = { path = "../hipfire-arch-inkling2" }
 rdna-compute = { path = "../rdna-compute" }
 ureq = "3"
 sha2.workspace = true

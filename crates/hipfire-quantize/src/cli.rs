@@ -91,12 +91,13 @@ pub(crate) struct QuantizeArgs {
           conflicts_with_all = ["qwen4_flash_next", "flux_pipe", "mq4v2_final_codes",
                                 "mq3v2_final_codes", "mq2v2_final_codes", "reap_overlay"])]
     pub recipe: Option<String>,
-    /// `--recipe stock-fp8-mtp-sidecar` only: the stock-FP8 AR artifact the
-    /// sidecar extends.
+    /// `--recipe stock-fp8-mtp-sidecar`: the stock-FP8 AR artifact the
+    /// sidecar extends. `--format inkling2-dspark-bf16`: the Inkling-2 trunk
+    /// HFQ (legacy or XTS) the DSpark sidecar pairs with.
     #[arg(long, value_name = "MODEL_HFQ")]
     pub base: Option<String>,
-    /// `--recipe stock-fp8-mtp-sidecar` only: refuse a base whose whole-file
-    /// SHA-256 is not this value (64 hex digits).
+    /// `--recipe stock-fp8-mtp-sidecar` / `--format inkling2-dspark-bf16`:
+    /// refuse a base whose whole-file SHA-256 is not this value (64 hex digits).
     #[arg(long = "base-sha256", value_name = "HEX")]
     pub base_sha256: Option<String>,
     /// Developer-only (build feature `qwen4-dev-profiles`): produce a COMPLETE
@@ -113,7 +114,8 @@ pub(crate) struct QuantizeArgs {
     pub qwen4_dev_tiny: Option<String>,
 
     /// Destination HFQ file.  With `--recipe stock-fp8-mtp-sidecar` it
-    /// defaults to `<base file name>.mtp` beside the base.
+    /// defaults to `<base file name>.mtp` beside the base; with `--format
+    /// inkling2-dspark-bf16` to `<base stem>-dspark.<ext>` beside it.
     #[arg(
         long,
         value_name = "PATH",
@@ -466,6 +468,8 @@ pub(crate) enum Route {
     Qwen4StockFp8,
     /// `--recipe stock-fp8-mtp-sidecar` MTP head sidecar of a stock FP8 artifact.
     Qwen4StockMtpSidecar,
+    /// `--format inkling2-dspark-bf16` Inkling-2 DSpark draft sidecar of a trunk.
+    Inkling2Dspark,
     /// `--qwen4-dev-tiny` complete developer tiny checkpoint (feature-gated).
     #[cfg(feature = "qwen4-dev-profiles")]
     Qwen4DevTiny,
@@ -491,6 +495,7 @@ const EVERY: &[Route] = &[
     Qwen4,
     Qwen4StockFp8,
     Qwen4StockMtpSidecar,
+    Inkling2Dspark,
     FinalCodes,
     EarlySpecial,
     Raon,
@@ -504,6 +509,7 @@ const EVERY: &[Route] = &[
     Qwen4,
     Qwen4StockFp8,
     Qwen4StockMtpSidecar,
+    Inkling2Dspark,
     Qwen4DevTiny,
     FinalCodes,
     EarlySpecial,
@@ -523,6 +529,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
             Qwen4,
             Qwen4StockFp8,
             Qwen4StockMtpSidecar,
+            Inkling2Dspark,
             FinalCodes,
             EarlySpecial,
             Raon,
@@ -538,6 +545,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
             Qwen4,
             Qwen4StockFp8,
             Qwen4StockMtpSidecar,
+            Inkling2Dspark,
             Qwen4DevTiny,
             FinalCodes,
             EarlySpecial,
@@ -552,11 +560,11 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("qwen4_flash_next", &[Qwen4]),
     ("qwen4_component_mode", &[Qwen4, Qwen4StockFp8]),
     ("recipe", &[Qwen4StockFp8, Qwen4StockMtpSidecar]),
-    ("base", &[Qwen4StockMtpSidecar]),
-    ("base_sha256", &[Qwen4StockMtpSidecar]),
+    ("base", &[Qwen4StockMtpSidecar, Inkling2Dspark]),
+    ("base_sha256", &[Qwen4StockMtpSidecar, Inkling2Dspark]),
     #[cfg(feature = "qwen4-dev-profiles")]
     ("qwen4_dev_tiny", &[Qwen4DevTiny]),
-    ("format", &[EarlySpecial, Raon, Main]),
+    ("format", &[Inkling2Dspark, EarlySpecial, Raon, Main]),
     ("head_quant", &[EarlySpecial]),
     ("head_only", &[EarlySpecial]),
     ("arch_id", &[ReapOverlay, Main]),
@@ -617,6 +625,7 @@ fn route_label(route: Route) -> &'static str {
         Qwen4 => "--qwen4-flash-next",
         Qwen4StockFp8 => "--recipe stock-fp8",
         Qwen4StockMtpSidecar => "--recipe stock-fp8-mtp-sidecar",
+        Inkling2Dspark => "--format inkling2-dspark-bf16",
         #[cfg(feature = "qwen4-dev-profiles")]
         Qwen4DevTiny => "--qwen4-dev-tiny",
         FinalCodes => "--mq*v2-final-codes",
@@ -1008,6 +1017,39 @@ mod route_tests {
                 "i"
             ])
             .is_err());
+    }
+
+    #[test]
+    fn inkling2_dspark_route_reads_only_format_input_base_sha_and_output() {
+        let base = [
+            "--format",
+            "inkling2-dspark-bf16",
+            "--input",
+            "i",
+            "--base",
+            "b.hfq",
+        ];
+        let args =
+            <QuantizeArgs as clap::FromArgMatches>::from_arg_matches(&matches(&base)).unwrap();
+        assert_eq!(crate::pipeline::route_for(&args), Inkling2Dspark);
+        reject_unreachable(&matches(&base), Inkling2Dspark).unwrap();
+        let mut full = base.to_vec();
+        full.extend(["--base-sha256", "ab", "--output", "o"]);
+        reject_unreachable(&matches(&full), Inkling2Dspark).unwrap();
+        for (flag, value) in [
+            ("--awq", None),
+            ("--imatrix", Some("x")),
+            ("--recipe", Some("stock-fp8")),
+        ] {
+            let mut argv = base.to_vec();
+            argv.push(flag);
+            argv.extend(value);
+            let err = reject_unreachable(&matches(&argv), Inkling2Dspark).unwrap_err();
+            assert!(
+                err.starts_with(&format!("{flag} has no effect")),
+                "{flag}: {err}"
+            );
+        }
     }
 
     #[test]

@@ -999,6 +999,8 @@ pub(crate) fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
         || args.mq2v2_final_codes.is_some()
     {
         Route::FinalCodes
+    } else if args.format == crate::inkling2_dspark::FORMAT {
+        Route::Inkling2Dspark
     } else if is_early_special_format(&args.format) {
         Route::EarlySpecial
     } else if args
@@ -1144,6 +1146,42 @@ pub(crate) fn run() {
             }
             Err(error) => {
                 eprintln!("error: stock-fp8-mtp-sidecar: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // ── Inkling-2 DSpark draft sidecar (`--format inkling2-dspark-bf16`) ────
+    // Dedicated producer: pinned `mtp.safetensors` + the paired trunk HFQ.
+    if route_for(&args) == crate::cli::Route::Inkling2Dspark {
+        let input = args
+            .input
+            .as_deref()
+            .expect("--input is required with --format inkling2-dspark-bf16");
+        let Some(base) = args.base.as_deref() else {
+            eprintln!("error: --format inkling2-dspark-bf16 requires --base <trunk.hfq>");
+            std::process::exit(2);
+        };
+        let output = (!args.output.is_empty()).then(|| Path::new(&args.output));
+        match crate::inkling2_dspark::run_cli(
+            Path::new(input),
+            Path::new(base),
+            args.base_sha256.as_deref(),
+            output,
+        ) {
+            Ok(s) => {
+                eprintln!(
+                    "inkling2-dspark-bf16: wrote {} (trunk layout {}, {} tensors, {} bytes, sha256={})",
+                    s.output.display(),
+                    s.layout,
+                    s.tensors,
+                    s.bytes,
+                    s.sha256
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("error: inkling2-dspark-bf16: {error}");
                 std::process::exit(2);
             }
         }
@@ -2771,7 +2809,7 @@ pub(crate) fn run() {
         // Inkling-2's `mtp.safetensors` is a separate DSpark sidecar with a
         // generic tensor namespace (`fuse_weight`, `layers.0.*`). Phase 1 is
         // text-only AR; folding it into the trunk would emit colliding,
-        // unconsumed tensors. It gets its own packer later.
+        // unconsumed tensors. `--format inkling2-dspark-bf16` packs it.
         shard_paths.retain(|p| p.file_name().and_then(|n| n.to_str()) != Some("mtp.safetensors"));
     }
     if arch_id == 17 {

@@ -13,6 +13,7 @@ pub mod arch;
 pub mod arch_model;
 pub mod carrier;
 pub mod config;
+pub mod dspark_weights;
 pub mod forward;
 pub mod gpu;
 pub mod gpu_forward;
@@ -23,6 +24,9 @@ pub use arch::Inkling2;
 pub use arch_model::{Inkling2Bundle, Inkling2State};
 pub use carrier::{load_inkling2_bundle, INKLING2_MAX_CONTEXT};
 pub use config::{LoopConfig, ARCH_ID, MTP_SIDECAR_ARCH_ID};
+pub use dspark_weights::{
+    InklingDsparkConfig, InklingDsparkSource, InklingDsparkTargetIdentity, InklingDsparkWeights,
+};
 pub use gpu::{
     upload, EmbedPacked, Inkling2Controller, Inkling2Expert, Inkling2GpuLayer, Inkling2GpuState,
     Inkling2GpuWeights, VramSummary, DOWN_K_LOGICAL, DOWN_K_PADDED, INKLING2_CONV_WIDTH,
