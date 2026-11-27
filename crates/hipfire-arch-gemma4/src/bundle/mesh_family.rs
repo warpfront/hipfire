@@ -195,22 +195,20 @@ impl MeshFamily for Gemma4Bundle {
     }
 
     fn next_prompt_rows(&mut self, _gpus: &mut Gpus, prompt: &[u32]) -> Result<usize> {
-        let stop = self.session.as_ref().and_then(SessionDriver::next_boundary);
+        let stop = self.segment_end(prompt, self.state.n_tokens);
         Ok(prompt_epoch_rows(
             self.state.n_tokens,
-            stop,
+            Some(stop),
             prompt.len(),
             self.prefill_rows,
         ))
     }
 
     fn prompt_rows_done(&mut self, gpus: &mut Gpus, prompt: &[u32], end: usize) -> Result<()> {
-        if self.session.as_ref().and_then(SessionDriver::next_boundary) != Some(end) {
+        if !self.prompt_epoch_drains(end) {
             return Ok(());
         }
-        let gpu = device(gpus)?;
-        self.with_session(|session, bundle| session.at_boundary(gpu, bundle, &prompt[..end]))
-            .unwrap_or(Ok(()))
+        self.capture_at(device(gpus)?, prompt, end)
     }
 
     /// Only a snapshot boundary needs the drain; the chunks between queue back

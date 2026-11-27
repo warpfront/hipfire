@@ -2221,10 +2221,11 @@ fn trace_gemma4_logits(
 ///      serve needs to build the non-stream body and the final usage chunk.
 ///
 /// Prompt cache: `Gemma4Bundle::prefill` plans the canonical render against
-/// the engine session cache (cold-exact snapshots only: the previous turn's
-/// prompt on the prefill chunk grid, or a cached stride snapshot) and the
-/// turn's snapshots publish only after the client commits; the daemon reports
-/// arch 13 `cache_capable` when a cache is attached.
+/// the engine session cache (cold-exact snapshots only: after the last
+/// end-of-turn token of the previous turn's prompt in its first 256 tokens,
+/// or on the 256-token chunk grid above them) and the turn's snapshots
+/// publish only after the client commits; the daemon reports arch 13
+/// `cache_capable` when a cache is attached.
 ///
 /// EAGLE spec-decode (arch-22 drafter via `params.drafter`, opt-in with
 /// `HIPFIRE_GEMMA4_EAGLE=1`; not faster than AR on gfx1151) runs tool-free
@@ -2339,9 +2340,9 @@ pub fn generate_gemma4(
     } else {
         hipfire_runtime::session_cache::SessionRoute::Ar
     };
-    // Plan against the canonical render: the previous turn's prompt on the
-    // prefill grid or a cached snapshot. Prefill resumes there and computes
-    // only the rest.
+    // Plan against the canonical render: the previous turn's prompt up to its
+    // last end-of-turn token, or a cached snapshot. Prefill resumes there and
+    // computes only the rest.
     let reused = hipfire_runtime::arch_model::ArchModel::session_plan(&*bundle, &prompt_ids, route);
     // G12: on the engine loop when the flag is set and the load admits it,
     // AR and EAGLE alike; a decline (nothing emitted) keeps the loops below.
