@@ -707,6 +707,22 @@ paired-t and bootstrap 95% CIs for mean KLD, p99 and NLL, in the JSON schema of
 the gfx1151 A4 `paired.py` receipts. It refuses to pair runs scored against
 different references.
 
+The same teacher also feeds the `mq4-xts` calibration capture (developer-only,
+CPU): `inkling_kld calib --source SAFETENSORS --model A.hfq --manifest
+calib-manifest.json --ids calib.u32 --out-dir DIR [--layers 5,6,20]
+[--batch-spans 8]` runs every role-`calib` span as an independent causal
+sequence with an observer tapped into `Teacher::visit` (Q/K/V rows, the `wo_ud`
+input, and per expert the selected FFN rows and post-SiTU rows) and writes
+`hfhs/L{LL}.hfhs` plus `L{LL}.json` per layer: HFHS v1 F32 `H = G/N` with `G`
+accumulated in F64 on disk (F32 inside 256-row chunks, no FMA, so the result is
+independent of thread count), `N` per name and visit, payload hashes, and
+per-expert route statistics. `--role check` dumps the raw F32 rows of the
+held-out spans instead. `inkling_kld srcdump --layers L,..` writes the source F32
+tensors as the quantizer ingests them, and `inkling_kld captest` shows the
+observer leaves the teacher's hidden states and logits bit-identical and the
+Grams equal an independent F64 recomputation. Without an observer the teacher is
+unchanged, so `fidelity` and the pinned references are unaffected.
+
 ## Dense Q8 attention conformance fixture (generated)
 
 `pin:model/dense-q8-llama.hfq` is generated in-tree, not downloaded: a seeded

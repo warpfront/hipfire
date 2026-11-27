@@ -62,6 +62,20 @@
 //! better), the paired-t 95% CI and a SplitMix64 percentile-bootstrap 95% CI,
 //! for mean KLD, p99 KLD and NLL. Same JSON schema as the gfx1151 A4 receipts'
 //! `paired.py`.
+//!
+//! `calib` runs the teacher over the spans of a calibration manifest (role
+//! `calib`, or `check` for the held-out rows; every span an independent causal
+//! sequence, nothing truncated) with a developer-only `CalibObserver` tapped
+//! into `Teacher::visit`. Role `calib` accumulates `G = Σ x xᵀ` per HFHS name
+//! (attention Q/K/V/AttnOut rows, per-expert selected gate/up rows and post-SiTU
+//! down rows) in F64 on disk per layer, then writes `hfhs/L{LL}.hfhs` (F32
+//! `H = G/N`) plus `L{LL}.json` (N, N per visit, payload hashes, route stats).
+//! Role `check` dumps the raw F32 rows instead. `srcdump` writes the source F32
+//! tensors of chosen layers as the quantizer ingests them; `captest` proves the
+//! observer leaves the teacher's logits bit-identical and the Grams equal an
+//! independent recomputation. The observer is a shared `&dyn` (the expert loop
+//! is parallel); with `None` every output is bit-identical to the unobserved
+//! teacher.
 
 #[allow(dead_code)]
 #[path = "../../hipfire-quantize/src/dequant.rs"]
@@ -83,8 +97,11 @@ use saddle_quant::format::kldref::{KldRef, RefHeader, RefWriter};
 use saddle_quant::format::kldseq;
 use saddle_quant::{ArtifactId, Estimator, OracleStats, TeacherVerdict, WindowSpec};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 const USAGE: &str = "usage:
@@ -92,6 +109,13 @@ const USAGE: &str = "usage:
                        [--n-ctx 2048] [--max-chunks 24] [--top-k 256] [--batch-chunks N]
   inkling_kld fidelity --source MODEL.safetensors --model ARTIFACT.hfq --slice TEXT --output OUT.json
                        [--n-ctx 64] [--chunks 4] [--sliding-window W] [--log-floor F]
+  inkling_kld calib    --source MODEL.safetensors --model ARTIFACT.hfq --manifest MANIFEST.json
+                       --ids CALIB.u32 --out-dir DIR [--layers 5,6,20] [--batch-spans 8]
+                       [--role calib|check]
+  inkling_kld srcdump  --source MODEL.safetensors --model ARTIFACT.hfq --layers 5,20 --out-dir DIR
+                       [--verify 1]
+  inkling_kld captest  --source MODEL.safetensors --model ARTIFACT.hfq --slice TEXT --out-dir DIR
+                       [--n-ctx 64] [--chunks 2] [--layers 5,6] [--sliding-window W] [--log-floor F]
   inkling_kld eval     --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq
                        [--max-chunks N] [--chunks-per-process 1]
   inkling_kld pair     --base BASE.kldseq --cand CAND.kldseq [--output OUT.json] [--boot 20000] [--seed 1]";
@@ -515,7 +539,11 @@ struct Teacher<'a> {
 impl Teacher<'_> {
     /// Final normalized hidden state of every position of `seqs` (all the
     /// same length), token-major `[s * len + t]`.
-    fn forward(&self, seqs: &[&[u32]]) -> Result<Vec<Vec<f32>>, String> {
+    fn forward(
+        &self,
+        seqs: &[&[u32]],
+        obs: Option<&dyn CalibObserver>,
+    ) -> Result<Vec<Vec<f32>>, String> {
         let cfg = self.cfg;
         let e = cfg.n_embd;
         let len = seqs[0].len();
@@ -539,8 +567,11 @@ impl Teacher<'_> {
         let mut visit = 0usize;
         let lc = &cfg.loop_cfg;
         for _ in 0..lc.core_start {
-            self.visit(visit, len, &mut toks, None)?;
+            self.visit(visit, len, &mut toks, None, obs)?;
             visit += 1;
+            if obs.is_some_and(|o| o.finished_after(visit - 1)) {
+                return Ok(Vec::new());
+            }
             eprintln!(
                 "  visit {visit}/{}  {:.0}s",
                 lc.n_slot(),
@@ -586,8 +617,11 @@ impl Teacher<'_> {
                 } else {
                     None
                 };
-                self.visit(visit, len, &mut toks, messages.as_ref())?;
+                self.visit(visit, len, &mut toks, messages.as_ref(), obs)?;
                 visit += 1;
+                if obs.is_some_and(|o| o.finished_after(visit - 1)) {
+                    return Ok(Vec::new());
+                }
                 eprintln!(
                     "  visit {visit}/{}  {:.0}s",
                     lc.n_slot(),
@@ -597,8 +631,11 @@ impl Teacher<'_> {
             prev.clone_from(&toks);
         }
         for _ in lc.core_end..cfg.n_phys {
-            self.visit(visit, len, &mut toks, None)?;
+            self.visit(visit, len, &mut toks, None, obs)?;
             visit += 1;
+            if obs.is_some_and(|o| o.finished_after(visit - 1)) {
+                return Ok(Vec::new());
+            }
             eprintln!(
                 "  visit {visit}/{}  {:.0}s",
                 lc.n_slot(),
@@ -624,6 +661,7 @@ impl Teacher<'_> {
         len: usize,
         toks: &mut [Tok],
         messages: Option<&(Vec<[Vec<f32>; 4]>, [ControllerWeights; 4])>,
+        obs: Option<&dyn CalibObserver>,
     ) -> Result<(), String> {
         let cfg = self.cfg;
         let w = self.w;
@@ -636,6 +674,21 @@ impl Teacher<'_> {
         let g = |s: &str| w.dense(&format!("{p}{s}"));
         let eps = cfg.rms_norm_eps;
         let rank = cfg.loop_cfg.gate_rank;
+        // Capture taps: only layers the observer wants; rows are final when handed out.
+        let watch = obs.filter(|o| o.wants(phys));
+        let tok_meta: Vec<RowMeta> = if watch.is_some() {
+            (0..n)
+                .map(|i| RowMeta {
+                    seq: (i / len) as u32,
+                    pos: (i % len) as u32,
+                    rank: 0,
+                    weight: f32::NAN,
+                    margin: f32::NAN,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // --- attention inputs: AttnRes mix, controllers, input norms ---
         let attn_q = if phys == 0 {
@@ -714,6 +767,11 @@ impl Teacher<'_> {
         };
         let (q_inp, k_inp, v_inp) = (column(0), column(1), column(2));
         drop(inputs);
+        if let Some(o) = watch {
+            o.observe(phys, visit, CalibSite::Q, None, &q_inp, ne, &tok_meta)?;
+            o.observe(phys, visit, CalibSite::K, None, &k_inp, ne, &tok_meta)?;
+            o.observe(phys, visit, CalibSite::V, None, &v_inp, ne, &tok_meta)?;
+        }
         let q = gemm(&q_inp, n, ne, g("attn.wq_du.weight")?, eattn);
         let k_raw = gemm(&k_inp, n, ne, g("attn.wk_dv.weight")?, ekv);
         let v_raw = gemm(&v_inp, n, ne, g("attn.wv_dv.weight")?, ekv);
@@ -912,6 +970,17 @@ impl Teacher<'_> {
             })
             .collect();
         drop((clipped, kv_rows, gate, sinks));
+        if let Some(o) = watch {
+            o.observe(
+                phys,
+                visit,
+                CalibSite::AttnOut,
+                None,
+                &attn_out,
+                eattn,
+                &tok_meta,
+            )?;
+        }
         let proj = gemm(&attn_out, n, eattn, g("attn.wo_ud.weight")?, ne);
         drop(attn_out);
         let ac_name = format!("{p}attn_sconv.weight");
@@ -984,16 +1053,30 @@ impl Teacher<'_> {
             .par_chunks_exact(n_experts)
             .map(|l| oracle::sigmoid_topk(l, bias, top_k, cfg.route_scale))
             .collect();
+        let margins: Vec<(f32, usize)> = if watch.is_some() {
+            logits
+                .par_chunks_exact(n_experts)
+                .zip(selected.par_iter())
+                .map(|(l, sel)| route_margin(l, bias, top_k, sel))
+                .collect::<Result<_, String>>()?
+        } else {
+            Vec::new()
+        };
         drop(logits);
         // by_expert[ex] lists (token, rank); slot[token * top_k + rank] is the
         // row of that pair in its expert's output.
-        let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_experts];
-        let mut slot = vec![0usize; n * top_k];
-        for (i, sel) in selected.iter().enumerate() {
-            for (rk, &(ex, _)) in sel.iter().enumerate() {
-                slot[i * top_k + rk] = by_expert[ex].len();
-                by_expert[ex].push((i, rk));
-            }
+        let (by_expert, slot) = route_tables(&selected, n_experts, top_k);
+        if let Some(o) = watch {
+            o.route(
+                phys,
+                visit,
+                &RouteInfo {
+                    top_k,
+                    n_experts,
+                    selected: &selected,
+                    margins: &margins,
+                },
+            )?;
         }
         let inter = cfg.inter;
         let per_expert: HashMap<usize, Vec<f32>> = (0..n_experts)
@@ -1005,6 +1088,30 @@ impl Teacher<'_> {
                 let mut xe = Vec::with_capacity(rows.len() * ne);
                 for &(i, _) in rows {
                     xe.extend_from_slice(&x_ffn[i * ne..(i + 1) * ne]);
+                }
+                let meta: Vec<RowMeta> = if watch.is_some() {
+                    rows.iter()
+                        .map(|&(i, rk)| RowMeta {
+                            seq: (i / len) as u32,
+                            pos: (i % len) as u32,
+                            rank: rk as u8,
+                            weight: selected[i][rk].1,
+                            margin: margins[i].0,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if let Some(o) = watch {
+                    o.observe(
+                        phys,
+                        visit,
+                        CalibSite::ExpertGateUp,
+                        Some(ex),
+                        &xe,
+                        ne,
+                        &meta,
+                    )?;
                 }
                 let gu_out = gemm(&xe, rows.len(), ne, &gu, 2 * inter);
                 drop(gu);
@@ -1021,6 +1128,17 @@ impl Teacher<'_> {
                         })
                     })
                     .collect();
+                if let Some(o) = watch {
+                    o.observe(
+                        phys,
+                        visit,
+                        CalibSite::ExpertDown,
+                        Some(ex),
+                        &act,
+                        inter,
+                        &meta,
+                    )?;
+                }
                 Ok((ex, gemm(&act, rows.len(), inter, &dn, ne)))
             })
             .collect::<Result<_, String>>()?;
@@ -1063,6 +1181,9 @@ impl Teacher<'_> {
             .for_each(|((t, cur), mc)| {
                 t.x = cur.iter().zip(&mc).map(|(a, b)| a + b).collect();
             });
+        if let Some(o) = watch {
+            o.end_visit(phys, visit)?;
+        }
         Ok(())
     }
 
@@ -1083,6 +1204,1195 @@ impl Teacher<'_> {
             });
         Ok(out)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Calibration capture: observer API, F64 Gram accumulation, HFHS output
+// ---------------------------------------------------------------------------
+
+/// Where in a visit a row set is observed. `Q` is the normalized Q-stream row
+/// that feeds `wq_du`, `wr_du` and `gate_attn` (one producer); `K`/`V` are the
+/// separately controlled and normalized rows of `wk_dv`/`wv_dv`; `AttnOut` is
+/// the gated attention output (the `wo_ud` input, K 3072); the expert sites
+/// see only the tokens that selected that expert (never router-weighted).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum CalibSite {
+    Q,
+    K,
+    V,
+    AttnOut,
+    ExpertGateUp,
+    ExpertDown,
+}
+
+impl CalibSite {
+    fn file_name(self) -> &'static str {
+        match self {
+            CalibSite::Q => "q",
+            CalibSite::K => "k",
+            CalibSite::V => "v",
+            CalibSite::AttnOut => "attn_out",
+            CalibSite::ExpertGateUp => "gate_up",
+            CalibSite::ExpertDown => "down",
+        }
+    }
+}
+
+/// Provenance of one observed row. `seq`/`pos` are the sequence index within
+/// the `forward` call and the token position; `rank`, `weight` and `margin`
+/// are the route rank (0 = best), the renormalized route weight and the
+/// 8th-vs-9th selection-score margin of that token at that visit. Attention
+/// rows carry `rank 0` and NaN `weight`/`margin`.
+#[derive(Clone, Copy, Debug)]
+struct RowMeta {
+    seq: u32,
+    pos: u32,
+    rank: u8,
+    weight: f32,
+    margin: f32,
+}
+
+/// One visit's routing decision for every token (token-major `seq * len + pos`).
+struct RouteInfo<'a> {
+    top_k: usize,
+    n_experts: usize,
+    selected: &'a [Vec<(usize, f32)>],
+    /// `(selection-score margin between the top_k-th and the next expert,
+    /// that next expert's id)` per token.
+    margins: &'a [(f32, usize)],
+}
+
+/// Developer-only tap on the batched teacher. Capture never changes
+/// selection, rows or state: the teacher hands out shared borrows after the
+/// values are final. The expert sites are called from the teacher's
+/// per-expert parallel loop (one call per expert and site per visit), so an
+/// observer must be `Sync`; `end_visit` runs serially after the loop.
+trait CalibObserver: Sync {
+    fn wants(&self, phys: usize) -> bool;
+    /// True when no later visit is needed (the teacher then returns early).
+    fn finished_after(&self, _visit: usize) -> bool {
+        false
+    }
+    fn route(&self, phys: usize, visit: usize, info: &RouteInfo) -> Result<(), String>;
+    #[allow(clippy::too_many_arguments)]
+    fn observe(
+        &self,
+        phys: usize,
+        visit: usize,
+        site: CalibSite,
+        expert: Option<usize>,
+        rows: &[f32],
+        k: usize,
+        meta: &[RowMeta],
+    ) -> Result<(), String>;
+    fn end_visit(&self, phys: usize, visit: usize) -> Result<(), String>;
+}
+
+/// Fans one teacher run out to several observers.
+struct Tee<'a>(Vec<&'a dyn CalibObserver>);
+
+impl CalibObserver for Tee<'_> {
+    fn wants(&self, phys: usize) -> bool {
+        self.0.iter().any(|o| o.wants(phys))
+    }
+    fn finished_after(&self, visit: usize) -> bool {
+        self.0.iter().all(|o| o.finished_after(visit))
+    }
+    fn route(&self, phys: usize, visit: usize, info: &RouteInfo) -> Result<(), String> {
+        for o in self.0.iter().filter(|o| o.wants(phys)) {
+            o.route(phys, visit, info)?;
+        }
+        Ok(())
+    }
+    fn observe(
+        &self,
+        phys: usize,
+        visit: usize,
+        site: CalibSite,
+        expert: Option<usize>,
+        rows: &[f32],
+        k: usize,
+        meta: &[RowMeta],
+    ) -> Result<(), String> {
+        for o in self.0.iter().filter(|o| o.wants(phys)) {
+            o.observe(phys, visit, site, expert, rows, k, meta)?;
+        }
+        Ok(())
+    }
+    fn end_visit(&self, phys: usize, visit: usize) -> Result<(), String> {
+        for o in self.0.iter().filter(|o| o.wants(phys)) {
+            o.end_visit(phys, visit)?;
+        }
+        Ok(())
+    }
+}
+
+/// `by_expert[e]` lists `(token, rank)` and `slot[token * top_k + rank]` is the
+/// row of that pair in its expert's output.
+type RouteTables = (Vec<Vec<(usize, usize)>>, Vec<usize>);
+
+fn route_tables(selected: &[Vec<(usize, f32)>], n_experts: usize, top_k: usize) -> RouteTables {
+    let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_experts];
+    let mut slot = vec![0usize; selected.len() * top_k];
+    for (i, sel) in selected.iter().enumerate() {
+        for (rk, &(ex, _)) in sel.iter().enumerate() {
+            slot[i * top_k + rk] = by_expert[ex].len();
+            by_expert[ex].push((i, rk));
+        }
+    }
+    (by_expert, slot)
+}
+
+/// Selection-score margin between the `k`-th and `(k+1)`-th expert of one
+/// token and the `(k+1)`-th expert's id: the same scores and stable sort as
+/// `oracle::sigmoid_topk`, and its top-`k` ids must equal `selected`.
+fn route_margin(
+    logits: &[f32],
+    bias: Option<&[f32]>,
+    k: usize,
+    selected: &[(usize, f32)],
+) -> Result<(f32, usize), String> {
+    let mut sel: Vec<(usize, f32)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (i, oracle::sigmoid(s) + bias.map_or(0.0, |v| v[i])))
+        .collect();
+    sel.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if sel.len() <= k || selected.len() != k {
+        return Err("route margin: fewer than top_k + 1 experts".into());
+    }
+    if sel[..k]
+        .iter()
+        .map(|s| s.0)
+        .ne(selected.iter().map(|s| s.0))
+    {
+        return Err(
+            "route margin: recomputed top-k ids differ from the teacher's selection".into(),
+        );
+    }
+    Ok((sel[k - 1].1 - sel[k].1, sel[k].0))
+}
+
+/// Rows per F32 Gram chunk. Within a chunk every product sum runs in `r`
+/// order in F32 (no FMA contraction), each chunk's tile is then added to the
+/// F64 accumulator in chunk order: bitwise independent of thread count and of
+/// the vector ISA.
+const GRAM_CHUNK: usize = 256;
+/// Feature panel width: K must be a multiple of it (2304, 3072, 1152 are).
+const PB: usize = 16;
+
+/// Elements of the block-upper-triangular F64 accumulator of a `k x k` Gram:
+/// block row `ib` stores its 16 rows from column `16 * ib` to `k`.
+fn tri_len(k: usize) -> usize {
+    let nb = k / PB;
+    PB * (k * nb - PB * nb * nb.saturating_sub(1) / 2)
+}
+
+fn tri_row_off(k: usize, ib: usize) -> usize {
+    PB * (k * ib - PB * ib * ib.saturating_sub(1) / 2)
+}
+
+#[inline(always)]
+unsafe fn tile_body(pi: *const f32, pj: *const f32, rr: usize) -> [[f32; PB]; PB] {
+    let mut acc = [[0.0f32; PB]; PB];
+    for r in 0..rr {
+        let xv = pj.add(r * PB);
+        for (ii, a) in acc.iter_mut().enumerate() {
+            let s = *pi.add(r * PB + ii);
+            for (l, al) in a.iter_mut().enumerate() {
+                *al = *al + s * *xv.add(l);
+            }
+        }
+    }
+    acc
+}
+
+#[target_feature(enable = "avx512f")]
+unsafe fn tile_avx512(pi: *const f32, pj: *const f32, rr: usize) -> [[f32; PB]; PB] {
+    tile_body(pi, pj, rr)
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn tile_avx2(pi: *const f32, pj: *const f32, rr: usize) -> [[f32; PB]; PB] {
+    tile_body(pi, pj, rr)
+}
+
+/// `acc[i][j] = Σ_r pi[r][i] * pj[r][j]` for one 16 x 16 tile of packed panels.
+fn tile16(pi: &[f32], pj: &[f32], rr: usize) -> [[f32; PB]; PB] {
+    assert!(pi.len() >= rr * PB && pj.len() >= rr * PB);
+    // SAFETY: bounds asserted above; feature presence checked at runtime.
+    unsafe {
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            tile_avx512(pi.as_ptr(), pj.as_ptr(), rr)
+        } else if std::arch::is_x86_feature_detected!("avx2") {
+            tile_avx2(pi.as_ptr(), pj.as_ptr(), rr)
+        } else {
+            tile_body(pi.as_ptr(), pj.as_ptr(), rr)
+        }
+    }
+}
+
+/// `acc += Σ_rows x xᵀ` (block-upper triangle) for `n` rows of width `k`.
+/// Deterministic: every accumulator element is owned by one task and is
+/// updated in fixed chunk/row order.
+fn gram_add(acc: &mut [f64], x: &[f32], n: usize, k: usize) {
+    assert!(
+        k % PB == 0 && k > 0,
+        "gram: K {k} is not a multiple of {PB}"
+    );
+    assert_eq!(acc.len(), tri_len(k), "gram: accumulator size");
+    assert_eq!(x.len(), n * k, "gram: row shape");
+    let nb = k / PB;
+    let mut blocks: Vec<&mut [f64]> = Vec::with_capacity(nb);
+    let mut rest = acc;
+    for ib in 0..nb {
+        let (head, tail) = rest.split_at_mut(PB * (k - PB * ib));
+        blocks.push(head);
+        rest = tail;
+    }
+    let mut panels = vec![0.0f32; nb * GRAM_CHUNK.min(n.max(1)) * PB];
+    for r0 in (0..n).step_by(GRAM_CHUNK) {
+        let rr = (n - r0).min(GRAM_CHUNK);
+        panels[..nb * rr * PB]
+            .par_chunks_mut(rr * PB)
+            .enumerate()
+            .for_each(|(jb, dst)| {
+                for r in 0..rr {
+                    let src = (r0 + r) * k + jb * PB;
+                    dst[r * PB..(r + 1) * PB].copy_from_slice(&x[src..src + PB]);
+                }
+            });
+        let pan = &panels[..nb * rr * PB];
+        blocks.par_iter_mut().enumerate().for_each(|(ib, blk)| {
+            let pi = &pan[ib * rr * PB..(ib + 1) * rr * PB];
+            let width = k - ib * PB;
+            for jb in ib..nb {
+                let pj = &pan[jb * rr * PB..(jb + 1) * rr * PB];
+                let tile = tile16(pi, pj, rr);
+                for (ii, trow) in tile.iter().enumerate() {
+                    let base = ii * width + (jb - ib) * PB;
+                    for (l, &v) in trow.iter().enumerate() {
+                        blk[base + l] += v as f64;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Full row-major `k x k` F32 `H = G / n` from the block-upper accumulator.
+fn hessian_from_tri(tri: &[f64], k: usize, n: u64) -> Vec<f32> {
+    assert_eq!(tri.len(), tri_len(k));
+    let nf = n as f64;
+    let mut out = vec![0.0f32; k * k];
+    out.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+        let (ib, ii) = (i / PB, i % PB);
+        for (j, o) in row.iter_mut().enumerate() {
+            let g = if j >= ib * PB {
+                tri[tri_row_off(k, ib) + ii * (k - ib * PB) + (j - ib * PB)]
+            } else {
+                let (jb, jj) = (j / PB, j % PB);
+                tri[tri_row_off(k, jb) + jj * (k - jb * PB) + (i - jb * PB)]
+            };
+            *o = (g / nf) as f32;
+        }
+    });
+    out
+}
+
+fn f32_bytes(v: &[f32]) -> &[u8] {
+    #[cfg(not(target_endian = "little"))]
+    compile_error!("HFHS payloads are written as raw little-endian floats");
+    // SAFETY: any f32 slice is valid as bytes; little-endian asserted above.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+}
+
+fn f64_bytes_mut(v: &mut [f64]) -> &mut [u8] {
+    // SAFETY: any bit pattern is a valid f64; the slice covers exactly the vector.
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+}
+
+/// One accumulator: tensor key (without `.weight` and layer prefix), K, and
+/// where its block-upper F64 triangle lives in the layer's accumulator file.
+struct Slot {
+    k: usize,
+    off: u64,
+    elems: usize,
+}
+
+struct Layout {
+    slots: Vec<Slot>,
+    index: HashMap<String, usize>,
+    bytes: u64,
+}
+
+impl Layout {
+    fn new(n_experts: usize, ne: usize, eattn: usize, inter: usize) -> Self {
+        let mut keys: Vec<(String, usize)> = vec![
+            ("attn.wq_du".into(), ne),
+            ("attn.wk_dv".into(), ne),
+            ("attn.wv_dv".into(), ne),
+            ("attn.wo_ud".into(), eattn),
+        ];
+        for e in 0..n_experts {
+            keys.push((format!("mlp.experts.{e}.gate_up_proj"), ne));
+            keys.push((format!("mlp.experts.{e}.down_proj"), inter));
+        }
+        let (mut slots, mut index, mut off) = (Vec::new(), HashMap::new(), 0u64);
+        for (key, k) in keys {
+            let elems = tri_len(k);
+            index.insert(key.clone(), slots.len());
+            slots.push(Slot { k, off, elems });
+            off += elems as u64 * 8;
+        }
+        Self {
+            slots,
+            index,
+            bytes: off,
+        }
+    }
+
+    fn slot(&self, key: &str) -> Result<&Slot, String> {
+        self.index
+            .get(key)
+            .map(|&i| &self.slots[i])
+            .ok_or_else(|| format!("no accumulator slot {key}"))
+    }
+}
+
+/// Slot key of an observed `(site, expert)`.
+fn site_key(site: CalibSite, expert: Option<usize>) -> Result<String, String> {
+    Ok(match (site, expert) {
+        (CalibSite::Q, None) => "attn.wq_du".into(),
+        (CalibSite::K, None) => "attn.wk_dv".into(),
+        (CalibSite::V, None) => "attn.wv_dv".into(),
+        (CalibSite::AttnOut, None) => "attn.wo_ud".into(),
+        (CalibSite::ExpertGateUp, Some(e)) => format!("mlp.experts.{e}.gate_up_proj"),
+        (CalibSite::ExpertDown, Some(e)) => format!("mlp.experts.{e}.down_proj"),
+        (s, e) => return Err(format!("site {s:?} with expert {e:?}")),
+    })
+}
+
+/// Pass index of a visit (0 outside the looped core).
+fn pass_of(cfg: &Inkling2Config, visit: usize) -> usize {
+    let lc = &cfg.loop_cfg;
+    let core_len = lc.core_end - lc.core_start;
+    if visit >= lc.core_start && visit < lc.core_start + lc.num_passes * core_len {
+        (visit - lc.core_start) / core_len
+    } else {
+        0
+    }
+}
+
+fn parse_layers(spec: Option<&String>, n_phys: usize) -> Result<Vec<usize>, String> {
+    let Some(spec) = spec else {
+        return Ok((0..n_phys).collect());
+    };
+    let mut out = BTreeSet::new();
+    for part in spec.split(',').filter(|p| !p.is_empty()) {
+        let l: usize = part
+            .parse()
+            .map_err(|_| format!("--layers: not a layer index: {part}"))?;
+        if l >= n_phys {
+            return Err(format!("--layers: {l} >= {n_phys} physical layers"));
+        }
+        out.insert(l);
+    }
+    if out.is_empty() {
+        return Err("--layers: empty".into());
+    }
+    Ok(out.into_iter().collect())
+}
+
+/// Last visit index at which any of `layers` runs.
+fn last_visit_of(cfg: &Inkling2Config, layers: &BTreeSet<usize>) -> usize {
+    (0..cfg.loop_cfg.n_slot())
+        .filter(|&v| layers.contains(&cfg.loop_cfg.layer_phys(v)))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Per-expert route statistics of one physical layer, over every observed visit.
+struct ExpertRoute {
+    n: u64,
+    by_visit: BTreeMap<usize, u64>,
+    rank_hist: Vec<u64>,
+    w_sum: f64,
+    w_min: f32,
+    /// Times this expert was the last selected one (rank top_k-1) of a token whose
+    /// top_k-th vs (top_k+1)-th margin was below 1e-6.
+    near_as_last: u64,
+    /// Times this expert was the first unselected one of such a token.
+    near_as_next: u64,
+}
+
+struct LayerRoute {
+    top_k: usize,
+    tokens_by_visit: BTreeMap<usize, u64>,
+    experts: Vec<ExpertRoute>,
+    near_tie_token_visits: u64,
+    margin_min: f32,
+}
+
+/// F64 Gram accumulators on disk (one block-upper-triangle slot per name),
+/// per-name/visit counts and route statistics.
+struct GramObserver {
+    cfg: Inkling2Config,
+    layers: BTreeSet<usize>,
+    early_stop: bool,
+    last_visit: usize,
+    layout: Layout,
+    dir: PathBuf,
+    files: HashMap<usize, std::fs::File>,
+    counts: Mutex<BTreeMap<(usize, String), BTreeMap<usize, u64>>>,
+    route: Mutex<BTreeMap<usize, LayerRoute>>,
+    expert_gram_ns: AtomicU64,
+    dense_gram_ns: AtomicU64,
+    io_ns: AtomicU64,
+    rows_seen: AtomicU64,
+}
+
+impl GramObserver {
+    fn acc_path(dir: &Path, phys: usize) -> PathBuf {
+        dir.join(format!("L{phys:02}.f64acc"))
+    }
+
+    fn new(
+        cfg: &Inkling2Config,
+        layers: &[usize],
+        dir: &Path,
+        n_experts: usize,
+        early_stop: bool,
+    ) -> Result<Self, String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        let layout = Layout::new(n_experts, cfg.n_embd, cfg.n_head * cfg.head_dim, cfg.inter);
+        let mut files = HashMap::new();
+        for &l in layers {
+            let p = Self::acc_path(dir, l);
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&p)
+                .map_err(|e| format!("create {}: {e}", p.display()))?;
+            f.set_len(layout.bytes)
+                .map_err(|e| format!("size {}: {e}", p.display()))?;
+            files.insert(l, f);
+        }
+        let set: BTreeSet<usize> = layers.iter().copied().collect();
+        Ok(Self {
+            cfg: cfg.clone(),
+            last_visit: last_visit_of(cfg, &set),
+            layers: set,
+            early_stop,
+            layout,
+            dir: dir.to_path_buf(),
+            files,
+            counts: Mutex::new(BTreeMap::new()),
+            route: Mutex::new(BTreeMap::new()),
+            expert_gram_ns: AtomicU64::new(0),
+            dense_gram_ns: AtomicU64::new(0),
+            io_ns: AtomicU64::new(0),
+            rows_seen: AtomicU64::new(0),
+        })
+    }
+
+    fn n_by_visit(&self, phys: usize, key: &str) -> BTreeMap<usize, u64> {
+        self.counts
+            .lock()
+            .expect("counts lock")
+            .get(&(phys, key.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// `(N_by_visit, N)` of one accumulator name.
+    fn n_of(&self, phys: usize, key: &str) -> (BTreeMap<usize, u64>, u64) {
+        let by = self.n_by_visit(phys, key);
+        let n = by.values().sum();
+        (by, n)
+    }
+
+    /// Writes `hfhs/L{LL}.hfhs` + `L{LL}.json` for one layer from its accumulator
+    /// file and deletes the accumulator. Returns the layer JSON.
+    fn finalize_layer(
+        &self,
+        phys: usize,
+        hfhs_dir: &Path,
+        run: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        use std::io::Write as _;
+        let file = self
+            .files
+            .get(&phys)
+            .ok_or("finalize: layer not accumulated")?;
+        let route = self.route.lock().expect("route lock");
+        let lr = route
+            .get(&phys)
+            .ok_or_else(|| format!("layer {phys}: no routing observed"))?;
+        let pfx = format!("model.llm.layers.{phys}.");
+        let top_k = lr.top_k;
+        let visits: Vec<usize> = lr.tokens_by_visit.keys().copied().collect();
+        let tokens_visits: u64 = lr.tokens_by_visit.values().sum();
+        // Σ_e N_e == top_k · tokens · visits, for both expert projections, and the
+        // route statistics agree with the row counts of the gathered inputs.
+        let mut sums = [0u64; 2];
+        let mut expert_json = Vec::new();
+        let total_n: u64 = lr.experts.iter().map(|e| e.n).sum();
+        let total_w: f64 = lr.experts.iter().map(|e| e.w_sum).sum();
+        for (e, er) in lr.experts.iter().enumerate() {
+            let (gu_by, gu_n) = self.n_of(phys, &format!("mlp.experts.{e}.gate_up_proj"));
+            let (dn_by, dn_n) = self.n_of(phys, &format!("mlp.experts.{e}.down_proj"));
+            if gu_n != er.n || dn_n != er.n || gu_by != er.by_visit || dn_by != er.by_visit {
+                return Err(format!(
+                    "layer {phys} expert {e}: route count {} vs gate_up {gu_n} / down {dn_n} rows",
+                    er.n
+                ));
+            }
+            sums[0] += gu_n;
+            sums[1] += dn_n;
+            let mut per_pass = BTreeMap::new();
+            for (&v, &c) in &er.by_visit {
+                *per_pass.entry(pass_of(&self.cfg, v)).or_insert(0u64) += c;
+            }
+            expert_json.push(serde_json::json!({
+                "expert": e, "N": er.n,
+                "count_by_pass": per_pass,
+                "count_by_visit": er.by_visit,
+                "traffic_share": if total_n > 0 { er.n as f64 / total_n as f64 } else { 0.0 },
+                "weight_share": if total_w > 0.0 { er.w_sum / total_w } else { 0.0 },
+                "route_weight_min": if er.n > 0 { Some(er.w_min) } else { None },
+                "route_weight_mean": if er.n > 0 { Some(er.w_sum / er.n as f64) } else { None },
+                "rank_hist": er.rank_hist,
+                "near_tie_as_last_selected": er.near_as_last,
+                "near_tie_as_first_unselected": er.near_as_next,
+            }));
+        }
+        let expected = top_k as u64 * tokens_visits;
+        if sums[0] != expected || sums[1] != expected || total_n != expected {
+            return Err(format!(
+                "layer {phys}: Σ_e N_e gate_up {} down {} route {total_n} != top_k·tokens·visits {expected}",
+                sums[0], sums[1]
+            ));
+        }
+
+        // Record list: (full name, accumulator key, K).
+        let mut records: Vec<(String, String, usize)> = Vec::new();
+        let q_name = format!("{pfx}attn.wq_du");
+        for (leaf, key) in [
+            ("wq_du", "attn.wq_du"),
+            ("wr_du", "attn.wq_du"),
+            ("gate_attn", "attn.wq_du"),
+            ("wk_dv", "attn.wk_dv"),
+            ("wv_dv", "attn.wv_dv"),
+            ("wo_ud", "attn.wo_ud"),
+        ] {
+            let k = self.layout.slot(key)?.k;
+            records.push((format!("{pfx}attn.{leaf}"), key.into(), k));
+        }
+        for e in 0..lr.experts.len() {
+            for leaf in ["gate_up_proj", "down_proj"] {
+                let key = format!("mlp.experts.{e}.{leaf}");
+                let k = self.layout.slot(&key)?.k;
+                records.push((format!("{pfx}{key}"), key, k));
+            }
+        }
+        let present: Vec<&(String, String, usize)> = records
+            .iter()
+            .filter(|(_, key, _)| self.n_of(phys, key).1 > 0)
+            .collect();
+        let missing: Vec<&str> = records
+            .iter()
+            .filter(|(_, key, _)| self.n_of(phys, key).1 == 0)
+            .map(|(n, _, _)| n.as_str())
+            .collect();
+
+        std::fs::create_dir_all(hfhs_dir).map_err(|e| e.to_string())?;
+        let path = hfhs_dir.join(format!("L{phys:02}.hfhs"));
+        let mut w = std::io::BufWriter::with_capacity(
+            8 << 20,
+            std::fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?,
+        );
+        let mut file_hash = Sha256::new();
+        let mut put = |w: &mut std::io::BufWriter<std::fs::File>, b: &[u8]| -> Result<(), String> {
+            file_hash.update(b);
+            w.write_all(b).map_err(|e| e.to_string())
+        };
+        put(&mut w, b"HFHS")?;
+        put(&mut w, &1u32.to_le_bytes())?;
+        put(&mut w, &(present.len() as u64).to_le_bytes())?;
+        put(&mut w, &0u64.to_le_bytes())?;
+        let mut names_json = serde_json::Map::new();
+        let mut cached: Option<(String, Vec<f32>, String)> = None; // (key, H, sha) of the last dense Q
+        let mut io_s = 0.0f64;
+        for (name, key, k) in &records {
+            let (by, n) = self.n_of(phys, key);
+            if n == 0 {
+                names_json.insert(
+                    name.clone(),
+                    serde_json::json!({"K": k, "N": 0, "N_by_visit": by, "missing": true}),
+                );
+                continue;
+            }
+            let cache_hit = matches!(&cached, Some((ck, _, _)) if ck == key);
+            let mut fresh: Option<(Vec<f32>, String)> = None;
+            if !cache_hit {
+                let slot = self.layout.slot(key)?;
+                let t = Instant::now();
+                let mut tri = vec![0.0f64; slot.elems];
+                file.read_exact_at(f64_bytes_mut(&mut tri), slot.off)
+                    .map_err(|e| format!("read accumulator {key}: {e}"))?;
+                io_s += t.elapsed().as_secs_f64();
+                let h = hessian_from_tri(&tri, *k, n);
+                drop(tri);
+                if let Some(i) = h.iter().position(|v| !v.is_finite()) {
+                    return Err(format!("{name}: non-finite H entry at {i}"));
+                }
+                if let Some(i) = (0..*k).find(|&i| h[i * k + i] < 0.0) {
+                    return Err(format!("{name}: negative diagonal at {i}"));
+                }
+                let sha = format!("{:x}", Sha256::digest(f32_bytes(&h)));
+                if key.starts_with("attn.") {
+                    cached = Some((key.clone(), h, sha));
+                } else {
+                    fresh = Some((h, sha));
+                }
+            }
+            // Dense records may alias the Q producer's cached matrix.
+            let (h, sha): (&[f32], &str) = match (&fresh, &cached) {
+                (Some((h, s)), _) => (h.as_slice(), s.as_str()),
+                (None, Some((_, h, s))) => (h.as_slice(), s.as_str()),
+                (None, None) => return Err("finalize: no matrix".into()),
+            };
+            put_record(&mut put, &mut w, name, *k, h)?;
+            let diag: Vec<f64> = (0..*k).map(|i| h[i * k + i] as f64).collect();
+            let alias =
+                (key == "attn.wq_du" && !name.ends_with(".wq_du")).then_some(q_name.as_str());
+            names_json.insert(name.clone(), record_json(*k, n, &by, sha, &diag, alias));
+        }
+        w.flush().map_err(|e| e.to_string())?;
+        let file_sha = format!("{:x}", file_hash.finalize());
+        let bytes = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+        let mut producer_map = serde_json::Map::new();
+        for leaf in ["wr_du", "gate_attn"] {
+            producer_map.insert(
+                format!("{pfx}attn.{leaf}"),
+                serde_json::Value::String(q_name.clone()),
+            );
+        }
+        let json = serde_json::json!({
+            "schema": "hipfire.inkling2.hfhs_layer.v1",
+            "layer": phys,
+            "hfhs": path.file_name().map(|s| s.to_string_lossy().to_string()),
+            "hfhs_bytes": bytes, "hfhs_sha256": file_sha,
+            "hfhs_format": "HFHS v1, F32 K x K of H = G/N, expert_idx 0, name = tensor name minus .weight",
+            "n_records": present.len(),
+            "missing_records": missing,
+            "accumulation": format!("G = sum x x^T: F32 within {GRAM_CHUNK}-row chunks (no FMA, r order), chunks summed in F64 in chunk order; H = G/N in F64 then rounded to F32"),
+            "run": run,
+            "visits": visits,
+            "producer_map": producer_map,
+            "names": names_json,
+            "route": {
+                "top_k": top_k,
+                "tokens_by_visit": lr.tokens_by_visit,
+                "token_visits": tokens_visits,
+                "sum_N_expected_top_k_tokens_visits": expected,
+                "sum_N_gate_up": sums[0], "sum_N_down": sums[1],
+                "near_tie_threshold": 1e-6,
+                "near_tie_token_visits": lr.near_tie_token_visits,
+                "margin_min": lr.margin_min,
+                "experts": expert_json,
+            },
+            "finalize_read_seconds": io_s,
+        });
+        std::fs::write(
+            hfhs_dir.join(format!("L{phys:02}.json")),
+            serde_json::to_string_pretty(&json).map_err(|e| e.to_string())? + "\n",
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::remove_file(Self::acc_path(&self.dir, phys)).ok();
+        Ok(json)
+    }
+}
+
+fn put_record(
+    put: &mut impl FnMut(&mut std::io::BufWriter<std::fs::File>, &[u8]) -> Result<(), String>,
+    w: &mut std::io::BufWriter<std::fs::File>,
+    name: &str,
+    k: usize,
+    h: &[f32],
+) -> Result<(), String> {
+    put(w, &(name.len() as u32).to_le_bytes())?;
+    put(w, name.as_bytes())?;
+    put(w, &0u32.to_le_bytes())?;
+    put(w, &(k as u32).to_le_bytes())?;
+    put(w, &1u32.to_le_bytes())?;
+    put(w, f32_bytes(h))
+}
+
+fn record_json(
+    k: usize,
+    n: u64,
+    by: &BTreeMap<usize, u64>,
+    sha: &str,
+    diag: &[f64],
+    alias_of: Option<&str>,
+) -> serde_json::Value {
+    let mean = diag.iter().sum::<f64>() / diag.len() as f64;
+    let min = diag.iter().copied().fold(f64::INFINITY, f64::min);
+    serde_json::json!({
+        "K": k, "N": n, "N_by_visit": by, "payload_sha256": sha,
+        "diag_mean": mean, "diag_min": min, "alias_of": alias_of,
+    })
+}
+
+impl CalibObserver for GramObserver {
+    fn wants(&self, phys: usize) -> bool {
+        self.layers.contains(&phys)
+    }
+
+    fn finished_after(&self, visit: usize) -> bool {
+        self.early_stop && visit >= self.last_visit
+    }
+
+    fn route(&self, phys: usize, visit: usize, info: &RouteInfo) -> Result<(), String> {
+        let mut map = self.route.lock().expect("route lock");
+        let lr = map.entry(phys).or_insert_with(|| LayerRoute {
+            top_k: info.top_k,
+            tokens_by_visit: BTreeMap::new(),
+            experts: (0..info.n_experts)
+                .map(|_| ExpertRoute {
+                    n: 0,
+                    by_visit: BTreeMap::new(),
+                    rank_hist: vec![0; info.top_k],
+                    w_sum: 0.0,
+                    w_min: f32::INFINITY,
+                    near_as_last: 0,
+                    near_as_next: 0,
+                })
+                .collect(),
+            near_tie_token_visits: 0,
+            margin_min: f32::INFINITY,
+        });
+        if lr.top_k != info.top_k || lr.experts.len() != info.n_experts {
+            return Err("route: top_k or expert count changed between visits".into());
+        }
+        *lr.tokens_by_visit.entry(visit).or_insert(0) += info.selected.len() as u64;
+        for (i, sel) in info.selected.iter().enumerate() {
+            let (margin, next) = info.margins[i];
+            let tie = margin < 1e-6;
+            lr.margin_min = lr.margin_min.min(margin);
+            if tie {
+                lr.near_tie_token_visits += 1;
+                if next < info.n_experts {
+                    lr.experts[next].near_as_next += 1;
+                }
+            }
+            for (rk, &(ex, w)) in sel.iter().enumerate() {
+                let er = &mut lr.experts[ex];
+                er.n += 1;
+                *er.by_visit.entry(visit).or_insert(0) += 1;
+                er.rank_hist[rk] += 1;
+                er.w_sum += w as f64;
+                er.w_min = er.w_min.min(w);
+                if tie && rk == info.top_k - 1 {
+                    er.near_as_last += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn observe(
+        &self,
+        phys: usize,
+        visit: usize,
+        site: CalibSite,
+        expert: Option<usize>,
+        rows: &[f32],
+        k: usize,
+        meta: &[RowMeta],
+    ) -> Result<(), String> {
+        let file = self
+            .files
+            .get(&phys)
+            .ok_or_else(|| format!("observe: layer {phys} is not accumulated"))?;
+        let key = site_key(site, expert)?;
+        let slot = self.layout.slot(&key)?;
+        let n = rows.len() / k;
+        if slot.k != k || rows.len() != n * k || meta.len() != n {
+            return Err(format!(
+                "{key}: K {k} / rows {} / meta {} do not match the slot",
+                rows.len(),
+                meta.len()
+            ));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let t0 = Instant::now();
+        let mut buf = vec![0.0f64; slot.elems];
+        file.read_exact_at(f64_bytes_mut(&mut buf), slot.off)
+            .map_err(|e| format!("read accumulator {key}: {e}"))?;
+        let t1 = Instant::now();
+        gram_add(&mut buf, rows, n, k);
+        let t2 = Instant::now();
+        file.write_all_at(f64_bytes_mut(&mut buf), slot.off)
+            .map_err(|e| format!("write accumulator {key}: {e}"))?;
+        let t3 = Instant::now();
+        let gram = if expert.is_some() {
+            &self.expert_gram_ns
+        } else {
+            &self.dense_gram_ns
+        };
+        gram.fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
+        self.io_ns
+            .fetch_add(((t1 - t0) + (t3 - t2)).as_nanos() as u64, Ordering::Relaxed);
+        self.rows_seen.fetch_add(n as u64, Ordering::Relaxed);
+        *self
+            .counts
+            .lock()
+            .expect("counts lock")
+            .entry((phys, key))
+            .or_default()
+            .entry(visit)
+            .or_insert(0) += n as u64;
+        Ok(())
+    }
+
+    fn end_visit(&self, _phys: usize, _visit: usize) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Raw F32 rows per layer/site for the held-out reconstruction metric.
+struct CheckObserver {
+    layers: BTreeSet<usize>,
+    last_visit: usize,
+    early_stop: bool,
+    cfg: Inkling2Config,
+    dir: PathBuf,
+    span_ids: Mutex<Vec<String>>,
+    pending: Mutex<Vec<CheckRows>>,
+    state: Mutex<BTreeMap<(usize, CalibSite), CheckFile>>,
+}
+
+struct CheckRows {
+    phys: usize,
+    visit: usize,
+    site: CalibSite,
+    expert: Option<usize>,
+    k: usize,
+    rows: Vec<f32>,
+    meta: Vec<RowMeta>,
+    spans: Vec<String>,
+}
+
+struct CheckFile {
+    file: std::io::BufWriter<std::fs::File>,
+    k: usize,
+    rows: u64,
+    segments: Vec<serde_json::Value>,
+}
+
+impl CheckObserver {
+    fn new(
+        cfg: &Inkling2Config,
+        layers: &[usize],
+        dir: &Path,
+        early_stop: bool,
+    ) -> Result<Self, String> {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let set: BTreeSet<usize> = layers.iter().copied().collect();
+        Ok(Self {
+            last_visit: last_visit_of(cfg, &set),
+            layers: set,
+            early_stop,
+            cfg: cfg.clone(),
+            dir: dir.to_path_buf(),
+            span_ids: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
+            state: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// Names (manifest ids) of the sequences of the next `forward` call.
+    fn set_batch(&self, ids: Vec<String>) {
+        *self.span_ids.lock().expect("span lock") = ids;
+    }
+
+    /// Writes the per-layer index JSON files; returns `(path, sha256)` of each.
+    fn finish(&self) -> Result<Vec<(PathBuf, String)>, String> {
+        use std::io::Write as _;
+        let mut state = self.state.lock().expect("state lock");
+        let mut by_layer: BTreeMap<usize, serde_json::Map<String, serde_json::Value>> =
+            BTreeMap::new();
+        for ((phys, site), cf) in state.iter_mut() {
+            cf.file.flush().map_err(|e| e.to_string())?;
+            by_layer.entry(*phys).or_default().insert(
+                site.file_name().to_string(),
+                serde_json::json!({
+                    "file": format!("L{phys:02}.{}.f32", site.file_name()),
+                    "K": cf.k, "rows": cf.rows, "segments": cf.segments,
+                }),
+            );
+        }
+        let mut out = Vec::new();
+        for (phys, sites) in by_layer {
+            let path = self.dir.join(format!("L{phys:02}.index.json"));
+            let body = serde_json::to_string_pretty(&serde_json::json!({
+                "schema": "hipfire.inkling2.check_rows.v1",
+                "layer": phys,
+                "dtype": "F32 little-endian, row-major, rows x K",
+                "sites": sites,
+            }))
+            .map_err(|e| e.to_string())?
+                + "\n";
+            std::fs::write(&path, &body).map_err(|e| e.to_string())?;
+            out.push((path, format!("{:x}", Sha256::digest(body.as_bytes()))));
+        }
+        Ok(out)
+    }
+}
+
+impl CalibObserver for CheckObserver {
+    fn wants(&self, phys: usize) -> bool {
+        self.layers.contains(&phys)
+    }
+
+    fn finished_after(&self, visit: usize) -> bool {
+        self.early_stop && visit >= self.last_visit
+    }
+
+    fn route(&self, _phys: usize, _visit: usize, _info: &RouteInfo) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn observe(
+        &self,
+        phys: usize,
+        visit: usize,
+        site: CalibSite,
+        expert: Option<usize>,
+        rows: &[f32],
+        k: usize,
+        meta: &[RowMeta],
+    ) -> Result<(), String> {
+        if rows.len() != meta.len() * k {
+            return Err("check observe: rows/meta mismatch".into());
+        }
+        let spans = self.span_ids.lock().expect("span lock").clone();
+        self.pending.lock().expect("pending lock").push(CheckRows {
+            phys,
+            visit,
+            site,
+            expert,
+            k,
+            rows: rows.to_vec(),
+            meta: meta.to_vec(),
+            spans,
+        });
+        Ok(())
+    }
+
+    fn end_visit(&self, phys: usize, visit: usize) -> Result<(), String> {
+        use std::io::Write as _;
+        let mut mine: Vec<CheckRows> = {
+            let mut p = self.pending.lock().expect("pending lock");
+            let (mine, rest): (Vec<_>, Vec<_>) = p
+                .drain(..)
+                .partition(|c| c.phys == phys && c.visit == visit);
+            *p = rest;
+            mine
+        };
+        mine.sort_by_key(|c| (c.site, c.expert));
+        let mut state = self.state.lock().expect("state lock");
+        for c in mine {
+            if !state.contains_key(&(phys, c.site)) {
+                let p = self
+                    .dir
+                    .join(format!("L{phys:02}.{}.f32", c.site.file_name()));
+                let f = std::fs::File::create(&p)
+                    .map_err(|e| format!("create {}: {e}", p.display()))?;
+                state.insert(
+                    (phys, c.site),
+                    CheckFile {
+                        file: std::io::BufWriter::with_capacity(8 << 20, f),
+                        k: c.k,
+                        rows: 0,
+                        segments: Vec::new(),
+                    },
+                );
+            }
+            let cf = state.get_mut(&(phys, c.site)).expect("inserted");
+            if cf.k != c.k {
+                return Err("check observe: K changed within a site".into());
+            }
+            cf.file
+                .write_all(f32_bytes(&c.rows))
+                .map_err(|e| e.to_string())?;
+            let n = c.meta.len();
+            cf.segments.push(serde_json::json!({
+                "visit": c.visit, "pass": pass_of(&self.cfg, c.visit), "expert": c.expert,
+                "row0": cf.rows, "rows": n,
+                "span": c.meta.iter().map(|m| c.spans.get(m.seq as usize).cloned().unwrap_or_default()).collect::<Vec<_>>(),
+                "pos": c.meta.iter().map(|m| m.pos).collect::<Vec<_>>(),
+                "rank": c.expert.map(|_| c.meta.iter().map(|m| m.rank).collect::<Vec<_>>()),
+                "weight": c.expert.map(|_| c.meta.iter().map(|m| m.weight).collect::<Vec<_>>()),
+                "margin": c.expert.map(|_| c.meta.iter().map(|m| m.margin).collect::<Vec<_>>()),
+            }));
+            cf.rows += n as u64;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Run bookkeeping
+// ---------------------------------------------------------------------------
+
+/// `(VmRSS, VmHWM)` of this process in KiB.
+fn rss_kib() -> (u64, u64) {
+    let mut out = (0, 0);
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+        for line in s.lines() {
+            let kib = |l: &str| {
+                l.split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            };
+            if line.starts_with("VmRSS:") {
+                out.0 = kib(line);
+            } else if line.starts_with("VmHWM:") {
+                out.1 = kib(line);
+            }
+        }
+    }
+    out
+}
+
+/// Bytes actually allocated under `dir` (sparse files count their blocks).
+fn disk_bytes(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let mut total = 0u64;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for ent in rd.flatten() {
+        let Ok(md) = ent.metadata() else { continue };
+        total += if md.is_dir() {
+            disk_bytes(&ent.path())
+        } else {
+            md.blocks() * 512
+        };
+    }
+    total
+}
+
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1u64 << 30) as f64
+}
+
+/// One calibration-manifest span: tokens `ids[offset .. offset + len]`.
+struct Span {
+    id: String,
+    source: String,
+    offset: usize,
+    len: usize,
+    role: String,
+}
+
+/// Parses `calib-manifest.json` (an array, or `{"spans": [...]}`, of
+/// `{id, source, offset, len, role}`; `offset` counts u32 tokens into the ids
+/// file) and returns the spans of `role` in manifest order plus the ids.
+fn load_spans(
+    manifest: &Path,
+    ids_path: &Path,
+    role: &str,
+    vocab: usize,
+) -> Result<(Vec<Span>, Vec<u32>), String> {
+    let text = std::fs::read_to_string(manifest)
+        .map_err(|e| format!("read {}: {e}", manifest.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("manifest: {e}"))?;
+    let arr = match &v {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Object(o) => o
+            .get("spans")
+            .and_then(|s| s.as_array())
+            .ok_or("manifest: no `spans` array")?,
+        _ => return Err("manifest: expected an array or {spans: []}".into()),
+    };
+    let bytes = std::fs::read(ids_path).map_err(|e| format!("read {}: {e}", ids_path.display()))?;
+    if bytes.len() % 4 != 0 {
+        return Err("ids file is not a whole number of u32".into());
+    }
+    let ids: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let mut spans = Vec::new();
+    for (i, s) in arr.iter().enumerate() {
+        let get_str = |k: &str| match s.get(k) {
+            Some(serde_json::Value::String(x)) => x.clone(),
+            Some(x) => x.to_string(),
+            None => String::new(),
+        };
+        let num = |k: &str| {
+            s.get(k)
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| format!("manifest span {i}: missing numeric `{k}`"))
+        };
+        let (offset, len) = (num("offset")? as usize, num("len")? as usize);
+        if get_str("role") != role {
+            continue;
+        }
+        if len == 0 || offset + len > ids.len() {
+            return Err(format!(
+                "manifest span {i}: [{offset}, +{len}) outside the {} ids",
+                ids.len()
+            ));
+        }
+        if let Some(bad) = ids[offset..offset + len]
+            .iter()
+            .find(|&&t| t as usize >= vocab)
+        {
+            return Err(format!(
+                "manifest span {i}: token id {bad} >= vocab {vocab}"
+            ));
+        }
+        spans.push(Span {
+            id: get_str("id"),
+            source: get_str("source"),
+            offset,
+            len,
+            role: role.to_string(),
+        });
+    }
+    if spans.is_empty() {
+        return Err(format!("manifest: no spans with role `{role}`"));
+    }
+    Ok((spans, ids))
+}
+
+/// Batches of span indices: equal length within a batch (the teacher's rule),
+/// ascending length, manifest order within a length, at most `batch` spans.
+fn plan_batches(spans: &[Span], batch: usize) -> Vec<Vec<usize>> {
+    let mut by_len: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, s) in spans.iter().enumerate() {
+        by_len.entry(s.len).or_default().push(i);
+    }
+    by_len
+        .into_values()
+        .flat_map(|v| v.chunks(batch).map(|c| c.to_vec()).collect::<Vec<_>>())
+        .collect()
+}
+
+fn config_of(model: &Path) -> Result<Inkling2Config, String> {
+    let hfq = HfqFile::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+    Inkling2Config::from_metadata_json(&hfq.metadata_json)
 }
 
 // ---------------------------------------------------------------------------
@@ -1231,7 +2541,7 @@ fn build_ref(a: &Args) -> Result<(), String> {
             "inkling_kld ref: chunks {b0}..{b1} ({} positions)",
             seqs.len() * run_len
         );
-        let hidden = teacher.forward(&seqs)?;
+        let hidden = teacher.forward(&seqs, None)?;
         for (si, c) in (b0..b1).enumerate() {
             let rows = &hidden[si * run_len + window.score_from..si * run_len + window.score_to];
             let logits = teacher.head(rows)?;
@@ -1333,7 +2643,7 @@ fn fidelity(a: &Args) -> Result<(), String> {
     let teacher = Teacher { w: &w, cfg: &cfg };
     let seqs: Vec<&[u32]> = tokens.chunks_exact(n_ctx).collect();
     let t0 = Instant::now();
-    let hidden = teacher.forward(&seqs)?;
+    let hidden = teacher.forward(&seqs, None)?;
     let logits = teacher.head(&hidden)?;
     let teacher_s = t0.elapsed().as_secs_f64();
     eprintln!(
@@ -1787,12 +3097,610 @@ fn pair(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// calib (Hessian / check-row capture over the calibration manifest)
+// ---------------------------------------------------------------------------
+
+fn calib(a: &Args) -> Result<(), String> {
+    let t_all = Instant::now();
+    let source = a.path("source")?;
+    let model = a.path("model")?;
+    let manifest = a.path("manifest")?;
+    let ids_path = a.path("ids")?;
+    let out_dir = a.path("out-dir")?;
+    let role =
+        a.0.get("role")
+            .cloned()
+            .unwrap_or_else(|| "calib".to_string());
+    if role != "calib" && role != "check" {
+        return Err(format!("--role: `calib` or `check`, not {role}"));
+    }
+    let batch_spans = a.num("batch-spans", 8)?.max(1);
+    let cfg = config_of(&model)?;
+    let layers = parse_layers(a.0.get("layers"), cfg.n_phys)?;
+    let (spans, ids) = load_spans(&manifest, &ids_path, &role, cfg.vocab_size)?;
+    let batches = plan_batches(&spans, batch_spans);
+    let total_tokens: usize = spans.iter().map(|s| s.len).sum();
+    std::fs::create_dir_all(&out_dir).map_err(|e| format!("mkdir {}: {e}", out_dir.display()))?;
+    eprintln!(
+        "inkling_kld calib: role {role}, {} spans / {total_tokens} tokens in {} batches (<= {batch_spans} spans), layers {layers:?}",
+        spans.len(),
+        batches.len()
+    );
+    let t0 = Instant::now();
+    let w = SourceWeights::open(&source)?;
+    let load_s = t0.elapsed().as_secs_f64();
+    let (rss0, _) = rss_kib();
+    eprintln!(
+        "inkling_kld calib: source dense F32 ready ({} tensors) in {load_s:.0}s, RSS {:.1} GiB",
+        w.dense.len(),
+        rss0 as f64 / (1u64 << 20) as f64
+    );
+    let teacher = Teacher { w: &w, cfg: &cfg };
+    let n_experts = w
+        .dense(&format!("model.llm.layers.{}.mlp.gate.weight", layers[0]))?
+        .len()
+        / cfg.n_embd;
+    let run = serde_json::json!({
+        "role": role,
+        "manifest": artifact_id(&manifest)?,
+        "ids": artifact_id(&ids_path)?,
+        "source": {"path": source.display().to_string(),
+                   "bytes": std::fs::metadata(&source).map_err(|e| e.to_string())?.len()},
+        "model_for_config_and_tokenizer": model.display().to_string(),
+        "binary": artifact_id(&std::env::current_exe().map_err(|e| e.to_string())?)?,
+        "n_spans": spans.len(), "tokens": total_tokens, "batch_spans": batch_spans,
+        "spans": spans.iter().map(|s| serde_json::json!({
+            "id": s.id, "source": s.source, "offset": s.offset, "len": s.len, "role": s.role,
+        })).collect::<Vec<_>>(),
+        "layers": layers,
+        "engine_commit": engine_commit(),
+    });
+    let mut disk_peak = 0u64;
+    let mut batch_log = Vec::new();
+    let t_fwd = Instant::now();
+    let visits_run;
+    let gram_obs;
+    let check_obs;
+    match role.as_str() {
+        "calib" => {
+            gram_obs = Some(GramObserver::new(
+                &cfg,
+                &layers,
+                &out_dir.join("acc"),
+                n_experts,
+                true,
+            )?);
+            check_obs = None;
+            visits_run = gram_obs.as_ref().map_or(0, |o| o.last_visit + 1);
+        }
+        _ => {
+            gram_obs = None;
+            check_obs = Some(CheckObserver::new(
+                &cfg,
+                &layers,
+                &out_dir.join("check"),
+                true,
+            )?);
+            visits_run = check_obs.as_ref().map_or(0, |o| o.last_visit + 1);
+        }
+    }
+    let obs: &dyn CalibObserver = match (&gram_obs, &check_obs) {
+        (Some(g), _) => g,
+        (_, Some(c)) => c,
+        _ => unreachable!("one observer"),
+    };
+    for (bi, b) in batches.iter().enumerate() {
+        let seqs: Vec<&[u32]> = b
+            .iter()
+            .map(|&i| &ids[spans[i].offset..spans[i].offset + spans[i].len])
+            .collect();
+        if let Some(c) = &check_obs {
+            c.set_batch(b.iter().map(|&i| spans[i].id.clone()).collect());
+        }
+        let tb = Instant::now();
+        teacher.forward(&seqs, Some(obs))?;
+        let (rss, hwm) = rss_kib();
+        let disk = disk_bytes(&out_dir);
+        disk_peak = disk_peak.max(disk);
+        let secs = tb.elapsed().as_secs_f64();
+        let toks: usize = b.iter().map(|&i| spans[i].len).sum();
+        eprintln!(
+            "inkling_kld calib: batch {}/{} ({} spans, {toks} tokens) {secs:.0}s ({:.1} s/1K tokens), RSS {:.1} GiB (peak {:.1}), disk {:.1} GiB",
+            bi + 1,
+            batches.len(),
+            b.len(),
+            secs / (toks as f64 / 1000.0),
+            rss as f64 / (1u64 << 20) as f64,
+            hwm as f64 / (1u64 << 20) as f64,
+            gib(disk)
+        );
+        batch_log.push(serde_json::json!({
+            "batch": bi, "spans": b.len(), "tokens": toks, "seconds": secs,
+            "seconds_per_1k_tokens": secs / (toks as f64 / 1000.0),
+            "rss_kib": rss, "rss_hwm_kib": hwm, "disk_bytes": disk,
+        }));
+    }
+    let forward_s = t_fwd.elapsed().as_secs_f64();
+
+    let t_fin = Instant::now();
+    let mut outputs = Vec::new();
+    if let Some(g) = &gram_obs {
+        let hfhs_dir = out_dir.join("hfhs");
+        for &l in &layers {
+            let tl = Instant::now();
+            let j = g.finalize_layer(l, &hfhs_dir, &run)?;
+            let disk = disk_bytes(&out_dir);
+            disk_peak = disk_peak.max(disk);
+            let missing = j["missing_records"].as_array().map_or(0, Vec::len);
+            eprintln!(
+                "inkling_kld calib: layer {l} -> {} ({:.2} GiB, sha256 {}), {missing} records without data, {:.0}s, disk {:.1} GiB",
+                j["hfhs"].as_str().unwrap_or("?"),
+                gib(j["hfhs_bytes"].as_u64().unwrap_or(0)),
+                j["hfhs_sha256"].as_str().unwrap_or("?"),
+                tl.elapsed().as_secs_f64(),
+                gib(disk)
+            );
+            outputs.push(serde_json::json!({
+                "layer": l, "hfhs_bytes": j["hfhs_bytes"], "hfhs_sha256": j["hfhs_sha256"],
+                "missing_records": missing,
+            }));
+        }
+        std::fs::remove_dir_all(out_dir.join("acc")).ok();
+    }
+    if let Some(c) = &check_obs {
+        for (p, sha) in c.finish()? {
+            outputs.push(serde_json::json!({"index": p.display().to_string(), "sha256": sha}));
+        }
+        disk_peak = disk_peak.max(disk_bytes(&out_dir));
+    }
+    let finalize_s = t_fin.elapsed().as_secs_f64();
+    let (_, hwm) = rss_kib();
+    let ns = |x: &AtomicU64| x.load(Ordering::Relaxed) as f64 / 1e9;
+    let summary = serde_json::json!({
+        "schema": "hipfire.inkling2.calib_run.v1",
+        "run": run,
+        "visits_run": visits_run,
+        "phases": {
+            "load_source_s": load_s,
+            "forward_wall_s": forward_s,
+            "finalize_s": finalize_s,
+            "total_s": t_all.elapsed().as_secs_f64(),
+            "gram_expert_thread_s": gram_obs.as_ref().map(|g| ns(&g.expert_gram_ns)),
+            "gram_dense_wall_s": gram_obs.as_ref().map(|g| ns(&g.dense_gram_ns)),
+            "accumulator_io_thread_s": gram_obs.as_ref().map(|g| ns(&g.io_ns)),
+            "rows_accumulated": gram_obs.as_ref().map(|g| g.rows_seen.load(Ordering::Relaxed)),
+            "threads": rayon::current_num_threads(),
+        },
+        "forward_s_per_1k_tokens": forward_s / (total_tokens as f64 / 1000.0),
+        "rss_hwm_kib": hwm,
+        "disk_peak_bytes": disk_peak,
+        "batches": batch_log,
+        "outputs": outputs,
+    });
+    std::fs::write(
+        out_dir.join(format!("calib-run-{role}.json")),
+        serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())? + "\n",
+    )
+    .map_err(|e| e.to_string())?;
+    eprintln!(
+        "inkling_kld calib: done in {:.0}s (forward {forward_s:.0}s, finalize {finalize_s:.0}s), peak RSS {:.1} GiB, peak disk {:.1} GiB",
+        t_all.elapsed().as_secs_f64(),
+        hwm as f64 / (1u64 << 20) as f64,
+        gib(disk_peak)
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// srcdump (the quantizer's source F32 tensors, for the offline solver)
+// ---------------------------------------------------------------------------
+
+fn srcdump(a: &Args) -> Result<(), String> {
+    let source = a.path("source")?;
+    let model = a.path("model")?;
+    let out_dir = a.path("out-dir")?;
+    let verify = a.num("verify", 1)? != 0;
+    let cfg = config_of(&model)?;
+    let layers = parse_layers(a.0.get("layers"), cfg.n_phys)?;
+    std::fs::create_dir_all(&out_dir).map_err(|e| format!("mkdir {}: {e}", out_dir.display()))?;
+    let t0 = Instant::now();
+    let w = SourceWeights::open(&source)?;
+    eprintln!(
+        "inkling_kld srcdump: source ready in {:.0}s",
+        t0.elapsed().as_secs_f64()
+    );
+    let n_experts = w
+        .dense(&format!("model.llm.layers.{}.mlp.gate.weight", layers[0]))?
+        .len()
+        / cfg.n_embd;
+    for &l in &layers {
+        use std::io::Write as _;
+        let tl = Instant::now();
+        let pfx = format!("model.llm.layers.{l}.");
+        let path = out_dir.join(format!("L{l:02}.f32"));
+        let mut bw = std::io::BufWriter::with_capacity(
+            8 << 20,
+            std::fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?,
+        );
+        let mut hash = Sha256::new();
+        let mut off = 0u64;
+        let mut tensors: Vec<serde_json::Value> = Vec::new();
+        let mut emit = |bw: &mut std::io::BufWriter<std::fs::File>,
+                        name: String,
+                        shape: Vec<usize>,
+                        v: &[f32]|
+         -> Result<(), String> {
+            if shape.iter().product::<usize>() != v.len() {
+                return Err(format!("{name}: shape {shape:?} vs {} elements", v.len()));
+            }
+            let b = f32_bytes(v);
+            hash.update(b);
+            bw.write_all(b).map_err(|e| e.to_string())?;
+            tensors.push(serde_json::json!({
+                "name": name, "offset_bytes": off, "shape": shape, "numel": v.len(),
+            }));
+            off += b.len() as u64;
+            Ok(())
+        };
+        for leaf in ["wq_du", "wk_dv", "wv_dv", "wr_du", "gate_attn", "wo_ud"] {
+            let name = format!("{pfx}attn.{leaf}.weight");
+            let (shape, v) = w.dense_shaped(&name)?;
+            emit(&mut bw, name, shape.to_vec(), v)?;
+        }
+        for leaf in ["mlp.gate.weight", "mlp.gate.bias"] {
+            let name = format!("{pfx}{leaf}");
+            if let Ok((shape, v)) = w.dense_shaped(&name) {
+                emit(&mut bw, name, shape.to_vec(), v)?;
+            } else if leaf.ends_with("weight") {
+                return Err(format!("source: tensor not found: {name}"));
+            }
+        }
+        for e in 0..n_experts {
+            let (rows, cols, gu) = w.gate_up(l, e)?;
+            emit(
+                &mut bw,
+                format!("{pfx}mlp.experts.{e}.gate_up_proj.weight"),
+                vec![rows, cols],
+                &gu,
+            )?;
+            let (rows, cols, dn) = w.down(l, e)?;
+            emit(
+                &mut bw,
+                format!("{pfx}mlp.experts.{e}.down_proj.weight"),
+                vec![rows, cols],
+                &dn,
+            )?;
+        }
+        bw.flush().map_err(|e| e.to_string())?;
+        drop(bw);
+        let sha = format!("{:x}", hash.finalize());
+        let kind = |stem: &str| {
+            if w.st
+                .tensor_data(&format!("{pfx}mlp.experts.{stem}_amax"))
+                .is_some()
+            {
+                "nvfp4"
+            } else {
+                "mxfp8"
+            }
+        };
+        let mut verify_json = serde_json::Value::Null;
+        if verify {
+            let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+            // SAFETY: read-only map of a file this process just wrote and closed.
+            let mm = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| e.to_string())?;
+            let by_name: HashMap<&str, (u64, usize)> = tensors
+                .iter()
+                .map(|t| {
+                    (
+                        t["name"].as_str().expect("name"),
+                        (
+                            t["offset_bytes"].as_u64().expect("offset"),
+                            t["numel"].as_u64().expect("numel") as usize,
+                        ),
+                    )
+                })
+                .collect();
+            let equal = |name: &str, want: &[f32]| -> Result<bool, String> {
+                let &(o, n) = by_name
+                    .get(name)
+                    .ok_or_else(|| format!("{name} not dumped"))?;
+                if n != want.len() {
+                    return Ok(false);
+                }
+                let got = &mm[o as usize..o as usize + n * 4];
+                Ok(got
+                    .chunks_exact(4)
+                    .zip(want)
+                    .all(|(c, &x)| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) == x.to_bits()))
+            };
+            // (1) every expert tensor equals the per-token reference's own read
+            //     (`WeightSource::f32`, the path `forward_token_cached` uses);
+            // (2) the regroup indices re-derived independently from the raw
+            //     decoder output: grouped gate j = raw row 2j, up j = raw row 2j+1.
+            let results: Vec<Result<(bool, bool), String>> = (0..n_experts)
+                .into_par_iter()
+                .map(|e| {
+                    let gu_name = format!("{pfx}mlp.experts.{e}.gate_up_proj.weight");
+                    let dn_name = format!("{pfx}mlp.experts.{e}.down_proj.weight");
+                    let (gs, gv) = w.f32(&gu_name)?;
+                    let (ds, dv) = w.f32(&dn_name)?;
+                    let same = gs == vec![2 * cfg.inter, cfg.n_embd]
+                        && ds == vec![cfg.n_embd, cfg.inter]
+                        && equal(&gu_name, &gv)?
+                        && equal(&dn_name, &dv)?;
+                    let (rows, cols, raw) =
+                        w.decode_stacked(&format!("{pfx}mlp.experts.w13_weight"), e)?;
+                    let inter = rows / 2;
+                    let mut regroup = true;
+                    let &(o, n) = by_name.get(gu_name.as_str()).ok_or("gate_up not dumped")?;
+                    let got = &mm[o as usize..o as usize + n * 4];
+                    let at = |row: usize, c: usize| {
+                        let i = (row * cols + c) * 4;
+                        u32::from_le_bytes([got[i], got[i + 1], got[i + 2], got[i + 3]])
+                    };
+                    for j in 0..inter {
+                        for c in 0..cols {
+                            regroup &= at(j, c) == raw[(2 * j) * cols + c].to_bits()
+                                && at(inter + j, c) == raw[(2 * j + 1) * cols + c].to_bits();
+                        }
+                    }
+                    Ok((same, regroup))
+                })
+                .collect();
+            let (mut same, mut regroup) = (0usize, 0usize);
+            for r in results {
+                let (s, g) = r?;
+                same += usize::from(s);
+                regroup += usize::from(g);
+            }
+            // Attention/router tensors, re-read through the reference's path.
+            let mut dense_same = 0usize;
+            let mut dense_total = 0usize;
+            for t in &tensors {
+                let name = t["name"].as_str().expect("name");
+                if name.contains(".mlp.experts.") {
+                    continue;
+                }
+                dense_total += 1;
+                let (_, v) = w.f32(name)?;
+                dense_same += usize::from(equal(name, &v)?);
+            }
+            verify_json = serde_json::json!({
+                "experts": n_experts,
+                "experts_bit_identical_to_reference_read": same,
+                "experts_regroup_independently_verified": regroup,
+                "dense_tensors": dense_total, "dense_bit_identical": dense_same,
+            });
+            if same != n_experts || regroup != n_experts || dense_same != dense_total {
+                return Err(format!(
+                    "layer {l}: srcdump verification failed: {verify_json}"
+                ));
+            }
+        }
+        let json = serde_json::json!({
+            "schema": "hipfire.inkling2.srcdump.v1",
+            "layer": l,
+            "file": path.file_name().map(|s| s.to_string_lossy().to_string()),
+            "dtype": "F32 little-endian, row-major",
+            "bytes": off, "sha256": sha,
+            "formats": {"w13": kind("w13_weight"), "w2": kind("w2_weight")},
+            "decode": "hipfire-quantize dequant.rs strict NVFP4 (amax/outer_scale_denominator) / MXFP8 E8M0; w13 [g0,u0,g1,u1..] regrouped to [gate..., up...]",
+            "tensors": tensors,
+            "verify": verify_json,
+            "engine_commit": engine_commit(),
+        });
+        std::fs::write(
+            out_dir.join(format!("L{l:02}.json")),
+            serde_json::to_string_pretty(&json).map_err(|e| e.to_string())? + "\n",
+        )
+        .map_err(|e| e.to_string())?;
+        eprintln!(
+            "inkling_kld srcdump: layer {l} ({} / {}) {:.2} GiB sha256 {sha} in {:.0}s, verify {verify_json}",
+            kind("w13_weight"),
+            kind("w2_weight"),
+            gib(off),
+            tl.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// captest (observer on vs off, count identity, Gram vs raw rows)
+// ---------------------------------------------------------------------------
+
+/// `Σ_r x xᵀ` in F64 of the rows of one check site (all visits, or one expert).
+fn naive_gram_from_check(
+    dir: &Path,
+    phys: usize,
+    site: &str,
+    expert: Option<usize>,
+) -> Result<(usize, u64, Vec<f64>), String> {
+    let idx: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(format!("L{phys:02}.index.json")))
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let s = &idx["sites"][site];
+    let k = s["K"].as_u64().ok_or("check index: K")? as usize;
+    let bytes = std::fs::read(dir.join(s["file"].as_str().ok_or("check index: file")?))
+        .map_err(|e| e.to_string())?;
+    let mut g = vec![0.0f64; k * k];
+    let mut n = 0u64;
+    for seg in s["segments"].as_array().ok_or("check index: segments")? {
+        if expert.is_some() && seg["expert"].as_u64().map(|e| e as usize) != expert {
+            continue;
+        }
+        let (row0, rows) = (
+            seg["row0"].as_u64().ok_or("row0")? as usize,
+            seg["rows"].as_u64().ok_or("rows")? as usize,
+        );
+        for r in row0..row0 + rows {
+            let x: Vec<f64> = bytes[r * k * 4..(r + 1) * k * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
+                .collect();
+            for i in 0..k {
+                for j in 0..k {
+                    g[i * k + j] += x[i] * x[j];
+                }
+            }
+            n += 1;
+        }
+    }
+    Ok((k, n, g))
+}
+
+fn captest(a: &Args) -> Result<(), String> {
+    let source = a.path("source")?;
+    let model = a.path("model")?;
+    let slice = a.path("slice")?;
+    let out_dir = a.path("out-dir")?;
+    let n_ctx = a.num("n-ctx", 64)?;
+    let n_chunk = a.num("chunks", 2)?;
+    let (mut cfg, tokens) = corpus_windows(&model, &slice, n_ctx, n_chunk)?;
+    if let Some(sw) = a.opt_num("sliding-window")? {
+        cfg.sliding_window = sw;
+    }
+    if let Some(lf) = a.opt_num("log-floor")? {
+        cfg.log_floor = lf;
+    }
+    let default_layers = "5,6".to_string();
+    let layers = parse_layers(a.0.get("layers").or(Some(&default_layers)), cfg.n_phys)?;
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    let w = SourceWeights::open(&source)?;
+    let teacher = Teacher { w: &w, cfg: &cfg };
+    let n_experts = w
+        .dense(&format!("model.llm.layers.{}.mlp.gate.weight", layers[0]))?
+        .len()
+        / cfg.n_embd;
+    let seqs: Vec<&[u32]> = tokens.chunks_exact(n_ctx).collect();
+    let n_tok = seqs.len() * n_ctx;
+
+    let t0 = Instant::now();
+    let hidden_off = teacher.forward(&seqs, None)?;
+    let logits_off = teacher.head(&hidden_off)?;
+    let off_s = t0.elapsed().as_secs_f64();
+
+    let gram = GramObserver::new(&cfg, &layers, &out_dir.join("acc"), n_experts, false)?;
+    let check = CheckObserver::new(&cfg, &layers, &out_dir.join("check"), false)?;
+    check.set_batch((0..seqs.len()).map(|i| format!("chunk{i}")).collect());
+    let tee = Tee(vec![&gram, &check]);
+    let t1 = Instant::now();
+    let hidden_on = teacher.forward(&seqs, Some(&tee))?;
+    let logits_on = teacher.head(&hidden_on)?;
+    let on_s = t1.elapsed().as_secs_f64();
+    let hidden_equal = hidden_off.len() == hidden_on.len()
+        && hidden_off.iter().zip(&hidden_on).all(|(a, b)| {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+        });
+    let logits_equal = logits_off.len() == logits_on.len()
+        && logits_off
+            .iter()
+            .zip(&logits_on)
+            .all(|(x, y)| x.to_bits() == y.to_bits());
+    let index = check.finish()?;
+
+    // Finalize (also enforces Σ_e N_e == top_k·tokens·visits for gate_up and down).
+    let run = serde_json::json!({"role": "captest", "tokens": n_tok});
+    let hfhs_dir = out_dir.join("hfhs");
+    let mut layer_receipts = Vec::new();
+    let mut worst_rel = 0.0f64;
+    for &l in &layers {
+        let j = gram.finalize_layer(l, &hfhs_dir, &run)?;
+        let sc = hipfire_quantize::hessian_io::HessianSidecar::open(
+            &hfhs_dir.join(format!("L{l:02}.hfhs")),
+        )
+        .map_err(|e| format!("reader: {e}"))?;
+        let pfx = format!("model.llm.layers.{l}.");
+        // Gram vs an independent F64 recomputation from the raw check rows.
+        let mut probes: Vec<(String, &str, Option<usize>)> = vec![
+            (format!("{pfx}attn.wq_du"), "q", None),
+            (format!("{pfx}attn.wk_dv"), "k", None),
+            (format!("{pfx}attn.wo_ud"), "attn_out", None),
+        ];
+        let busiest = j["route"]["experts"]
+            .as_array()
+            .and_then(|v| v.iter().max_by_key(|e| e["N"].as_u64().unwrap_or(0)))
+            .and_then(|e| e["expert"].as_u64())
+            .map(|e| e as usize)
+            .ok_or("no experts")?;
+        probes.push((
+            format!("{pfx}mlp.experts.{busiest}.gate_up_proj"),
+            "gate_up",
+            Some(busiest),
+        ));
+        probes.push((
+            format!("{pfx}mlp.experts.{busiest}.down_proj"),
+            "down",
+            Some(busiest),
+        ));
+        let mut probe_json = Vec::new();
+        for (name, site, ex) in probes {
+            let (k, n, g) = naive_gram_from_check(&out_dir.join("check"), l, site, ex)?;
+            let h = sc
+                .get(&name, 0)
+                .ok_or_else(|| format!("HFHS has no record {name}"))?;
+            let n_json = j["names"][&name]["N"].as_u64().unwrap_or(0);
+            if h.k != k || n_json != n {
+                return Err(format!("{name}: K {} vs {k}, N {n_json} vs rows {n}", h.k));
+            }
+            let gmax = g.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            let mut worst = 0.0f64;
+            for i in 0..k {
+                for jx in 0..k {
+                    let got = h.at(i, jx) * n as f64;
+                    worst = worst.max((got - g[i * k + jx]).abs() / gmax);
+                }
+            }
+            worst_rel = worst_rel.max(worst);
+            probe_json.push(serde_json::json!({"name": name, "K": k, "N": n, "max_rel_err_vs_f64_naive": worst}));
+        }
+        layer_receipts.push(serde_json::json!({
+            "layer": l,
+            "sum_N_gate_up": j["route"]["sum_N_gate_up"], "sum_N_down": j["route"]["sum_N_down"],
+            "sum_N_expected": j["route"]["sum_N_expected_top_k_tokens_visits"],
+            "visits": j["visits"], "records": j["n_records"], "probes": probe_json,
+        }));
+    }
+    let receipt = serde_json::json!({
+        "schema": "hipfire.inkling2.captest.v1",
+        "n_ctx": n_ctx, "chunks": n_chunk, "tokens": n_tok,
+        "sliding_window": cfg.sliding_window, "log_floor": cfg.log_floor,
+        "observer_off_seconds": off_s, "observer_on_seconds": on_s,
+        "hidden_bit_identical_on_vs_off": hidden_equal,
+        "logits_bit_identical_on_vs_off": logits_equal,
+        "worst_gram_rel_err": worst_rel,
+        "layers": layer_receipts,
+        "check_index": index.iter().map(|(p, s)| serde_json::json!({"path": p.display().to_string(), "sha256": s})).collect::<Vec<_>>(),
+        "engine_commit": engine_commit(),
+    });
+    let text = serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())?;
+    std::fs::write(out_dir.join("captest.json"), text.clone() + "\n").map_err(|e| e.to_string())?;
+    println!("{text}");
+    std::fs::remove_dir_all(out_dir.join("acc")).ok();
+    if !hidden_equal || !logits_equal {
+        return Err("captest: observer-on teacher differs from observer-off".into());
+    }
+    if worst_rel > 1e-4 {
+        return Err(format!(
+            "captest: Gram differs from the naive F64 recomputation (rel {worst_rel:e})"
+        ));
+    }
+    Ok(())
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let cmd = args.next().unwrap_or_default();
     let result = Args::parse(args).and_then(|a| match cmd.as_str() {
         "ref" => build_ref(&a),
         "fidelity" => fidelity(&a),
+        "calib" => calib(&a),
+        "srcdump" => srcdump(&a),
+        "captest" => captest(&a),
         "eval" => eval(&a),
         "eval-worker" => eval_worker(&a),
         "pair" => pair(&a),
@@ -1801,5 +3709,284 @@ fn main() {
     if let Err(e) = result {
         eprintln!("inkling_kld: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Small-integer test rows: every product and sum is exact in F32 and F64,
+    /// so Gram comparisons are bitwise.
+    fn rows_of(n: usize, k: usize, salt: usize) -> Vec<f32> {
+        (0..n * k)
+            .map(|i| (((i * 7 + salt * 13 + i / k * 3) % 7) as f32) - 3.0)
+            .collect()
+    }
+
+    fn naive_expert_grams(
+        visits: &[(Vec<Vec<(usize, f32)>>, Vec<f32>)],
+        k: usize,
+        n_experts: usize,
+    ) -> Vec<(Vec<f64>, u64)> {
+        let mut out = vec![(vec![0.0f64; k * k], 0u64); n_experts];
+        for (selected, x) in visits {
+            for (t, sel) in selected.iter().enumerate() {
+                for &(e, _) in sel {
+                    let row = &x[t * k..(t + 1) * k];
+                    for i in 0..k {
+                        for j in 0..k {
+                            out[e].0[i * k + j] += row[i] as f64 * row[j] as f64;
+                        }
+                    }
+                    out[e].1 += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// What `Teacher::visit` does to the gathered rows of every expert, one
+    /// accumulator per expert, visits in order.
+    fn observed_expert_grams(
+        visits: &[(Vec<Vec<(usize, f32)>>, Vec<f32>)],
+        k: usize,
+        n_experts: usize,
+        top_k: usize,
+    ) -> Vec<(Vec<f64>, u64)> {
+        let mut acc: Vec<(Vec<f64>, u64)> = (0..n_experts)
+            .map(|_| (vec![0.0f64; tri_len(k)], 0u64))
+            .collect();
+        for (selected, x) in visits {
+            let (by_expert, _) = route_tables(selected, n_experts, top_k);
+            for (e, rows) in by_expert.iter().enumerate() {
+                let mut xe = Vec::new();
+                for &(i, _) in rows {
+                    xe.extend_from_slice(&x[i * k..(i + 1) * k]);
+                }
+                gram_add(&mut acc[e].0, &xe, rows.len(), k);
+                acc[e].1 += rows.len() as u64;
+            }
+        }
+        acc.into_iter()
+            .map(|(tri, n)| {
+                (
+                    hessian_from_tri(&tri, k, 1)
+                        .iter()
+                        .map(|&v| v as f64)
+                        .collect(),
+                    n,
+                )
+            })
+            .collect()
+    }
+
+    /// The count / moment identity the capture must satisfy.
+    fn compare(want: &[(Vec<f64>, u64)], got: &[(Vec<f64>, u64)]) -> Result<(), String> {
+        for (e, (w, g)) in want.iter().zip(got).enumerate() {
+            if w.1 != g.1 {
+                return Err(format!("expert {e}: N {} vs {}", w.1, g.1));
+            }
+            if w.0 != g.0 {
+                return Err(format!("expert {e}: Gram differs"));
+            }
+        }
+        Ok(())
+    }
+
+    fn scenario() -> (usize, usize, usize, Vec<(Vec<Vec<(usize, f32)>>, Vec<f32>)>) {
+        let (k, n_experts, top_k, tokens) = (32usize, 5usize, 2usize, 12usize);
+        // Three passes over the same tokens; expert 1 is selected by every token
+        // of every pass (a repeated 3-pass expert), the second slot alternates.
+        let visits = (0..3)
+            .map(|v| {
+                let selected: Vec<Vec<(usize, f32)>> = (0..tokens)
+                    .map(|t| vec![(1, 0.6), (2 + (t + v) % 2, 0.4)])
+                    .collect();
+                (selected, rows_of(tokens, k, v + 1))
+            })
+            .collect();
+        (k, n_experts, top_k, visits)
+    }
+
+    #[test]
+    fn hand_gram_repeated_three_pass_expert() {
+        let (k, n_experts, top_k, visits) = scenario();
+        let want = naive_expert_grams(&visits, k, n_experts);
+        let got = observed_expert_grams(&visits, k, n_experts, top_k);
+        compare(&want, &got).expect("observer Gram equals the hand Gram");
+        // Expert 1: 12 tokens x 3 passes; expert 0 and 4 never selected.
+        assert_eq!(got[1].1, 36);
+        assert_eq!(got[0].1, 0);
+        assert_eq!(got[4].1, 0);
+        // Σ_e N_e == top_k · tokens · visits.
+        assert_eq!(got.iter().map(|g| g.1).sum::<u64>(), (2 * 12 * 3) as u64);
+        // Expert 1 accumulates all three passes: hand-check one entry.
+        let h: f64 = visits
+            .iter()
+            .map(|(_, x)| {
+                (0..12)
+                    .map(|t| x[t * k + 3] as f64 * x[t * k + 17] as f64)
+                    .sum::<f64>()
+            })
+            .sum();
+        assert_eq!(got[1].0[3 * k + 17], h);
+        assert_eq!(got[1].0[17 * k + 3], h, "symmetric");
+    }
+
+    #[test]
+    fn planted_selected_id_permutation_fails_the_check() {
+        let (k, n_experts, top_k, visits) = scenario();
+        let want = naive_expert_grams(&visits, k, n_experts);
+        // Plant a permutation e -> (e + 1) % E of the selected ids in the gather.
+        let permuted: Vec<(Vec<Vec<(usize, f32)>>, Vec<f32>)> = visits
+            .iter()
+            .map(|(sel, x)| {
+                (
+                    sel.iter()
+                        .map(|s| s.iter().map(|&(e, w)| ((e + 1) % n_experts, w)).collect())
+                        .collect(),
+                    x.clone(),
+                )
+            })
+            .collect();
+        let got = observed_expert_grams(&permuted, k, n_experts, top_k);
+        let err = compare(&want, &got).expect_err("a permuted expert id must be caught");
+        assert!(err.contains("expert"), "{err}");
+        // A swap of two ids in a single visit is caught too.
+        let mut swapped = visits.clone();
+        for s in &mut swapped[1].0 {
+            for p in s.iter_mut() {
+                if p.0 == 2 {
+                    p.0 = 3;
+                } else if p.0 == 3 {
+                    p.0 = 2;
+                }
+            }
+        }
+        let got = observed_expert_grams(&swapped, k, n_experts, top_k);
+        assert!(compare(&want, &got).is_err());
+    }
+
+    #[test]
+    fn gram_chunks_and_threads_are_exact() {
+        // More rows than one chunk, a K with several panels, ragged last chunk.
+        let (n, k) = (GRAM_CHUNK * 2 + 37, 48usize);
+        let x = rows_of(n, k, 5);
+        let mut tri = vec![0.0f64; tri_len(k)];
+        gram_add(&mut tri, &x, n, k);
+        let h = hessian_from_tri(&tri, k, 1);
+        for i in 0..k {
+            for j in 0..k {
+                let want: f64 = (0..n)
+                    .map(|r| x[r * k + i] as f64 * x[r * k + j] as f64)
+                    .sum();
+                assert_eq!(h[i * k + j] as f64, want, "G[{i}][{j}]");
+            }
+        }
+        // Splitting the rows across calls (batches) gives the same bits.
+        let mut tri2 = vec![0.0f64; tri_len(k)];
+        gram_add(&mut tri2, &x[..100 * k], 100, k);
+        gram_add(&mut tri2, &x[100 * k..], n - 100, k);
+        assert_eq!(tri, tri2);
+        // Thread count does not matter.
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool");
+        let mut tri3 = vec![0.0f64; tri_len(k)];
+        one.install(|| gram_add(&mut tri3, &x, n, k));
+        assert_eq!(tri, tri3);
+    }
+
+    #[test]
+    fn gram_on_real_valued_rows_matches_f64_within_f32_chunk_error() {
+        let (n, k) = (700usize, 32usize);
+        let x: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32 * 0.37).sin() * 1.7 + (i as f32 * 0.011).cos()) * 0.5)
+            .collect();
+        let mut tri = vec![0.0f64; tri_len(k)];
+        gram_add(&mut tri, &x, n, k);
+        let h = hessian_from_tri(&tri, k, 1);
+        let mut gmax = 0.0f64;
+        let mut worst = 0.0f64;
+        for i in 0..k {
+            for j in 0..k {
+                let want: f64 = (0..n)
+                    .map(|r| x[r * k + i] as f64 * x[r * k + j] as f64)
+                    .sum();
+                gmax = gmax.max(want.abs());
+                worst = worst.max((h[i * k + j] as f64 - want).abs());
+            }
+        }
+        assert!(worst / gmax < 1e-5, "rel err {}", worst / gmax);
+    }
+
+    #[test]
+    fn tri_layout_counts() {
+        // K = 32: block rows of 16 x 32 and 16 x 16.
+        assert_eq!(tri_len(32), 16 * 32 + 16 * 16);
+        assert_eq!(tri_row_off(32, 1), 16 * 32);
+        let k = 2304;
+        let nb = k / PB;
+        assert_eq!(
+            tri_len(k),
+            (0..nb).map(|ib| PB * (k - PB * ib)).sum::<usize>()
+        );
+        assert_eq!(
+            tri_row_off(k, 5),
+            (0..5).map(|ib| PB * (k - PB * ib)).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn route_margin_matches_selection_and_names_the_ninth() {
+        let logits = [0.0f32, 3.0, -1.0, 2.0, 1.0, 2.5];
+        let sel = oracle::sigmoid_topk(&logits, None, 3, 1.0);
+        let (margin, next) = route_margin(&logits, None, 3, &sel).expect("margin");
+        assert_eq!(sel.iter().map(|s| s.0).collect::<Vec<_>>(), vec![1, 5, 3]);
+        assert_eq!(next, 4);
+        let want = oracle::sigmoid(2.0) - oracle::sigmoid(1.0);
+        assert!((margin - want).abs() < 1e-7);
+        // A planted selection that is not the top-k is rejected.
+        let mut bad = sel.clone();
+        bad.swap(0, 2);
+        assert!(route_margin(&logits, None, 3, &bad).is_err());
+    }
+
+    #[test]
+    fn hfhs_records_round_trip_through_the_quantizer_reader() {
+        use std::io::Write as _;
+        let tmp = tempfile::NamedTempFile::new().expect("tmp");
+        let (k, n_experts, top_k, visits) = scenario();
+        let got = observed_expert_grams(&visits, k, n_experts, top_k);
+        let mut w = std::io::BufWriter::new(tmp.reopen().expect("reopen"));
+        let mut put = |w: &mut std::io::BufWriter<std::fs::File>, b: &[u8]| -> Result<(), String> {
+            w.write_all(b).map_err(|e| e.to_string())
+        };
+        put(&mut w, b"HFHS").expect("w");
+        put(&mut w, &1u32.to_le_bytes()).expect("w");
+        put(&mut w, &1u64.to_le_bytes()).expect("w");
+        put(&mut w, &0u64.to_le_bytes()).expect("w");
+        let h: Vec<f32> = got[1].0.iter().map(|&v| v as f32).collect();
+        put_record(
+            &mut put,
+            &mut w,
+            "model.llm.layers.0.mlp.experts.1.down_proj",
+            k,
+            &h,
+        )
+        .expect("record");
+        w.flush().expect("flush");
+        drop(w);
+        let sc = hipfire_quantize::hessian_io::HessianSidecar::open(tmp.path()).expect("open");
+        let r = sc
+            .get("model.llm.layers.0.mlp.experts.1.down_proj", 0)
+            .expect("record present");
+        assert_eq!(r.k, k);
+        assert_eq!(r.at(3, 17), got[1].0[3 * k + 17]);
+        assert!(sc
+            .get("model.llm.layers.0.mlp.experts.0.down_proj", 0)
+            .is_none());
     }
 }
