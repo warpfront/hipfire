@@ -1939,6 +1939,11 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1151_V2_SRC: &str = concat!(
 /// when the upcoming linear carries an `awq_scale` sidecar. Math:
 /// (W·s) · (x/s) = W·x — divide before FWHT mirrors the offline pre-scaling.
 pub const ROTATE_X_MQ_AWQ_SRC: &str = include_str!("../../../kernels/src/rotate_x_mq_awq.hip");
+/// Per-routed-expert AWQ + FWHT-256 producer (`Gpu::rotate_x_mq_awq_topk`): one
+/// shared row, `top_k` ranks, each divided by its own expert's F32 AWQ vector
+/// (device pointer table) before the same rotation as `rotate_x_mq_awq`.
+pub const ROTATE_X_MQ_AWQ_TOPK_SRC: &str =
+    include_str!("../../../kernels/src/rotate_x_mq_awq_topk.hip");
 /// Phase A Stage A — F2: AWQ-aware variant of `fused_silu_mul_mq_rotate`
 /// for the down_proj / w_down input stage. Dispatched when down_proj
 /// carries an `awq_scale`. Divide happens AFTER silu*up reduction, BEFORE

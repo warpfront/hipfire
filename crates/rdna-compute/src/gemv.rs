@@ -8105,6 +8105,100 @@ impl Gpu {
         )
     }
 
+    /// Per-routed-expert AWQ + FWHT-256 producer for a MoE gate_up input:
+    /// `out[r, :] = FWHT256(x / S[expert_ids[r]])` for `r in 0..top_k`.
+    ///
+    /// `x`: F32 `[k]` (one shared row). `scale_ptrs`: `n_experts` `u64` device
+    /// pointers (`>= 8 * n_experts` bytes), entry `e` -> that expert's F32 `[k]`
+    /// AWQ vector. `expert_ids`: `top_k` i32 words. `out`: F32 `[top_k, k]` in
+    /// rank order. The divide is an exact f32 divide before the rotation, as in
+    /// [`Self::rotate_x_mq_awq`]: with `S == 1` every row is bitwise
+    /// [`Self::rotate_x_mq`] of `x`. An id outside `[0, n_experts)` writes a
+    /// zero row (no table read). `k` must be a positive multiple of 256.
+    pub fn rotate_x_mq_awq_topk(
+        &mut self,
+        x: &GpuTensor,
+        scale_ptrs: &GpuTensor,
+        expert_ids: &GpuTensor,
+        out: &GpuTensor,
+        k: usize,
+        top_k: usize,
+        n_experts: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let bad = |msg: String| {
+            Err(hip_bridge::HipError::new(
+                0,
+                &format!("rotate_x_mq_awq_topk: {msg}"),
+            ))
+        };
+        if k == 0 || k % 256 != 0 || top_k == 0 || n_experts == 0 {
+            return bad(format!(
+                "need k a positive multiple of 256 and top_k, n_experts > 0 (k={k}, top_k={top_k}, n_experts={n_experts})"
+            ));
+        }
+        for (what, have, need) in [
+            ("x", x.buf.size(), 4 * k),
+            ("scale_ptrs", scale_ptrs.buf.size(), 8 * n_experts),
+            ("expert_ids", expert_ids.buf.size(), 4 * top_k),
+            ("out", out.buf.size(), 4 * top_k * k),
+        ] {
+            if have < need {
+                return bad(format!("{what} holds {have} bytes, needs {need}"));
+            }
+        }
+        self.ensure_kernel(
+            "rotate_x_mq_awq_topk",
+            kernels::ROTATE_X_MQ_AWQ_TOPK_SRC,
+            "rotate_x_mq_awq_topk",
+        )?;
+        self.ensure_mq_signs()?;
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let outp = out.buf.as_ptr();
+        let pp = scale_ptrs.buf.as_ptr();
+        let ip = expert_ids.buf.as_ptr();
+        let kv = k as i32;
+        let nv = n_experts as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &outp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+        ];
+        let bytes = (k * 4 * 2 + 2 * 256 * 4) * top_k;
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", "rotate_x_mq_awq_topk", bytes);
+        let result = self.launch_maybe_blob(
+            "rotate_x_mq_awq_topk",
+            folded_rows_grid("rotate_x_mq_awq_topk", k / 256, top_k)?,
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(outp);
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(outp);
+        result
+    }
+
     /// MagnumQuant MQ4: rotate x once, then GEMV against rotated x.
     /// MQ4 weights are stored in HFQ4-G256 format with FWHT pre-applied, so the GEMV
     /// inner loop is identical to standard HFQ4 — we reuse the arch-tuned HFQ4 kernel.

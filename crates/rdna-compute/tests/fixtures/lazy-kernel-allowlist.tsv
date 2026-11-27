@@ -1080,6 +1080,7 @@ module	rotate_with_rms_gfx1100	config-opt-in	Non-default configuration: kernel.r
 module	rotate_with_rms_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemv.rs:3304
 module	rotate_x_mq_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	rotate_x_mq_awq_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	rotate_x_mq_awq_topk	non-core-family	Non-core family route: Inkling-2-Mini (arch 24) qt44-padded-awq-v1 per-expert gate_up producer; rdna-compute/src/gemv.rs:8150
 module	round_h_bf16_quality_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_EMU_BF16_H; rdna-compute/src/gemv.rs:4453-4460
 module	sigmoid_head_gate_mul	non-core-family	Non-core family route: LFM3, LFM3-Omni (arch 26); rdna-compute/src/norm.rs:3332
 module	sigmoid_mul_rotate_x_mq_awq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:7171
