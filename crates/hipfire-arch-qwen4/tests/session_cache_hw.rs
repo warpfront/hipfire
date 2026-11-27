@@ -79,6 +79,7 @@ use hipfire_runtime::session_cache::{SessionCache, SessionRoute, SessionState, S
 use hipfire_runtime::spec::{MtpDrafter, SpecAdvance, SpecStep, SpecTarget, Speculator};
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
+use rdna_compute::gdn_stream::GdnScanAlgorithm;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -170,29 +171,55 @@ fn assert_resolved_gdn_state(bundle: &Qwen4Bundle, request: &str, state_format: 
 }
 
 /// SHA-256 of every part of the live state at `position` on `route`: the
-/// metadata, each fixed part, then the valid rows of each row stream.
+/// metadata, each fixed part, then the valid rows of each row stream. A GDN
+/// stream carry's pending tiles digest only their first `pending_rows` rows:
+/// the rows past them are dead (whatever an earlier forward left there) and
+/// never read before they are rewritten.
 fn state_digests(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
     route: SessionRoute,
     position: usize,
 ) -> Vec<[u8; 32]> {
-    let recurrent_bytes: Vec<usize> = bundle
-        .state
-        .gdn
-        .iter()
-        .map(|layer| layer.recurrent.byte_size())
-        .collect();
+    // Per GDN layer: its first fixed part (the recurrent state) and size, and
+    // the live byte ranges of its carry's pending tiles, by buffer.
+    let mut first_part = 0;
+    let mut recurrent = Vec::new();
+    let mut live_ranges = Vec::new();
+    for layer in &bundle.state.gdn {
+        recurrent.push((first_part, layer.recurrent.byte_size()));
+        first_part += 2 + usize::from(layer.ef_residual.is_some());
+        if let Some(carry) = &layer.carry {
+            // tile_entry, pending_conv, pending_params.
+            first_part += 3;
+            // The WY16 tiles are row-major `[micro_rows, ..]` (conv) and
+            // `[2, micro_rows, ..]` (gate rows, then beta rows); other scan
+            // layouts digest whole.
+            if carry.plan.algorithm != GdnScanAlgorithm::Wy16 {
+                continue;
+            }
+            let tile = carry.plan.micro_rows;
+            let rows = carry.meta().pending_rows as usize;
+            let conv_row = carry.pending_conv.byte_size() / tile;
+            live_ranges.push((
+                std::ptr::from_ref(&carry.pending_conv.buf),
+                vec![(0, rows * conv_row)],
+            ));
+            let half = carry.pending_params.byte_size() / 2;
+            let params_row = half / tile;
+            live_ranges.push((
+                std::ptr::from_ref(&carry.pending_params.buf),
+                vec![(0, rows * params_row), (half, rows * params_row)],
+            ));
+        }
+    }
     let SnapshotParts { meta, layout } =
         SessionState::snapshot_parts(bundle, route, position).expect("state parts");
-    // Fixed parts are `[recurrent, conv]` per GDN layer first: the digested
-    // recurrent bytes are exactly the resolved format's state.
-    for (layer, bytes) in recurrent_bytes.iter().enumerate() {
+    // The digested recurrent bytes are exactly the resolved format's state.
+    for (layer, &(part, bytes)) in recurrent.iter().enumerate() {
         assert_eq!(
-            layout.fixed[2 * layer].bytes,
-            *bytes,
-            "snapshot part {} is not GDN layer {layer}'s recurrent state",
-            2 * layer
+            layout.fixed[part].bytes, bytes,
+            "snapshot part {part} is not GDN layer {layer}'s recurrent state"
         );
     }
     gpu.hip.device_synchronize().expect("sync");
@@ -208,11 +235,22 @@ fn state_digests(
                 .map(|stream| (stream.buf, 0, stream.rows * stream.row_bytes)),
         );
     for (buf, offset, bytes) in ranges {
-        let mut host = vec![0u8; bytes];
-        gpu.hip
-            .memcpy_dtoh_at(&mut host, buf, offset)
-            .expect("download state part");
-        digests.push(Sha256::digest(&host).into());
+        let whole = [(offset, bytes)];
+        let spans = live_ranges
+            .iter()
+            .find(|(live, _)| std::ptr::eq(*live, buf))
+            .map_or(&whole[..], |(_, spans)| &spans[..]);
+        let mut hash = Sha256::new();
+        for &(offset, bytes) in spans {
+            let mut host = vec![0u8; bytes];
+            if bytes > 0 {
+                gpu.hip
+                    .memcpy_dtoh_at(&mut host, buf, offset)
+                    .expect("download state part");
+            }
+            hash.update(&host);
+        }
+        digests.push(hash.finalize().into());
     }
     digests
 }
@@ -511,8 +549,21 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
         .unwrap_or_else(|| panic!("{MODEL_ENV} must name qwen3.8-flash-next-gptq3.mq4"));
     let mut hfq = HfqFile::open(&model).expect("open model");
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
-    let receipt = admit_hfqm_artifact(&hfq).expect("admission");
     let mut gpu = Gpu::init().expect("GPU");
+    // A split base (mq4-xts) keeps its PLE rows in a `.ple-q4` / `.ple-q8`
+    // sidecar beside it; an embedded-rows base resolves to itself.
+    hipfire_runtime::ple_sidecar::resolve_and_attach_ple_rows(
+        &mut hfq,
+        &model,
+        hipfire_config::memory::ple_format(),
+        &gpu.arch,
+        hipfire_runtime::ple_sidecar::ResolvePolicy {
+            derive_missing_q4: false,
+            progress: None,
+        },
+    )
+    .expect("PLE rows");
+    let receipt = admit_hfqm_artifact(&hfq).expect("admission");
     let domain = CacheDomain::for_model(&hfq, &tokenizer, None, "qwen4", gpu.device_id);
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
@@ -552,7 +603,7 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
     .expect("state format");
     let vocab = receipt.config.vocab_size;
     let backend = Qwen4KvBackend::automatic(&gpu);
-    let mut bundle = Qwen4Bundle::assemble_with_metadata(
+    let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
         receipt.config,
         &receipt.manifest.identity.recipe,
         transaction,
@@ -560,8 +611,10 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
         &mut gpu,
         MAX_SEQ,
         receipt.ple,
+        receipt.ple_rows,
         state_format,
         backend,
+        None,
     )
     .expect("assemble");
     bundle.set_turn_snapshots(turn_snapshots);
