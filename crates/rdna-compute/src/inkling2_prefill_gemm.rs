@@ -25,7 +25,6 @@
 
 use std::ffi::c_void;
 
-use crate::dispatch::{Gpu, GpuTensor};
 use hip_bridge::HipResult;
 
 /// Inline HIP source: one kernel, no shared edits.
@@ -492,8 +491,8 @@ impl crate::dispatch::Gpu {
 
 #[cfg(test)]
 mod gpu_tests {
-    use super::*;
     use crate::dispatch::DType;
+    use crate::inkling2_attn_prefill::init_inkling2_gpu;
 
     fn rng_next(state: &mut u64) -> u64 {
         let mut x = *state;
@@ -537,16 +536,11 @@ mod gpu_tests {
     /// (K=512 tail 2, K=1024 tail 0, K=2304 tail 1) and B=1/5/64.
     /// Bar: 0 differing F16 words (hence max|d| <= 1e-5 holds trivially).
     #[test]
-    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    #[ignore = "requires gfx1100/gfx1151 and the HIP toolchain"]
     fn gpu_batched_matches_per_row_lloyd() {
-        let mut gpu = match crate::gpu_test::init() {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("skip: no usable GPU ({e:?})");
-                return;
-            }
+        let Some(mut gpu) = init_inkling2_gpu(&["gfx1100", "gfx1151"]) else {
+            return;
         };
-        assert_eq!(gpu.arch, "gfx1100");
         // Centered codebook levels (i - 7.5), same role as the artifact LUT.
         let levels: Vec<u16> = (0..16)
             .map(|i| half::f16::from_f32(i as f32 - 7.5).to_bits())
@@ -611,16 +605,11 @@ mod gpu_tests {
 
     /// Gate: widen is bitwise the host f16 -> f32 cast (lossless by format).
     #[test]
-    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    #[ignore = "requires gfx1100/gfx1151 and the HIP toolchain"]
     fn gpu_widen_matches_host_cast() {
-        let mut gpu = match crate::gpu_test::init() {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("skip: no usable GPU ({e:?})");
-                return;
-            }
+        let Some(mut gpu) = init_inkling2_gpu(&["gfx1100", "gfx1151"]) else {
+            return;
         };
-        assert_eq!(gpu.arch, "gfx1100");
         let mut s = 0x91d3_7e57u64;
         let n = 8192;
         let fh: Vec<u16> = (0..n).map(|_| (rng_next(&mut s) & 0xFFFF) as u16).collect();
@@ -641,16 +630,11 @@ mod gpu_tests {
 
     /// Gate: set_pos writes the device word exactly (blocked-visit reset).
     #[test]
-    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    #[ignore = "requires gfx1100/gfx1151 and the HIP toolchain"]
     fn gpu_set_pos_roundtrip() {
-        let mut gpu = match crate::gpu_test::init() {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("skip: no usable GPU ({e:?})");
-                return;
-            }
+        let Some(mut gpu) = init_inkling2_gpu(&["gfx1100", "gfx1151"]) else {
+            return;
         };
-        assert_eq!(gpu.arch, "gfx1100");
         let w = gpu.alloc_tensor(&[1], DType::F32).expect("word alloc");
         for pos in [0usize, 1, 511, 1_000_000] {
             gpu.inkling2_gf_set_pos(&w, pos).expect("set_pos");
@@ -666,16 +650,11 @@ mod gpu_tests {
     /// wiring serves real weights through this arm. Same (M, K, B) cells as
     /// the Lloyd gate, including every tail path and multi-block grids.
     #[test]
-    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    #[ignore = "requires gfx1100/gfx1151 and the HIP toolchain"]
     fn gpu_batched_matches_per_row_uniform() {
-        let mut gpu = match crate::gpu_test::init() {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("skip: no usable GPU ({e:?})");
-                return;
-            }
+        let Some(mut gpu) = init_inkling2_gpu(&["gfx1100", "gfx1151"]) else {
+            return;
         };
-        assert_eq!(gpu.arch, "gfx1100");
         let lut = super::inkling2_identity_lut();
         // Identity check on the host: LUT words decode to 0.0..15.0.
         for q in 0..16u32 {

@@ -43,9 +43,7 @@ fn argmax(v: &[f32]) -> u32 {
         .0 as u32
 }
 
-#[test]
-#[ignore = "needs the 14 GB MQ4 artifact + gfx1100"]
-fn d1_steady() {
+fn test_gpu() -> Option<Gpu> {
     if std::env::var("HIPFIRE_HOME").is_err() {
         std::env::set_var("HIPFIRE_HOME", r"D:\hipfire-models\inkling2-home");
     }
@@ -54,13 +52,32 @@ fn d1_steady() {
         Ok("0"),
         "D1 gates require HIPFIRE_GRAPH=0"
     );
+    let gpu = match Gpu::init() {
+        Ok(gpu) => gpu,
+        Err(e) => {
+            eprintln!("skip: no usable GPU ({e:?})");
+            return None;
+        }
+    };
+    if !matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151") {
+        eprintln!("skip: requires gfx1100/gfx1151, found {}", gpu.arch);
+        return None;
+    }
+    Some(gpu)
+}
+
+#[test]
+#[ignore = "needs the 14 GB MQ4 artifact + gfx1100/gfx1151"]
+fn d1_steady() {
     let out = std::env::var("INKLING2_D1_OUT").unwrap_or_else(|_| "target/d1-out".into());
     std::fs::create_dir_all(&out).expect("out dir");
+    let Some(mut gpu) = test_gpu() else {
+        return;
+    };
 
     let hfq = HfqFile::open(std::path::Path::new(ART)).expect("open artifact");
     let cfg = Inkling2Config::from_metadata_json(&hfq.metadata_json).expect("parse config");
     let weights = Inkling2Weights::load(&hfq, &cfg).expect("index weights");
-    let mut gpu = Gpu::init().expect("gpu init");
     let (gw, gs): (Inkling2GpuWeights, Inkling2GpuState) =
         upload(&weights, &cfg, &mut gpu, 64).expect("gpu upload");
     let mut bundle = Inkling2Bundle {

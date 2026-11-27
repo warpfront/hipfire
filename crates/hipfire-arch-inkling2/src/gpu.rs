@@ -420,6 +420,7 @@ fn transform_conv(
 enum PendingOwner {
     Tensor(GpuTensor),
     Weight(WeightTensor),
+    Layer(Inkling2GpuLayer),
 }
 
 /// Mid-load failure frees everything already allocated (cohere2moe pattern).
@@ -462,6 +463,18 @@ impl LoadTx {
         }
     }
 
+    fn hold_layer(&mut self, layer: Inkling2GpuLayer) -> usize {
+        self.owners.push(Some(PendingOwner::Layer(layer)));
+        self.owners.len() - 1
+    }
+
+    fn take_layer(&mut self, slot: usize) -> Result<Inkling2GpuLayer, String> {
+        match self.owners.get_mut(slot).and_then(Option::take) {
+            Some(PendingOwner::Layer(layer)) => Ok(layer),
+            _ => Err(format!("inkling2: load slot {slot} is not a layer")),
+        }
+    }
+
     /// Mutable access to a still-pending weight (typed-XTS sidecar attach).
     fn weight_mut(&mut self, slot: usize) -> Result<&mut WeightTensor, String> {
         match self.owners.get_mut(slot) {
@@ -490,6 +503,7 @@ impl Drop for LoadTx {
                     let _ = gpu.free_tensor(t);
                 }
                 PendingOwner::Weight(w) => w.free_all(gpu),
+                PendingOwner::Layer(layer) => layer.free_gpu(gpu),
             }
         }
     }
@@ -599,12 +613,8 @@ pub struct Inkling2GpuLayer {
     pub ptr_gu: GpuTensor,
     /// D1: expert down device addresses, uploaded once at load.
     pub ptr_dn: GpuTensor,
-    /// D1: per-expert gate_up Lloyd codebooks, uploaded once at load
-    /// (`[n_experts, 8]` u32). `None` on non-Lloyd (uniform/MQ6) layers.
-    pub lut_gu: Option<GpuTensor>,
-    /// D1: per-expert down Lloyd codebooks, uploaded once at load. `None`
-    /// on non-Lloyd layers.
-    pub lut_dn: Option<GpuTensor>,
+    /// `Some` iff the file is the typed XTS layout; see [`Inkling2XtsLayer`].
+    pub xts: Option<Inkling2XtsLayer>,
 }
 
 impl Inkling2GpuLayer {
@@ -653,12 +663,6 @@ impl Inkling2GpuLayer {
         }
         let _ = gpu.free_tensor(self.ptr_gu);
         let _ = gpu.free_tensor(self.ptr_dn);
-        if let Some(t) = self.lut_gu {
-            let _ = gpu.free_tensor(t);
-        }
-        if let Some(t) = self.lut_dn {
-            let _ = gpu.free_tensor(t);
-        }
         for e in self.experts {
             e.free_gpu(gpu);
         }
@@ -1053,136 +1057,46 @@ pub struct Inkling2GpuState {
 /// outputs (`visit_out`, pushed `block`) still come from the pool — only
 /// temps that die at visit end live here.
 ///
-/// Shapes derive from `cfg` at alloc; `rel_bias`/`partials`/`slots` cover
-/// the largest visit (`max_rows`), so one scratch serves every visit.
+/// Shapes derive from `cfg` at alloc; `rel_bias` covers the largest visit
+/// (`max_rows`), so one scratch serves every visit.
 pub struct Inkling2VisitScratch {
-    /// Norm-once staging: bank rows are RMSNormed once when pushed (with
-    /// the same tree reduction as the copying path) and read via pointers
-    /// by [`crate::gpu_forward`] mix calls. `[max_bank, e]`, `max_bank=6`.
-    pub normed_bank: GpuTensor,
     /// In-kernel `cur` normalization target for the ptr mix (one `[e]` row).
     pub mix_cur_normed: GpuTensor,
-    /// Ptr-mix output staging (`[qr_max, e]`, `qr_max=4` for cross msgs).
-    pub mix_out: GpuTensor,
     /// Controller scratch (`[4*e + rank]`).
     pub ctrl_scratch: GpuTensor,
-    /// Controller output staging (`[e]`).
-    pub ctrl_out: GpuTensor,
     /// `[nh, max_rows]` rel-bias staging (largest visit).
     pub rel_bias: GpuTensor,
-    /// Blocked-attention partials (`[max_ntiles*nh*130]`, largest visit).
-    pub partials: GpuTensor,
-    /// Decoded-attention head output staging (`[nh*hd]`).
-    pub attn_heads: GpuTensor,
-    /// D1 follow-up slots (allocated now, wired when the card is free):
-    /// fixed-shape visit temps, one buffer per live name so values never
-    /// alias. Each is `[e]` except where noted.
-    pub v_q: GpuTensor,
-    pub v_k_raw: GpuTensor,
-    pub v_v_raw: GpuTensor,
-    pub v_r: GpuTensor,
-    pub v_k_conv: GpuTensor, // [nkv*hd]
-    pub v_v_conv: GpuTensor, // [nkv*hd]
-    pub v_vc: GpuTensor,     // [nkv*hd]
-    pub v_sinks: GpuTensor,  // [nh]
-    pub v_gate: GpuTensor,
-    pub v_wo_out: GpuTensor,
-    pub v_attn_res: GpuTensor,
-    pub v_cur: GpuTensor,
-    pub v_ffn_in: GpuTensor,
-    pub v_ffn_normed: GpuTensor,
-    pub v_router_logits: GpuTensor, // [n_experts]
-    pub v_topk_idx: GpuTensor,      // [n_expert_used] i32 bits
-    pub v_topk_w: GpuTensor,        // [n_expert_used]
-    pub v_ffn_x_rot: GpuTensor,
-    pub v_act: GpuTensor,      // [n_expert_used, 1280]
-    pub v_rot: GpuTensor,      // [n_expert_used, 1280]
-    pub v_down_exp: GpuTensor, // [n_expert_used, e]
-    pub v_moe_raw: GpuTensor,
-    pub v_moe_conv: GpuTensor,
 }
 
 impl Inkling2VisitScratch {
     fn alloc(gpu: &mut Gpu, cfg: &Inkling2Config, max_rows: usize) -> Result<Self, String> {
         let e = cfg.n_embd;
         let nh = cfg.n_head;
-        let hd = cfg.head_dim;
-        let nkv = cfg.n_head_kv;
-        let ekv = nkv * hd;
         let rank = cfg.loop_cfg.gate_rank;
-        let ku = cfg.n_expert_used;
-        let max_ntiles = max_rows.div_ceil(256).max(1);
-        let mut mk = |shape: &[usize], what: &str| {
-            gpu.alloc_tensor(shape, DType::F32)
-                .map_err(|e| format!("inkling2: scratch alloc {what}: {e:?}"))
+        let mut tx = LoadTx::new(gpu);
+        let mut mk = |shape: &[usize], what: &str| -> Result<usize, String> {
+            let g = unsafe { &mut *tx.gpu };
+            let t = g
+                .alloc_tensor(shape, DType::F32)
+                .map_err(|e| format!("inkling2: scratch alloc {what}: {e:?}"))?;
+            Ok(tx.hold_tensor(t))
         };
-        Ok(Self {
-            normed_bank: mk(&[6, e], "normed_bank")?,
-            mix_cur_normed: mk(&[e], "mix_cur_normed")?,
-            mix_out: mk(&[4, e], "mix_out")?,
-            ctrl_scratch: mk(&[4 * e + rank], "ctrl_scratch")?,
-            ctrl_out: mk(&[e], "ctrl_out")?,
-            rel_bias: mk(&[nh, max_rows], "rel_bias")?,
-            partials: mk(&[max_ntiles * nh * 130], "partials")?,
-            attn_heads: mk(&[nh * hd], "attn_heads")?,
-            v_q: mk(&[e], "v_q")?,
-            v_k_raw: mk(&[e], "v_k_raw")?,
-            v_v_raw: mk(&[e], "v_v_raw")?,
-            v_r: mk(&[e], "v_r")?,
-            v_k_conv: mk(&[ekv], "v_k_conv")?,
-            v_v_conv: mk(&[ekv], "v_v_conv")?,
-            v_vc: mk(&[ekv], "v_vc")?,
-            v_sinks: mk(&[nh], "v_sinks")?,
-            v_gate: mk(&[e], "v_gate")?,
-            v_wo_out: mk(&[e], "v_wo_out")?,
-            v_attn_res: mk(&[e], "v_attn_res")?,
-            v_cur: mk(&[e], "v_cur")?,
-            v_ffn_in: mk(&[e], "v_ffn_in")?,
-            v_ffn_normed: mk(&[e], "v_ffn_normed")?,
-            v_router_logits: mk(&[cfg.n_experts], "v_router")?,
-            v_topk_idx: mk(&[ku], "v_topk_idx")?,
-            v_topk_w: mk(&[ku], "v_topk_w")?,
-            v_ffn_x_rot: mk(&[e], "v_ffn_x_rot")?,
-            v_act: mk(&[ku, 1280], "v_act")?,
-            v_rot: mk(&[ku, 1280], "v_rot")?,
-            v_down_exp: mk(&[ku, e], "v_down_exp")?,
-            v_moe_raw: mk(&[e], "v_moe_raw")?,
-            v_moe_conv: mk(&[e], "v_moe_conv")?,
-        })
+        let mix_cur_normed = mk(&[e], "mix_cur_normed")?;
+        let ctrl_scratch = mk(&[4 * e + rank], "ctrl_scratch")?;
+        let rel_bias = mk(&[nh, max_rows], "rel_bias")?;
+        let scratch = Self {
+            mix_cur_normed: tx.take_tensor(mix_cur_normed)?,
+            ctrl_scratch: tx.take_tensor(ctrl_scratch)?,
+            rel_bias: tx.take_tensor(rel_bias)?,
+        };
+        tx.commit();
+        Ok(scratch)
     }
 
     fn free_gpu(self, gpu: &mut Gpu) {
-        let _ = gpu.free_tensor(self.normed_bank);
         let _ = gpu.free_tensor(self.mix_cur_normed);
-        let _ = gpu.free_tensor(self.mix_out);
         let _ = gpu.free_tensor(self.ctrl_scratch);
-        let _ = gpu.free_tensor(self.ctrl_out);
         let _ = gpu.free_tensor(self.rel_bias);
-        let _ = gpu.free_tensor(self.partials);
-        let _ = gpu.free_tensor(self.attn_heads);
-        let _ = gpu.free_tensor(self.v_q);
-        let _ = gpu.free_tensor(self.v_k_raw);
-        let _ = gpu.free_tensor(self.v_v_raw);
-        let _ = gpu.free_tensor(self.v_r);
-        let _ = gpu.free_tensor(self.v_k_conv);
-        let _ = gpu.free_tensor(self.v_v_conv);
-        let _ = gpu.free_tensor(self.v_vc);
-        let _ = gpu.free_tensor(self.v_sinks);
-        let _ = gpu.free_tensor(self.v_gate);
-        let _ = gpu.free_tensor(self.v_wo_out);
-        let _ = gpu.free_tensor(self.v_attn_res);
-        let _ = gpu.free_tensor(self.v_cur);
-        let _ = gpu.free_tensor(self.v_ffn_in);
-        let _ = gpu.free_tensor(self.v_ffn_normed);
-        let _ = gpu.free_tensor(self.v_router_logits);
-        let _ = gpu.free_tensor(self.v_topk_idx);
-        let _ = gpu.free_tensor(self.v_topk_w);
-        let _ = gpu.free_tensor(self.v_ffn_x_rot);
-        let _ = gpu.free_tensor(self.v_act);
-        let _ = gpu.free_tensor(self.v_rot);
-        let _ = gpu.free_tensor(self.v_down_exp);
-        let _ = gpu.free_tensor(self.v_moe_raw);
-        let _ = gpu.free_tensor(self.v_moe_conv);
     }
 }
 
@@ -2123,15 +2037,6 @@ pub fn upload(
         bytes: et.data.clone(),
     };
 
-    // Per-visit state (own cleanup on failure; weights stay in the tx).
-    let g = unsafe { &mut *tx.gpu };
-    let state = Inkling2GpuState::new_with_max_seq(g, cfg, max_seq)?;
-
-    let full_visits = state.visit_rows.iter().filter(|&&r| r == max_seq).count();
-    let swa_visits = state.visit_rows.len() - full_visits;
-    let down_pad_extra_bytes =
-        (cfg.n_phys * cfg.n_experts * e * (DOWN_K_PADDED - DOWN_K_LOGICAL) / 256 * 136) as u64;
-
     // Materialize: move everything out of the transaction, then commit.
     let take_w = |tx: &mut LoadTx, slot: usize| tx.take_weight(slot);
     let take_t = |tx: &mut LoadTx, slot: usize| tx.take_tensor(slot);
@@ -2148,8 +2053,29 @@ pub fn upload(
             forget: tx.take_tensor(slots[2])?,
         })
     };
-    let mut layers = Vec::with_capacity(layer_slots.len());
+    let mut layer_slots_out = Vec::with_capacity(layer_slots.len());
     for s in layer_slots {
+        // D1: expert pointer tables upload once here (load-lifetime stable:
+        // expert buffers are load-owned, never pool-recycled). Keep both the
+        // experts and tables in the tx until every upload has succeeded.
+        let mut gu_bytes = Vec::with_capacity(8 * s.experts.len());
+        let mut dn_bytes = Vec::with_capacity(8 * s.experts.len());
+        for &(gs, ds) in &s.experts {
+            let gate_up = tx.weight_mut(gs)?;
+            gu_bytes.extend_from_slice(&(gate_up.buf.buf.as_ptr() as u64).to_ne_bytes());
+            let down = tx.weight_mut(ds)?;
+            dn_bytes.extend_from_slice(&(down.buf.buf.as_ptr() as u64).to_ne_bytes());
+        }
+        let g = unsafe { &mut *tx.gpu };
+        let ptr_gu = g
+            .upload_raw(&gu_bytes, &[gu_bytes.len()])
+            .map_err(|e| format!("inkling2: upload ptr_gu: {e:?}"))?;
+        let ptr_gu = tx.hold_tensor(ptr_gu);
+        let g = unsafe { &mut *tx.gpu };
+        let ptr_dn = g
+            .upload_raw(&dn_bytes, &[dn_bytes.len()])
+            .map_err(|e| format!("inkling2: upload ptr_dn: {e:?}"))?;
+        let ptr_dn = tx.hold_tensor(ptr_dn);
         let mut experts = Vec::with_capacity(s.experts.len());
         for (gs, ds) in s.experts {
             experts.push(Inkling2Expert {
@@ -2157,61 +2083,7 @@ pub fn upload(
                 down: take_w(&mut tx, ds)?,
             });
         }
-        // D1: expert pointer/LUT tables upload once here (load-lifetime
-        // stable: expert buffers are load-owned, never pool-recycled).
-        let g = unsafe { &mut *tx.gpu };
-        let gu_bytes: Vec<u8> = experts
-            .iter()
-            .flat_map(|x| (x.gate_up.buf.buf.as_ptr() as u64).to_ne_bytes())
-            .collect();
-        let dn_bytes: Vec<u8> = experts
-            .iter()
-            .flat_map(|x| (x.down.buf.buf.as_ptr() as u64).to_ne_bytes())
-            .collect();
-        let ptr_gu = g
-            .upload_raw(&gu_bytes, &[gu_bytes.len()])
-            .map_err(|e| format!("inkling2: upload ptr_gu: {e:?}"))?;
-        let ptr_dn = g
-            .upload_raw(&dn_bytes, &[dn_bytes.len()])
-            .map_err(|e| format!("inkling2: upload ptr_dn: {e:?}"))?;
-        let gate_lloyd = experts
-            .first()
-            .map(|x| x.gate_up.gpu_dtype == DType::MQ4G256V2Lloyd)
-            .unwrap_or(false);
-        let down_lloyd = experts
-            .first()
-            .map(|x| x.down.gpu_dtype == DType::MQ4G256V2Lloyd)
-            .unwrap_or(false);
-        let lut_bytes = |f: &dyn Fn(&Inkling2Expert) -> Option<[u32; 8]>| -> Vec<u8> {
-            experts
-                .iter()
-                .flat_map(|x| {
-                    f(x).unwrap_or([0u32; 8])
-                        .iter()
-                        .flat_map(|w| w.to_ne_bytes())
-                        .collect::<Vec<u8>>()
-                })
-                .collect()
-        };
-        let lut_gu = if gate_lloyd {
-            let bytes = lut_bytes(&|x| x.gate_up.lloyd_lut_f16);
-            Some(
-                g.upload_raw(&bytes, &[bytes.len()])
-                    .map_err(|e| format!("inkling2: upload lut_gu: {e:?}"))?,
-            )
-        } else {
-            None
-        };
-        let lut_dn = if down_lloyd {
-            let bytes = lut_bytes(&|x| x.down.lloyd_lut_f16);
-            Some(
-                g.upload_raw(&bytes, &[bytes.len()])
-                    .map_err(|e| format!("inkling2: upload lut_dn: {e:?}"))?,
-            )
-        } else {
-            None
-        };
-        layers.push(Inkling2GpuLayer {
+        let layer = Inkling2GpuLayer {
             wq: take_w(&mut tx, s.wq)?,
             wk: take_w(&mut tx, s.wk)?,
             wv: take_w(&mut tx, s.wv)?,
@@ -2247,11 +2119,21 @@ pub fn upload(
             router: take_w(&mut tx, s.router)?,
             router_bias: take_opt_t(&mut tx, s.router_bias)?,
             experts,
-            ptr_gu,
-            ptr_dn,
-            lut_gu,
-            lut_dn,
-        });
+            ptr_gu: take_t(&mut tx, ptr_gu)?,
+            ptr_dn: take_t(&mut tx, ptr_dn)?,
+            xts: match s.xts {
+                Some(x) => Some(Inkling2XtsLayer {
+                    gu_awq: take_t(&mut tx, x.gu_awq)?,
+                    down_awq: take_t(&mut tx, x.down_awq)?,
+                    gu_ptrs: take_t(&mut tx, x.gu_ptrs)?,
+                    down_ptrs: take_t(&mut tx, x.down_ptrs)?,
+                    gu_awq_ptrs: take_t(&mut tx, x.gu_awq_ptrs)?,
+                    down_awq_ptrs: take_t(&mut tx, x.down_awq_ptrs)?,
+                }),
+                None => None,
+            },
+        };
+        layer_slots_out.push(tx.hold_layer(layer));
     }
     let unembed = take_w(&mut tx, unembed)?;
     let norm = take_t(&mut tx, norm)?;
@@ -2261,7 +2143,21 @@ pub fn upload(
     for slot in cross_slots {
         cross_pass.push(take_t(&mut tx, slot)?);
     }
+    // Allocate state only after every fallible weight/table upload has
+    // succeeded. Until commit, LoadTx owns completed layers as well as every
+    // pending tensor/weight, so any failure frees the whole partial load.
+    let g = unsafe { &mut *tx.gpu };
+    let state = Inkling2GpuState::new_with_max_seq(g, cfg, max_seq)?;
+    let mut layers = Vec::with_capacity(layer_slots_out.len());
+    for slot in layer_slots_out {
+        layers.push(tx.take_layer(slot)?);
+    }
     tx.commit();
+
+    let full_visits = state.visit_rows.iter().filter(|&&r| r == max_seq).count();
+    let swa_visits = state.visit_rows.len() - full_visits;
+    let down_pad_extra_bytes =
+        (cfg.n_phys * cfg.n_experts * e * (DOWN_K_PADDED - DOWN_K_LOGICAL) / 256 * 136) as u64;
     let mq4v2_symmetric_prev = sym_flag.as_mut().map(SymFlagGuard::keep);
 
     let kv_bytes = state.kv_bytes;
@@ -2834,11 +2730,18 @@ mod xts_gpu_tests {
         let idt = gpu.alloc_tensor(&[8], DType::F32).unwrap();
         let idb: Vec<u8> = ids.iter().flat_map(|v| v.to_ne_bytes()).collect();
         gpu.hip.memcpy_htod(&idt.buf, &idb).unwrap();
-        let mut tmp = vec![xt, idt];
+        let mut tmp = Vec::new();
         let mut capture = None;
-        let di =
-            crate::gpu_forward::xts_expert_stage(&mut gpu, &cfg, &xl, &mut tmp, 0, 1, &mut capture)
-                .expect("xts stage");
+        let di = crate::gpu_forward::xts_expert_stage(
+            &mut gpu,
+            &cfg,
+            &xl,
+            &mut tmp,
+            &xt,
+            &idt,
+            &mut capture,
+        )
+        .expect("xts stage");
         let got = gpu.download_f32(&tmp[di]).unwrap();
         assert_eq!(got.len(), 8 * e);
 
@@ -2889,7 +2792,7 @@ mod xts_gpu_tests {
             "xts stage vs CPU f32 reference: max abs err {worst}, peak {peak}"
         );
 
-        for t in tmp {
+        for t in tmp.into_iter().chain([xt, idt]) {
             let _ = gpu.free_tensor(t);
         }
         xl.free_gpu(&mut gpu);

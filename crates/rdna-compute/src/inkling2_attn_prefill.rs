@@ -8,15 +8,15 @@
 //! Ported from the stack's `inkling2_attn_prefill` for the beta upstream PR:
 //! the Q8_0 twin (brief F1Q) is omitted -- beta has no Q8 KV path (brief 15
 //! not on beta), so the F16 twin is the only batched attention route here.
-//! Beta-rel-bias rule: out-of-extent distances CLAMP to the last table
-//! column, exactly like beta's `inkling2_rel_bias_gather_f32` (NOT the
-//! stack's zero-term rule, which belongs to the separate rel-bias PR).
+//! Relative-bias rule: distances at or past `rel_extent` contribute a zero
+//! table term, while the per-head sink is still subtracted (`0.0 - sink`).
+//! This matches the eager path and `inkling2_rel_bias_gather_f32`.
 //!
 //! * [`prefill_key_plan`] -- the absolute-position key schedule one workgroup
 //!   streams (shared by the host twin and the HIP kernel below).
 //! * [`qtile_attn_reference`] -- host twin of the kernel's exact op order
 //!   (legacy tree-reduction order, phantom-sink init, rel-bias r-order and
-//!   clamp past extent, per-query masking by skip). Bitwise-equal to the
+//!   zero-term past extent, per-query masking by skip). Bitwise-equal to the
 //!   single-row seam by construction; the unit tests below pin that.
 //! * [`INKLING2_ATTN_PREFILL_HIP_SRC`] -- the kernel source (grid
 //!   `(nqtile, 8)`, block 128, QT=16 queries x 3 Q-heads per workgroup, one
@@ -86,15 +86,15 @@ fn tree_dot128(q: &[f32], k: &[f32]) -> f32 {
 }
 
 /// In-register relative bias for one `(query, head, distance)`, mirroring
-/// beta's `inkling2_rel_bias_gather_f32` exactly: ascending-`r` accumulation,
-/// out-of-extent distances clamp to the last table column, then subtract
-/// `sink[h]`.
+/// beta's `inkling2_rel_bias_gather_f32` exactly: ascending-`r` accumulation
+/// in extent, zero table term past extent, then subtract `sink[h]`.
 fn rel_bias_reg(rel_bh: &[f32], table: &[f32], sink_bh: f32, dist: usize, extent: usize) -> f32 {
     debug_assert_eq!(rel_bh.len(), 16);
-    let d = if dist < extent { dist } else { extent - 1 };
     let mut v = 0.0f32;
-    for r in 0..16 {
-        v += table[r * extent + d] * rel_bh[r];
+    if dist < extent {
+        for r in 0..16 {
+            v += table[r * extent + dist] * rel_bh[r];
+        }
     }
     v - sink_bh
 }
@@ -328,10 +328,6 @@ extern "C" __global__ void inkling2_attn_prefill_qtile_f32(
             int lo = p + 1 - n_kv;
             if (t < lo || t > p) continue;   // masked: zero ops.
             int dist = p - t;
-            // Beta clamp past rel_extent (NOT a zero-term): dist >= extent
-            // reads the last table column, exactly like the single-row
-            // `inkling2_rel_bias_gather_f32` kernel beta's eager path runs.
-            int dd = dist < extent ? dist : extent - 1;
             for (int h = 0; h < 3; ++h) {
                 int H = kh * 3 + h;
                 // Fix #1a: wave-shuffle dot over 128 lanes (4 waves of 32).
@@ -345,9 +341,13 @@ extern "C" __global__ void inkling2_attn_prefill_qtile_f32(
                 if ((d & 31) == 0) wsum[ws][d >> 5] = x;
                 __syncthreads();
                 float s = (wsum[ws][0] + wsum[ws][1]) + (wsum[ws][2] + wsum[ws][3]);
+                // Upstream zero-term past rel_extent (NOT a clamp): the table
+                // term is zero, while the sink subtraction below remains.
                 float bias = -sinks[(size_t)b * 24 + H];
-                for (int r = 0; r < 16; ++r) {
-                    bias += table[r * extent + dd] * rel[((size_t)b * 24 + H) * 16 + r];
+                if (dist < extent) {
+                    for (int r = 0; r < 16; ++r) {
+                        bias += table[r * extent + dist] * rel[((size_t)b * 24 + H) * 16 + r];
+                    }
                 }
                 s = s * inv_sqrt_d + bias;
                 float m_new = fmaxf(mm[qb][h], s);
@@ -829,6 +829,22 @@ impl Gpu {
     }
 }
 #[cfg(test)]
+pub(crate) fn init_inkling2_gpu(arches: &[&str]) -> Option<crate::gpu_test::TestGpu> {
+    let gpu = match crate::gpu_test::init() {
+        Ok(gpu) => gpu,
+        Err(e) => {
+            eprintln!("skip: no usable GPU ({e:?})");
+            return None;
+        }
+    };
+    if !arches.contains(&gpu.arch.as_str()) {
+        eprintln!("skip: requires {}, found {}", arches.join("/"), gpu.arch);
+        return None;
+    }
+    Some(gpu)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -929,7 +945,7 @@ mod tests {
 
     #[test]
     fn qtile_full_tiles_no_wrap() {
-        // B=33: two full QT=16 tiles + tail of 1; no ring wrap, no clamp.
+        // B=33: two full QT=16 tiles + tail of 1; no ring wrap, no rollover.
         assert_bitwise(
             "full_tiles",
             &Case {
@@ -956,14 +972,22 @@ mod tests {
     }
 
     #[test]
-    fn qtile_dist_clamp_past_extent() {
-        // base_pos 2000 with extent 1024: dist exceeds extent, clamp path
-        // (beta rule, matching the single-row gather kernel).
+    fn qtile_rel_bias_rollover_1023_1024() {
+        let mut table = vec![0.0f32; 16 * 1024];
+        table[1023] = 2.0;
+        let rel = [
+            1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        assert_eq!(rel_bias_reg(&rel, &table, 0.25, 1023, 1024), 1.75);
+        assert_eq!(rel_bias_reg(&rel, &table, 0.25, 1024, 1024), -0.25);
+
+        // Row 0 reaches dist 1023 (last table column); row 1 reaches 1024
+        // (zero table term, sink still subtracted).
         assert_bitwise(
-            "clamp_past_extent",
+            "rel_bias_rollover",
             &Case {
-                b: 5,
-                base_pos: 2000,
+                b: 2,
+                base_pos: 1023,
                 rows: 4096,
                 extent: 1024,
             },
@@ -1002,24 +1026,19 @@ mod tests {
 
     /// Gate: one batched qtile launch == per-row single-row reference on the
     /// same F16 K/V bytes, at 4 shapes (single-key, SWA wrap, full tiles +
-    /// tail, dist clamp past extent). Bar: max|d| <= 1e-4.
+    /// tail, 1023/1024 rel-bias rollover). Bar: max|d| <= 1e-4.
     #[test]
-    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    #[ignore = "requires gfx1100/gfx1151 and the HIP toolchain"]
     fn gpu_qtile_matches_single_row_f16() {
-        let mut gpu = match crate::gpu_test::init() {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("skip: no usable GPU ({e:?})");
-                return;
-            }
+        let Some(mut gpu) = init_inkling2_gpu(&["gfx1100", "gfx1151"]) else {
+            return;
         };
-        assert_eq!(gpu.arch, "gfx1100");
         let inv = 1.0f32 / 128f32.sqrt();
         for (b, base_pos, rows, extent) in [
             (1usize, 0usize, 8usize, 64usize),
             (17, 20, 8, 64),
             (33, 100, 512, 256),
-            (5, 2000, 2048, 1024),
+            (2, 1023, 4096, 1024),
         ] {
             let mut s = 0xA77E_1cca_b10c5u64
                 .wrapping_add(b as u64)
@@ -1155,16 +1174,11 @@ mod tests {
     /// Vacuity guard: the post-write ring provably differs from the true
     /// keys on redirected rows, so a dead redirect cannot pass.
     #[test]
-    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    #[ignore = "requires gfx1100/gfx1151 and the HIP toolchain"]
     fn gpu_qtile_swa_redirect() {
-        let mut gpu = match crate::gpu_test::init() {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("skip: no usable GPU ({e:?})");
-                return;
-            }
+        let Some(mut gpu) = init_inkling2_gpu(&["gfx1100", "gfx1151"]) else {
+            return;
         };
-        assert_eq!(gpu.arch, "gfx1100");
         let inv = 1.0f32 / 128f32.sqrt();
         let (b, base_pos, rows, extent) = (5usize, 10usize, 8usize, 64usize);
         let (ev_lo, ev_hi) = (2usize, 7usize); // [base-rows, base+b-rows)

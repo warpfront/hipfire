@@ -6,8 +6,9 @@
 //!
 //! Baseline is beta's per-token eager loop (`forward_token_gpu` per
 //! position) — beta has no chunked-prefill seam (brief 11 not on beta).
-//! All GPU tests are `#[ignore]`d: they need the 14 GB MQ4 artifact, the
-//! GPU, and the lock at `C:\Users\Jan\AppData\Local\Temp\opencode\gpu-lock`
+//! All GPU tests are `#[ignore]`d: they need the 14 GB MQ4 artifact, a
+//! gfx1100/gfx1151 GPU, and the lock at
+//! `C:\Users\Jan\AppData\Local\Temp\opencode\gpu-lock`
 //! (claim before any run: write `U2 <pid>`, release after).
 //! Run fresh-process, one gate at a time:
 //!
@@ -23,6 +24,8 @@
 //!    Bar: the auditor's agreement bar (argmax equal, KL <= 0.005), NOT
 //!    bit-parity: the widen-step carries inherent F16 rounding.
 //! 1b. Same at 128 tokens (no wrap; isolates the wiring delta).
+//! 1c. Same at 128 tokens on the typed mq4-xts layout
+//!    (`INKLING2_XTS_ARTIFACT=PATH`), covering per-expert AWQ.
 //! 2. TTFT 2048 before/after (`F1_ARM=seam|batched` single-arm mode for
 //!    interleaved fresh-process ABBA). No bar — the ratio is recorded
 //!    honestly for upstream to judge; correctness gates are the hard
@@ -51,16 +54,34 @@ fn ensure_home() {
     );
 }
 
-fn open_artifact() -> (Inkling2Config, Inkling2Weights) {
-    let hfq = HfqFile::open(std::path::Path::new(ART)).expect("open artifact");
+fn open_artifact_at(path: &std::path::Path) -> (Inkling2Config, Inkling2Weights) {
+    let hfq = HfqFile::open(path).expect("open artifact");
     let cfg = Inkling2Config::from_metadata_json(&hfq.metadata_json).expect("parse config");
     let weights = Inkling2Weights::load(&hfq, &cfg).expect("index weights");
     (cfg, weights)
 }
 
-fn test_gpu() -> Gpu {
+fn open_artifact() -> (Inkling2Config, Inkling2Weights) {
+    let path = std::env::var_os("INKLING2_ARTIFACT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(ART));
+    open_artifact_at(&path)
+}
+
+fn test_gpu() -> Option<Gpu> {
     ensure_home();
-    Gpu::init().expect("gpu init")
+    let gpu = match Gpu::init() {
+        Ok(gpu) => gpu,
+        Err(e) => {
+            eprintln!("skip: no usable GPU ({e:?})");
+            return None;
+        }
+    };
+    if !matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151") {
+        eprintln!("skip: requires gfx1100/gfx1151, found {}", gpu.arch);
+        return None;
+    }
+    Some(gpu)
 }
 
 fn make_bundle(
@@ -81,6 +102,12 @@ fn make_bundle(
 
 fn fresh_bundle(gpu: &mut Gpu, max_seq: usize) -> Inkling2Bundle {
     let (cfg, weights) = open_artifact();
+    let (gw, gs) = upload(&weights, &cfg, gpu, max_seq).expect("gpu upload");
+    make_bundle(cfg, weights, gw, gs)
+}
+
+fn fresh_bundle_at(gpu: &mut Gpu, max_seq: usize, path: &std::path::Path) -> Inkling2Bundle {
+    let (cfg, weights) = open_artifact_at(path);
     let (gw, gs) = upload(&weights, &cfg, gpu, max_seq).expect("gpu upload");
     make_bundle(cfg, weights, gw, gs)
 }
@@ -159,10 +186,12 @@ fn kl_p_q(p_logits: &[f32], q_logits: &[f32]) -> f32 {
 /// its own `f1 arm:` line with dt); unset runs both arms plus the parity
 /// asserts (default gate behavior).
 #[test]
-#[ignore = "needs MQ4 artifact + GPU + lock"]
+#[ignore = "needs MQ4 artifact + gfx1100/gfx1151 + lock"]
 fn f1_gate1_batched_matches_eager_2048() {
     let arm = std::env::var("F1_ARM").unwrap_or_default();
-    let mut gpu = test_gpu();
+    let Some(mut gpu) = test_gpu() else {
+        return;
+    };
     let prompt = {
         let (cfg, _) = open_artifact();
         make_prompt(2048, cfg.unpadded_vocab_size)
@@ -219,9 +248,11 @@ fn f1_gate1_batched_matches_eager_2048() {
 /// Gate 1b: short-prompt parity of the blocked path (128 tokens, no SWA
 /// wrap). Bar is the auditor's agreement bar.
 #[test]
-#[ignore = "needs MQ4 artifact + GPU + lock"]
+#[ignore = "needs MQ4 artifact + gfx1100/gfx1151 + lock"]
 fn f1_gate1b_short_parity_128() {
-    let mut gpu = test_gpu();
+    let Some(mut gpu) = test_gpu() else {
+        return;
+    };
     let n_vocab = open_artifact().0.unpadded_vocab_size;
     let prompt = make_prompt(128, n_vocab);
     let mut b0 = fresh_bundle(&mut gpu, 4096);
@@ -248,14 +279,44 @@ fn f1_gate1b_short_parity_128() {
     );
 }
 
+/// Gate 1c: the default mq4-xts layout keeps its per-expert AWQ path through
+/// both eager decode and blocked prefill. Set `INKLING2_XTS_ARTIFACT` to the
+/// typed XTS HFQ; the agreement bar matches gate 1b.
+#[test]
+#[ignore = "needs mq4-xts artifact + gfx1100/gfx1151 + lock"]
+fn f1_gate1c_xts_parity_128() {
+    let Some(mut gpu) = test_gpu() else {
+        return;
+    };
+    let path = std::env::var_os("INKLING2_XTS_ARTIFACT")
+        .map(std::path::PathBuf::from)
+        .expect("set INKLING2_XTS_ARTIFACT to the mq4-xts HFQ");
+    let mut b0 = fresh_bundle_at(&mut gpu, 4096, &path);
+    let prompt = make_prompt(128, b0.config.unpadded_vocab_size);
+    let eager = eager_prefill(&mut b0, &mut gpu, &prompt);
+    free_bundle_gpu(&mut b0, &mut gpu);
+    drop(b0);
+    let mut b1 = fresh_bundle_at(&mut gpu, 4096, &path);
+    let blocked = prefill_prompt_gpu_blocked(&mut b1, &mut gpu, &prompt, 0).unwrap();
+    let m = max_abs(&eager, &blocked);
+    let a_eager = argmax(&eager);
+    let a_block = argmax(&blocked);
+    let kl = kl_p_q(&eager, &blocked);
+    eprintln!("f1 gate1c xts: max|d|={m:e} argmax {a_eager} vs {a_block} KL={kl:e}");
+    assert_eq!(a_eager, a_block, "XTS blocked argmax differs from eager");
+    assert!(kl <= 0.005, "XTS blocked KL {kl:e} exceeds 0.005");
+}
+
 /// Gate 2: TTFT 2048 before/after. No bar — the ratio is recorded honestly
 /// for upstream to judge; correctness gates are the hard requirement.
 /// Baseline is beta's per-token eager loop (unmodified beta build), same
 /// prompt bytes, fresh processes, throwaway first, interleaved ABBA.
 #[test]
-#[ignore = "needs MQ4 artifact + GPU + lock"]
+#[ignore = "needs MQ4 artifact + gfx1100/gfx1151 + lock"]
 fn f1_gate2_ttft() {
-    let mut gpu = test_gpu();
+    let Some(mut gpu) = test_gpu() else {
+        return;
+    };
     let prompt = {
         let (cfg, _) = open_artifact();
         make_prompt(2048, cfg.unpadded_vocab_size)
@@ -278,9 +339,11 @@ fn f1_gate2_ttft() {
 
 /// Gate 4: 8192-token prompt prefills without OOM.
 #[test]
-#[ignore = "needs MQ4 artifact + GPU + lock"]
+#[ignore = "needs MQ4 artifact + gfx1100/gfx1151 + lock"]
 fn f1_gate4_long_prompt_no_oom() {
-    let mut gpu = test_gpu();
+    let Some(mut gpu) = test_gpu() else {
+        return;
+    };
     let prompt = {
         let (cfg, _) = open_artifact();
         make_prompt(8192, cfg.unpadded_vocab_size)

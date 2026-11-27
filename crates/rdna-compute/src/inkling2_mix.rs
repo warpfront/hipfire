@@ -668,6 +668,7 @@ impl Gpu {
 mod gpu_tests {
     use super::*;
     use crate::dispatch::DType;
+    use crate::inkling2_attn_prefill::init_inkling2_gpu;
     use crate::inkling2_control::INKLING2_CONTROL_EPS;
 
     fn rng_next(state: &mut u64) -> u64 {
@@ -734,16 +735,11 @@ mod gpu_tests {
     /// (n_embd 2304, 5 bank blocks + cur, 2 query rows) and on a randomized
     /// case. Bar: <= 1e-5 abs.
     #[test]
-    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    #[ignore = "requires gfx1100/gfx1151 and the HIP toolchain"]
     fn gpu_matches_cpu_reference() {
-        let mut gpu = match crate::gpu_test::init() {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("skip: no usable GPU ({e:?})");
-                return;
-            }
+        let Some(mut gpu) = init_inkling2_gpu(&["gfx1100", "gfx1151"]) else {
+            return;
         };
-        assert_eq!(gpu.arch, "gfx1100");
         assert_eq!(INKLING2_MIX_EPS, INKLING2_CONTROL_EPS);
         // (a) model dims.
         let (n_embd, n_blocks, query_rows) = (2304usize, 5usize, 2usize);
@@ -779,16 +775,11 @@ mod gpu_tests {
     /// matches the copying path bitwise at model dims. The copying path is
     /// the pre-change behavior; equality here is the no-reassociation proof.
     #[test]
-    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    #[ignore = "requires gfx1100/gfx1151 and the HIP toolchain"]
     fn gpu_ptr_path_matches_copying_path_bitwise() {
-        let mut gpu = match crate::gpu_test::init() {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("skip: no usable GPU ({e:?})");
-                return;
-            }
+        let Some(mut gpu) = init_inkling2_gpu(&["gfx1100", "gfx1151"]) else {
+            return;
         };
-        assert_eq!(gpu.arch, "gfx1100");
         let (n_embd, n_blocks, query_rows) = (2304usize, 5usize, 2usize);
         let mut s = 0x51ab_3c9d_2ef0_1123u64;
         let blocks_h: Vec<Vec<f32>> = (0..n_blocks)
