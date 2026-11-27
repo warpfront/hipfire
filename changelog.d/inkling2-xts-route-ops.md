@@ -1,0 +1,3 @@
+### Changes
+
+- **Developer example `inkling_xts_routes` (`hipfire-arch-inkling2`): operator-level per-route quality of the Inkling-2-Mini `mq4-xts` artifact.** It scores every activation route the typed `qt44-padded-awq-v1` layout admits on gfx1201 (scalar decode chain, grouped weight-only / W4A8 / W4A4 / W4FP8 experts with the per-slot AWQ producer, dense native / A4 / A8 / `HIPFIRE_IU4_PREFILL=0` FP8 and F16) against an F64 CPU teacher built from the exact source weights on held-out check rows, and an exact-arithmetic floor of the artifact's own weights. Developer-only; no product dispatch changes.
