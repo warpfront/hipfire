@@ -296,8 +296,10 @@ rows; legacy fn-lanes are not row-exact by default):
   with legacy fn-lanes, whose window policy differs (HIPF-615). A cell not in
   the baseline, an engine arm with no baseline, or bench params (`k`, `runs`,
   `workloads`, `args`) that differ from the baseline's mark the run
-  `pass-partial`: the cell order and the run count move lane tau (the first
-  run of a cell drafts higher than the later runs). A change that moves the
+  `pass-partial`: the cell order and the run count move lane tau (in the
+  multiturn cells the first run drafts highest). The gate cannot see a lane
+  tau loss below ~15 %, and the k>1 targets do not catch one either (a −41 %
+  mutant passed the multiturn/4 target, HIPF-604). A change that moves the
   lane window policy writes a new baseline and records why
 - **target** (k>1): output tok/s at least the target's − `tol_pct`, TTFT p50
   and p99 at most the target's + `tol_pct`

@@ -799,14 +799,17 @@ def conc_self_test():
     assert spec_unexercised({}, jab, None) == [] and spec_unexercised(sn, {"g_spec": None}, None) == []
 
     # k>1 lane tau vs a stored engine baseline (HIPF-604): bound -15 %
-    def runs3(loop, tau4, runs=3):
+    def runs3(loop, tau4, runs=3, tau2=None):
         a = conc_arm(loop, "noslots", tau=3.0)
-        for key in [f"{wl}/{k}/{n}/0/0" for wl in ("stateless", "multiturn") for k in (1, 4)
-                    for n in range(2, runs + 1)]:
-            a["reqs"][key] = req(tau=3.0, loop=loop)
+        for key in [f"{wl}/{k}/{n}/0/0" for wl in ("stateless", "multiturn") for k in (1, 2, 4)
+                    for n in range(1, runs + 1)]:
+            if key not in a["reqs"] and (tau2 is not None or key.split("/")[1] != "2"):
+                a["reqs"][key] = req(tau=3.0, loop=loop)
+        if tau2 is not None:
+            a["cells"].update({f"{wl}/2": a["cells"][f"{wl}/4"] for wl in ("stateless", "multiturn")})
         for key, x in a["reqs"].items():
-            if loop == "engine" and key.split("/")[1] == "4":
-                x["done"]["tau"] = tau4
+            if loop == "engine" and key.split("/")[1] in ("2", "4"):
+                x["done"]["tau"] = tau4 if key.split("/")[1] == "4" else tau2
         return a
     lt = {"lane_tau": {"bench": bench_params({"runs": 3}),
                        "arms": {"engine-noslots": {"stateless/4": {"mean": 2.0}, "multiturn/4": {"mean": 2.0}}}}}
@@ -819,6 +822,13 @@ def conc_self_test():
     assert lane(no_tau)["fails"] == ["engine-noslots: lane tau 1"]  # every lane request must report tau
     short = cj(eng=runs3("engine", 1.0, runs=2), leg=runs3("legacy", 3.0, runs=2), c={**lt, "runs": 2})
     assert short["ok"] and short["unexercised"] == ["engine-noslots: lane tau baseline bench params differ"], short
+    for diff in ({"args": ["--max-tokens", "64"]}, {"workloads": ["stateless"]}):
+        assert lane(runs3("engine", 1.0), {**lt, **diff})["unexercised"] == [
+            "engine-noslots: lane tau baseline bench params differ"], diff
+    lt2 = {"lane_tau": {**lt["lane_tau"], "arms": {"engine-noslots": {
+        **lt["lane_tau"]["arms"]["engine-noslots"], "stateless/2": {"mean": 2.0}, "multiturn/2": {"mean": 2.0}}}}}
+    k2 = lambda t: cj(eng=runs3("engine", 2.0, tau2=t), leg=runs3("legacy", 3.0, tau2=3.0), c={"runs": 3, **lt2})
+    assert k2(1.71)["ok"] and k2(1.69)["fails"] == ["engine-noslots: lane tau 2"]  # k=2 cells gate too
     one = lane(runs3("engine", 1.0), {"lane_tau": {**lt["lane_tau"], "arms": {"engine-noslots": {
         "stateless/4": {"mean": 1.0}}}}})
     assert one["ok"] and one["unexercised"] == ["engine-noslots: lane tau multiturn/4 not in the baseline"], one
@@ -1327,8 +1337,8 @@ def judge_conc(arms, c, expect_engine):
 
 
 def bench_params(c):
-    """The conc settings that move a cell's lane tau: cell order, run count (later runs
-    draft lower than the first), prompts and lengths (HIPF-604)."""
+    """The conc settings that move a cell's lane tau: cell order, run count (in multiturn
+    cells the first run drafts highest), prompts and lengths (HIPF-604)."""
     return {x: c.get(x) for x in ("k", "runs", "workloads", "args")}
 
 
