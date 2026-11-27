@@ -50,7 +50,7 @@ use crate::arch_model::Inkling2Bundle;
 use crate::config::Inkling2Config;
 use crate::gpu::{
     swa_gather_map, swa_slot, Inkling2Controller, Inkling2GpuLayer, Inkling2GpuState,
-    Inkling2GpuWeights, Inkling2XtsLayer, INKLING2_CONV_WIDTH,
+    Inkling2GpuWeights, Inkling2VisitScratch, INKLING2_CONV_WIDTH,
 };
 use hip_bridge::{DeviceBuffer, KernargBlob};
 use hipfire_dispatch::pipeline::run_uniform_moe_down_expanded;
@@ -63,7 +63,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 // ---------------------------------------------------------------------------
-// Dedicated HIP (the only two kernels in this file)
+// Dedicated HIP (conv + decode attention + D1 zero-copy decode kernels)
 // ---------------------------------------------------------------------------
 
 const INKLING2_GF_MODULE: &str = "inkling2_gpu_forward";
@@ -71,6 +71,60 @@ const INKLING2_GF_MODULE: &str = "inkling2_gpu_forward";
 const INKLING2_GF_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+
+// --- D1 zero-copy decode kernels --------------------------------------
+// Device pos word: advanced once per token by a 1-thread kernel, so the
+// steady-state step performs zero H2Ds. 0.0f32 and 0u32 share bits, so
+// reset writes the word with the existing F32 fill path.
+extern "C" __global__ void inkling2_gf_advance_pos(unsigned int* __restrict__ pos) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) *pos += 1u;
+}
+
+// Device slots/dists map: slots[k] = (start+k) % rows,
+// dists[k] = pos-(start+k), n_kv = min(pos+1, rows), all from the device
+// pos word. One thread per k; grid covers the largest visit. Matches
+// swa_gather_map() exactly (same arithmetic, same order); the host keeps
+// validating tags fail-closed with zero H2D.
+extern "C" __global__ void inkling2_gf_build_slots_dists(
+    const unsigned int* __restrict__ pos,
+    int* __restrict__ slots,
+    int* __restrict__ dists,
+    int rows) {
+    int k = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    unsigned int p = *pos;
+    int n_kv = (int)p + 1;
+    if (n_kv > rows) n_kv = rows;
+    if (k >= n_kv) return;
+    int kp = (int)p + 1 - n_kv + k;
+    slots[k] = kp % rows;
+    dists[k] = (int)p - kp;
+}
+
+// Batched KV write, F16 path. Grid (8, 2): block (h, kv) converts one
+// 128-wide F32 head row into cache row wpos. Bitwise identical to 16
+// separate convert_f32_to_f16_into launches (same (_Float16) cast).
+extern "C" __global__ void inkling2_gf_kv_write_f16_batched(
+    const float* __restrict__ k_conv, // [8, 128] contiguous
+    const float* __restrict__ vc,     // [8, 128] contiguous
+    unsigned short* __restrict__ k0, unsigned short* __restrict__ k1,
+    unsigned short* __restrict__ k2, unsigned short* __restrict__ k3,
+    unsigned short* __restrict__ k4, unsigned short* __restrict__ k5,
+    unsigned short* __restrict__ k6, unsigned short* __restrict__ k7,
+    unsigned short* __restrict__ v0, unsigned short* __restrict__ v1,
+    unsigned short* __restrict__ v2, unsigned short* __restrict__ v3,
+    unsigned short* __restrict__ v4, unsigned short* __restrict__ v5,
+    unsigned short* __restrict__ v6, unsigned short* __restrict__ v7,
+    int wpos, int hd) {
+    int h = (int)blockIdx.x;   // 0..7
+    int kv = (int)blockIdx.y;  // 0 = K, 1 = V
+    int d = (int)threadIdx.x;  // 0..127
+    if (h >= 8 || d >= hd) return;
+    unsigned short* ks[8] = {k0, k1, k2, k3, k4, k5, k6, k7};
+    unsigned short* vs[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
+    const float* src = (kv == 0 ? k_conv : vc) + (size_t)h * (size_t)hd;
+    unsigned short* row = (kv == 0 ? ks[h] : vs[h]) + (size_t)wpos * (size_t)hd;
+    row[d] = __half_as_ushort((__half)(src[d]));
+}
 
 // Short conv, one thread per channel. Static path taps W[l,C] over
 // x = [past0, past1, past2, cur] (01 uploads [K,C] with row 0 oldest).
@@ -180,7 +234,108 @@ fn ensure_kernels(gpu: &mut Gpu) -> Result<(), String> {
         "inkling2_gf_attn_decode_f32",
     )
     .map_err(|e| format!("inkling2 gpu fwd: attn kernel: {e:?}"))?;
+    gpu.ensure_kernel_public(
+        INKLING2_GF_MODULE,
+        INKLING2_GF_HIP_SRC,
+        "inkling2_gf_advance_pos",
+    )
+    .map_err(|e| format!("inkling2 gpu fwd: advance_pos kernel: {e:?}"))?;
+    gpu.ensure_kernel_public(
+        INKLING2_GF_MODULE,
+        INKLING2_GF_HIP_SRC,
+        "inkling2_gf_build_slots_dists",
+    )
+    .map_err(|e| format!("inkling2 gpu fwd: slots kernel: {e:?}"))?;
+    gpu.ensure_kernel_public(
+        INKLING2_GF_MODULE,
+        INKLING2_GF_HIP_SRC,
+        "inkling2_gf_kv_write_f16_batched",
+    )
+    .map_err(|e| format!("inkling2 gpu fwd: kv_write kernel: {e:?}"))?;
     Ok(())
+}
+
+/// D1: advance the device pos word by one (1 thread, 0 H2D). Launched once
+/// per completed token; the slots kernel of the next token reads the word.
+fn launch_advance_pos(gpu: &mut Gpu, pos_dev: &GpuTensor) -> Result<(), String> {
+    let mut blob = KernargBlob::new();
+    blob.push_ptr(pos_dev.buf.as_ptr());
+    blob.pad_to(16);
+    gpu.launch_kernel_blob(
+        "inkling2_gf_advance_pos",
+        [1, 1, 1],
+        [1, 1, 1],
+        0,
+        blob.as_mut_slice(),
+    )
+    .map_err(|e| format!("inkling2 gpu fwd: advance pos launch: {e:?}"))
+}
+
+/// D1: build slots/dists maps on-device from the pos word (grid covers
+/// `max_rows`; threads past n_kv exit). Replaces 2 H2D uploads per visit.
+fn launch_build_slots_dists(
+    gpu: &mut Gpu,
+    pos_dev: &GpuTensor,
+    slots_dev: &GpuTensor,
+    dists_dev: &GpuTensor,
+    max_rows: usize,
+) -> Result<(), String> {
+    let mut blob = KernargBlob::new();
+    blob.push_ptr(pos_dev.buf.as_ptr());
+    blob.push_ptr(slots_dev.buf.as_ptr());
+    blob.push_ptr(dists_dev.buf.as_ptr());
+    blob.push_i32(max_rows as i32);
+    blob.pad_to(16);
+    let grid = [(max_rows as u32).div_ceil(256).max(1), 1, 1];
+    gpu.launch_kernel_blob(
+        "inkling2_gf_build_slots_dists",
+        grid,
+        [256, 1, 1],
+        0,
+        blob.as_mut_slice(),
+    )
+    .map_err(|e| format!("inkling2 gpu fwd: slots launch: {e:?}"))
+}
+
+/// D1: single batched F16 KV-write launch per visit, grid (8, 2). `k_conv`
+/// and `vc` are the contiguous `[8, 128]` visit temps; each cache head
+/// buffer receives row `wpos`. Bitwise identical to 16 converts.
+#[allow(clippy::too_many_arguments)]
+fn launch_kv_write_f16_batched(
+    gpu: &mut Gpu,
+    k_conv: &GpuTensor,
+    vc: &GpuTensor,
+    k_cache: &[GpuTensor],
+    v_cache: &[GpuTensor],
+    wpos: usize,
+    head_dim: usize,
+) -> Result<(), String> {
+    if k_cache.len() != 8 || v_cache.len() != 8 {
+        return Err("inkling2 gpu fwd: batched kv write needs 8 K and 8 V caches".to_string());
+    }
+    if head_dim != 128 {
+        return Err("inkling2 gpu fwd: batched kv write is head_dim=128".to_string());
+    }
+    let mut blob = KernargBlob::new();
+    blob.push_ptr(k_conv.buf.as_ptr());
+    blob.push_ptr(vc.buf.as_ptr());
+    for t in k_cache {
+        blob.push_ptr(t.buf.as_ptr());
+    }
+    for t in v_cache {
+        blob.push_ptr(t.buf.as_ptr());
+    }
+    blob.push_i32(wpos as i32);
+    blob.push_i32(head_dim as i32);
+    blob.pad_to(16);
+    gpu.launch_kernel_blob(
+        "inkling2_gf_kv_write_f16_batched",
+        [8, 2, 1],
+        [128, 1, 1],
+        0,
+        blob.as_mut_slice(),
+    )
+    .map_err(|e| format!("inkling2 gpu fwd: kv_write launch: {e:?}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -293,74 +448,19 @@ fn free_all(gpu: &mut Gpu, ts: Vec<GpuTensor>) {
     }
 }
 
-/// Checked non-owning byte-range view into a pool-served buffer.
-///
-/// The reuse pool best-fit may hand a larger buffer to an exact-size request,
-/// so a bigger buffer is normal: the view takes the logical
-/// `[byte_offset, byte_offset + byte_len)` prefix (same elements a fresh
-/// exact buffer would hold — `>=`, not `==`). A short buffer fails closed
-/// with `Err` (surfaces as 503) instead of an `assert!` panic that would
-/// kill the daemon when the pool retires under OOM pressure. Never clamps:
-/// short is refused, never silently truncated.
-fn sub_buf(
-    t: &GpuTensor,
-    byte_offset: usize,
-    byte_len: usize,
-    what: &str,
-) -> Result<DeviceBuffer, String> {
-    let end = byte_offset.checked_add(byte_len).ok_or_else(|| {
-        format!("inkling2 gpu fwd: {what}: offset {byte_offset}+len {byte_len} overflows")
-    })?;
-    let have = t.buf.size();
-    if end > have {
-        return Err(format!(
-            "inkling2 gpu fwd: {what}: need [{byte_offset},{end}) of {have} buffer bytes"
-        ));
-    }
-    Ok(t.buf.byte_view(byte_offset, byte_len))
-}
-
 /// Non-owning `[rows, cols]` F32 view of a whole buffer. The pool best-fit may
 /// hand a larger buffer to an exact-size request; the view takes the logical
 /// prefix (same elements a fresh exact buffer would hold), so `>=` is the
-/// correct gate, not `==`. Short buffers and wrong dtypes fail closed with
-/// `Err`, never a daemon-killing `assert!`.
-fn view2(t: &GpuTensor, rows: usize, cols: usize) -> Result<GpuTensor, String> {
-    if t.dtype != DType::F32 {
-        return Err(format!(
-            "inkling2 gpu fwd: view2 of {:?}, need F32",
-            t.dtype
-        ));
-    }
-    let len = rows
-        .checked_mul(cols)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or_else(|| format!("inkling2 gpu fwd: view2 [{rows},{cols}] extent overflows"))?;
-    Ok(GpuTensor {
-        buf: sub_buf(t, 0, len, "view2")?,
+/// correct gate, not `==`.
+fn view2(t: &GpuTensor, rows: usize, cols: usize) -> GpuTensor {
+    assert_eq!(t.dtype, DType::F32, "inkling2 gpu fwd: view of non-F32");
+    assert!(
+        t.buf.size() >= rows * cols * 4,
+        "inkling2 gpu fwd: view extent"
+    );
+    GpuTensor {
+        buf: t.buf.byte_view(0, rows * cols * 4),
         shape: vec![rows, cols],
-        dtype: DType::F32,
-    })
-}
-
-/// Non-owning `[hd]` F32 view of one head row inside a `[heads*hd]` buffer.
-/// A short pool buffer fails closed with `Err`, never a `byte_view` panic.
-fn head_view(t: &GpuTensor, h: usize, hd: usize) -> Result<GpuTensor, String> {
-    if t.dtype != DType::F32 {
-        return Err(format!(
-            "inkling2 gpu fwd: head view of {:?}, need F32",
-            t.dtype
-        ));
-    }
-    let row_len = hd
-        .checked_mul(4)
-        .ok_or_else(|| "inkling2 gpu fwd: head view extent overflows".to_string())?;
-    let off = h
-        .checked_mul(row_len)
-        .ok_or_else(|| format!("inkling2 gpu fwd: head view head {h}*{hd} overflows"))?;
-    Ok(GpuTensor {
-        buf: sub_buf(t, off, row_len, "head_view")?,
-        shape: vec![hd],
         dtype: DType::F32,
     })
 }
@@ -398,17 +498,17 @@ fn copy_row_from(
 }
 
 fn dup(gpu: &mut Gpu, src: &GpuTensor, what: &str) -> Result<GpuTensor, String> {
-    // Size the copy from the shape, not the buffer: the pool best-fit may
-    // hand a larger buffer to an exact-size request, and sizing from the
-    // buffer would clone pool slack into the copy. The buffer must still
-    // hold all logical elements; a short buffer fails closed, never a panic.
+    // Logical element count, NOT buffer bytes: the pool best-fit may hand a
+    // larger buffer to an [e] request, and sizing the copy from the buffer
+    // would clone pool slack into the shape (a [3072]-shaped "copy" of an
+    // [e] row — silent under copy-with-explicit-counts, fatal to D1's
+    // pointer banks). The buffer must still hold all logical elements.
     let n: usize = src.shape.iter().product();
-    if src.buf.size() / 4 < n {
-        return Err(format!(
-            "inkling2 gpu fwd: dup {what}: buffer {} words < shape {n}",
-            src.buf.size() / 4
-        ));
-    }
+    assert!(
+        src.buf.size() / 4 >= n,
+        "inkling2 gpu fwd: dup {what}: buffer {} words < shape {n}",
+        src.buf.size() / 4
+    );
     let out = gpu
         .alloc_tensor(&[n], DType::F32)
         .map_err(|e| format!("inkling2 gpu fwd: dup {what}: {e:?}"))?;
@@ -436,153 +536,56 @@ fn cap_put(
     Ok(())
 }
 
-/// Routed-expert stage of a typed-XTS (`qt44-padded-awq-v1`) layer for one row
-/// (scalar decode): returns the `tmp` index of `down_exp [top_k, n_embd]`.
-///
-/// 1. `rotate_x_mq_awq_topk`: `rows[r] = FWHT256(ffn_normed / S_gu[e_r])` (exact f32
-///    divide; with `S == 1` bitwise `rotate_x_mq` of the shared row);
-/// 2. gate_up through the qt44 expanded GEMV with per-rank rows (`m = 2*inter`,
-///    `k = n_embd`) -> `[top_k, 2*inter]` rows `[gate | up]`;
-/// 3. SiTU (gate offset 0, up offset `inter`, ld `2*inter`, logical `inter`, physical
-///    `down_k_physical`) with the per-expert down AWQ divide (`row_expert` = route ids);
-/// 4. `rotate_x_mq_batched` over the physical width;
-/// 5. down through the same expanded GEMV (`m = n_embd`, `k = down_k_physical`).
-///
-/// No D2H of route ids, no host expert loop, no per-token table rebuild: the
-/// pointer tables live on the layer. Failure leaves `tmp` for the caller to free.
-pub(crate) fn xts_expert_stage(
-    gpu: &mut Gpu,
-    cfg: &Inkling2Config,
-    xl: &Inkling2XtsLayer,
-    tmp: &mut Vec<GpuTensor>,
-    ffn_normed: usize,
-    topk_idx: usize,
-    cap: &mut Option<HashMap<String, Vec<f32>>>,
-) -> Result<usize, String> {
-    let e = cfg.n_embd;
-    let inter = cfg.inter;
-    let phys = crate::weights::xts_down_dims(cfg).1;
-    let k_top = cfg.n_expert_used;
-    let n_exp = cfg.n_experts;
-    let rows = at(gpu, tmp, &[k_top, e], "xts_x_rot")?;
-    gpu.rotate_x_mq_awq_topk(
-        &tmp[ffn_normed],
-        &xl.gu_awq_ptrs,
-        &tmp[topk_idx],
-        &tmp[rows],
-        e,
-        k_top,
-        n_exp,
-    )
-    .map_err(|e2| format!("inkling2 gpu fwd: xts producer: {e2:?}"))?;
-    let gu = at(gpu, tmp, &[k_top, 2 * inter], "xts_gate_up")?;
-    run_uniform_moe_down_expanded(
-        gpu,
-        DType::MQ4G256V2,
-        &xl.gu_ptrs,
-        &tmp[topk_idx],
-        &tmp[rows],
-        &tmp[gu],
-        2 * inter,
-        e,
-        k_top,
-        1,
-    )
-    .map_err(|e2| format!("inkling2 gpu fwd: xts gate_up: {e2:?}"))?;
-    cap_put(cap, gpu, "gate_up", &tmp[gu])?;
-    let act = at(gpu, tmp, &[k_top, phys], "xts_act")?;
-    gpu.ffn_activation_rows_f32(&FfnActivationRows {
-        activation: FfnActivation::Situ {
-            gate_beta: cfg.situ_beta,
-            value_beta: cfg.situ_linear_beta,
-        },
-        gate: &tmp[gu],
-        gate_offset: 0,
-        gate_ld: 2 * inter,
-        up: &tmp[gu],
-        up_offset: inter,
-        up_ld: 2 * inter,
-        out: &tmp[act],
-        rows: k_top,
-        logical_n: inter,
-        phys_n: phys,
-        round_inputs: false,
-        round_output: false,
-        awq: FfnAwq::PerExpert {
-            table: &xl.down_awq_ptrs,
-            row_expert: &tmp[topk_idx],
-            n_experts: n_exp,
-        },
-    })
-    .map_err(|e2| format!("inkling2 gpu fwd: xts situ: {e2:?}"))?;
-    cap_put(cap, gpu, "act", &tmp[act])?;
-    let rot = at(gpu, tmp, &[k_top, phys], "xts_rot")?;
-    gpu.rotate_x_mq_batched(&tmp[act], &tmp[rot], phys, k_top)
-        .map_err(|e2| format!("inkling2 gpu fwd: xts act rotate: {e2:?}"))?;
-    let down_exp = at(gpu, tmp, &[k_top, e], "xts_down_exp")?;
-    run_uniform_moe_down_expanded(
-        gpu,
-        DType::MQ4G256V2,
-        &xl.down_ptrs,
-        &tmp[topk_idx],
-        &tmp[rot],
-        &tmp[down_exp],
-        e,
-        phys,
-        k_top,
-        1,
-    )
-    .map_err(|e2| format!("inkling2 gpu fwd: xts down: {e2:?}"))?;
-    cap_put(cap, gpu, "down_exp", &tmp[down_exp])?;
-    cap_put(cap, gpu, "rot_b", &tmp[rot])?;
-    Ok(down_exp)
-}
-
-/// AttnRes-style mix over `bank_rows + cur` with a `[qr, e]` query.
-/// Self-contained scratch: only the `[qr, e]` output escapes.
-/// Peak AttnRes state count is 5 (post-loop visits, final output mix),
-/// inside 02's 6-state kernel cap.
+/// AttnRes-style mix over norm-once `normed_bank` + `cur` with a `[qr, e]` query.
+/// D1 zero-copy path: bank rows are already RMSNormed (norm-once at push
+/// with the same tree reduction as the copying path, so bitwise identical),
+/// `cur` is normalized in-kernel into `scratch.mix_cur_normed`. No bank
+/// allocation, no `copy_rows`, no per-call bank re-norm. Only the `[qr, e]`
+/// output escapes (pool-owned, as before).
 fn gpu_mix(
     gpu: &mut Gpu,
-    bank_rows: &[&GpuTensor],
+    scratch: &Inkling2VisitScratch,
+    normed_bank: &[&GpuTensor],
     cur: &GpuTensor,
     query: &GpuTensor,
     e: usize,
     qr: usize,
     eps: f32,
 ) -> Result<GpuTensor, String> {
-    let n = bank_rows.len() + 1;
+    let n = normed_bank.len() + 1;
     if !(1..=6).contains(&n) {
         return Err(format!("inkling2 gpu fwd: mix states {n} exceeds 6"));
+    }
+    if normed_bank.len() > 5 {
+        return Err(format!(
+            "inkling2 gpu fwd: mix bank {} exceeds 5",
+            normed_bank.len()
+        ));
     }
     let mut tmp = Vec::new();
     let fail = |gpu: &mut Gpu, tmp: Vec<GpuTensor>, msg: String| -> Result<GpuTensor, String> {
         free_all(gpu, tmp);
         Err(msg)
     };
-    let b = match at(gpu, &mut tmp, &[n, e], "mix_bank") {
-        Ok(i) => i,
-        Err(msg) => return fail(gpu, tmp, msg),
-    };
-    for (i, r) in bank_rows.iter().chain(std::iter::once(&cur)).enumerate() {
-        if let Err(e2) = gpu.copy_rows_strided_f32(r, &tmp[b], 1, e, e, e, i * e, None) {
-            return fail(gpu, tmp, format!("inkling2 gpu fwd: mix bank row: {e2:?}"));
-        }
-    }
-    let normed = match at(gpu, &mut tmp, &[n, e], "mix_normed") {
-        Ok(i) => i,
-        Err(msg) => return fail(gpu, tmp, msg),
-    };
+    // Only the output allocates; every input is read in place.
     let out = match at(gpu, &mut tmp, &[qr, e], "mix_out") {
         Ok(i) => i,
         Err(msg) => return fail(gpu, tmp, msg),
     };
-    let qv = match view2(query, qr, e) {
-        Ok(v) => v,
-        Err(msg) => return fail(gpu, tmp, msg),
-    };
-    if let Err(e2) = gpu.inkling2_mix_f32_gpu(&tmp[b], &qv, &tmp[normed], &tmp[out], n, e, qr, eps)
-    {
+    let qv = view2(query, qr, e);
+    // Norm cur into the persistent slot inside the wrapper (one independent
+    // batch row — bitwise identical to norming it as part of a contiguous
+    // bank with the same eps).
+    if let Err(e2) = gpu.inkling2_mix_ptr_f32_gpu(
+        normed_bank,
+        cur,
+        &scratch.mix_cur_normed,
+        &qv,
+        &tmp[out],
+        e,
+        qr,
+        eps,
+    ) {
         return fail(gpu, tmp, format!("inkling2 gpu fwd: mix: {e2:?}"));
     }
     let got = tmp.pop().expect("mix out is last");
@@ -590,9 +593,13 @@ fn gpu_mix(
     Ok(got)
 }
 
-/// One fused controller step. Self-contained scratch; only the output escapes.
+/// One fused controller step. Internal scratch is the persistent
+/// `scratch.ctrl_scratch` slot (dead after each call); only the output
+/// escapes (pool-owned, as before — the four message outputs stay live
+/// simultaneously, so they cannot share one slot).
 fn gpu_control(
     gpu: &mut Gpu,
+    scratch: &Inkling2VisitScratch,
     cur: &GpuTensor,
     msg: &GpuTensor,
     ctrl: &Inkling2Controller,
@@ -608,10 +615,6 @@ fn gpu_control(
         Ok(i) => i,
         Err(msg) => return fail(gpu, tmp, msg),
     };
-    let scratch = match at(gpu, &mut tmp, &[4 * e + rank], "ctrl_scratch") {
-        Ok(i) => i,
-        Err(msg) => return fail(gpu, tmp, msg),
-    };
     if let Err(e2) = gpu.inkling2_control_f32_gpu(
         cur,
         msg,
@@ -619,14 +622,13 @@ fn gpu_control(
         &ctrl.gain,
         &ctrl.forget,
         &tmp[out],
-        &tmp[scratch],
+        &scratch.ctrl_scratch,
         e,
         rank,
     ) {
         return fail(gpu, tmp, format!("inkling2 gpu fwd: control: {e2:?}"));
     }
-    let _ = tmp.remove(scratch);
-    let got = tmp.remove(out);
+    let got = tmp.pop().expect("ctrl out is last");
     free_all(gpu, tmp);
     Ok(got)
 }
@@ -638,6 +640,9 @@ fn gpu_control(
 struct VisitOut {
     visit_out: GpuTensor,
     push: Option<GpuTensor>,
+    /// D1 norm-once twin of `push`: RMSNormed once at push time, rides in
+    /// `Owned.blocks_n` and feeds every later mix via pointers.
+    push_normed: Option<GpuTensor>,
 }
 
 /// `msgs`: pass > 0 core visits carry `(msg_bank, prev_out, cross[4,e], ctrls)`.
@@ -649,10 +654,12 @@ fn run_visit(
     layer: &Inkling2GpuLayer,
     x: &GpuTensor,
     blocks: &[GpuTensor],
+    blocks_normed: &[GpuTensor],
     visit: usize,
     phys: usize,
     pos: usize,
     msgs: Option<(
+        &[GpuTensor],
         &[GpuTensor],
         &GpuTensor,
         &GpuTensor,
@@ -673,12 +680,16 @@ fn run_visit(
     let mut tmp: Vec<GpuTensor> = Vec::new();
     // Block-push made before the MoE half; freed with tmp on error.
     let mut push: Option<GpuTensor> = None;
+    let mut push_normed: Option<GpuTensor> = None;
     macro_rules! step {
         ($expr:expr, $what:literal) => {
             match $expr {
                 Ok(v) => v,
                 Err(e) => {
                     if let Some(p) = push.take() {
+                        let _ = gpu.free_tensor(p);
+                    }
+                    if let Some(p) = push_normed.take() {
                         let _ = gpu.free_tensor(p);
                     }
                     free_all(gpu, tmp);
@@ -721,8 +732,17 @@ fn run_visit(
         }
         // Mirrors forward.rs: 3 rows when the query carries them, else 1.
         let qr = if total / e >= 3 { 3 } else { 1 };
-        let bank_rows: Vec<&GpuTensor> = blocks.iter().collect();
-        let mixed = step!(gpu_mix(gpu, &bank_rows, x, aq, e, qr, eps), "attn mix");
+        // D1: the normed twins ride alongside `blocks` (norm-once at push).
+        assert_eq!(
+            blocks.len(),
+            blocks_normed.len(),
+            "inkling2 gpu fwd: blocks/normed length split"
+        );
+        let bank_n: Vec<&GpuTensor> = blocks_normed.iter().collect();
+        let mixed = step!(
+            gpu_mix(gpu, &gs.scratch, &bank_n, x, aq, e, qr, eps),
+            "attn mix"
+        );
         tmp.push(mixed);
         let mi = tmp.len() - 1;
         if qr >= 3 {
@@ -756,7 +776,12 @@ fn run_visit(
     // mids survive in tmp for the MoE half (FFN message + controller 3).
     let mut mids: Option<[usize; 4]> = None;
     let (qc0, kc0, vc0) = match &msgs {
-        Some((bank, prev_out, cross, ctrls)) => {
+        Some((bank, bank_normed, prev_out, cross, ctrls)) => {
+            assert_eq!(
+                bank.len(),
+                bank_normed.len(),
+                "inkling2 gpu fwd: msg bank/normed split"
+            );
             let (bqi, bki, bvi) = match (bq, bk, bv) {
                 (Some(a), Some(b), Some(c)) => (a, b, c),
                 _ => {
@@ -778,9 +803,9 @@ fn run_visit(
                     shape: vec![1, e],
                     dtype: DType::F32,
                 };
-                let bank_refs: Vec<&GpuTensor> = bank.iter().collect();
+                let bank_refs: Vec<&GpuTensor> = bank_normed.iter().collect();
                 let msg = step!(
-                    gpu_mix(gpu, &bank_refs, prev_out, &qj, e, 1, eps),
+                    gpu_mix(gpu, &gs.scratch, &bank_refs, prev_out, &qj, e, 1, eps),
                     "msg mix"
                 );
                 tmp.push(msg);
@@ -795,6 +820,7 @@ fn run_visit(
             let q = step!(
                 gpu_control(
                     gpu,
+                    &gs.scratch,
                     &tmp[bqi],
                     &tmp[m[0]],
                     &ctrls[0],
@@ -808,6 +834,7 @@ fn run_visit(
             let k = step!(
                 gpu_control(
                     gpu,
+                    &gs.scratch,
                     &tmp[bki],
                     &tmp[m[1]],
                     &ctrls[1],
@@ -821,6 +848,7 @@ fn run_visit(
             let v = step!(
                 gpu_control(
                     gpu,
+                    &gs.scratch,
                     &tmp[bvi],
                     &tmp[m[2]],
                     &ctrls[2],
@@ -1046,29 +1074,39 @@ fn run_visit(
     }
     let wpos = if swa { swa_slot(pos, rows) } else { pos };
     gs.visit_pos_tags[visit][wpos] = pos as u32;
-    let (slots, dists) = match swa_gather_map(&gs.visit_pos_tags[visit], pos, rows) {
-        Ok(m) => m,
+    gs.visit_cap[visit] = pos + 1;
+    // D1: tags stay host-side (fail-closed validation, zero H2D). The
+    // slots/dists maps are built on-device from the pos word advanced once
+    // per token; host recomputation below only validates the window.
+    let n_kv = match swa_gather_map(&gs.visit_pos_tags[visit], pos, rows) {
+        Ok((slots, _)) => slots.len(),
         Err(e) => {
             free_all(gpu, tmp);
             return Err(format!("inkling2 gpu fwd: {e}"));
         }
     };
-    let n_kv = slots.len();
-    let dist_bytes: Vec<u8> = dists.iter().flat_map(|d| d.to_le_bytes()).collect();
-    let dist = step!(
-        hip(gpu.upload_raw(&dist_bytes, &[dist_bytes.len()]), "dist"),
-        "dist"
+    step!(
+        launch_build_slots_dists(gpu, &gs.pos_dev, &gs.slots_dev, &gs.dists_dev, rows),
+        "slots kernel"
     );
-    tmp.push(dist);
-    let di = tmp.len() - 1;
-    let slot_bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
-    let slot_buf = step!(
-        hip(gpu.upload_raw(&slot_bytes, &[slot_bytes.len()]), "slots"),
-        "slots"
-    );
-    tmp.push(slot_buf);
-    let si = tmp.len() - 1;
-    let rel_bias = step!(at(gpu, &mut tmp, &[nh, n_kv], "rel_bias"), "alloc");
+    // Device-map views (first n_kv words; kernels only read the prefix).
+    let dists_v = GpuTensor {
+        buf: gs.dists_dev.buf.byte_view(0, n_kv * 4),
+        shape: vec![n_kv],
+        dtype: DType::F32,
+    };
+    let slots_v = GpuTensor {
+        buf: gs.slots_dev.buf.byte_view(0, n_kv * 4),
+        shape: vec![n_kv],
+        dtype: DType::F32,
+    };
+    // Persistent rel_bias staging: prefix [nh, n_kv] of the largest-visit
+    // buffer (same prefix bytes the per-visit alloc produced).
+    let rel_bias_v = GpuTensor {
+        buf: gs.scratch.rel_bias.buf.byte_view(0, nh * n_kv * 4),
+        shape: vec![nh, n_kv],
+        dtype: DType::F32,
+    };
     {
         let rv = step!(view2(&tmp[r], nh, cfg.n_rel), "view");
         step!(
@@ -1076,8 +1114,8 @@ fn run_visit(
                 &rv,
                 &layer.rel_table,
                 &tmp[sinks],
-                &tmp[di],
-                &tmp[rel_bias],
+                &dists_v,
+                &rel_bias_v,
                 cfg.n_rel,
                 nh,
                 cfg.n_extent,
@@ -1091,24 +1129,27 @@ fn run_visit(
     step!(cap_put(cap, gpu, "vc", &tmp[vc]), "capture");
     step!(cap_put(cap, gpu, "rc", &tmp[r]), "capture");
     step!(cap_put(cap, gpu, "sinks", &tmp[sinks]), "capture");
-    step!(cap_put(cap, gpu, "rel_bias", &tmp[rel_bias]), "capture");
-    // KV write (F32 -> F16 rows), then decode attention over 0..n_kv.
-    for h in 0..nkv {
-        let src_k = step!(head_view(&tmp[k_conv], h, hd), "view");
-        let dst_k = gs.k_cache[visit][h].sub_offset(wpos * hd, hd);
-        step!(
-            gpu.convert_f32_to_f16_into(&src_k, &dst_k, hd),
-            "k cache write"
-        );
-        let src_v = step!(head_view(&tmp[vc], h, hd), "view");
-        let dst_v = gs.v_cache[visit][h].sub_offset(wpos * hd, hd);
-        step!(
-            gpu.convert_f32_to_f16_into(&src_v, &dst_v, hd),
-            "v cache write"
-        );
-    }
-    gs.visit_cap[visit] = pos + 1;
-    let attn_heads = step!(at(gpu, &mut tmp, &[eattn], "attn_heads"), "alloc");
+    step!(cap_put(cap, gpu, "rel_bias", &rel_bias_v), "capture");
+    // D1: one batched KV-write launch per visit (grid (8, 2)) replaces 16
+    // per-head launches. F16 keeps the (_Float16) cast bit-identically.
+    step!(
+        launch_kv_write_f16_batched(
+            gpu,
+            &tmp[k_conv],
+            &tmp[vc],
+            &gs.k_cache[visit],
+            &gs.v_cache[visit],
+            wpos,
+            hd
+        ),
+        "k/v cache write"
+    );
+    // D1: persistent attention staging (visit-scoped temps, no pool churn).
+    let attn_heads_v = GpuTensor {
+        buf: gs.scratch.attn_heads.buf.byte_view(0, eattn * 4),
+        shape: vec![eattn],
+        dtype: DType::F32,
+    };
     {
         let qv = step!(view2(&tmp[q], nh, hd), "view");
         step!(
@@ -1117,9 +1158,9 @@ fn run_visit(
                 &qv,
                 &gs.k_cache[visit],
                 &gs.v_cache[visit],
-                &tmp[rel_bias],
-                &tmp[si],
-                &tmp[attn_heads],
+                &rel_bias_v,
+                &slots_v,
+                &attn_heads_v,
                 n_kv,
                 nh,
                 hd
@@ -1127,7 +1168,7 @@ fn run_visit(
             "attn"
         );
     }
-    step!(cap_put(cap, gpu, "attn_heads", &tmp[attn_heads]), "capture");
+    step!(cap_put(cap, gpu, "attn_heads", &attn_heads_v), "capture");
     // Output gate + projection + post conv.
     let gate = step!(at(gpu, &mut tmp, &[eattn], "gate"), "alloc");
     step!(
@@ -1136,12 +1177,12 @@ fn run_visit(
     );
     step!(gpu.sigmoid_f32(&tmp[gate]), "gate sigmoid");
     step!(
-        gpu.mul_f32(&tmp[attn_heads], &tmp[gate], &tmp[attn_heads]),
+        gpu.mul_f32(&attn_heads_v, &tmp[gate], &attn_heads_v),
         "gate mul"
     );
     let wo_out = step!(at(gpu, &mut tmp, &[e], "wo_out"), "alloc");
     step!(
-        weight_gemv(gpu, &layer.wo, &tmp[attn_heads], &tmp[wo_out]),
+        weight_gemv(gpu, &layer.wo, &attn_heads_v, &tmp[wo_out]),
         "wo"
     );
     step!(cap_put(cap, gpu, "wo_out", &tmp[wo_out]), "capture");
@@ -1166,6 +1207,24 @@ fn run_visit(
     let has_push = phys % cfg.attn_res_block == 0;
     if has_push {
         push = Some(step!(dup(gpu, x, "block"), "dup"));
+        // D1 norm-once: RMSNorm the pushed block once (same tree reduction
+        // as the copying path, so bitwise identical); every later mix reads
+        // the twin via pointers and never re-norms it.
+        let pn = match gpu.alloc_tensor(&[e], DType::F32) {
+            Ok(t) => t,
+            Err(e2) => {
+                let _ = gpu.free_tensor(push.take().expect("push"));
+                free_all(gpu, tmp);
+                return Err(format!("inkling2 gpu fwd: alloc block_normed: {e2:?}"));
+            }
+        };
+        if let Err(e2) = gpu.inkling2_rmsnorm_nogamma_f32(x, &pn, 1, e, eps) {
+            let _ = gpu.free_tensor(push.take().expect("push"));
+            let _ = gpu.free_tensor(pn);
+            free_all(gpu, tmp);
+            return Err(format!("inkling2 gpu fwd: block norm: {e2:?}"));
+        }
+        push_normed = Some(pn);
     }
     let cur = step!(at(gpu, &mut tmp, &[e], "cur"), "alloc");
     if has_push {
@@ -1186,23 +1245,36 @@ fn run_visit(
         if let Some(p) = push.take() {
             let _ = gpu.free_tensor(p);
         }
+        if let Some(p) = push_normed.take() {
+            let _ = gpu.free_tensor(p);
+        }
         return Err(format!(
             "inkling2 gpu fwd: mlp_query len {} != {e}",
             layer.mlp_query.buf.size() / 4
         ));
     }
-    let block_rows: Vec<&GpuTensor> = blocks.iter().chain(push.iter()).collect();
+    let block_n: Vec<&GpuTensor> = blocks_normed.iter().chain(push_normed.iter()).collect();
     let ffn_mixed = step!(
-        gpu_mix(gpu, &block_rows, &tmp[cur], &layer.mlp_query, e, 1, eps),
+        gpu_mix(
+            gpu,
+            &gs.scratch,
+            &block_n,
+            &tmp[cur],
+            &layer.mlp_query,
+            e,
+            1,
+            eps
+        ),
         "ffn mix"
     );
     tmp.push(ffn_mixed);
     let fmi = tmp.len() - 1;
     let ffn_in = match (&msgs, mids) {
-        (Some((_, _, _, ctrls)), Some(m)) => {
+        (Some((_, _, _, _, ctrls)), Some(m)) => {
             let f = step!(
                 gpu_control(
                     gpu,
+                    &gs.scratch,
                     &tmp[fmi],
                     &tmp[m[3]],
                     &ctrls[3],
@@ -1256,131 +1328,102 @@ fn run_visit(
     );
     step!(cap_put(cap, gpu, "topk_idx", &tmp[topk_idx]), "capture");
     step!(cap_put(cap, gpu, "topk_w", &tmp[topk_w]), "capture");
-    // Typed XTS layout: one indexed AWQ+FWHT producer, qt44 expanded GEMVs, all
-    // tables built at load and owned by the layer. Legacy layers (`xts == None`)
-    // take the unchanged branch below.
-    let down_exp = if let Some(xl) = layer.xts.as_ref() {
-        step!(
-            xts_expert_stage(gpu, cfg, xl, &mut tmp, ffn_normed, topk_idx, cap),
-            "xts experts"
-        )
-    } else {
-        // Expert pointer tables (per-expert buffers; rebuilt per visit —
-        // 2 KiB of H2D, no lifetime questions).
-        let gu_bytes: Vec<u8> = layer
-            .experts
-            .iter()
-            .flat_map(|x| (x.gate_up.buf.buf.as_ptr() as u64).to_ne_bytes())
-            .collect();
-        let dn_bytes: Vec<u8> = layer
-            .experts
-            .iter()
-            .flat_map(|x| (x.down.buf.buf.as_ptr() as u64).to_ne_bytes())
-            .collect();
-        let ptr_gu = step!(at(gpu, &mut tmp, &[2 * cfg.n_experts], "ptr_gu"), "alloc");
-        let ptr_dn = step!(at(gpu, &mut tmp, &[2 * cfg.n_experts], "ptr_dn"), "alloc");
-        step!(
-            gpu.hip.memcpy_htod(&tmp[ptr_gu].buf, &gu_bytes),
-            "gu ptr table"
-        );
-        step!(
-            gpu.hip.memcpy_htod(&tmp[ptr_dn].buf, &dn_bytes),
-            "dn ptr table"
-        );
-        // Rotate, gate_up (batched), SiTU, rotate, down (batched expanded).
-        let ffn_x_rot = step!(at(gpu, &mut tmp, &[e], "ffn_x_rot"), "alloc");
-        step!(
-            rotate_x_mq_for(
-                gpu,
-                &layer.experts[0].gate_up,
-                &tmp[ffn_normed],
-                &tmp[ffn_x_rot],
-                e
-            ),
-            "ffn rotate"
-        );
-        step!(cap_put(cap, gpu, "ffn_x_rot", &tmp[ffn_x_rot]), "capture");
-        let inter = cfg.inter;
-        let gate_b = step!(
-            at(gpu, &mut tmp, &[cfg.n_expert_used, inter], "gate_b"),
-            "alloc"
-        );
-        let up_b = step!(
-            at(gpu, &mut tmp, &[cfg.n_expert_used, inter], "up_b"),
-            "alloc"
-        );
-        step!(
-            gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-                &tmp[ptr_gu],
-                &tmp[topk_idx],
-                &tmp[ffn_x_rot],
-                &tmp[gate_b],
-                &tmp[up_b],
-                2 * inter,
-                e,
-                cfg.n_expert_used,
-                1
-            ),
-            "gate_up"
-        );
-        step!(cap_put(cap, gpu, "gate_b", &tmp[gate_b]), "capture");
-        step!(cap_put(cap, gpu, "up_b", &tmp[up_b]), "capture");
-        let act = step!(
-            at(gpu, &mut tmp, &[cfg.n_expert_used, 1280], "act"),
-            "alloc"
-        );
-        step!(
-            gpu.ffn_activation_rows_f32(&FfnActivationRows {
-                activation: FfnActivation::Situ {
-                    gate_beta: cfg.situ_beta,
-                    value_beta: cfg.situ_linear_beta
-                },
-                gate: &tmp[gate_b],
-                gate_offset: 0,
-                gate_ld: inter,
-                up: &tmp[up_b],
-                up_offset: 0,
-                up_ld: inter,
-                out: &tmp[act],
-                rows: cfg.n_expert_used,
-                logical_n: inter,
-                phys_n: 1280,
-                round_inputs: false,
-                round_output: false,
-                awq: FfnAwq::None,
-            }),
-            "situ"
-        );
-        step!(cap_put(cap, gpu, "act", &tmp[act]), "capture");
-        let rot = step!(
-            at(gpu, &mut tmp, &[cfg.n_expert_used, 1280], "rot"),
-            "alloc"
-        );
-        step!(
-            gpu.rotate_x_mq_batched(&tmp[act], &tmp[rot], 1280, cfg.n_expert_used),
-            "act rotate"
-        );
-        let down_exp = step!(
-            at(gpu, &mut tmp, &[cfg.n_expert_used, e], "down_exp"),
-            "alloc"
-        );
-        step!(
-            gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
-                &tmp[ptr_dn],
-                &tmp[topk_idx],
-                &tmp[rot],
-                &tmp[down_exp],
-                e,
-                1280,
-                cfg.n_expert_used,
-                1
-            ),
-            "down"
-        );
-        step!(cap_put(cap, gpu, "down_exp", &tmp[down_exp]), "capture");
-        step!(cap_put(cap, gpu, "rot_b", &tmp[rot]), "capture");
-        down_exp
-    };
+    // D1: expert pointer tables are load-resident on the layer
+    // (`ptr_gu/dn` uploaded once at load — addresses are load-owned and
+    // stable). This deletes 2 H2Ds per visit. Visit tmp keeps no table
+    // copies.
+    // Rotate, gate_up (batched), SiTU, rotate, down (batched expanded).
+    let ffn_x_rot = step!(at(gpu, &mut tmp, &[e], "ffn_x_rot"), "alloc");
+    step!(
+        rotate_x_mq_for(
+            gpu,
+            &layer.experts[0].gate_up,
+            &tmp[ffn_normed],
+            &tmp[ffn_x_rot],
+            e
+        ),
+        "ffn rotate"
+    );
+    step!(cap_put(cap, gpu, "ffn_x_rot", &tmp[ffn_x_rot]), "capture");
+    let inter = cfg.inter;
+    let gate_b = step!(
+        at(gpu, &mut tmp, &[cfg.n_expert_used, inter], "gate_b"),
+        "alloc"
+    );
+    let up_b = step!(
+        at(gpu, &mut tmp, &[cfg.n_expert_used, inter], "up_b"),
+        "alloc"
+    );
+    step!(
+        gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+            &layer.ptr_gu,
+            &tmp[topk_idx],
+            &tmp[ffn_x_rot],
+            &tmp[gate_b],
+            &tmp[up_b],
+            2 * inter,
+            e,
+            cfg.n_expert_used,
+            1
+        ),
+        "gate_up"
+    );
+    step!(cap_put(cap, gpu, "gate_b", &tmp[gate_b]), "capture");
+    step!(cap_put(cap, gpu, "up_b", &tmp[up_b]), "capture");
+    let act = step!(
+        at(gpu, &mut tmp, &[cfg.n_expert_used, 1280], "act"),
+        "alloc"
+    );
+    step!(
+        gpu.ffn_activation_rows_f32(&FfnActivationRows {
+            activation: FfnActivation::Situ {
+                gate_beta: cfg.situ_beta,
+                value_beta: cfg.situ_linear_beta
+            },
+            gate: &tmp[gate_b],
+            gate_offset: 0,
+            gate_ld: inter,
+            up: &tmp[up_b],
+            up_offset: 0,
+            up_ld: inter,
+            out: &tmp[act],
+            rows: cfg.n_expert_used,
+            logical_n: inter,
+            phys_n: 1280,
+            round_inputs: false,
+            round_output: false,
+            awq: FfnAwq::None,
+        }),
+        "situ"
+    );
+    step!(cap_put(cap, gpu, "act", &tmp[act]), "capture");
+    let rot = step!(
+        at(gpu, &mut tmp, &[cfg.n_expert_used, 1280], "rot"),
+        "alloc"
+    );
+    step!(
+        gpu.rotate_x_mq_batched(&tmp[act], &tmp[rot], 1280, cfg.n_expert_used),
+        "act rotate"
+    );
+    let down_exp = step!(
+        at(gpu, &mut tmp, &[cfg.n_expert_used, e], "down_exp"),
+        "alloc"
+    );
+    step!(
+        gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+            &layer.ptr_dn,
+            &tmp[topk_idx],
+            &tmp[rot],
+            &tmp[down_exp],
+            e,
+            1280,
+            cfg.n_expert_used,
+            1
+        ),
+        "down"
+    );
+    step!(cap_put(cap, gpu, "down_exp", &tmp[down_exp]), "capture");
+    step!(cap_put(cap, gpu, "rot_b", &tmp[rot]), "capture");
     let moe_raw = step!(at(gpu, &mut tmp, &[e], "moe_raw"), "alloc");
     step!(
         gpu.ffn_moe_combine_f32(&MoeCombine {
@@ -1424,11 +1467,14 @@ fn run_visit(
     );
     step!(cap_put(cap, gpu, "moe_conv", &tmp[moe_conv]), "capture");
     // Tail: visit_out escapes; everything else dies here. Only add/capture
-    // can fail past this point — free the three survivors explicitly.
+    // can fail past this point — free the survivors explicitly.
     let visit_out = match gpu.alloc_tensor(&[e], DType::F32) {
         Ok(t) => t,
         Err(e2) => {
             if let Some(p) = push.take() {
+                let _ = gpu.free_tensor(p);
+            }
+            if let Some(p) = push_normed.take() {
                 let _ = gpu.free_tensor(p);
             }
             free_all(gpu, tmp);
@@ -1440,6 +1486,9 @@ fn run_visit(
         if let Some(p) = push.take() {
             let _ = gpu.free_tensor(p);
         }
+        if let Some(p) = push_normed.take() {
+            let _ = gpu.free_tensor(p);
+        }
         free_all(gpu, tmp);
         return Err(format!("inkling2 gpu fwd: moe residual: {e2:?}"));
     }
@@ -1448,11 +1497,18 @@ fn run_visit(
         if let Some(p) = push.take() {
             let _ = gpu.free_tensor(p);
         }
+        if let Some(p) = push_normed.take() {
+            let _ = gpu.free_tensor(p);
+        }
         free_all(gpu, tmp);
         return Err(format!("inkling2 gpu fwd: capture: {e2:?}"));
     }
     free_all(gpu, tmp);
-    Ok(VisitOut { visit_out, push })
+    Ok(VisitOut {
+        visit_out,
+        push,
+        push_normed,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1464,9 +1520,14 @@ fn run_visit(
 struct Owned {
     x: Option<GpuTensor>,
     blocks: Vec<GpuTensor>,
+    /// D1 norm-once twins: `blocks_n[i]` is the RMSNorm of `blocks[i]`
+    /// (same index, freed in lockstep). Mix calls read these via pointers.
+    blocks_n: Vec<GpuTensor>,
     prelude_x: Option<GpuTensor>,
     prelude_blocks: Vec<GpuTensor>,
+    prelude_blocks_n: Vec<GpuTensor>,
     prev_blocks: Vec<GpuTensor>,
+    prev_blocks_n: Vec<GpuTensor>,
     prev_out: Option<GpuTensor>,
 }
 
@@ -1478,13 +1539,22 @@ impl Owned {
         for t in self.blocks {
             let _ = gpu.free_tensor(t);
         }
+        for t in self.blocks_n {
+            let _ = gpu.free_tensor(t);
+        }
         if let Some(t) = self.prelude_x {
             let _ = gpu.free_tensor(t);
         }
         for t in self.prelude_blocks {
             let _ = gpu.free_tensor(t);
         }
+        for t in self.prelude_blocks_n {
+            let _ = gpu.free_tensor(t);
+        }
         for t in self.prev_blocks {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.prev_blocks_n {
             let _ = gpu.free_tensor(t);
         }
         if let Some(t) = self.prev_out {
@@ -1532,6 +1602,16 @@ fn drive(
         trace,
         &mut o,
     );
+    // D1: advance the device pos word once per completed token (1-thread
+    // kernel, 0 H2D). The slots kernel of the next token reads the new word.
+    // A failed token leaves the word behind — but its KV writes are also
+    // partial, so the session is already torn down by the caller.
+    if r.is_ok() {
+        if let Err(e) = launch_advance_pos(gpu, &gs.pos_dev) {
+            o.free(gpu);
+            return Err(format!("inkling2 gpu fwd: advance pos: {e}"));
+        }
+    }
     o.free(gpu);
     r
 }
@@ -1563,6 +1643,12 @@ fn step_visit(
                     o.prev_blocks.len()
                 ));
             }
+            // D1: normed twins slice in lockstep with the blocks.
+            assert_eq!(
+                o.prev_blocks.len(),
+                o.prev_blocks_n.len(),
+                "inkling2 gpu fwd: prev blocks/normed split"
+            );
             let ctrls = match &gw.layers[phys].controllers {
                 Some(c) => c,
                 None => {
@@ -1576,6 +1662,7 @@ fn step_visit(
                 // the first core block (`blocks[prelude_len + 1..]`), as in the
                 // CPU reference; the mix appends `prev_out`.
                 &o.prev_blocks[skip..],
+                &o.prev_blocks_n[skip..],
                 o.prev_out.as_ref().expect("prev_out"),
                 &gw.cross_pass[core_i],
                 ctrls,
@@ -1589,6 +1676,7 @@ fn step_visit(
         &gw.layers[phys],
         &x,
         &o.blocks,
+        &o.blocks_n,
         visit,
         phys,
         pos,
@@ -1601,6 +1689,9 @@ fn step_visit(
     }
     if let Some(p) = vo.push {
         o.blocks.push(p);
+    }
+    if let Some(p) = vo.push_normed {
+        o.blocks_n.push(p);
     }
     hip(gpu.free_tensor(x), "x free")?;
     o.x = Some(vo.visit_out);
@@ -1687,14 +1778,24 @@ fn drive_body(
     }
     // Snapshot prelude stream for the pass resets.
     o.prelude_x = Some(dup(gpu, o.x.as_ref().expect("x"), "prelude_x")?);
-    for b in o.blocks.drain(..) {
+    // D1: drain blocks and their normed twins in lockstep (same order).
+    assert_eq!(
+        o.blocks.len(),
+        o.blocks_n.len(),
+        "inkling2 gpu fwd: prelude drain split"
+    );
+    for (b, bn) in o.blocks.drain(..).zip(o.blocks_n.drain(..)) {
         let d = dup(gpu, &b, "prelude_block")?;
+        let dn = dup(gpu, &bn, "prelude_block_n")?;
         o.prelude_blocks.push(d);
+        o.prelude_blocks_n.push(dn);
         hip(gpu.free_tensor(b), "block free")?;
+        hip(gpu.free_tensor(bn), "block_n free")?;
     }
     // prev_* seeds pass 1's bank (pass 0 itself takes no messages).
-    for b in &o.prelude_blocks {
+    for (b, bn) in o.prelude_blocks.iter().zip(o.prelude_blocks_n.iter()) {
         o.prev_blocks.push(dup(gpu, b, "prev_block")?);
+        o.prev_blocks_n.push(dup(gpu, bn, "prev_block_n")?);
     }
     o.prev_out = Some(dup(gpu, o.prelude_x.as_ref().expect("x"), "prev_out")?);
     // Loop passes.
@@ -1703,12 +1804,19 @@ fn drive_body(
         if let Some(x) = o.x.take() {
             hip(gpu.free_tensor(x), "x free")?;
         }
-        for b in o.blocks.drain(..) {
+        assert_eq!(
+            o.blocks.len(),
+            o.blocks_n.len(),
+            "inkling2 gpu fwd: pass drain split"
+        );
+        for (b, bn) in o.blocks.drain(..).zip(o.blocks_n.drain(..)) {
             hip(gpu.free_tensor(b), "block free")?;
+            hip(gpu.free_tensor(bn), "block_n free")?;
         }
         o.x = Some(dup(gpu, o.prelude_x.as_ref().expect("x"), "pass x")?);
-        for b in &o.prelude_blocks {
+        for (b, bn) in o.prelude_blocks.iter().zip(o.prelude_blocks_n.iter()) {
             o.blocks.push(dup(gpu, b, "pass block")?);
+            o.blocks_n.push(dup(gpu, bn, "pass block_n")?);
         }
         for i in 0..core_len {
             let take = if pass > 0 { Some((i, 0)) } else { None };
@@ -1729,11 +1837,18 @@ fn drive_body(
         }
         // prev_* for the next pass (dead after the last one — skip it).
         if pass + 1 < cfg.loop_cfg.num_passes {
-            for b in o.prev_blocks.drain(..) {
+            assert_eq!(
+                o.prev_blocks.len(),
+                o.prev_blocks_n.len(),
+                "inkling2 gpu fwd: prev drain split"
+            );
+            for (b, bn) in o.prev_blocks.drain(..).zip(o.prev_blocks_n.drain(..)) {
                 hip(gpu.free_tensor(b), "prev block free")?;
+                hip(gpu.free_tensor(bn), "prev block_n free")?;
             }
-            for b in &o.blocks {
+            for (b, bn) in o.blocks.iter().zip(o.blocks_n.iter()) {
                 o.prev_blocks.push(dup(gpu, b, "prev block")?);
+                o.prev_blocks_n.push(dup(gpu, bn, "prev block_n")?);
             }
             if let Some(p) = o.prev_out.take() {
                 hip(gpu.free_tensor(p), "prev out free")?;
@@ -1776,10 +1891,16 @@ fn drive_body(
         ));
     }
     let x = o.x.take().expect("x");
-    let block_refs: Vec<&GpuTensor> = o.blocks.iter().collect();
+    assert_eq!(
+        o.blocks.len(),
+        o.blocks_n.len(),
+        "inkling2 gpu fwd: final blocks/normed split"
+    );
+    let block_n: Vec<&GpuTensor> = o.blocks_n.iter().collect();
     let mixed = match gpu_mix(
         gpu,
-        &block_refs,
+        &gs.scratch,
+        &block_n,
         &x,
         &gw.output_query,
         e,
@@ -1997,109 +2118,60 @@ mod tests {
         assert!(swa_gather_map(&tags, 50, 0).is_err());
     }
 
-    // View-cut bounds gates (upstream #1192): the reuse pool best-fit may
-    // hand a LARGER buffer to an exact-size request (Kaden's case: 15704 B
-    // handed to a 12288 B view). The view must take the logical prefix;
-    // a SHORT buffer must fail closed with Err (503), never panic the
-    // daemon, and never silently clamp. Host-only: view cuts are pure
-    // pointer arithmetic + size checks, no kernel launch.
-    use super::{head_view, sub_buf, view2};
-    use hip_bridge::DeviceBuffer;
-    use rdna_compute::{DType, GpuTensor};
-
-    /// Fake pool buffer: host backing, never launched. Views only read the
-    /// pointer + size, so no device is touched. The backing vec must stay
-    /// alive while views exist (same rule as a real pool buffer).
-    fn fake_tensor(backing: &[u8], shape: Vec<usize>, dtype: DType) -> GpuTensor {
-        GpuTensor {
-            buf: unsafe {
-                DeviceBuffer::from_raw(backing.as_ptr() as *mut std::ffi::c_void, backing.len())
-            },
-            shape,
-            dtype,
+    /// D1 host model of `inkling2_gf_build_slots_dists`: one "thread" per k
+    /// over the device pos word. Must equal `swa_gather_map` (the H2D path
+    /// it replaces) on every (pos, rows), including ring wrap.
+    fn slots_dists_kernel_model(pos: usize, rows: usize) -> (Vec<i32>, Vec<i32>) {
+        assert!(rows > 0);
+        let n_kv = (pos + 1).min(rows);
+        let start = pos + 1 - n_kv;
+        let mut slots = vec![0i32; n_kv];
+        let mut dists = vec![0i32; n_kv];
+        // One thread per k, same arithmetic and order as the kernel.
+        for k in 0..n_kv {
+            let kp = start + k;
+            slots[k] = (kp % rows) as i32;
+            dists[k] = (pos - kp) as i32;
         }
+        (slots, dists)
+    }
+
+    /// Drive-faithful tags: slot s holds the last key_pos written there.
+    fn tags_for(pos: usize, rows: usize) -> Vec<u32> {
+        let n_kv = (pos + 1).min(rows);
+        let start = pos + 1 - n_kv;
+        let mut tags = vec![0u32; rows];
+        for kp in start..=pos {
+            tags[swa_slot(kp, rows)] = kp as u32;
+        }
+        tags
     }
 
     #[test]
-    fn view2_oversized_pool_buffer_takes_logical_prefix() {
-        // Kaden's exact bytes: 15704 B buffer, 12288 B ([1, 3072]) wanted.
-        let backing = vec![0xABu8; 15704];
-        let t = fake_tensor(&backing, vec![3926], DType::F32);
-        let v = view2(&t, 1, 3072).expect("oversized buffer must view");
-        assert_eq!(v.shape, vec![1, 3072]);
-        assert_eq!(v.dtype, DType::F32);
-        // Prefix, not the whole buffer: slack is excluded from the view.
-        assert_eq!(v.buf.size(), 12288);
-        assert_eq!(v.buf.as_ptr(), t.buf.as_ptr());
-    }
-
-    #[test]
-    fn view2_exact_size_unchanged() {
-        // Happy path is bit-identical to the old assert-gated behavior:
-        // same shape, same extent, same base.
-        let backing = vec![0u8; 12288];
-        let t = fake_tensor(&backing, vec![3072], DType::F32);
-        let v = view2(&t, 1, 3072).expect("exact buffer must view");
-        assert_eq!(v.shape, vec![1, 3072]);
-        assert_eq!(v.buf.size(), 12288);
-        assert_eq!(v.buf.as_ptr(), t.buf.as_ptr());
-    }
-
-    #[test]
-    fn view2_short_buffer_fails_closed() {
-        // One word short: Err, never a panic, never a clamped view.
-        let backing = vec![0u8; 12284];
-        let t = fake_tensor(&backing, vec![3071], DType::F32);
-        assert!(view2(&t, 1, 3072).is_err());
-    }
-
-    #[test]
-    fn view2_wrong_dtype_fails_closed() {
-        let backing = vec![0u8; 12288];
-        let t = fake_tensor(&backing, vec![3072], DType::F16);
-        assert!(view2(&t, 1, 3072).is_err());
-    }
-
-    #[test]
-    fn view2_extent_overflow_fails_closed() {
-        // Checked arithmetic: no panic even in debug builds.
-        let backing = vec![0u8; 16];
-        let t = fake_tensor(&backing, vec![4], DType::F32);
-        assert!(view2(&t, usize::MAX, usize::MAX).is_err());
-    }
-
-    #[test]
-    fn sub_buf_never_clamps() {
-        let backing = vec![0u8; 100];
-        let t = fake_tensor(&backing, vec![25], DType::F32);
-        // Exact and prefix both fine.
-        assert_eq!(sub_buf(&t, 0, 100, "t").unwrap().size(), 100);
-        assert_eq!(sub_buf(&t, 0, 64, "t").unwrap().size(), 64);
-        assert_eq!(sub_buf(&t, 36, 64, "t").unwrap().size(), 64);
-        // Short by one byte, and offset+len overflow: Err, not clamped.
-        assert!(sub_buf(&t, 0, 101, "t").is_err());
-        assert!(sub_buf(&t, 37, 64, "t").is_err());
-        assert!(sub_buf(&t, usize::MAX, 1, "t").is_err());
-    }
-
-    #[test]
-    fn head_view_short_buffer_fails_closed() {
-        // [8, 128] F32 head bank = 4096 B; head 7 needs [3584, 4096).
-        let backing = vec![0u8; 4096];
-        let bank = fake_tensor(&backing, vec![1024], DType::F32);
-        let v = head_view(&bank, 7, 128).expect("exact head must view");
-        assert_eq!(v.shape, vec![128]);
-        assert_eq!(v.buf.size(), 512);
-        // Head past the end, and a truncated bank: Err, never a panic.
-        assert!(head_view(&bank, 8, 128).is_err());
-        let short = fake_tensor(&backing[..4000], vec![1000], DType::F32);
-        assert!(head_view(&short, 7, 128).is_err());
-        // Oversized pool buffer takes the logical prefix.
-        let big = vec![0u8; 5000];
-        let big_bank = fake_tensor(&big, vec![1250], DType::F32);
-        assert_eq!(head_view(&big_bank, 0, 128).unwrap().buf.size(), 512);
-        // Wrong dtype fails closed.
-        let f16 = fake_tensor(&backing, vec![1024], DType::F16);
-        assert!(head_view(&f16, 0, 128).is_err());
+    fn slots_kernel_model_matches_gather_map() {
+        // Full-visit rows (max_seq-like), SWA rows, degenerate rows.
+        for rows in [1usize, 3, 1024, 4096, 32768] {
+            for pos in [
+                0usize, 1, 2, 7, 63, 255, 1023, 1024, 1025, 2500, 5000, 100000,
+            ] {
+                let tags = tags_for(pos, rows);
+                let (want_slots, want_dists) =
+                    swa_gather_map(&tags, pos, rows).expect("gather map");
+                let (got_slots, got_dists) = slots_dists_kernel_model(pos, rows);
+                assert_eq!(got_slots, want_slots, "pos={pos} rows={rows}: slots");
+                assert_eq!(got_dists, want_dists, "pos={pos} rows={rows}: dists");
+                // Window invariants the attention kernels rely on.
+                assert_eq!(got_slots.len(), (pos + 1).min(rows));
+                assert_eq!(*got_dists.first().unwrap(), (got_slots.len() - 1) as i32);
+                assert_eq!(*got_dists.last().unwrap(), 0);
+            }
+        }
+        // Ring wrap: oldest key_pos is 1477 in physical slot 453.
+        let (slots, dists) = slots_dists_kernel_model(2500, 1024);
+        assert_eq!(slots.len(), 1024);
+        assert_eq!(slots[0], 1477 % 1024);
+        assert_eq!(*slots.last().unwrap(), 2500 % 1024);
+        assert_eq!(dists[0], 1023);
+        assert_eq!(*dists.last().unwrap(), 0);
     }
 }

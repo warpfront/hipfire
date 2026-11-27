@@ -91,6 +91,145 @@ extern "C" __global__ void inkling2_mix_query_row_f32(
 }
 "#;
 
+/// gfx1100 decode envelope for `mix()` over device-resident pointers
+/// (D1 zero-copy path).
+///
+/// Pass 2 only: the bank rows are already RMSNormed (norm-once at push time
+/// with the same [`inkling2_rmsnorm_nogamma_f32`] tree reduction, so values
+/// are bitwise identical to the copying path) and addressed directly — no
+/// `mix_bank` allocation, no `copy_rows`. `cur` is normalized in-kernel into
+/// caller-owned `cur_normed` with the identical tree reduction (one row is
+/// one independent batch row either way). The query-row body below is
+/// instruction-identical to pass 2 of [`INKLING2_MIX_HIP_SRC`]: same dot
+/// order, same softmax, same weighted sum, states in `[bank..., cur]` order.
+pub const INKLING2_MIX_PTR_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+// out[q * n_embd + i] = sum_s softmax_s(dot(normed_s, query_q)/sqrt(n_embd)) * normed_s[i]
+// s0..s4 are the already-normed bank rows (max 5: n_states <= 6 incl cur),
+// cur_normed is the in-kernel-normalized cur row (state index n_bank).
+// One block per query row, blockDim.x == 256 fixed. n_bank <= 5.
+extern "C" __global__ void inkling2_mix_query_ptr_f32(
+    const float* __restrict__ s0,
+    const float* __restrict__ s1,
+    const float* __restrict__ s2,
+    const float* __restrict__ s3,
+    const float* __restrict__ s4,
+    const float* __restrict__ cur_normed,
+    const float* __restrict__ query,  // [query_rows, n_embd]
+    float* __restrict__ out,          // [query_rows, n_embd]
+    int n_bank,
+    int n_embd,
+    float inv_sqrt_embd) {
+    const int q = blockIdx.x; // one block per query row
+    const int t = threadIdx.x;
+    __shared__ float sh[256];
+    __shared__ float w[6]; // n_bank + 1 <= 6: one softmax weight per state
+    const float* st[6];
+    st[0] = s0; st[1] = s1; st[2] = s2; st[3] = s3; st[4] = s4;
+    st[5] = cur_normed;
+    const int n_states = n_bank + 1;
+    // 1. scores[s] = dot(st_s, query_q) * inv_sqrt_embd, cooperatively.
+    for (int s = 0; s < n_states; ++s) {
+        float acc = 0.0f;
+        const float* ns = st[s];
+        const float* qq = query + (size_t)q * n_embd;
+        for (int i = t; i < n_embd; i += blockDim.x) {
+            acc += ns[i] * qq[i];
+        }
+        sh[t] = acc;
+        __syncthreads();
+        for (int st_ = blockDim.x >> 1; st_ > 0; st_ >>= 1) {
+            if (t < st_) sh[t] += sh[t + st_];
+            __syncthreads();
+        }
+        if (t == 0) w[s] = sh[0] * inv_sqrt_embd;
+        __syncthreads();
+    }
+    // 2. stable softmax over the <= 6 weights on thread 0, then broadcast.
+    if (t == 0) {
+        float mx = w[0];
+        for (int s = 1; s < n_states; ++s) {
+            if (w[s] > mx) mx = w[s];
+        }
+        float sum = 0.0f;
+        for (int s = 0; s < n_states; ++s) {
+            w[s] = expf(w[s] - mx);
+            sum += w[s];
+        }
+        for (int s = 0; s < n_states; ++s) w[s] /= sum;
+    }
+    __syncthreads();
+    // 3. out[q, i] = sum_s w[s] * st[s][i], cooperatively.
+    float* oq = out + (size_t)q * n_embd;
+    for (int i = t; i < n_embd; i += blockDim.x) {
+        float acc = 0.0f;
+        for (int s = 0; s < n_states; ++s) {
+            acc += w[s] * st[s][i];
+        }
+        oq[i] = acc;
+    }
+}
+"#;
+
+/// Zero-copy `mix()` host twin (D1): `normed_bank` rows are already
+/// RMSNormed (norm-once at push), `cur` is raw. Norms only `cur`, then runs
+/// the exact [`inkling2_mix_f32`] math. Must equal `inkling2_mix_f32` over
+/// the same `(bank, cur)` bitwise (`==`, not approximate) — the kernel
+/// contract is no reassociation anywhere.
+pub fn inkling2_mix_ptr_f32_host(
+    normed_bank: &[Vec<f32>],
+    cur: &[f32],
+    query: &[f32],
+    n_embd: usize,
+    query_rows: usize,
+) -> Vec<f32> {
+    assert!(normed_bank.len() <= 5, "D1 ptr mix holds <= 5 bank rows");
+    let states: Vec<Vec<f32>> = normed_bank
+        .iter()
+        .map(|b| {
+            assert_eq!(b.len(), n_embd);
+            b.clone()
+        })
+        .chain(std::iter::once(rmsnorm_row(cur)))
+        .collect();
+    let ns = states.len();
+    assert!((1..=6).contains(&ns));
+    let inv = 1.0 / (n_embd as f32).sqrt();
+    let mut weights = vec![0.0f32; query_rows * ns];
+    for q in 0..query_rows {
+        let mut max = f32::NEG_INFINITY;
+        for s in 0..ns {
+            let dot: f32 = (0..n_embd)
+                .map(|i| states[s][i] * query[q * n_embd + i])
+                .sum();
+            let sc = dot * inv;
+            weights[q * ns + s] = sc;
+            if sc > max {
+                max = sc;
+            }
+        }
+        let mut sum = 0.0f32;
+        for s in 0..ns {
+            let e = (weights[q * ns + s] - max).exp();
+            weights[q * ns + s] = e;
+            sum += e;
+        }
+        for s in 0..ns {
+            weights[q * ns + s] /= sum;
+        }
+    }
+    let mut out = vec![0.0f32; query_rows * n_embd];
+    for (s, st) in states.iter().enumerate() {
+        for q in 0..query_rows {
+            let p = weights[q * ns + s];
+            for i in 0..n_embd {
+                out[q * n_embd + i] += p * st[i];
+            }
+        }
+    }
+    out
+}
+
 fn rmsnorm_row(x: &[f32]) -> Vec<f32> {
     let mut sum = 0.0f32;
     for &v in x {
@@ -291,6 +430,35 @@ mod tests {
         }
     }
 
+    /// D1 ptr twin equals the copying reference bitwise: norm-once bank rows
+    /// plus raw cur must reproduce `inkling2_mix_f32` exactly (no
+    /// reassociation anywhere on the zero-copy path).
+    #[test]
+    fn ptr_twin_matches_copying_reference_bitwise() {
+        for (n_embd, n_blocks, query_rows, seed) in [
+            (2304usize, 5usize, 2usize, 0x51ab_3c9d_2ef0_1123u64),
+            (2304usize, 0usize, 1usize, 0x1234_5678_9abc_def0u64),
+            (128usize, 3usize, 4usize, 0x0102_0304_0506_0708u64),
+            (64usize, 5usize, 3usize, 0xdead_beef_cafe_0001u64),
+        ] {
+            let mut s = seed;
+            let blocks: Vec<Vec<f32>> = (0..n_blocks)
+                .map(|_| rand_vec(&mut s, n_embd, -2.0, 2.0))
+                .collect();
+            let cur = rand_vec(&mut s, n_embd, -2.0, 2.0);
+            let query = rand_vec(&mut s, query_rows * n_embd, -1.0, 1.0);
+            let normed: Vec<Vec<f32>> = blocks.iter().map(|b| rmsnorm_row(b)).collect();
+            let got = inkling2_mix_ptr_f32_host(&normed, &cur, &query, n_embd, query_rows);
+            let want = inkling2_mix_f32(&blocks, &cur, &query, n_embd, query_rows);
+            assert_eq!(got.len(), want.len());
+            let d = max_abs_diff(&got, &want);
+            assert_eq!(
+                d, 0.0,
+                "n_embd={n_embd} blocks={n_blocks} qr={query_rows}: diff {d}"
+            );
+        }
+    }
+
     #[test]
     fn per_query_rows_are_independent() {
         // Each query row only reads its own query vector: appending a row
@@ -396,6 +564,103 @@ impl Gpu {
         assert_eq!(bank.shape, vec![n_states, n_embd]);
         self.inkling2_rmsnorm_nogamma_f32(bank, normed, n_states, n_embd, eps)?;
         self.inkling2_mix_query_row_f32(normed, query, out, n_states, n_embd, query_rows)
+    }
+
+    /// Zero-copy `mix()` (D1): `bank` holds up to 5 already-normed `[e]`
+    /// rows (norm-once at push with [`Self::inkling2_rmsnorm_nogamma_f32`]),
+    /// `cur` is raw and normalized into caller-owned `cur_normed` with the
+    /// same tree reduction (one independent batch row — bitwise identical to
+    /// norming it as part of a contiguous bank). No bank allocation, no
+    /// `copy_rows`, no bank re-norm.
+    pub fn inkling2_mix_ptr_f32_gpu(
+        &mut self,
+        bank: &[&GpuTensor],
+        cur: &GpuTensor,
+        cur_normed: &GpuTensor,
+        query: &GpuTensor,
+        out: &GpuTensor,
+        n_embd: usize,
+        query_rows: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            bank.len() <= 5,
+            "D1 ptr mix holds <= 5 bank rows, got {}",
+            bank.len()
+        );
+        for (i, b) in bank.iter().enumerate() {
+            assert_eq!(
+                b.shape,
+                vec![n_embd],
+                "D1 ptr mix bank row {i}/{} shape {:?} != [{n_embd}]",
+                bank.len(),
+                b.shape
+            );
+        }
+        assert_eq!(cur.shape, vec![n_embd]);
+        assert_eq!(cur_normed.shape, vec![n_embd]);
+        assert_eq!(query.shape, vec![query_rows, n_embd]);
+        assert_eq!(out.shape, vec![query_rows, n_embd]);
+        self.inkling2_rmsnorm_nogamma_f32(cur, cur_normed, 1, n_embd, eps)?;
+        self.ensure_kernel(
+            "inkling2_mix_ptr",
+            INKLING2_MIX_PTR_HIP_SRC,
+            "inkling2_mix_query_ptr_f32",
+        )?;
+        let cur_normed_ptr = cur_normed.buf.as_ptr();
+        // Unused bank slots alias the normed cur: a kernel state index only
+        // ever reads s < n_bank (+cur at index 5), and an empty bank (visit
+        // 0 ffn mix without a push) degrades to the exact single-state path
+        // instead of dereferencing null.
+        let cn_const = cur_normed_ptr as *const c_void;
+        let mut ptrs = [cn_const; 5];
+        let owned: Vec<*const c_void> = bank
+            .iter()
+            .map(|b| b.buf.as_ptr() as *const c_void)
+            .collect();
+        for (i, p) in owned.iter().enumerate() {
+            ptrs[i] = *p;
+        }
+        let query_ptr = query.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let n_bank_val = bank.len() as i32;
+        let n_embd_val = n_embd as i32;
+        let inv_sqrt_embd = 1.0 / (n_embd as f32).sqrt();
+        let mut params: Vec<*mut c_void> = vec![
+            &ptrs[0] as *const _ as *mut c_void,
+            &ptrs[1] as *const _ as *mut c_void,
+            &ptrs[2] as *const _ as *mut c_void,
+            &ptrs[3] as *const _ as *mut c_void,
+            &ptrs[4] as *const _ as *mut c_void,
+            &cur_normed_ptr as *const _ as *mut c_void,
+            &query_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &n_bank_val as *const _ as *mut c_void,
+            &n_embd_val as *const _ as *mut c_void,
+            &inv_sqrt_embd as *const _ as *mut c_void,
+        ];
+        // Same 256-wide reduction + 6 softmax weights as the copying pass 2.
+        self.launch_maybe_blob(
+            "inkling2_mix_query_ptr_f32",
+            [query_rows as u32, 1, 1],
+            [256, 1, 1],
+            (256 + 6) * 4,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in ptrs {
+                    b.push_ptr(p);
+                }
+                b.push_ptr(cur_normed_ptr);
+                b.push_ptr(query_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(n_bank_val);
+                b.push_i32(n_embd_val);
+                b.push_f32(inv_sqrt_embd);
+                b
+            },
+        )
     }
 }
 
@@ -508,5 +773,94 @@ mod gpu_tests {
             eprintln!("mix randomized ({} blocks) max abs diff: {d}", n_blocks);
             assert!(d <= 1e-5, "randomized diff {d}");
         }
+    }
+
+    /// D1 gate (GPU phase): ptr path (norm-once bank + in-kernel cur norm)
+    /// matches the copying path bitwise at model dims. The copying path is
+    /// the pre-change behavior; equality here is the no-reassociation proof.
+    #[test]
+    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    fn gpu_ptr_path_matches_copying_path_bitwise() {
+        let mut gpu = match crate::gpu_test::init() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skip: no usable GPU ({e:?})");
+                return;
+            }
+        };
+        assert_eq!(gpu.arch, "gfx1100");
+        let (n_embd, n_blocks, query_rows) = (2304usize, 5usize, 2usize);
+        let mut s = 0x51ab_3c9d_2ef0_1123u64;
+        let blocks_h: Vec<Vec<f32>> = (0..n_blocks)
+            .map(|_| (0..n_embd).map(|_| rng_f32(&mut s, -2.0, 2.0)).collect())
+            .collect();
+        let cur_h: Vec<f32> = (0..n_embd).map(|_| rng_f32(&mut s, -2.0, 2.0)).collect();
+        let query_h: Vec<f32> = (0..query_rows * n_embd)
+            .map(|_| rng_f32(&mut s, -1.0, 1.0))
+            .collect();
+        // Copying path (pre-change behavior).
+        let n_states = n_blocks + 1;
+        let mut bank_h: Vec<f32> = Vec::with_capacity(n_states * n_embd);
+        for b in &blocks_h {
+            bank_h.extend_from_slice(b);
+        }
+        bank_h.extend_from_slice(&cur_h);
+        let bank = gpu.upload_f32(&bank_h, &[n_states, n_embd]).expect("bank");
+        let query = gpu
+            .upload_f32(&query_h, &[query_rows, n_embd])
+            .expect("query");
+        let normed = gpu
+            .alloc_tensor(&[n_states, n_embd], DType::F32)
+            .expect("normed");
+        let out_copy = gpu
+            .alloc_tensor(&[query_rows, n_embd], DType::F32)
+            .expect("out");
+        gpu.inkling2_mix_f32_gpu(
+            &bank,
+            &query,
+            &normed,
+            &out_copy,
+            n_states,
+            n_embd,
+            query_rows,
+            INKLING2_MIX_EPS,
+        )
+        .expect("copying mix");
+        let want = gpu.download_f32(&out_copy).expect("download");
+        // Ptr path: norm each bank row once (norm-once), in-kernel cur norm.
+        let mut bank_normed = Vec::with_capacity(n_blocks);
+        for b in &blocks_h {
+            let t = gpu.upload_f32(b, &[n_embd]).expect("bank row");
+            let n = gpu.alloc_tensor(&[n_embd], DType::F32).expect("normed row");
+            gpu.inkling2_rmsnorm_nogamma_f32(&t, &n, 1, n_embd, INKLING2_MIX_EPS)
+                .expect("norm once");
+            bank_normed.push(n);
+        }
+        let cur = gpu.upload_f32(&cur_h, &[n_embd]).expect("cur");
+        let cur_n = gpu.alloc_tensor(&[n_embd], DType::F32).expect("cur normed");
+        let out_ptr = gpu
+            .alloc_tensor(&[query_rows, n_embd], DType::F32)
+            .expect("out ptr");
+        let refs: Vec<&GpuTensor> = bank_normed.iter().collect();
+        gpu.inkling2_mix_ptr_f32_gpu(
+            &refs,
+            &cur,
+            &cur_n,
+            &query,
+            &out_ptr,
+            n_embd,
+            query_rows,
+            INKLING2_MIX_EPS,
+        )
+        .expect("ptr mix");
+        let got = gpu.download_f32(&out_ptr).expect("download ptr");
+        assert_eq!(got.len(), want.len());
+        let d = got
+            .iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("ptr vs copying max abs diff: {d}");
+        assert_eq!(d, 0.0, "ptr path must be bitwise identical");
     }
 }
