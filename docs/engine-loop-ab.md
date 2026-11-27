@@ -77,6 +77,11 @@ own route files: Qwen4 native MTP via `"mtp_mode": "on"`, a DFlash drafter via
 - `conc`: the concurrency matrix, see Concurrency.
 - `batch_load` (default `{"continuous_batch_size": 4, "serve_vmm_batch": {}}`):
   merged over `load` for the batch-path cache scenario.
+- `batch_reuse` (default `"turn"`): what a batch-path follow-up must reuse.
+  `"turn"`: its conversation's whole committed previous turn. `"prompt"`: a
+  prefix of the previous prompt only, at least legacy's reuse; set it on the
+  Gemma 4 routes, whose template re-renders earlier replies (see Batch-path
+  cache scenario).
 - `perf_decode_gain` (default false): a G-perf decode gain above +2 % is
   `intended` (intended diff 7). Set it only on a Gemma 4 AR route.
 
@@ -159,6 +164,15 @@ These are reported as `intended` and do not fail the run:
    with `perf_decode_gain`, G-perf reports a decode delta above +2 % as
    `intended`. A decode delta below −2 % and a prefill delta outside ±2 %
    still fail.
+8. **Gemma 4 prefill chunks split at turn ends (cross-build only, HIPF-598).**
+   From `7cfe290b6` on, a Gemma 4 prefill ends a chunk after each `<turn|>`
+   in the first 256 prompt tokens, so a follow-up can reuse its prefix. Both
+   loops split the same way, so no A/B diff follows from it, and reuse is
+   byte-identical to a cold prefill (cache on == cache off). Only receipts
+   from builds before `7cfe290b6` are not comparable token for token: 6 of 27
+   A/B requests (`cold`, `multi_turn[2]`, `seeded_repro`, `seeded_sweep[6]`,
+   `isolation`) differ from token 24 or 57 on. No harness rule; it is listed
+   for cross-build comparisons of matrix rows.
 
 Every other difference is a diff.
 
@@ -302,18 +316,31 @@ keep no records):
 - every request ends in `done`; P1 and D1 `aborted`; `loop` is `engine` with
   `expect_engine`
 - the twins' turn 0 are token-exact
-- **reuse:** P~1, D~1 (concurrent follow-ups) and the retries P1r, D1r
-  (after the aborts) reuse at least their conversation's committed turn 0;
-  P2, D~2 and D2r (after the resident abort and P2's turn) reuse at least
-  their committed turn 1:
+- **reuse** (`batch_reuse` `"turn"`, the default): P~1, D~1 (concurrent
+  follow-ups) and the retries P1r, D1r (after the aborts) reuse at least their
+  conversation's committed turn 0; P2, D~2 and D2r (after the resident abort
+  and P2's turn) at least their committed turn 1; P3, D~3 and D3r their
+  committed turn 2:
   `cached_tokens` >= its prompt plus every committed id (a follow-up that
   reuses the whole turn reports exactly that). The receipt lists
   `reuse[turn] = [cached, committed previous turn]`. D2r and D~2 have identical
   prompts, so either may continue either record: both reuse only when D's
   record survived D2's abort and P2's turn.
-- a retry with its control's reuse (P1r vs P~1, D1r vs D~1, D2r vs D~2, identical
-  prompts) has the control's tokens and ids; with a different reuse the pair is
-  only noted
+- **reuse** (`batch_reuse` `"prompt"`, Gemma 4): the chat template drops the
+  thinking-off primer of earlier model turns, so a reply never sits at its
+  decoded positions in the next prompt and no follow-up can reuse its committed
+  turn. Gemma 4 reuses the previous prompt up to its last `<turn|>` in the
+  first 256 tokens, or a snapshot of it on the 256-token grid above (the
+  snapshot pool may have dropped the deepest ones: P2 2048 of a 3017-token
+  previous prompt, on both loops). The harness has no prompt token ids to
+  compute that floor, so every follow-up must reuse more than 0 tokens and at
+  least the legacy arm's reuse of the same request (`reuse[turn] = [cached,
+  committed previous turn, legacy cached]`). HIPF-598 head `a3a1f4354` passes
+  it; its base `3f0594c3c` fails P~1, D~1, D1r, D~2, D2r and D3r (0 reused).
+- every retry (P1r, D1r, D2r, D3r) reuses at least its control (P~1, D~1,
+  D~2, D~3): the abort lost nothing a twin without an abort kept. With the
+  control's reuse it has the control's tokens and ids (identical prompts);
+  with more reuse the pair is only noted
 
 The notes also list the requests whose lane record the engine logged as not
 continued (`refused`, tag N = the N-th `gen_start` on the daemon's stdout), so

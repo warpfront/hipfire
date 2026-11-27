@@ -304,15 +304,20 @@ def hist_len(r):
     return (d.get("cached_tokens") or 0) + (d.get("prefill_tokens") or 0) + n
 
 
-def batch_checks(rows, expect_engine):
+def batch_checks(rows, expect_engine, reuse_mode="turn", ref=None):
     """The `--batch` gates on one arm's rows (the run gates the engine arm only;
     legacy fn-lanes keep no records). Pure: --self-test drives it with fakes.
     - every request ends in `done`; the aborted ones `aborted`, the others batched
     - the twins' turn 0 are token-exact (identical prompts at once)
-    - every turn 1 that finished (P~1, D~1, and the retries P1r, D1r after the
-      aborts) reuses at least its conversation's committed turn 0; P2, D~2 and
-      D2r (after D2's resident abort and P2's turn) reuse their committed turn 1
-    - a retry with the control's reuse gives the control's tokens and ids"""
+    - reuse_mode "turn": every turn 1 that finished (P~1, D~1, and the retries P1r,
+      D1r after the aborts) reuses at least its conversation's committed turn 0;
+      P2, D~2 and D2r (after D2's resident abort and P2's turn) their committed
+      turn 1; P3, D~3, D3r their committed turn 2
+    - reuse_mode "prompt" (a template that re-renders earlier replies, Gemma 4): the
+      reply is never reusable, so every follow-up reuses more than 0 and at least
+      the `ref` arm's (legacy) reuse of the same request
+    - a retry reuses at least its control (the abort lost nothing), and with the
+      control's reuse gives the control's tokens and ids"""
     fails, unex, notes = [], [], []
     cached = lambda r: r["done"].get("cached_tokens") or 0
     same = lambda a, b: (a["events"], a["ids"]) == (b["events"], b["ids"])
@@ -341,10 +346,19 @@ def batch_checks(rows, expect_engine):
                           ("P2", "P1r", 1), ("D~2", "D~1", 1), ("D2r", "D1r", 1),
                           ("P3", "P2", 2), ("D~3", "D~2", 2), ("D3r", "D2r", 2)):
         reuse[turn] = [cached(rows[turn]), hist_len(rows[prev])]
-        if reuse[turn][0] < reuse[turn][1]:
+        if reuse_mode == "turn" and reuse[turn][0] < reuse[turn][1]:
             fails.append(f"{turn} reused {reuse[turn][0]} < {reuse[turn][1]} (its committed turn {n})")
+        elif reuse_mode == "prompt":
+            floor = cached(ref[turn]) if ref else 0
+            reuse[turn].append(floor)
+            if not reuse[turn][0]:
+                fails.append(f"{turn} reused no prefix")
+            elif reuse[turn][0] < floor:
+                fails.append(f"{turn} reused {reuse[turn][0]} < legacy {floor}")
     for retry, ctrl in (("P1r", "P~1"), ("D1r", "D~1"), ("D2r", "D~2"), ("D3r", "D~3")):
-        if cached(rows[retry]) != cached(rows[ctrl]):
+        if cached(rows[retry]) < cached(rows[ctrl]):
+            fails.append(f"{retry} reused {cached(rows[retry])} < control {ctrl} {cached(rows[ctrl])} (the abort lost reuse)")
+        elif cached(rows[retry]) != cached(rows[ctrl]):
             notes.append(f"{retry} reused {cached(rows[retry])}, control {ctrl} {cached(rows[ctrl])}: tokens not compared")
         elif not same(rows[retry], rows[ctrl]):
             fails.append(f"{retry} tokens differ from {ctrl} at the same reuse")
@@ -841,10 +855,25 @@ def batch_self_test():
     good = batch_checks(rows(), True)
     assert good["ok"] and not good["unexercised"] and not good["notes"], good
     assert good["reuse"]["P1r"] == [7, 7]
-    assert batch_checks(rows(P1r=row("cd", cached=0)), True)["fails"] == ["P1r reused 0 < 7 (its committed turn 0)"]
+    assert batch_checks(rows(P1r=row("cd", cached=0)), True)["fails"] == [
+        "P1r reused 0 < 7 (its committed turn 0)", "P1r reused 0 < control P~1 7 (the abort lost reuse)"]
     assert batch_checks(rows(**{"D~1": row("ef", cached=3)}), True)["fails"] == ["D~1 reused 3 < 7 (its committed turn 0)"]
     assert batch_checks(rows(D1r=row("eX", cached=7)), True)["fails"] == ["D1r tokens differ from D~1 at the same reuse"]
-    assert batch_checks(rows(D2r=row("ij", cached=0)), True)["fails"] == ["D2r reused 0 < 14 (its committed turn 1)"]
+    assert batch_checks(rows(D2r=row("ij", cached=0)), True)["fails"] == [
+        "D2r reused 0 < 14 (its committed turn 1)", "D2r reused 0 < control D~2 14 (the abort lost reuse)"]
+    # a retry below its control fails even where the turn floor holds (a control that reused more)
+    assert batch_checks(rows(**{"D~3": row("kl", cached=30)}), True)["fails"] == [
+        "D3r reused 21 < control D~3 30 (the abort lost reuse)"]
+    # "prompt" mode (Gemma 4): any reuse > 0 and >= legacy's; the committed turn is not required
+    gem = rows(**{"P~1": row("cd", cached=3), "P1r": row("cd", cached=3)})
+    leg = rows(**{"P~1": row("cd", cached=3), "D~1": row("ef", cached=2), "P1r": row("cd", cached=3)})
+    assert batch_checks(gem, True)["fails"] == ["P~1 reused 3 < 7 (its committed turn 0)",
+                                                "P1r reused 3 < 7 (its committed turn 0)"]
+    ok_g = batch_checks(gem, True, "prompt", leg)
+    assert ok_g["ok"] and ok_g["reuse"]["D~1"] == [7, 7, 2], ok_g
+    assert batch_checks(rows(**{"D~1": row("ef", cached=1), "D1r": row("ef", cached=1)}), True, "prompt", leg
+                        )["fails"] == ["D~1 reused 1 < legacy 2", "D1r reused 1 < legacy 7"]
+    assert batch_checks(rows(**{"P~1": row("cd", cached=0)}), True, "prompt")["fails"] == ["P~1 reused no prefix"]
     assert batch_checks(rows(D2r=row("iX", cached=14)), True)["fails"] == ["D2r tokens differ from D~2 at the same reuse"]
     more = batch_checks(rows(D1r=row("eX", cached=9), D2r=row("ij", cached=16), D3r=row("kl", cached=23)),
                         True)  # more than the control: not compared
@@ -1305,8 +1334,9 @@ def main():
     if batch_on:
         brows = {arm: run_batch(args, route, arm, out) for arm in ARMS}
         # gated on the engine arm; legacy fn-lanes keep no lane records (reference row)
-        batch = {"engine": batch_checks(brows["engine"], route.get("expect_engine", False)),
-                 "legacy_reference": batch_checks(brows["legacy"], False), "arms": brows}
+        mode = route.get("batch_reuse", "turn")
+        batch = {"engine": batch_checks(brows["engine"], route.get("expect_engine", False), mode, brows["legacy"]),
+                 "legacy_reference": batch_checks(brows["legacy"], False, mode), "arms": brows}
         unex += [f"batch: {u}" for u in batch["engine"]["unexercised"]]
         summary.append(f"batch reuse={batch['engine']['reuse']} "
                        + ("pass" if batch["engine"]["ok"] else "FAIL: " + "; ".join(batch["engine"]["fails"])))
