@@ -173,3 +173,45 @@ class DflashShadowVerdictTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Inkling2RouteProofTests(unittest.TestCase):
+    @staticmethod
+    def row(arm, ctx=128, digest="d1"):
+        backend = {"pm4": "pm4", "graph": "graph", "eager": "eager"}[arm]
+        key = {"pm4": "timed_pm4_replays", "graph": "timed_graph_replays", "eager": "timed_eager_steps"}[arm]
+        return {
+            "type": "decode_result",
+            "context_tokens": ctx,
+            "logits_fnv64": digest,
+            "inkling_decode": {"backend": backend, "timed_steps": 48, key: 48},
+        }
+
+    def report(self, **over):
+        marker = {"pm4": "decode backend: retained PM4", "graph": "decode backend: graph", "eager": "decode backend: eager"}
+        arms = {a: {"rows": [self.row(a)], "log": marker[a]} for a in marker}
+        arms.update(over)
+        return {"arms": arms}
+
+    def test_exact_route_and_digest_pass(self):
+        self.assertEqual(harness.inkling2_failures(self.report()), [])
+
+    def test_digest_mismatch_fails(self):
+        bad = self.report(graph={"rows": [self.row("graph", digest="d2")], "log": "decode backend: graph"})
+        self.assertTrue(any("digests differ" in f for f in harness.inkling2_failures(bad)))
+
+    def test_fallback_and_missing_replays_fail(self):
+        row = self.row("pm4")
+        row["inkling_decode"]["timed_pm4_replays"] = 40
+        row["inkling_decode"]["timed_graph_replays"] = 8
+        bad = self.report(pm4={"rows": [row], "log": "decode backend: retained PM4"})
+        failures = harness.inkling2_failures(bad)
+        self.assertTrue(any("timed_pm4_replays=40" in f for f in failures))
+        self.assertTrue(any("a fallback or foreign route ran" in f for f in failures))
+
+    def test_missing_log_marker_and_arm_fail(self):
+        bad = self.report(eager={"rows": [self.row("eager")], "log": ""})
+        self.assertTrue(any("route line" in f for f in harness.inkling2_failures(bad)))
+        report = self.report()
+        del report["arms"]["graph"]
+        self.assertTrue(any("graph: arm missing" in f for f in harness.inkling2_failures(report)))

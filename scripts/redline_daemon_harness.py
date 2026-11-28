@@ -45,11 +45,16 @@ class Daemon:
         env.update(
             HIPFIRE_REPLAY_BACKEND="shadow",
             HIPFIRE_REPLAY_MANUAL_CAPTURE="1",
-            HIPFIRE_KV_MODE=kv_mode,
             HIPFIRE_AR_GRAPH="0",
             HIPFIRE_GRAPH="0",
         )
+        if kv_mode:
+            env["HIPFIRE_KV_MODE"] = kv_mode
         env.update(extra_env or {})
+        # A None value removes the variable (the product-default arm of
+        # --inkling2 carries none of the shadow/graph switches).
+        for key in [k for k, v in env.items() if v is None]:
+            del env[key]
         self.proc = subprocess.Popen(
             [str(binary)],
             cwd=REPO,
@@ -604,6 +609,190 @@ def run_g0(daemon, args, report):
     report["pass"] = ok
     return ok
 
+
+# --- Inkling-2-Mini (arch 24) served decode route proof -------------------
+#
+# The product decode of the admitted row is the retained PM4 tape (graph under
+# HIPFIRE_REPLAY_BACKEND=hip, eager under HIPFIRE_GRAPH=0). This mode loads the
+# model once per arm with exactly that environment and drives the daemon's
+# arch-24 `bench_decode` (the same `forward_plain_ar_gpu` wrapper `serve`
+# decodes with), requiring: the executed backend is the arm's (no fallback,
+# every timed step a replay), the FNV-1a digest of every step's full unpadded
+# logits is identical across all three arms and across repeated requests (exact
+# C1), and the daemon log carries the typed route line. Manual shadow state
+# comparison (KV/conv/tags/banks, blob oracle) lives in
+# `crates/hipfire-arch-inkling2/tests/{decode_replay_hw,decode_serve_hw}.rs`.
+
+INKLING2_ARMS = {
+    # name: (extra env, backend the bench ledger must report, log marker)
+    "pm4": (
+        {
+            "HIPFIRE_REPLAY_BACKEND": None,
+            "HIPFIRE_REPLAY_MANUAL_CAPTURE": None,
+            "HIPFIRE_AR_GRAPH": None,
+            "HIPFIRE_GRAPH": None,
+            "HIPFIRE_REPLAY_ROUTE_PROOF_LOG": "1",
+        },
+        "pm4",
+        "decode backend: retained PM4",
+    ),
+    "graph": (
+        {
+            "HIPFIRE_REPLAY_BACKEND": "hip",
+            "HIPFIRE_REPLAY_MANUAL_CAPTURE": None,
+            "HIPFIRE_AR_GRAPH": None,
+            "HIPFIRE_GRAPH": None,
+        },
+        "graph",
+        "decode backend: graph",
+    ),
+    "eager": (
+        {
+            "HIPFIRE_REPLAY_BACKEND": "hip",
+            "HIPFIRE_REPLAY_MANUAL_CAPTURE": None,
+            "HIPFIRE_AR_GRAPH": None,
+            "HIPFIRE_GRAPH": "0",
+        },
+        "eager",
+        "decode backend: eager",
+    ),
+}
+
+
+def inkling2_arm_failures(arm, rows, log_text):
+    """Failures of one arm's bench_decode rows (`rows` = list of responses)."""
+    _env, backend, marker = INKLING2_ARMS[arm]
+    failures = []
+    if not rows:
+        return [f"{arm}: no bench_decode rows"]
+    for row in rows:
+        label = f"{arm} ctx {row.get('context_tokens')}"
+        ledger = row.get("inkling_decode")
+        if row.get("type") != "decode_result" or not isinstance(ledger, dict):
+            failures.append(f"{label}: not a decode_result with an inkling_decode ledger")
+            continue
+        steps = ledger.get("timed_steps")
+        if not steps:
+            failures.append(f"{label}: zero timed steps")
+            continue
+        if ledger.get("backend") != backend:
+            failures.append(f"{label}: executed backend {ledger.get('backend')!r}, wanted {backend!r}")
+        want = {
+            "pm4": "timed_pm4_replays",
+            "graph": "timed_graph_replays",
+            "eager": "timed_eager_steps",
+        }[arm]
+        if ledger.get(want) != steps:
+            failures.append(f"{label}: {want}={ledger.get(want)} of {steps} timed steps")
+        other = {
+            "pm4": ("timed_graph_replays", "timed_eager_steps", "timed_pm4_failed_steps"),
+            "graph": ("timed_pm4_replays", "timed_eager_steps", "timed_graph_capture_failed_steps"),
+            "eager": ("timed_pm4_replays", "timed_graph_replays"),
+        }[arm]
+        for key in other:
+            if ledger.get(key):
+                failures.append(f"{label}: {key}={ledger.get(key)} (a fallback or foreign route ran)")
+        if ledger.get("pm4_sticky") or ledger.get("sticky") or ledger.get("arena_refusal"):
+            failures.append(
+                f"{label}: sticky/refusal pm4={ledger.get('pm4_sticky')!r} "
+                f"graph={ledger.get('sticky')!r} arena={ledger.get('arena_refusal')!r}"
+            )
+        if not row.get("logits_fnv64"):
+            failures.append(f"{label}: no logits digest")
+    if marker not in log_text:
+        failures.append(f"{arm}: the daemon log has no {marker!r} route line")
+    return failures
+
+
+def inkling2_failures(report):
+    """Verdict over `report["arms"]` = {arm: {"rows": [...], "log": str}}."""
+    failures = []
+    digests = {}
+    for arm in INKLING2_ARMS:
+        data = report["arms"].get(arm)
+        if data is None:
+            failures.append(f"{arm}: arm missing")
+            continue
+        failures.extend(inkling2_arm_failures(arm, data["rows"], data["log"]))
+        for row in data["rows"]:
+            digests.setdefault(row.get("context_tokens"), {}).setdefault(
+                row.get("logits_fnv64"), []
+            ).append(arm)
+    for ctx, by_digest in digests.items():
+        if len(by_digest) != 1:
+            failures.append(f"ctx {ctx}: logits digests differ across arms/requests: {by_digest}")
+    return failures
+
+
+def run_inkling2(args, model, daemon_path):
+    arms = {}
+    report = {
+        "mode": "inkling2",
+        "model": str(model),
+        "daemon": str(daemon_path),
+        "contexts": args.inkling2_contexts,
+        "iterations": args.inkling2_iterations,
+        "repeats": args.inkling2_repeats,
+        "arms": arms,
+    }
+    for arm, (env, _backend, _marker) in INKLING2_ARMS.items():
+        log_path = Path(args.log).with_suffix(f".{arm}.log")
+        # No kv_mode: the real carrier-default F16 KV, no q8/FP8 override.
+        daemon = Daemon(daemon_path, log_path, args.timeout, "", dict(env))
+        rows = []
+        try:
+            load = daemon.request(
+                {
+                    "type": "load",
+                    "model": str(model),
+                    "params": {
+                        **({"max_seq": args.max_seq} if args.max_seq is not None else {}),
+                        "dflash_mode": "off",
+                        "dspark_mode": "off",
+                        "mtp_mode": "off",
+                        "ngram_draft": False,
+                    },
+                }
+            )
+            if load.get("type") != "loaded":
+                raise RuntimeError(f"unexpected load response: {load}")
+            for ctx in args.inkling2_contexts:
+                for _ in range(args.inkling2_repeats):
+                    rows.append(
+                        daemon.request(
+                            {
+                                "type": "bench_decode",
+                                "context_tokens": ctx,
+                                "iterations": args.inkling2_iterations,
+                                "warmup_iterations": 2,
+                                "logits_digest": True,
+                            }
+                        )
+                    )
+        finally:
+            daemon.close()
+        arms[arm] = {"rows": rows, "log": log_path.read_text(errors="replace")}
+        for row in rows:
+            ledger = row.get("inkling_decode", {})
+            print(
+                f"inkling2 {arm:5s} ctx {row.get('context_tokens'):5} backend={ledger.get('backend')} "
+                f"timed={ledger.get('timed_steps')} {row.get('us_per_token', 0) / 1000:.3f} ms/token "
+                f"({row.get('tok_s', 0):.1f} tok/s) digest={row.get('logits_fnv64')}",
+                flush=True,
+            )
+    failures = inkling2_failures(report)
+    report["failures"] = failures
+    report["pass"] = not failures
+    output = Path(args.out)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2) + "\n")
+    print(f"report={output} pass={report['pass']}", flush=True)
+    for line in failures:
+        print(f"  FAIL {line}", flush=True)
+    if failures:
+        raise SystemExit(f"inkling2 route proof failed {len(failures)} check(s); see {output}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -781,7 +970,22 @@ def main():
         default=3,
         help="fixed target verify batch for the DSpark shadow (default: 3)",
     )
+    parser.add_argument(
+        "--inkling2",
+        action="store_true",
+        help=(
+            "Inkling-2-Mini (arch 24) served-decode route proof: one daemon load per arm "
+            "(product-default PM4, HIPFIRE_REPLAY_BACKEND=hip graph, HIPFIRE_GRAPH=0 eager), "
+            "arch-24 bench_decode with a logits digest; the digest must be identical across arms "
+            "and every timed step must be a replay of the arm's own backend"
+        ),
+    )
+    parser.add_argument("--inkling2-contexts", type=int, nargs="+", default=[128, 2048])
+    parser.add_argument("--inkling2-iterations", type=int, default=48)
+    parser.add_argument("--inkling2-repeats", type=int, default=2)
     args = parser.parse_args()
+    if args.inkling2 and args.kv_mode is None:
+        args.kv_mode = ""
     if args.kv_mode is None:
         args.kv_mode = "bf16" if args.qwen4 else "q8"
     # Qwen4's shadow snapshot reads full_row_units in each tensor's native
@@ -796,6 +1000,9 @@ def main():
         sys.exit(f"model not found: {model}")
     if not daemon_path.is_file():
         sys.exit(f"daemon not found: {daemon_path}")
+    if args.inkling2:
+        run_inkling2(args, model, daemon_path)
+        return
     draft = Path(args.draft).expanduser().resolve() if args.draft else None
     if args.dspark_verify_shadow and (draft is None or not draft.is_file()):
         sys.exit("--dspark-verify-shadow requires an existing --draft sidecar")
