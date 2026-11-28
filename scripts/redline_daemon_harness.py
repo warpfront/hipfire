@@ -737,8 +737,13 @@ def run_inkling2(args, model, daemon_path):
     }
     for arm, (env, _backend, _marker) in INKLING2_ARMS.items():
         log_path = Path(args.log).with_suffix(f".{arm}.log")
-        # No kv_mode: the real carrier-default F16 KV, no q8/FP8 override.
-        daemon = Daemon(daemon_path, log_path, args.timeout, "", dict(env))
+        # An isolated HIPFIRE_HOME: the caller's config.toml (for example an
+        # iu4/A4 prefill tier) would change the recipe and refuse the admitted
+        # row. No kv_mode: the real carrier-default F16 KV, no q8/FP8 override.
+        home = log_path.parent / f"home-{arm}"
+        home.mkdir(parents=True, exist_ok=True)
+        arm_env = dict(env, HIPFIRE_HOME=str(home), HIPFIRE_NO_REGISTRY_FETCH="1")
+        daemon = Daemon(daemon_path, log_path, args.timeout, "", arm_env)
         rows = []
         try:
             load = daemon.request(
