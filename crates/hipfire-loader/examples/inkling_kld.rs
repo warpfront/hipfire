@@ -3305,8 +3305,8 @@ fn bench_decode(a: &Args) -> Result<(), String> {
             .max_by(|x, y| x.1.total_cmp(y.1))
             .map_or(0, |(i, _)| i as u32)
     };
-    let mut run =
-        |b: &mut hipfire_arch_inkling2::Inkling2Bundle| -> Result<(Vec<f64>, Vec<u32>), String> {
+    let mut run = |b: &mut hipfire_arch_inkling2::Inkling2Bundle|
+     -> Result<(Vec<f64>, Vec<u32>, String), String> {
             b.reset_session_state(&mut gpu)?;
             let mut last = Vec::new();
             hipfire_arch_inkling2::forward_prefill_gpu(
@@ -3318,6 +3318,9 @@ fn bench_decode(a: &Args) -> Result<(), String> {
             )?;
             let mut next = argmax(&last);
             let (mut ms, mut gen) = (Vec::with_capacity(steps), Vec::with_capacity(steps));
+            // Every step's logits row, so a bitwise-preserving body change can
+            // be checked by digest identity (outside the timed region).
+            let mut digest = Sha256::new();
             for s in 0..steps {
                 gen.push(next);
                 let t0 = Instant::now();
@@ -3327,17 +3330,18 @@ fn bench_decode(a: &Args) -> Result<(), String> {
                     hipfire_arch_inkling2::forward_token_gpu(b, &mut gpu, next, ctx + s)?
                 };
                 ms.push(t0.elapsed().as_secs_f64() * 1e3);
+                digest.update(f32_bytes(&row));
                 next = argmax(&row);
             }
-            Ok((ms, gen))
+            Ok((ms, gen, format!("{:x}", digest.finalize())))
         };
-    let (_, warm_gen) = run(b)?;
+    let (_, warm_gen, warm_sha) = run(b)?;
     let mut per_rep = Vec::with_capacity(reps);
     for r in 0..reps {
-        let (ms, gen) = run(b)?;
-        if gen != warm_gen {
+        let (ms, gen, sha) = run(b)?;
+        if gen != warm_gen || sha != warm_sha {
             return Err(format!(
-                "bench-decode: rep {r} generated ids differ from the warm-up's"
+                "bench-decode: rep {r} generated ids or logits differ from the warm-up's"
             ));
         }
         let total: f64 = ms.iter().sum();
@@ -3373,6 +3377,7 @@ fn bench_decode(a: &Args) -> Result<(), String> {
         "reps": per_rep,
         "median_tok_s": median,
         "generated_ids": warm_gen,
+        "decode_logits_sha256": warm_sha,
     });
     std::fs::write(
         &output,
