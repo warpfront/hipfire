@@ -20,10 +20,12 @@
 //! norms, clips, conv, sinks, router F16 WMMA, top-k, SiTU, AWQ producers,
 //! combine), so [`PrefillMode::ROW_EXACT`] (per-row GEMV linears, the indexed
 //! expert chain and the decode attention per row) reproduces the scalar loop
-//! bit for bit, state included. [`PrefillMode::BLOCKED`] changes three named
+//! bit for bit, state included. [`PrefillMode::BLOCKED`] changes four named
 //! arithmetic sites: the dense linears (weight-only WMMA GEMM, X rounded to
-//! F16), the routed experts (grouped weight-only WMMA) and the attention
-//! (blocked causal FA2, hi/lo Q/P, no partition merge).
+//! F16), the F32 controller / sink / dynamic-tap projections (hi/lo-F16 WMMA
+//! GEMMs, `rdna_compute::inkling2_hilo`), the routed experts (grouped
+//! weight-only WMMA) and the attention (blocked causal FA2, hi/lo Q/P, no
+//! partition merge). The router stays bitwise (the `mb8` chain per tile).
 //!
 //! **KV ring.** A block's keys/values are staged as F16 and the attention
 //! reads pre-block keys from the cache and in-block keys from the staging
@@ -58,6 +60,7 @@ use rdna_compute::ffn_activation::{
 };
 use rdna_compute::inkling2_attention::inkling2_attn_fa2_splits;
 use rdna_compute::inkling2_attention_prefill::{Inkling2PrefillAttn, INKLING2_ATTN_PREFILL_REL};
+use rdna_compute::inkling2_hilo::{Inkling2HiloBlend, Inkling2HiloGemm};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::ffi::c_void;
 use std::sync::{Arc, LazyLock};
@@ -1046,88 +1049,138 @@ fn clip_rows(
     )
 }
 
-/// One fused controller step over `rows` rows (singleton
-/// `inkling2_control_f32_gpu` arithmetic per row). `out [rows, e]`.
+/// `y [rows, m] = x [rows, k] . A^T` for every `(A, x, y)`: one hi/lo-F16
+/// WMMA GEMM launch over all of them (blocked), or the singleton `gemv_f32`
+/// arithmetic per row (row-exact).
+fn proj_rows(
+    gpu: &mut Gpu,
+    ps: &[(&GpuTensor, &GpuTensor, &GpuTensor)],
+    m: usize,
+    k: usize,
+    rows: usize,
+    gemm: bool,
+) -> Result<(), String> {
+    if gemm {
+        let probs: Vec<Inkling2HiloGemm<'_>> = ps
+            .iter()
+            .map(|&(w, x, y)| Inkling2HiloGemm { w, x, y })
+            .collect();
+        return hip(gpu.inkling2_gemm_hilo_f32(&probs, m, k, rows), "hilo gemm");
+    }
+    for &(a, x, y) in ps {
+        gemv_rows(gpu, a, x, k, y, m, m, k, rows)?;
+    }
+    Ok(())
+}
+
+/// One controller input of [`control_rows`]: `(cur, msg, controller)`, rows `[rows, e]`.
+type CtrlIn<'a> = (&'a GpuTensor, &'a GpuTensor, &'a Inkling2Controller);
+
+/// Fused controller steps over `rows` rows, one `out [rows, e]` per input.
+/// Row-exact: the singleton `inkling2_control_f32_gpu` arithmetic per row.
+/// Blocked (`gemm`): the down projections of every input in one hi/lo-F16
+/// WMMA GEMM launch, then their gain/forget projections and blend in another.
 #[allow(clippy::too_many_arguments)]
 fn control_rows(
     gpu: &mut Gpu,
     ar: &mut Arena,
-    cur: &GpuTensor,
-    msg: &GpuTensor,
-    ctrl: &Inkling2Controller,
+    ins: &[CtrlIn<'_>],
     e: usize,
     rank: usize,
     rows: usize,
-) -> Result<T, String> {
+    gemm: bool,
+) -> Result<Vec<T>, String> {
     let eps = rdna_compute::inkling2_control::INKLING2_CONTROL_EPS;
-    let gate = ar.f32(gpu, rows * 2 * e, "ctrl_gate")?;
-    let g = ar.f32(gpu, rows * rank, "ctrl_g")?;
-    let gain = ar.f32(gpu, rows * e, "ctrl_gain")?;
-    let forget = ar.f32(gpu, rows * e, "ctrl_forget")?;
-    let out = ar.f32(gpu, rows * e, "ctrl_out")?;
-    for (half, x) in [(0usize, cur), (1, msg)] {
-        let mut b = KernargBlob::new();
-        b.push_ptr(ptr(x));
-        b.push_i32(e as i32);
-        b.push_ptr(ar.get(gate).buf.as_ptr().wrapping_byte_add(half * e * 4) as *const c_void);
-        b.push_i32((2 * e) as i32);
-        b.push_i32(rows as i32);
-        b.push_i32(e as i32);
-        b.push_f32(eps);
-        launch(
+    let mut gates = Vec::with_capacity(ins.len());
+    let mut gs = Vec::with_capacity(ins.len());
+    let mut outs = Vec::with_capacity(ins.len());
+    for &(cur, msg, _) in ins {
+        let gate = ar.f32(gpu, rows * 2 * e, "ctrl_gate")?;
+        gates.push(gate);
+        gs.push(ar.f32(gpu, rows * rank, "ctrl_g")?);
+        outs.push(ar.f32(gpu, rows * e, "ctrl_out")?);
+        for (half, x) in [(0usize, cur), (1, msg)] {
+            let mut b = KernargBlob::new();
+            b.push_ptr(ptr(x));
+            b.push_i32(e as i32);
+            b.push_ptr(ar.get(gate).buf.as_ptr().wrapping_byte_add(half * e * 4) as *const c_void);
+            b.push_i32((2 * e) as i32);
+            b.push_i32(rows as i32);
+            b.push_i32(e as i32);
+            b.push_f32(eps);
+            launch(
+                gpu,
+                "ink_pf_rmsnorm_nogamma_ld_f32",
+                [grid_u32(rows, "ctrl norm")?, 1, 1],
+                [256, 1, 1],
+                0,
+                b,
+            )?;
+        }
+    }
+    let downs: Vec<_> = ins
+        .iter()
+        .zip(gates.iter().zip(&gs))
+        .map(|(&(_, _, c), (&x, &y))| (&c.down, ar.get(x), ar.get(y)))
+        .collect();
+    proj_rows(gpu, &downs, rank, 2 * e, rows, gemm)?;
+    if gemm {
+        let blends: Vec<_> = ins
+            .iter()
+            .zip(gs.iter().zip(&outs))
+            .map(|(&(cur, msg, c), (&g, &out))| Inkling2HiloBlend {
+                gain_w: &c.gain,
+                forget_w: &c.forget,
+                g: ar.get(g),
+                cur,
+                msg,
+                out: ar.get(out),
+            })
+            .collect();
+        hip(
+            gpu.inkling2_control_up_blend_hilo(&blends, e, rank, rows),
+            "control up+blend",
+        )?;
+        return Ok(outs);
+    }
+    for (&(cur, msg, c), (&g, &out)) in ins.iter().zip(gs.iter().zip(&outs)) {
+        let gain = ar.f32(gpu, rows * e, "ctrl_gain")?;
+        let forget = ar.f32(gpu, rows * e, "ctrl_forget")?;
+        gemv_rows(
             gpu,
-            "ink_pf_rmsnorm_nogamma_ld_f32",
-            [grid_u32(rows, "ctrl norm")?, 1, 1],
-            [256, 1, 1],
-            0,
-            b,
+            &c.gain,
+            ar.get(g),
+            rank,
+            ar.get(gain),
+            e,
+            e,
+            rank,
+            rows,
+        )?;
+        gemv_rows(
+            gpu,
+            &c.forget,
+            ar.get(g),
+            rank,
+            ar.get(forget),
+            e,
+            e,
+            rank,
+            rows,
+        )?;
+        hip(
+            gpu.inkling2_control_blend_gpu_f32(
+                cur,
+                msg,
+                ar.get(gain),
+                ar.get(forget),
+                ar.get(out),
+                rows * e,
+            ),
+            "control blend",
         )?;
     }
-    gemv_rows(
-        gpu,
-        &ctrl.down,
-        ar.get(gate),
-        2 * e,
-        ar.get(g),
-        rank,
-        rank,
-        2 * e,
-        rows,
-    )?;
-    gemv_rows(
-        gpu,
-        &ctrl.gain,
-        ar.get(g),
-        rank,
-        ar.get(gain),
-        e,
-        e,
-        rank,
-        rows,
-    )?;
-    gemv_rows(
-        gpu,
-        &ctrl.forget,
-        ar.get(g),
-        rank,
-        ar.get(forget),
-        e,
-        e,
-        rank,
-        rows,
-    )?;
-    hip(
-        gpu.inkling2_control_blend_gpu_f32(
-            cur,
-            msg,
-            ar.get(gain),
-            ar.get(forget),
-            ar.get(out),
-            rows * e,
-        ),
-        "control blend",
-    )?;
-    Ok(out)
+    Ok(outs)
 }
 
 static GEMM_FAMILY: LazyLock<GemmFamily> = LazyLock::new(GemmFamily::new);
@@ -1320,12 +1373,19 @@ fn visit_body(
             mix_rows(gpu, &states, cross, ar.get(msg), n, e, 4, eps)?;
             mids = Some(msg);
             let rank = cfg.loop_cfg.gate_rank;
-            let mut outs = Vec::with_capacity(3);
-            for (j, base) in [bq, bk, bv].into_iter().enumerate() {
-                let mj = view(ar.get(msg), j * ne, &[n, e])?;
-                let o = control_rows(gpu, ar, base, &mj, &ctrls[j], e, rank, n)?;
-                outs.push(view(ar.get(o), 0, &[n, e])?);
-            }
+            let mjs = (0..3)
+                .map(|j| view(ar.get(msg), j * ne, &[n, e]))
+                .collect::<Result<Vec<_>, _>>()?;
+            let ins: Vec<CtrlIn<'_>> = [bq, bk, bv]
+                .into_iter()
+                .zip(&mjs)
+                .zip(ctrls.iter())
+                .map(|((base, mj), ctrl)| (base, mj, ctrl))
+                .collect();
+            let mut outs = control_rows(gpu, ar, &ins, e, rank, n, c.mode.gemm)?
+                .into_iter()
+                .map(|o| view(ar.get(o), 0, &[n, e]))
+                .collect::<Result<Vec<_>, _>>()?;
             let v = outs.pop().unwrap();
             let k = outs.pop().unwrap();
             let q = outs.pop().unwrap();
@@ -1427,8 +1487,14 @@ fn visit_body(
         let dw = nkv * cfg.conv_kernel;
         let dk = ar.f32(gpu, n * dw, "dyn_k")?;
         let dv = ar.f32(gpu, n * dw, "dyn_v")?;
-        gemv_rows(gpu, kp, ar.get(ki), e, ar.get(dk), dw, dw, e, n)?;
-        gemv_rows(gpu, vp, ar.get(vi), e, ar.get(dv), dw, dw, e, n)?;
+        proj_rows(
+            gpu,
+            &[(kp, ar.get(ki), ar.get(dk)), (vp, ar.get(vi), ar.get(dv))],
+            dw,
+            e,
+            n,
+            gemm,
+        )?;
         let s = 1.0 / 3.0;
         conv_rows(
             gpu,
@@ -1494,7 +1560,14 @@ fn visit_body(
     }
     // Sinks `[n, nh]`.
     let sinks = ar.f32(gpu, n * nh, "sinks")?;
-    gemv_rows(gpu, &layer.sink, ar.get(qi), e, ar.get(sinks), nh, nh, e, n)?;
+    proj_rows(
+        gpu,
+        &[(&layer.sink, ar.get(qi), ar.get(sinks))],
+        nh,
+        e,
+        n,
+        gemm,
+    )?;
     // KV + attention.
     let ring = gs.visit_rows[visit];
     if !swa && p + n > ring {
@@ -1585,7 +1658,8 @@ fn visit_body(
         (Some((_, _, _, ctrls)), Some(m)) => {
             let m3 = view(ar.get(m), 3 * ne, &[n, e])?;
             let fm = view(ar.get(ffn_mixed), 0, &[n, e])?;
-            control_rows(gpu, ar, &fm, &m3, &ctrls[3], e, cfg.loop_cfg.gate_rank, n)?
+            let ins: [CtrlIn<'_>; 1] = [(&fm, &m3, &ctrls[3])];
+            control_rows(gpu, ar, &ins, e, cfg.loop_cfg.gate_rank, n, c.mode.gemm)?[0]
         }
         _ => ffn_mixed,
     };

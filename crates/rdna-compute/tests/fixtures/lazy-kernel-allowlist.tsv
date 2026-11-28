@@ -958,6 +958,7 @@ module	inkling2_clip	non-core-family	Non-core family route: Inkling-2-Mini (arch
 module	inkling2_control_blend	non-core-family	Non-core family route: Inkling-2-Mini (arch 24); rdna-compute/src/inkling2_control.rs:421
 module	inkling2_gpu_forward	non-core-family	Non-core family route: Inkling-2-Mini (arch 24); hipfire-arch-inkling2/src/gpu_forward.rs:170
 module	inkling2_gpu_prefill	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), blocked prefill row kernels; hipfire-arch-inkling2/src/gpu_prefill.rs:437
+module	inkling2_hilo_gemm	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx12 blocked prefill hi/lo-F16 F32 projections; rdna-compute/src/inkling2_hilo.rs:369
 module	inkling2_mix_query	non-core-family	Non-core family route: Inkling-2-Mini (arch 24); rdna-compute/src/inkling2_mix.rs:341
 module	inkling2_rel_bias	non-core-family	Non-core family route: Inkling-2-Mini (arch 24); rdna-compute/src/inkling2_rel_bias.rs:285
 module	inkling2_rmsnorm_nogamma	non-core-family	Non-core family route: Inkling-2-Mini (arch 24); rdna-compute/src/inkling2_control.rs:375
