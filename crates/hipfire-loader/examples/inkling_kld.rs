@@ -121,7 +121,7 @@ const USAGE: &str = "usage:
                        [--route ar|prefill|decode-scalar|decode-blocked]
                        [--prefill-routes dense=f16|fp8|a8|a4,experts=f16|fp8|a8|a4]
   inkling_kld bench    --model CANDIDATE.hfq --ref REF.kldref --output OUT.json [--n 2048]
-                       [--reps 3] [--prefill-routes ...]
+                       [--reps 3] [--prefill-routes ...] [--block-rows N (dev)]
   inkling_kld bench-decode --model CANDIDATE.hfq --ref REF.kldref --output OUT.json
                        [--ctx 128] [--steps 64] [--reps 3] [--body blocked|scalar] [--prefill-routes ...]
   inkling_kld pair     --base BASE.kldseq --cand CAND.kldseq [--output OUT.json] [--boot 20000] [--seed 1]";
@@ -3170,24 +3170,25 @@ fn eval(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
-/// Prompt-prefill speed of the blocked prefill on one load: chunk 0's first `n`
-/// reference tokens from position 0, head on the last row (the generate
-/// contract). One untimed warm-up prefill (kernel compile/cache), then `reps`
-/// timed prefills, each after `reset_session_state`; the last row's logits must
-/// hash identically across every rep.
+/// Prompt-prefill speed of the blocked prefill on one load: the first `n`
+/// reference tokens (chunks concatenated in order) from position 0, head on the
+/// last row (the generate contract). One untimed warm-up prefill (kernel
+/// compile/cache), then `reps` timed prefills, each after `reset_session_state`;
+/// the last row's logits must hash identically across every rep. `--block-rows`
+/// (dev) overrides the load's prefill block size.
 fn bench(a: &Args) -> Result<(), String> {
     let model = a.path("model")?;
     let ref_path = a.path("ref")?;
     let output = a.path("output")?;
     let reps = a.num("reps", 3)?.max(1);
     let (reference, mmap) = open_ref(&ref_path)?;
-    let h = &reference.header;
     let n = a.num("n", 2048)?;
-    if n == 0 || n > h.n_ctx {
-        return Err(format!("--n {n}: expected 1..={}", h.n_ctx));
-    }
     let tokens = reference.tokens(&mmap).map_err(|e| e.to_string())?;
+    if n == 0 || n > tokens.len() {
+        return Err(format!("--n {n}: expected 1..={}", tokens.len()));
+    }
     let ids = &tokens[..n];
+    let block_rows = a.opt_num("block-rows")?;
     let routes = prefill_routes_arg(a)?;
     let mut gpu = rdna_compute::Gpu::init().map_err(|e| format!("gpu init: {e:?}"))?;
     let t_load = Instant::now();
@@ -3199,21 +3200,49 @@ fn bench(a: &Args) -> Result<(), String> {
     if !hipfire_arch_inkling2::prefill_supported(b, &gpu) {
         return Err("bench: blocked prefill not supported on this load".into());
     }
+    if let Some(rows) = block_rows {
+        // Size the load's prefill scratch for the dev block (untimed).
+        let cfg = b.config.clone();
+        b.gpu_state
+            .as_mut()
+            .ok_or("bench: no Inkling-2 gpu state")?
+            .resize_prefill_scratch(&mut gpu, &cfg, rows.min(n))?;
+    }
     let executed = b
         .gpu_state
         .as_ref()
         .map(|s| format!("{:?}", s.prefill_routes));
+    let scratch_bytes = b
+        .gpu_state
+        .as_ref()
+        .and_then(|s| s.prefill_scratch.as_ref())
+        .map(|s| s.bytes());
     let mut run = |b: &mut hipfire_arch_inkling2::Inkling2Bundle| -> Result<(f64, String), String> {
         b.reset_session_state(&mut gpu)?;
         let mut last = Vec::new();
         let t0 = Instant::now();
-        hipfire_arch_inkling2::forward_prefill_gpu(
-            b,
-            &mut gpu,
-            ids,
-            0,
-            hipfire_arch_inkling2::PrefillLogits::Last(&mut last),
-        )?;
+        let logits = hipfire_arch_inkling2::PrefillLogits::Last(&mut last);
+        match block_rows {
+            None => hipfire_arch_inkling2::forward_prefill_gpu(b, &mut gpu, ids, 0, logits)?,
+            Some(rows) => {
+                let routes = b
+                    .gpu_state
+                    .as_ref()
+                    .ok_or("bench: no Inkling-2 gpu state")?
+                    .prefill_routes;
+                hipfire_arch_inkling2::forward_prefill_gpu_with(
+                    b,
+                    &mut gpu,
+                    ids,
+                    0,
+                    logits,
+                    hipfire_arch_inkling2::PrefillMode::BLOCKED,
+                    routes,
+                    rows,
+                    None,
+                )?
+            }
+        }
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         let mut d = Sha256::new();
         for v in &last {
@@ -3246,6 +3275,8 @@ fn bench(a: &Args) -> Result<(), String> {
                       "engine_commit": engine_commit()},
         "n": n,
         "prefill_routes": executed,
+        "block_rows": block_rows,
+        "prefill_scratch_bytes": scratch_bytes,
         "load_s": load_s,
         "warmup_ms": warm_ms,
         "ms": ms,
