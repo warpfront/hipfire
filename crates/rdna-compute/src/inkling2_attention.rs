@@ -35,6 +35,9 @@ pub const INKLING2_ATTN_FA2_MODULE: &str = "inkling2_attention_fa2";
 /// ([`Fa2Bias::Rel`]): the same source built with `INK_FA2_RELB`.
 pub const INKLING2_ATTN_FA2_RELB_MODULE: &str = "inkling2_attention_fa2_relb";
 
+/// Module of the device-position kernels ([`Gpu::inkling2_attn_decode_fa2_pos`]).
+pub const INKLING2_ATTN_FA2_POS_MODULE: &str = "inkling2_attention_fa2_pos";
+
 macro_rules! fa2_src {
     () => {
         r#"
@@ -80,11 +83,38 @@ __device__ __forceinline__ float ink_fa2_relb(
 }
 #endif
 
+#ifdef INK_FA2_POS
+// `inkling2_attn_fa2_splits` (rdna-compute/src/inkling2_attention.rs); the
+// two MUST stay identical.
+__device__ __forceinline__ int ink_fa2_splits(int n)
+{
+    return n <= 128 ? 2 : n <= 192 ? 4 : n <= 2048 ? 8 : n <= 4096 ? 16 : 8;
+}
+#endif
+
 // Grid (n_splits, 8), block 128 (four wave32s; every wave fills, wave w owns
 // KT16 subtile w of each KT64 tile). Built with INK_FA2_RELB (module
 // `inkling2_attention_fa2_relb`), the biased score is computed in place from
 // the rel row, rel table, sink and distances instead of read from `bias`.
-#ifdef INK_FA2_RELB
+#if defined(INK_FA2_POS)
+// Device-position variant: no slot/dist maps, no host live length. Grid
+// (split_cap, 8); splits at or past the device split count return before any
+// LDS use.
+extern "C" __global__ __launch_bounds__(128, 1) void inkling2_attn_fa2_partial_pos_gfx1201(
+    const float* __restrict__ q,
+    KvPlanes kp,
+    KvPlanes vp,
+    const float* __restrict__ rel,
+    const float* __restrict__ table,
+    const float* __restrict__ sink,
+    const unsigned* __restrict__ pos,
+    float* __restrict__ lse,
+    float* __restrict__ oacc,
+    int ring,
+    int n_rel,
+    int n_extent,
+    float inv_sqrt_d)
+#elif defined(INK_FA2_RELB)
 extern "C" __global__ __launch_bounds__(128, 1) void inkling2_attn_fa2_partial_relb_gfx1201(
     const float* __restrict__ q,
     KvPlanes kp,
@@ -115,6 +145,13 @@ extern "C" __global__ __launch_bounds__(128, 1) void inkling2_attn_fa2_partial_g
     float inv_sqrt_d)
 #endif
 {
+#ifdef INK_FA2_POS
+    // Logical window of the device position: oldest key `win0`, `n_kv` keys.
+    const int pos_v = (int)(*pos);
+    const int n_kv = min(pos_v + 1, ring);
+    const int win0 = pos_v + 1 - n_kv;
+    const int n_splits = ink_fa2_splits(n_kv);
+#endif
     const int split = (int)blockIdx.x;
     const int kv_h = (int)blockIdx.y;
     if (split >= n_splits || kv_h >= IKV)
@@ -185,7 +222,12 @@ extern "C" __global__ __launch_bounds__(128, 1) void inkling2_attn_fa2_partial_g
             half8_t kv = {0, 0, 0, 0, 0, 0, 0, 0};
             half8_t vv = {0, 0, 0, 0, 0, 0, 0, 0};
             if (gk < key_end) {
+#ifdef INK_FA2_POS
+                const size_t row = (size_t)((unsigned)(win0 + gk) % (unsigned)ring) * ID
+                                   + (size_t)c * 8;
+#else
                 const size_t row = (size_t)slots[gk] * ID + (size_t)c * 8;
+#endif
                 kv = *(const half8_t*)(kb + row);
                 vv = *(const half8_t*)(vb + row);
             }
@@ -204,9 +246,15 @@ extern "C" __global__ __launch_bounds__(128, 1) void inkling2_attn_fa2_partial_g
             const int hh = idx >> 6;
             const int kk = idx & 63;
             const int hq = IGQA * kv_h + hh;
+#ifdef INK_FA2_POS
+            if (kt + kk < key_end)
+                relb[hh][kk] = ink_fa2_relb(rel + (size_t)hq * (size_t)n_rel, table, sink[hq],
+                                            n_kv - 1 - (kt + kk), n_rel, n_extent);
+#else
             if (kt + kk < key_end)
                 relb[hh][kk] = ink_fa2_relb(rel + (size_t)hq * (size_t)n_rel, table, sink[hq],
                                             dists[kt + kk], n_rel, n_extent);
+#endif
         }
 #endif
         __syncthreads();
@@ -298,14 +346,28 @@ extern "C" __global__ __launch_bounds__(128, 1) void inkling2_attn_fa2_partial_g
     }
 }
 
-#ifndef INK_FA2_RELB
+#if !defined(INK_FA2_RELB) || defined(INK_FA2_POS)
 // Grid 24, block 128. The sink is one synthetic key, score 0 and value 0.
+// Built with INK_FA2_POS (module `inkling2_attention_fa2_pos`) the split count
+// is `ink_fa2_splits(min(pos + 1, ring))` from the device position.
+#ifdef INK_FA2_POS
+extern "C" __global__ __launch_bounds__(128) void inkling2_attn_fa2_merge_pos_gfx1201(
+    const float* __restrict__ lse,
+    const float* __restrict__ oacc,
+    float* __restrict__ out,
+    const unsigned* __restrict__ pos,
+    int ring)
+#else
 extern "C" __global__ __launch_bounds__(128) void inkling2_attn_fa2_merge_gfx1201(
     const float* __restrict__ lse,
     const float* __restrict__ oacc,
     float* __restrict__ out,
     int n_splits)
+#endif
 {
+#ifdef INK_FA2_POS
+    const int n_splits = ink_fa2_splits(min((int)(*pos) + 1, ring));
+#endif
     const int h = (int)blockIdx.x;
     const int d = (int)threadIdx.x;
     if (h >= IH)
@@ -337,9 +399,24 @@ pub const INKLING2_ATTN_FA2_HIP_SRC: &str = fa2_src!();
 
 pub const INKLING2_ATTN_FA2_RELB_HIP_SRC: &str = concat!("#define INK_FA2_RELB 1\n", fa2_src!());
 
+/// Module of the device-position partial and merge kernels
+/// ([`Gpu::inkling2_attn_decode_fa2_pos`]): the same source built with
+/// `INK_FA2_POS` (which implies the in-kernel relative bias).
+pub const INKLING2_ATTN_FA2_POS_HIP_SRC: &str = concat!(
+    "#define INK_FA2_POS 1\n#define INK_FA2_RELB 1\n",
+    fa2_src!()
+);
+
+/// Device-position partial kernel symbol (grid `[split_cap, 8, 1]`).
+pub const INKLING2_ATTN_FA2_PARTIAL_POS: &str = "inkling2_attn_fa2_partial_pos_gfx1201";
+
+/// Device-position merge kernel symbol (grid `[24, 1, 1]`).
+pub const INKLING2_ATTN_FA2_MERGE_POS: &str = "inkling2_attn_fa2_merge_pos_gfx1201";
+
 use std::ffi::c_void;
 
-use crate::dispatch::{Gpu, GpuTensor};
+use crate::dispatch::{Gpu, GpuTensor, ReplayLaunchBindings};
+use crate::inkling2_fuse_post::Inkling2DecodeAddr;
 use hip_bridge::{HipError, HipResult};
 
 pub const INKLING2_ATTN_HEADS: usize = 24;
@@ -570,6 +647,143 @@ impl Gpu {
                 b.push_i32(splits_val);
                 b
             },
+        )
+    }
+}
+
+/// Operands of [`Gpu::inkling2_attn_decode_fa2_pos`]: the device-position
+/// singleton FA2 decode attention. The live window comes from the device
+/// position and the visit's constant ring size alone (`n = min(pos+1, ring)`,
+/// oldest key position `pos+1-n`, physical slot `key_pos % ring`, relative
+/// distance `n-1-j`); no slot/distance maps and no by-value live length.
+///
+/// `split_cap` is the immutable grid width: it MUST be at least
+/// `inkling2_attn_fa2_splits(min(pos+1, ring))` for every position the
+/// recording serves (the device cannot report a violation; splits past the cap
+/// would be missing from the merge). `lse` / `oacc` are caller-owned scratch of
+/// at least `split_cap * 24` / `split_cap * 24 * 128` F32.
+pub struct Inkling2Fa2DecodePos<'a> {
+    /// `[24, 128]` F32.
+    pub q: &'a GpuTensor,
+    /// Eight F16 `[ring, 128]` head planes each.
+    pub k_cache: &'a [GpuTensor],
+    pub v_cache: &'a [GpuTensor],
+    /// `[24, n_rel]` F32 (clipped).
+    pub rel: &'a GpuTensor,
+    /// `[n_rel, n_extent]` F32.
+    pub table: &'a GpuTensor,
+    /// `[24]` F32.
+    pub sink: &'a GpuTensor,
+    pub lse: &'a GpuTensor,
+    pub oacc: &'a GpuTensor,
+    /// `[24, 128]` F32.
+    pub out: &'a GpuTensor,
+    pub addr: Inkling2DecodeAddr<'a>,
+    pub n_rel: usize,
+    pub n_extent: usize,
+    pub split_cap: usize,
+}
+
+impl Gpu {
+    /// Device-position split-KV FA2 decode attention for one Inkling-2 query
+    /// row ([`Inkling2Fa2DecodePos`]). Bitwise
+    /// [`Gpu::inkling2_attn_decode_fa2`] with [`Fa2Bias::Rel`] over the map
+    /// of the same position and `splits = inkling2_attn_fa2_splits(n)`: the
+    /// partial grid is `[split_cap, 8, 1]` (splits past the actual count
+    /// return before touching LDS or scratch), the merge grid `[24, 1, 1]`;
+    /// both derive the actual split count from the device position. Fails
+    /// closed off gfx1201.
+    pub fn inkling2_attn_decode_fa2_pos(
+        &mut self,
+        a: &Inkling2Fa2DecodePos<'_>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let bad = |m: String| Err(HipError::new(0, &format!("inkling2_attn_decode_fa2_pos: {m}")));
+        let (h, kvh, d) = (
+            INKLING2_ATTN_HEADS,
+            INKLING2_ATTN_KV_HEADS,
+            INKLING2_ATTN_HEAD_DIM,
+        );
+        if self.arch != "gfx1201" {
+            return bad(format!("gfx1201 only, not {}", self.arch));
+        }
+        if a.k_cache.len() != kvh || a.v_cache.len() != kvh {
+            return bad("need 8 K and 8 V head planes".into());
+        }
+        let ring = a.addr.ring_rows as usize;
+        let (n_rel, n_extent, cap) = (a.n_rel, a.n_extent, a.split_cap);
+        if cap == 0 || cap > INKLING2_ATTN_MAX_SPLITS || ring == 0 || ring > i32::MAX as usize {
+            return bad(format!("split_cap {cap}, ring_rows {ring}"));
+        }
+        if n_rel == 0 || n_rel > i32::MAX as usize || n_extent == 0 || n_extent > i32::MAX as usize
+        {
+            return bad(format!("n_rel {n_rel}, n_extent {n_extent}"));
+        }
+        let f32_len = |t: &GpuTensor| t.buf.size() / 4;
+        let plane_bytes = ring * d * 2;
+        if f32_len(a.q) < h * d
+            || f32_len(a.out) < h * d
+            || f32_len(a.rel) < h * n_rel
+            || f32_len(a.table) < n_rel * n_extent
+            || f32_len(a.sink) < h
+            || a.addr.pos.buf.size() < 4
+            || f32_len(a.lse) < cap * h
+            || f32_len(a.oacc) < cap * h * d
+            || a.k_cache.iter().chain(a.v_cache).any(|t| t.buf.size() < plane_bytes)
+        {
+            return bad("operand too small".into());
+        }
+        self.ensure_kernel(
+            INKLING2_ATTN_FA2_POS_MODULE,
+            INKLING2_ATTN_FA2_POS_HIP_SRC,
+            INKLING2_ATTN_FA2_PARTIAL_POS,
+        )?;
+        self.ensure_kernel(
+            INKLING2_ATTN_FA2_POS_MODULE,
+            INKLING2_ATTN_FA2_POS_HIP_SRC,
+            INKLING2_ATTN_FA2_MERGE_POS,
+        )?;
+        let p = |t: &GpuTensor| t.buf.as_ptr() as *const c_void;
+        let (lse_ptr, oacc_ptr, pos_ptr) = (p(a.lse), p(a.oacc), p(a.addr.pos));
+        let isd = 1.0f32 / (d as f32).sqrt();
+        let mut b = hip_bridge::KernargBlob::new();
+        b.push_ptr(p(a.q));
+        for t in a.k_cache.iter().chain(a.v_cache) {
+            b.push_ptr(p(t));
+        }
+        b.push_ptr(p(a.rel));
+        b.push_ptr(p(a.table));
+        b.push_ptr(p(a.sink));
+        b.push_ptr(pos_ptr);
+        b.push_ptr(lse_ptr);
+        b.push_ptr(oacc_ptr);
+        b.push_i32(ring as i32);
+        b.push_i32(n_rel as i32);
+        b.push_i32(n_extent as i32);
+        b.push_f32(isd);
+        b.pad_to(16);
+        self.launch_blob_recorded(
+            INKLING2_ATTN_FA2_PARTIAL_POS,
+            [cap as u32, kvh as u32, 1],
+            [128, 1, 1],
+            0,
+            b.as_mut_slice(),
+            ReplayLaunchBindings::NONE,
+        )?;
+        let mut m = hip_bridge::KernargBlob::new();
+        m.push_ptr(lse_ptr);
+        m.push_ptr(oacc_ptr);
+        m.push_ptr(p(a.out));
+        m.push_ptr(pos_ptr);
+        m.push_i32(ring as i32);
+        m.pad_to(16);
+        self.launch_blob_recorded(
+            INKLING2_ATTN_FA2_MERGE_POS,
+            [h as u32, 1, 1],
+            [d as u32, 1, 1],
+            0,
+            m.as_mut_slice(),
+            ReplayLaunchBindings::NONE,
         )
     }
 }

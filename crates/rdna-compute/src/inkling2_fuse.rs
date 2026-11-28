@@ -19,7 +19,7 @@
 
 use std::ffi::c_void;
 
-use crate::dispatch::{Gpu, GpuTensor};
+use crate::dispatch::{Gpu, GpuTensor, ReplayLaunchBindings};
 use hip_bridge::{HipError, HipResult, KernargBlob};
 
 /// Module of the fused glue kernels.
@@ -506,12 +506,13 @@ impl Gpu {
         b.push_f32(a.mix_eps);
         b.pad_to(16);
         let rows_u = u32::try_from(rows).map_err(|_| HipError::new(0, "rows exceed u32"))?;
-        self.launch_kernel_blob(
+        self.launch_blob_recorded(
             INKLING2_FZ_MIX_NORM_ROT,
             [rows_u, qr as u32, 1],
             [FZ_THREADS as u32, 1, 1],
             0,
             b.as_mut_slice(),
+            ReplayLaunchBindings::NONE,
         )?;
         for o in a.out {
             for tg in &o.targets {

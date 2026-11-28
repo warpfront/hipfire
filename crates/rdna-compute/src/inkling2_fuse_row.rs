@@ -22,7 +22,7 @@
 
 use std::ffi::c_void;
 
-use crate::dispatch::{Gpu, GpuTensor};
+use crate::dispatch::{Gpu, GpuTensor, ReplayLaunchBindings};
 use crate::inkling2_fuse::fz_awq_fwht_hip;
 use crate::scratch::{Int8MmqPrepared, Int8MmqReservation};
 use hip_bridge::{HipError, HipResult, KernargBlob};
@@ -336,12 +336,13 @@ impl Gpu {
         let blocks = segs.iter().map(|s| s.m.div_ceil(2)).max().unwrap_or(0);
         let blocks =
             u32::try_from(blocks).map_err(|_| HipError::new(0, "inkling2_fz_gemv_segs: grid"))?;
-        self.launch_kernel_blob(
+        self.launch_blob_recorded(
             INKLING2_FZ_GEMV_SEGS,
             [blocks, 1, segs.len() as u32],
             [32, 1, 1],
             0,
             b.as_mut_slice(),
+            ReplayLaunchBindings::NONE,
         )
     }
 
@@ -418,12 +419,13 @@ impl Gpu {
         b.push_i32(a.m_total_max as i32);
         b.push_i32(a.block_m as i32);
         b.pad_to(16);
-        self.launch_kernel_blob(
+        self.launch_blob_recorded(
             INKLING2_FZ_ROUTE_ROW,
             [1, 1, 1],
             [1024, 1, 1],
             0,
             b.as_mut_slice(),
+            ReplayLaunchBindings::NONE,
         )?;
         Ok(Int8MmqPrepared::from_reservation(res))
     }

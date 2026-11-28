@@ -18,7 +18,7 @@
 
 use std::ffi::c_void;
 
-use crate::dispatch::{Gpu, GpuTensor};
+use crate::dispatch::{Gpu, GpuTensor, ReplayLaunchBindings};
 use crate::inkling2_fuse::fz_awq_fwht_hip;
 use hip_bridge::{HipError, HipResult, KernargBlob};
 
@@ -27,6 +27,10 @@ pub const INKLING2_FUSE_POST_MODULE: &str = "inkling2_fuse_post";
 
 /// Attention-producer epilogue ([`Gpu::inkling2_fz_attn_post`]).
 pub const INKLING2_FZ_ATTN_POST: &str = "inkling2_fz_attn_post_f32";
+
+/// Singleton decode epilogue with the K/V slot formed on the device
+/// ([`Gpu::inkling2_fz_attn_post_decode`]).
+pub const INKLING2_FZ_ATTN_POST_DECODE: &str = "inkling2_fz_attn_post_decode_f32";
 
 /// Output-gate sigmoid·mul + AWQ/FWHT producer ([`Gpu::inkling2_fz_gate_rot`]).
 pub const INKLING2_FZ_GATE_ROT: &str = "inkling2_fz_gate_rot_f32";
@@ -41,6 +45,119 @@ pub const INKLING2_FZ_CONV_STATE: &str = "inkling2_fz_conv_state4_f32";
 pub const FZ_HEAD_DIM: usize = 128;
 /// Relative-logit width per head the fused epilogue is built for.
 pub const FZ_N_REL: usize = 16;
+
+/// The attention-producer epilogue kernel text, instantiated twice into
+/// [`INKLING2_FUSE_POST_HIP_SRC`] by the preprocessor: `FZ_KNAME` (symbol),
+/// `FZ_DEC` (device-formed ring slot) and `FZ_EXTRA` (decode-only kernel
+/// arguments `dpos, dring`).
+macro_rules! fz_attn_post_kernel {
+    () => {
+        r#"
+// Attention producers' epilogue of one visit, block (part, row b), 128 threads
+// (head_dim 128, n_rel 16). Parts [0, nkv): K head (conv, L2 clip at qk_clip);
+// [nkv, 2nkv): V head (conv, gamma-less RMSNorm); then nh Q heads (scaled L2
+// clip in place) and nh / 8 Rel blocks (8 heads of 16, scaled L2 clip in
+// place). K/V land as F32 rows (`k_f32`/`v_f32`, nullable) and/or F16 at
+// `k16.p[h] + b * kv_ld` (nullable: staging planes, or the cache slot of a
+// one-row block). `state_update` (rows == 1 only) shifts the K/V history.
+// Per element the arithmetic of ink_pf_conv_rows_f32, ink_pf_l2_clip_rows_f32,
+// inkling2_rmsnorm_nogamma_f32 (blockDim 256 over 128: the upper half adds 0)
+// and ink_pf_kv_stage_f16.
+extern "C" __global__ __launch_bounds__(128)
+void FZ_KNAME(
+    float* __restrict__ q, const float* __restrict__ q_scale, float qk_clip,
+    float* __restrict__ rel, const float* __restrict__ rel_scale, float rel_clip,
+    const float* __restrict__ k_raw, const float* __restrict__ v_raw,
+    const float* __restrict__ k_sw, const float* __restrict__ v_sw,
+    const float* __restrict__ dyn_k, const float* __restrict__ dyn_v, int dyn_ld,
+    float conv_scale, float* state, int state_stride, int k_off, int v_off,
+    int state_update, float v_eps,
+    float* __restrict__ k_f32, float* __restrict__ v_f32,
+    FzPlanes8 k16, FzPlanes8 v16, int kv_ld,
+    int rows, int nh, int nkv FZ_EXTRA)
+{
+    const int blk = (int)blockIdx.x;
+    const int b = (int)blockIdx.y;
+    const int t = (int)threadIdx.x;
+    if (b >= rows) return;
+    __shared__ float sh[128];
+    const int ekv = nkv * 128;
+    if (blk < 2 * nkv) {
+        const bool is_v = blk >= nkv;
+        const int h = is_v ? blk - nkv : blk;
+        const int ch = h * 128 + t;
+        const int off = is_v ? v_off : k_off;
+        float x1, x2, xc;
+        const float c = fz_conv(is_v ? v_raw : k_raw, ekv, is_v ? v_sw : k_sw,
+                                is_v ? dyn_v : dyn_k, dyn_ld, state, state_stride, off,
+                                ekv, 128, conv_scale, b, ch, x1, x2, xc);
+        sh[t] = c * c;
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) {
+            if (t < s) sh[t] += sh[t + s];
+            __syncthreads();
+        }
+        float o;
+        if (is_v) {
+            const float inv = 1.0f / sqrtf(sh[0] / (float)128 + v_eps);
+            o = c * inv;
+        } else {
+            const float norm = sqrtf(sh[0]) + 1e-6f;
+            float factor = qk_clip / norm;
+            if (factor > 1.0f) factor = 1.0f;
+            o = c * factor;
+        }
+        float* f = is_v ? v_f32 : k_f32;
+        if (f) f[(size_t)b * ekv + ch] = o;
+        _Float16* d = is_v ? v16.p[h] : k16.p[h];
+        if (d) {
+#if FZ_DEC
+            // Decode: plane base + the device-formed ring slot (`kv_ld` is 0).
+            d[(size_t)((*dpos) % (unsigned)dring) * 128 + t] = (_Float16)o;
+#else
+            d[(size_t)b * kv_ld + t] = (_Float16)o;
+#endif
+        }
+        if (state_update) fz_conv_shift(state, state_stride, off, ch, x1, x2, xc);
+        return;
+    }
+    if (blk < 2 * nkv + nh) {
+        const int h = blk - 2 * nkv;
+        const size_t idx = ((size_t)b * nh + h) * 128 + t;
+        float v = q[idx];
+        v *= q_scale[h * 128 + t];
+        sh[t] = v * v;
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) {
+            if (t < s) sh[t] += sh[t + s];
+            __syncthreads();
+        }
+        const float norm = sqrtf(sh[0]) + 1e-6f;
+        float factor = qk_clip / norm;
+        if (factor > 1.0f) factor = 1.0f;
+        q[idx] = v * factor;
+        return;
+    }
+    const int g = t >> 4;
+    const int l = t & 15;
+    const int hh = (blk - 2 * nkv - nh) * 8 + g;
+    const size_t idx = ((size_t)b * nh + hh) * 16 + l;
+    float v = rel[idx];
+    v *= rel_scale[hh * 16 + l];
+    sh[t] = v * v;
+    __syncthreads();
+    for (int s = 8; s > 0; s >>= 1) {
+        if (l < s) sh[t] += sh[t + s];
+        __syncthreads();
+    }
+    const float norm = sqrtf(sh[g * 16]) + 1e-6f;
+    float factor = rel_clip / norm;
+    if (factor > 1.0f) factor = 1.0f;
+    rel[idx] = v * factor;
+}
+"#
+    };
+}
 
 pub const INKLING2_FUSE_POST_HIP_SRC: &str = concat!(
     "#include <hip/hip_runtime.h>\n",
@@ -92,101 +209,19 @@ __device__ __forceinline__ void fz_conv_shift(
 
 struct FzPlanes8 { _Float16* p[8]; };
 
-// Attention producers' epilogue of one visit, block (part, row b), 128 threads
-// (head_dim 128, n_rel 16). Parts [0, nkv): K head (conv, L2 clip at qk_clip);
-// [nkv, 2nkv): V head (conv, gamma-less RMSNorm); then nh Q heads (scaled L2
-// clip in place) and nh / 8 Rel blocks (8 heads of 16, scaled L2 clip in
-// place). K/V land as F32 rows (`k_f32`/`v_f32`, nullable) and/or F16 at
-// `k16.p[h] + b * kv_ld` (nullable: staging planes, or the cache slot of a
-// one-row block). `state_update` (rows == 1 only) shifts the K/V history.
-// Per element the arithmetic of ink_pf_conv_rows_f32, ink_pf_l2_clip_rows_f32,
-// inkling2_rmsnorm_nogamma_f32 (blockDim 256 over 128: the upper half adds 0)
-// and ink_pf_kv_stage_f16.
-extern "C" __global__ __launch_bounds__(128)
-void inkling2_fz_attn_post_f32(
-    float* __restrict__ q, const float* __restrict__ q_scale, float qk_clip,
-    float* __restrict__ rel, const float* __restrict__ rel_scale, float rel_clip,
-    const float* __restrict__ k_raw, const float* __restrict__ v_raw,
-    const float* __restrict__ k_sw, const float* __restrict__ v_sw,
-    const float* __restrict__ dyn_k, const float* __restrict__ dyn_v, int dyn_ld,
-    float conv_scale, float* state, int state_stride, int k_off, int v_off,
-    int state_update, float v_eps,
-    float* __restrict__ k_f32, float* __restrict__ v_f32,
-    FzPlanes8 k16, FzPlanes8 v16, int kv_ld,
-    int rows, int nh, int nkv)
-{
-    const int blk = (int)blockIdx.x;
-    const int b = (int)blockIdx.y;
-    const int t = (int)threadIdx.x;
-    if (b >= rows) return;
-    __shared__ float sh[128];
-    const int ekv = nkv * 128;
-    if (blk < 2 * nkv) {
-        const bool is_v = blk >= nkv;
-        const int h = is_v ? blk - nkv : blk;
-        const int ch = h * 128 + t;
-        const int off = is_v ? v_off : k_off;
-        float x1, x2, xc;
-        const float c = fz_conv(is_v ? v_raw : k_raw, ekv, is_v ? v_sw : k_sw,
-                                is_v ? dyn_v : dyn_k, dyn_ld, state, state_stride, off,
-                                ekv, 128, conv_scale, b, ch, x1, x2, xc);
-        sh[t] = c * c;
-        __syncthreads();
-        for (int s = 64; s > 0; s >>= 1) {
-            if (t < s) sh[t] += sh[t + s];
-            __syncthreads();
-        }
-        float o;
-        if (is_v) {
-            const float inv = 1.0f / sqrtf(sh[0] / (float)128 + v_eps);
-            o = c * inv;
-        } else {
-            const float norm = sqrtf(sh[0]) + 1e-6f;
-            float factor = qk_clip / norm;
-            if (factor > 1.0f) factor = 1.0f;
-            o = c * factor;
-        }
-        float* f = is_v ? v_f32 : k_f32;
-        if (f) f[(size_t)b * ekv + ch] = o;
-        _Float16* d = is_v ? v16.p[h] : k16.p[h];
-        if (d) d[(size_t)b * kv_ld + t] = (_Float16)o;
-        if (state_update) fz_conv_shift(state, state_stride, off, ch, x1, x2, xc);
-        return;
-    }
-    if (blk < 2 * nkv + nh) {
-        const int h = blk - 2 * nkv;
-        const size_t idx = ((size_t)b * nh + h) * 128 + t;
-        float v = q[idx];
-        v *= q_scale[h * 128 + t];
-        sh[t] = v * v;
-        __syncthreads();
-        for (int s = 64; s > 0; s >>= 1) {
-            if (t < s) sh[t] += sh[t + s];
-            __syncthreads();
-        }
-        const float norm = sqrtf(sh[0]) + 1e-6f;
-        float factor = qk_clip / norm;
-        if (factor > 1.0f) factor = 1.0f;
-        q[idx] = v * factor;
-        return;
-    }
-    const int g = t >> 4;
-    const int l = t & 15;
-    const int hh = (blk - 2 * nkv - nh) * 8 + g;
-    const size_t idx = ((size_t)b * nh + hh) * 16 + l;
-    float v = rel[idx];
-    v *= rel_scale[hh * 16 + l];
-    sh[t] = v * v;
-    __syncthreads();
-    for (int s = 8; s > 0; s >>= 1) {
-        if (l < s) sh[t] += sh[t + s];
-        __syncthreads();
-    }
-    const float norm = sqrtf(sh[g * 16]) + 1e-6f;
-    float factor = rel_clip / norm;
-    if (factor > 1.0f) factor = 1.0f;
-    rel[idx] = v * factor;
-}
+"#,
+    // The attention epilogue is one text built twice: the legacy launcher's
+    // kernel (K/V planes already offset to the slot, host `kv_ld`) and the
+    // singleton decode kernel (plane BASES, slot `*dpos % dring` on the
+    // device). Same body, same math and operation order.
+    "#define FZ_KNAME inkling2_fz_attn_post_f32\n#define FZ_DEC 0\n#define FZ_EXTRA\n",
+    fz_attn_post_kernel!(),
+    "#undef FZ_KNAME\n#undef FZ_DEC\n#undef FZ_EXTRA\n",
+    "#define FZ_KNAME inkling2_fz_attn_post_decode_f32\n#define FZ_DEC 1\n",
+    "#define FZ_EXTRA , const unsigned* __restrict__ dpos, int dring\n",
+    fz_attn_post_kernel!(),
+    "#undef FZ_KNAME\n#undef FZ_DEC\n#undef FZ_EXTRA\n",
+    r#"
 
 // Output-gate producer: x_out = AWQ+FWHT256 of attn * sigmoid(gate) per row
 // (`sigmoid_f32`, `mul_f32`, then `rotate_x_mq_awq`), folded 1-D grid
@@ -267,6 +302,15 @@ pub struct FzKv16 {
     pub row_ld: usize,
 }
 
+/// Stable device-side addressing of a singleton decode launch: `pos` points at
+/// one aligned u32 of device input (absolute zero-based position) and
+/// `ring_rows` is the visit's constant ring size; the K/V slot is
+/// `pos % ring_rows`. No dependency on the Inkling model crate.
+pub struct Inkling2DecodeAddr<'a> {
+    pub pos: &'a GpuTensor,
+    pub ring_rows: u32,
+}
+
 /// [`Gpu::inkling2_fz_attn_post`] operands (head_dim 128, n_rel 16).
 pub struct Inkling2FzAttnPost<'a> {
     /// `[rows, nh, 128]`, clipped in place.
@@ -328,6 +372,49 @@ impl Gpu {
     /// L2 clips in place, and (one row) the K/V history shift. Bitwise the
     /// unfused conv / clip / norm / F16-stage chain.
     pub fn inkling2_fz_attn_post(&mut self, a: &Inkling2FzAttnPost<'_>) -> HipResult<()> {
+        self.fz_attn_post_launch(a, None)
+    }
+
+    /// [`Self::inkling2_fz_attn_post`] of the singleton decode body with the
+    /// K/V cache slot formed on the device: `a.kv16` holds the plane BASE
+    /// pointers (`row_ld` 0) and each K/V head row lands at plane base +
+    /// `(*addr.pos % addr.ring_rows) * 128` F16 elements, in the same launch
+    /// and op order as the legacy slot-offset launch (Q/Rel clips, F16
+    /// conversion, static/dynamic conv taps, history shift, all before the
+    /// attention). One row, `state_update`, no F32 K/V outputs. The kernel
+    /// arguments hold no position value, only the stable `pos` address.
+    pub fn inkling2_fz_attn_post_decode(
+        &mut self,
+        a: &Inkling2FzAttnPost<'_>,
+        addr: Inkling2DecodeAddr<'_>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let bad = |m: &str| {
+            Err(HipError::new(
+                0,
+                &format!("inkling2_fz_attn_post_decode: {m}"),
+            ))
+        };
+        if a.rows != 1 || !a.state_update {
+            return bad("one row with the in-kernel history shift only");
+        }
+        if a.k_f32.is_some() || a.v_f32.is_some() {
+            return bad("no F32 K/V output");
+        }
+        if !a.kv16.as_ref().is_some_and(|kv| kv.row_ld == 0) {
+            return bad("needs kv16 plane bases with row_ld 0");
+        }
+        if addr.ring_rows == 0 || addr.ring_rows > i32::MAX as u32 || addr.pos.buf.size() < 4 {
+            return bad("ring_rows 0 or position buffer smaller than one u32");
+        }
+        self.fz_attn_post_launch(a, Some(&addr))
+    }
+
+    fn fz_attn_post_launch(
+        &mut self,
+        a: &Inkling2FzAttnPost<'_>,
+        decode: Option<&Inkling2DecodeAddr<'_>>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         let bad = |m: String| Err(HipError::new(0, &format!("inkling2_fz_attn_post: {m}")));
         let (rows, nh, nkv) = (a.rows, a.nh, a.nkv);
@@ -358,7 +445,12 @@ impl Gpu {
         {
             return bad("operand too small".into());
         }
-        self.fz_post_ensure(INKLING2_FZ_ATTN_POST)?;
+        let sym = if decode.is_some() {
+            INKLING2_FZ_ATTN_POST_DECODE
+        } else {
+            INKLING2_FZ_ATTN_POST
+        };
+        self.fz_post_ensure(sym)?;
         let p = |t: &GpuTensor| t.buf.as_ptr() as *const c_void;
         let null = std::ptr::null::<c_void>();
         let mut b = KernargBlob::new();
@@ -404,15 +496,20 @@ impl Gpu {
         b.push_i32(rows as i32);
         b.push_i32(nh as i32);
         b.push_i32(nkv as i32);
+        if let Some(addr) = decode {
+            b.push_ptr(p(addr.pos));
+            b.push_i32(addr.ring_rows as i32);
+        }
         b.pad_to(16);
         let parts = (2 * nkv + nh + nh / 8) as u32;
         let rows_u = u32::try_from(rows).map_err(|_| HipError::new(0, "rows exceed u32"))?;
-        self.launch_kernel_blob(
-            INKLING2_FZ_ATTN_POST,
+        self.launch_blob_recorded(
+            sym,
             [parts, rows_u, 1],
             [hd as u32, 1, 1],
             0,
             b.as_mut_slice(),
+            ReplayLaunchBindings::NONE,
         )
     }
 
@@ -452,12 +549,13 @@ impl Gpu {
         b.pad_to(16);
         let grid = u32::try_from((k / 256) * rows)
             .map_err(|_| HipError::new(0, "inkling2_fz_gate_rot: grid exceeds u32"))?;
-        self.launch_kernel_blob(
+        self.launch_blob_recorded(
             INKLING2_FZ_GATE_ROT,
             [grid, 1, 1],
             [32, 1, 1],
             0,
             b.as_mut_slice(),
+            ReplayLaunchBindings::NONE,
         )?;
         self.scratch.invalidate_x_caches_for(x_rot.buf.as_ptr());
         Ok(())
@@ -509,12 +607,13 @@ impl Gpu {
         b.push_i32(state_update as i32);
         b.pad_to(16);
         let rows_u = u32::try_from(rows).map_err(|_| HipError::new(0, "rows exceed u32"))?;
-        self.launch_kernel_blob(
+        self.launch_blob_recorded(
             INKLING2_FZ_CONV_RES,
             [channels.div_ceil(256) as u32, rows_u, 1],
             [256, 1, 1],
             0,
             b.as_mut_slice(),
+            ReplayLaunchBindings::NONE,
         )
     }
 
@@ -560,12 +659,13 @@ impl Gpu {
         b.push_i32(rows as i32);
         b.pad_to(16);
         let max_ch = streams.iter().map(|s| s.2).max().unwrap_or(0);
-        self.launch_kernel_blob(
+        self.launch_blob_recorded(
             INKLING2_FZ_CONV_STATE,
             [max_ch.div_ceil(256) as u32, streams.len() as u32, 1],
             [256, 1, 1],
             0,
             b.as_mut_slice(),
+            ReplayLaunchBindings::NONE,
         )
     }
 }

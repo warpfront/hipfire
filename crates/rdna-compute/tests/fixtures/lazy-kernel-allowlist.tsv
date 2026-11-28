@@ -954,6 +954,7 @@ module	indexer_top_k_buf_unrolled	non-core-family	Non-core family route: DeepSee
 module	indexer_topk_twostage	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:22083
 module	inkling2_attention_fa2	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 decode attention; rdna-compute/src/inkling2_attention.rs:347
 module	inkling2_attention_fa2_relb	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 one-row decode attention with the relative bias folded in; rdna-compute/src/inkling2_attention.rs:452
+module	inkling2_attention_fa2_pos	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 device-position singleton decode attention (partial + merge, no host maps); rdna-compute/src/inkling2_attention.rs:737
 module	inkling2_attention_prefill	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 blocked prefill attention; rdna-compute/src/inkling2_attention_prefill.rs:362
 module	inkling2_clip	non-core-family	Non-core family route: Inkling-2-Mini (arch 24); rdna-compute/src/inkling2_clip.rs:274
 module	inkling2_control_blend	non-core-family	Non-core family route: Inkling-2-Mini (arch 24); rdna-compute/src/inkling2_control.rs:421
