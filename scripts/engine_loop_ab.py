@@ -1093,8 +1093,10 @@ TAP_FILTER = ('import json, os, sys\np = json.loads(os.environ.get("TAP_LOAD") o
               '        m["params"] = {**(m.get("params") or {}), **p}\n'
               '        line = json.dumps(m) + "\\n"\n'
               '    sys.stdout.write(line)\n    sys.stdout.flush()\n')
-TAP = ('#!/usr/bin/env bash\npython3 -u -c "$TAP_FILTER" | tee -a "$TAP_OUT.in" | "$TAP_DAEMON" "$@" '
-       '| tee -a "$TAP_OUT"\nexit "${PIPESTATUS[2]}"\n')
+# The daemon reads its input through a process substitution: as a pipeline stage, bash would wait
+# for the input tee, which waits for the client, so a daemon exit stayed hidden behind open stdout.
+TAP = ('#!/usr/bin/env bash\n"$TAP_DAEMON" "$@" < <(python3 -u -c "$TAP_FILTER" | tee -a "$TAP_OUT.in") '
+       '| tee -a "$TAP_OUT"\nexit "${PIPESTATUS[0]}"\n')
 WORKLOADS = ("stateless", "multiturn")  # bench's order for `--workload both`
 
 
