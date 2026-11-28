@@ -858,6 +858,24 @@ const fn write(offset: usize) -> PointerEffect {
     }
 }
 
+/// Kernels whose by-value struct arguments carry device pointers (`FzStates` /
+/// `FzQRows`, the `KvPlanes` / `FzPlanes8` K/V plane tables). The code-object
+/// metadata names only `global_buffer` arguments, so a certification of these
+/// kernels would declare the visible pointers alone and let the resource-
+/// independence wait policy elide waits across the hidden reads and writes
+/// (measured: PM4 replay of the Inkling decode body diverged from eager under
+/// the default wait policy and was bitwise clean once those boundaries kept
+/// their waits). They record with unknown effects, so every edge around them
+/// stays serialized.
+fn embeds_unnamed_pointers(kernel: &str) -> bool {
+    matches!(
+        kernel,
+        "inkling2_fz_mix_norm_rot_f32"
+            | "inkling2_attn_fa2_partial_pos_gfx1201"
+            | "inkling2_fz_attn_post_decode_f32"
+    )
+}
+
 /// Pointer fields and memory effects for kernels admitted to Qwen AR replay.
 ///
 /// A non-const kernel pointer is conservatively classified as `Write`, which
@@ -8132,6 +8150,7 @@ impl ReplayController {
         }
         let certified_effects = artifact
             .as_ref()
+            .filter(|_| !embeds_unnamed_pointers(kernel))
             .and_then(|artifact| artifact.radiowave())
             .and_then(|certification| certification.argument_effects(kernel))
             .map(|effects| {

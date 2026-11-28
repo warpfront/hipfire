@@ -123,7 +123,7 @@ const USAGE: &str = "usage:
   inkling_kld bench    --model CANDIDATE.hfq --ref REF.kldref --output OUT.json [--n 2048]
                        [--reps 3] [--prefill-routes ...] [--block-rows N (dev)]
   inkling_kld bench-decode --model CANDIDATE.hfq --ref REF.kldref --output OUT.json
-                       [--ctx 128] [--steps 64] [--reps 3] [--body stock|scalar|frozen|frozen-stream|graph] [--prefill-routes ...]
+                       [--ctx 128] [--steps 64] [--reps 3] [--body stock|scalar|frozen|frozen-stream|graph|pm4|pm4-stream] [--prefill-routes ...]
   inkling_kld pair     --base BASE.kldseq --cand CAND.kldseq [--output OUT.json] [--boot 20000] [--seed 1]";
 
 /// Receipt schema written beside every `.kldseq`.
@@ -3329,12 +3329,17 @@ fn bench(a: &Args) -> Result<(), String> {
 /// `--body stock` (alias `blocked`; `forward_decode_gpu`, the blocked body at one
 /// row), `scalar` (`forward_token_gpu`), `frozen` (the S2 stage/body/finish on
 /// the ordinary stream), `frozen-stream` (the same on the Gpu's owned stream,
-/// to separate the stream effect from the graph effect) or `graph`
+/// to separate the stream effect from the graph effect), `graph`
 /// (`decode_replay::DecodeGraph` over the frozen body; a dev opt-in that needs
-/// `HIPFIRE_GRAPH=1`). Each step's forward call is timed (host argmax excluded).
+/// `HIPFIRE_GRAPH=1`), `pm4` (`decode_replay::DecodePm4`: the retained PM4 tape
+/// of the whole body, null-stream staging/readback) or `pm4-stream` (the same
+/// with staging/readback ordered on the owned stream); both need
+/// `HIPFIRE_REPLAY_BACKEND=redline HIPFIRE_REPLAY_TRANSPORT=pm4` on gfx1201.
+/// Each step's forward call is timed (host argmax excluded).
 /// One untimed warm-up rep (its per-step times are reported as the cold first
-/// turn; for `graph` it holds the eager token and the capture); every timed rep
-/// must generate the warm-up's token ids, and a graph rep must be all replay.
+/// turn; for `graph`/`pm4` it holds the eager token, the capture/recording and
+/// the prepare); every timed rep must generate the warm-up's token ids, and a
+/// graph/pm4 rep must be all replay.
 fn bench_decode(a: &Args) -> Result<(), String> {
     let model = a.path("model")?;
     let ref_path = a.path("ref")?;
@@ -3348,15 +3353,16 @@ fn bench_decode(a: &Args) -> Result<(), String> {
         Some("frozen") => "frozen",
         Some("frozen-stream") => "frozen-stream",
         Some("graph") => "graph",
-        Some(other) => {
-            return Err(format!(
-                "--body: expected stock|scalar|frozen|frozen-stream|graph, got {other}"
-            ))
-        }
+        Some("pm4") => "pm4",
+        Some("pm4-stream") => "pm4-stream",
+        Some(other) => return Err(format!(
+            "--body: expected stock|scalar|frozen|frozen-stream|graph|pm4|pm4-stream, got {other}"
+        )),
     };
     let blocked = body != "scalar";
     let frozen = body == "frozen" || body == "frozen-stream";
     let graph = body == "graph";
+    let pm4 = body == "pm4" || body == "pm4-stream";
     let (reference, mmap) = open_ref(&ref_path)?;
     let tokens = reference.tokens(&mmap).map_err(|e| e.to_string())?;
     if ctx == 0 || ctx > tokens.len() {
@@ -3384,11 +3390,18 @@ fn bench_decode(a: &Args) -> Result<(), String> {
                 .into(),
         );
     }
+    if pm4 && !hipfire_arch_inkling2::decode_replay::pm4_dev_opt_in(&gpu) {
+        return Err(
+            "bench-decode --body pm4 is a dev opt-in: run with HIPFIRE_REPLAY_BACKEND=redline HIPFIRE_REPLAY_TRANSPORT=pm4 on gfx1201"
+                .into(),
+        );
+    }
     if body == "frozen-stream" {
         gpu.ensure_capture_stream()
             .map_err(|e| format!("owned stream: {e:?}"))?;
     }
     let mut dg = hipfire_arch_inkling2::decode_replay::DecodeGraph::new(graph);
+    let mut dp = hipfire_arch_inkling2::decode_replay::DecodePm4::new(pm4, body == "pm4-stream");
     struct RepOut {
         ms: Vec<f64>,
         gen: Vec<u32>,
@@ -3396,12 +3409,15 @@ fn bench_decode(a: &Args) -> Result<(), String> {
         /// Steps that replayed / ran eager + capture / ran eager.
         routes: [u32; 3],
         capture_ms: f64,
+        prepare_ms: f64,
+        /// Retained-replay observations of the rep: (count, failed).
+        obs: [u64; 2],
         /// Host time inside the launch calls per step: hipModuleLaunchKernel
         /// (us, count) and hipGraphLaunch (us, count).
         host: [f64; 4],
     }
     let mut run = |b: &mut hipfire_arch_inkling2::Inkling2Bundle| -> Result<RepOut, String> {
-        use hipfire_arch_inkling2::decode_replay::StepRoute;
+        use hipfire_arch_inkling2::decode_replay::{Pm4Route, StepRoute};
         b.reset_session_state(&mut gpu)?;
         let mut last = Vec::new();
         hipfire_arch_inkling2::forward_prefill_gpu(
@@ -3413,12 +3429,13 @@ fn bench_decode(a: &Args) -> Result<(), String> {
         )?;
         let mut next = argmax(&last);
         let (mut ms, mut gen) = (Vec::with_capacity(steps), Vec::with_capacity(steps));
-        let (mut routes, mut capture_ms) = ([0u32; 3], 0.0f64);
+        let (mut routes, mut capture_ms, mut prepare_ms) = ([0u32; 3], 0.0f64, 0.0f64);
         // Every step's logits row, so a bitwise-preserving body change can
         // be checked by digest identity (outside the timed region).
         let mut digest = Sha256::new();
         let mut frow: Vec<f32> = Vec::new();
         hip_bridge::launch_counters::reset();
+        gpu.replay.begin_replay_observation_window();
         for s in 0..steps {
             gen.push(next);
             let t0 = Instant::now();
@@ -3442,6 +3459,18 @@ fn bench_decode(a: &Args) -> Result<(), String> {
                     StepRoute::Eager(_) => routes[2] += 1,
                 }
                 &frow
+            } else if pm4 {
+                let rep = dp.forward(b, &mut gpu, next, ctx + s, &mut frow)?;
+                match rep.route {
+                    Pm4Route::Replay => routes[0] += 1,
+                    Pm4Route::Recorded => {
+                        routes[1] += 1;
+                        capture_ms += rep.record_ns as f64 / 1e6;
+                        prepare_ms += rep.prepare_ns as f64 / 1e6;
+                    }
+                    Pm4Route::Warm | Pm4Route::Eager(_) => routes[2] += 1,
+                }
+                &frow
             } else if blocked {
                 frow = hipfire_arch_inkling2::forward_decode_gpu(b, &mut gpu, next, ctx + s)?;
                 &frow
@@ -3453,6 +3482,8 @@ fn bench_decode(a: &Args) -> Result<(), String> {
             digest.update(f32_bytes(row));
             next = argmax(row);
         }
+        let o = gpu.replay.replay_observation();
+        let obs = [o.count, u64::from(o.failed)];
         let per = |v: u64| v as f64 / steps as f64;
         let host = [
             per(hip_bridge::launch_counters::launch_kernel::time_ns()) / 1e3,
@@ -3466,6 +3497,8 @@ fn bench_decode(a: &Args) -> Result<(), String> {
             sha: format!("{:x}", digest.finalize()),
             routes,
             capture_ms,
+            prepare_ms,
+            obs,
             host,
         })
     };
@@ -3481,6 +3514,7 @@ fn bench_decode(a: &Args) -> Result<(), String> {
             sha,
             routes,
             host,
+            obs,
             ..
         } = run(b)?;
         if gen != warm_gen || sha != warm_sha {
@@ -3488,9 +3522,14 @@ fn bench_decode(a: &Args) -> Result<(), String> {
                 "bench-decode: rep {r} generated ids or logits differ from the warm-up's"
             ));
         }
-        if graph && routes != [steps as u32, 0, 0] {
+        if (graph || pm4) && routes != [steps as u32, 0, 0] {
             return Err(format!(
-                "bench-decode: graph rep {r} was not all replay (replay/capture/eager = {routes:?}): the run left its one-bucket envelope"
+                "bench-decode: graph/pm4 rep {r} was not all replay (replay/record/eager = {routes:?}): the run left its one-bucket envelope"
+            ));
+        }
+        if pm4 && obs != [steps as u64, 0] {
+            return Err(format!(
+                "bench-decode: pm4 rep {r} retained-replay observation (count, failed) = {obs:?}, expected [{steps}, 0]"
             ));
         }
         let total: f64 = ms.iter().sum();
@@ -3511,10 +3550,27 @@ fn bench_decode(a: &Args) -> Result<(), String> {
             "host_launches_per_step": host[1],
             "host_graph_launch_us_per_step": host[2],
             "host_graph_launches_per_step": host[3],
+            "pm4_replay_observation": {"count": obs[0], "failed": obs[1]},
             "step_ms": ms,
         }));
     }
     let cold_total: f64 = cold.ms.iter().sum();
+    let pm4_stats = {
+        let s = dp.stats();
+        serde_json::json!({
+            "eager_steps": s.eager_steps, "warm_steps": s.warm_steps,
+            "replays": s.replays, "recordings": s.recordings,
+            "record_failures": s.record_failures, "releases": s.releases,
+            "nodes": s.nodes, "unique_symbols": s.unique_symbols,
+            "eager_launches": s.eager_launches,
+            "last_record_ms": s.last_record_ns as f64 / 1e6,
+            "last_prepare_ms": s.last_prepare_ns as f64 / 1e6,
+            "command_dwords": s.command_dwords, "queue_id": s.queue_id,
+            "sticky_reason": dp.sticky_reason(),
+            "quarantined": dp.quarantined(),
+            "recorded_symbols": dp.recorded_symbols(),
+        })
+    };
     let graph_stats = {
         let s = dg.stats();
         serde_json::json!({
@@ -3528,6 +3584,9 @@ fn bench_decode(a: &Args) -> Result<(), String> {
     };
     if graph {
         dg.release(&mut gpu)?;
+    }
+    if pm4 {
+        dp.release(&mut gpu)?;
     }
     let mut tok_s: Vec<f64> = per_rep
         .iter()
@@ -3554,8 +3613,11 @@ fn bench_decode(a: &Args) -> Result<(), String> {
             "step_ms": cold.ms,
             "routes": {"replay": cold.routes[0], "eager_capture": cold.routes[1], "eager": cold.routes[2]},
             "capture_ms": cold.capture_ms,
+            "prepare_ms": cold.prepare_ms,
+            "pm4_replay_observation": {"count": cold.obs[0], "failed": cold.obs[1]},
         },
         "graph": graph_stats,
+        "pm4": pm4_stats,
         "generated_ids": warm_gen,
         "decode_logits_sha256": warm_sha,
     });
