@@ -397,6 +397,11 @@ keep no records):
   D~2, D~3): the abort lost nothing a twin without an abort kept. With the
   control's reuse it has the control's tokens and ids (identical prompts);
   with more reuse the pair is only noted
+- with `expect_engine`, the engine logged the D2 and D3 aborts on the resident
+  state (`[engine] request <tag> cancelled on the resident state`, receipt
+  `resident_cancels`). A changed timing that cancels D2 or D3 in a lane can
+  pass every reuse gate, but it does not test the resident cancel, so it fails
+  here (HIPF-616)
 
 The notes also list the requests whose lane record the engine logged as not
 continued (`refused`, tag N = the N-th `gen_start` on the daemon's stdout), so

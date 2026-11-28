@@ -314,8 +314,10 @@ def run_batch(args, route, arm, out):
         res.update(d.generate_many([("D3r", batch_req(hist["D"], mt), None), ("D~3", batch_req(hist["D~"], mt), None)]))
     finally:
         res["daemon_rc"] = d.close()
-    with open(f"{prefix}.jsonl") as f:
-        res["refused"] = refused_records(f, Path(f"{prefix}.stderr").read_text(errors="replace"))
+    lines = Path(f"{prefix}.jsonl").read_text().splitlines()
+    log = Path(f"{prefix}.stderr").read_text(errors="replace")
+    res["refused"] = refused_records(lines, log)
+    res["resident_cancels"] = refused_records(lines, log, RESIDENT_CANCEL)
     return res
 
 
@@ -341,7 +343,9 @@ def batch_checks(rows, expect_engine, reuse_mode="turn", ref=None):
       reply is never reusable, so every follow-up reuses more than 0 and at least
       the `ref` arm's (legacy) reuse of the same request
     - a retry reuses at least its control (the abort lost nothing), and with the
-      control's reuse gives the control's tokens and ids"""
+      control's reuse gives the control's tokens and ids
+    - expect_engine: the engine logged the D2 and D3 aborts on the resident state
+      (`resident_cancels`); a lane cancel passes the reuse gates but tests another path"""
     fails, unex, notes = [], [], []
     cached = lambda r: r["done"].get("cached_tokens") or 0
     same = lambda a, b: (a["events"], a["ids"]) == (b["events"], b["ids"])
@@ -362,6 +366,10 @@ def batch_checks(rows, expect_engine, reuse_mode="turn", ref=None):
     for name in ("D1", "D2"):
         if len(rows[name]["events"]) > rows[name]["max_tokens"] // 2:
             unex.append(f"{name}: the abort landed at {len(rows[name]['events'])}/{rows[name]['max_tokens']} events")
+    if expect_engine:
+        for name in ("D2", "D3"):
+            if name not in rows.get("resident_cancels", []):
+                fails.append(f"{name}: the abort did not land on the resident state (engine log)")
     for a, b in (("P0", "P~0"), ("D0", "D~0")):
         if not same(rows[a], rows[b]):
             fails.append(f"twins {a}/{b} differ at turn 0")
@@ -393,12 +401,14 @@ def batch_checks(rows, expect_engine, reuse_mode="turn", ref=None):
     return {"ok": not fails, "fails": fails, "unexercised": unex, "notes": notes, "reuse": reuse}
 
 
-def refused_records(lines, log_text):
-    """The requests whose lane record the engine logged as not continued: tag N is
-    the N-th `gen_start` on the daemon's stdout (see refused_followups)."""
+def refused_records(lines, log_text, pattern=None):
+    """The requests whose lane record the engine logged as not continued (or the
+    requests `pattern` names by tag): tag N is the N-th `gen_start` on the daemon's
+    stdout (see refused_followups)."""
     starts = [e.get("id") for e in map(json.loads, (ln for ln in lines if '"gen_start"' in ln))
               if e.get("type") == "gen_start"]
-    return [starts[t - 1] if 0 < t <= len(starts) else f"tag {t}" for t in map(int, REFUSAL.findall(log_text))]
+    return [starts[t - 1] if 0 < t <= len(starts) else f"tag {t}"
+            for t in map(int, (pattern or REFUSAL).findall(log_text))]
 
 
 def strip_timing(v):
@@ -1016,7 +1026,8 @@ def batch_self_test():
                 "D2": row("x" * 8, finish="aborted", mt=256), "P2": row("gh", cached=14),
                 "D2r": row("ij", cached=14), "D~2": row("ij", cached=14),  # turn 2 commits 14 + 5 + 2 = 21
                 "D3": row("kl", finish="aborted"), "P3": row("mn", cached=21),
-                "D3r": row("kl", cached=21), "D~3": row("kl", cached=21), "daemon_rc": 0}
+                "D3r": row("kl", cached=21), "D~3": row("kl", cached=21), "daemon_rc": 0,
+                "resident_cancels": ["D2", "D3"]}
         return {**base, **over}
     good = batch_checks(rows(), True)
     assert good["ok"] and not good["unexercised"] and not good["notes"], good
@@ -1049,6 +1060,10 @@ def batch_self_test():
     assert batch_checks(rows(P0=row(loop="legacy")), False)["ok"]
     assert not batch_checks(rows(D1r=row(typ="error")), True)["ok"]
     assert not batch_checks(rows(daemon_rc=1), True)["ok"]
+    # D2's abort taken in a lane (the timing changed): the reuse gates pass, this one fails
+    assert batch_checks(rows(resident_cancels=["D3"]), True)["fails"] == [
+        "D2: the abort did not land on the resident state (engine log)"]
+    assert batch_checks(rows(resident_cancels=[]), False)["ok"]  # the legacy reference logs none
     late = batch_checks(rows(P1=row("ab", finish="aborted"), D1=row("x" * 200, finish="aborted", mt=256)), True)
     assert late["ok"] and len(late["unexercised"]) == 2
     assert batch_checks(rows(D1=row("x" * 9, finish="length", mt=256)), True)["unexercised"]
@@ -1058,6 +1073,7 @@ def batch_self_test():
     starts = [json.dumps({"type": "gen_start", "id": i}) for i in ("P0", "P~0", "D0")] + ['{"type":"token","id":"P0"}']
     assert refused_records(starts, "[engine] lane record 2 not continued: x\n[engine] lane record 7 not continued: y\n"
                            ) == ["P~0", "tag 7"]
+    assert refused_records(starts, "[engine] request 3 cancelled on the resident state\n", RESIDENT_CANCEL) == ["D0"]
 
 
 def host_state(own_pid=None):
@@ -1200,6 +1216,7 @@ def wire_requests(lines, order):
 
 
 REFUSAL = re.compile(r"\[engine\] lane record (\d+) not continued")
+RESIDENT_CANCEL = re.compile(r"\[engine\] request (\d+) cancelled on the resident state")
 
 
 def refused_followups(lines, log_text, order):

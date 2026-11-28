@@ -710,6 +710,7 @@ impl Driver {
             if !commit {
                 match live.held {
                     Some(Place::Resident) => {
+                        log_resident_cancel(live.tag);
                         let LoadedModel {
                             state,
                             asst_turn_cache,
@@ -1057,6 +1058,12 @@ fn keep_record(
     }
 }
 
+/// `engine_loop_ab.py --batch` reads this line to prove which path a cancel
+/// took (tag N = the N-th `gen_start`): a lane cancel logs nothing.
+fn log_resident_cancel(tag: u64) {
+    eprintln!("[engine] request {tag} cancelled on the resident state");
+}
+
 /// A resident AR request the client cancelled after its prompt ran, every
 /// token of `history` run: its state moves into a lane, which rewinds to its
 /// turn start as a cancelled lane request's does ([`cancel_lane`]), so another
@@ -1300,7 +1307,10 @@ impl<'a> Ctx<'a> {
         // drain of them is a device failure, not a client cancel.
         let exit = match exit {
             Exit::Aborted if place == Place::Resident => match self.runner.settle(self.gpus) {
-                Ok(()) => Exit::Aborted,
+                Ok(()) => {
+                    log_resident_cancel(self.live(idx).tag);
+                    Exit::Aborted
+                }
                 Err(error) => Exit::Failed(format!("drain failed: {error}")),
             },
             exit => exit,
