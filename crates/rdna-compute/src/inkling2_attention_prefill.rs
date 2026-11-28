@@ -5,11 +5,28 @@
 //! Inkling-2 blocked (multi-row) causal prefill attention, FA2 (gfx1201 only).
 //!
 //! The prefill producer of the split-KV decode kernel in
-//! [`crate::inkling2_attention`]: same fragment-major KT64 LDS planes,
-//! swapped-operand WMMA and hi/lo f16 Q and P, but one workgroup owns a
-//! 32-row query tile of one KV head (six waves: three Q heads x two 16-row
-//! subtiles) and walks the causal key range once, so there is no partition
-//! merge. Shape H24/KV8/D128 (GQA3).
+//! [`crate::inkling2_attention`]: fragment-major LDS planes, swapped-operand
+//! WMMA and hi/lo f16 Q and P, but one workgroup owns a 64-row query tile of
+//! one KV head (twelve waves: three Q heads x four 16-row subtiles) and walks
+//! the causal key range once, so there is no partition merge. Shape
+//! H24/KV8/D128 (GQA3).
+//!
+//! Schedule (AMD-KERNELS §4 exact items): query tiles dispatch longest-first;
+//! 32-key K/V tiles are double-buffered in LDS with the next-but-one tile
+//! prefetched into registers (one barrier per tile); V is transposed into its
+//! fragment layout from 4-key register blocks with 8-byte stores; the
+//! relative table is a 128-column LDS ring that takes 32 new columns per
+//! tile; interior 16-key subtiles (every key visible to every row and inside
+//! the extent) skip the mask and extent tests, subtiles wholly past the extent
+//! skip the relative dot, and the `O` rescale is skipped when no row's max
+//! moved; `1/l` is applied once at the end. The online-softmax update still
+//! runs per 16-key subtile with the same expressions, on a 16-key grid set by
+//! the tile's first key `max(0, pos0 + q0 - window + 1)`. That grid is the
+//! former 32-row kernel's whenever no 64-row tile straddles the SWA clamp at
+//! key 0 (with the 1024-key window: always when `pos0 % 64 == 0`, so every
+//! 512-row prefill block), and
+//! there the output is bitwise the former kernel's; otherwise only the
+//! rounding order differs (within the f64-reference budget).
 //!
 //! Score contract (identical to the decode route on the same operands):
 //! `dot(Q_h,K_j)/sqrt(128) + (sum_r table[r,d] * R[h,r] - sink[h])` with
@@ -37,30 +54,67 @@ pub const INKLING2_ATTN_PREFILL_HIP_SRC: &str = r#"
 #define IKV 8
 #define ID 128
 #define IGQA 3
-#define NQT 2
+#define NQT 4
 #define QROWS (16 * NQT)
+#define NT (32 * IGQA * NQT)
+#define KT 32
 #define NREL 16
-#define TW (QROWS + 64)
+#define TBR 128   // relative-table ring columns: >= QROWS + 2 * KT - 1, a power of two
+#define TBS 20    // ring column stride in floats: 16 channels + 4 pad (conflict-free b128 reads)
+#define VTH 128   // threads staging V (4 keys x 8 channels each)
+#define KPER (512 / (NT - VTH))
+#define NPF (KPER > 4 ? KPER : 4)
+#define TPER ((NREL * KT + NT - 1) / NT)
 
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
+typedef _Float16 __attribute__((ext_vector_type(4))) half4_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
+typedef float __attribute__((ext_vector_type(4))) float4_t;
 
 struct KvPlanes {
     const unsigned short* p[8];
 };
 
-__device__ __forceinline__ int ip_kfrag8(int sub, int dc, int lane)
+__device__ __forceinline__ int ip_kfrag(int sub, int dc, int lane)
 {
-    return (dc * 4 + sub) * 32 + lane;
+    return (dc * 2 + sub) * 32 + lane;
 }
-__device__ __forceinline__ int ip_vfrag8(int sub, int dc, int lane)
+__device__ __forceinline__ int ip_vfrag(int sub, int dc, int lane)
 {
     return (sub * 8 + dc) * 32 + lane;
 }
 
-// Grid (ceil(rows / 32), 8), block 192: wave w owns Q head 3*kv_h + w%3 over
-// query subtile w/3 (16 rows). Every wave loads the shared K/V tile.
-extern "C" __global__ __launch_bounds__(192, 1) void inkling2_attn_fa2_prefill_gfx1201(
+__device__ __forceinline__ half8_t ip_load(const unsigned short* sb, const unsigned short* cb,
+    int j, int jhi, int c, int pos0, int ring_rows)
+{
+    half8_t x = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (j <= jhi) {
+        if (j >= pos0)
+            x = *(const half8_t*)(sb + (size_t)(j - pos0) * ID + (size_t)c * 8);
+        else
+            x = *(const half8_t*)(cb + (size_t)(j % ring_rows) * ID + (size_t)c * 8);
+    }
+    return x;
+}
+
+// Relative-term dot for distance d (caller guarantees 0 <= d < n_extent).
+__device__ __forceinline__ float ip_rel(const float* TB, int d, const float* R)
+{
+    const float4_t* t = (const float4_t*)(TB + (d & (TBR - 1)) * TBS);
+    float v = 0.0f;
+#pragma unroll
+    for (int q4 = 0; q4 < 4; ++q4) {
+        const float4_t w = t[q4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            v += w[i] * R[q4 * 4 + i];
+    }
+    return v;
+}
+
+// Grid (ceil(rows / 64), 8), block 384: wave w owns Q head 3*kv_h + w%3 over
+// query subtile w/3 (16 rows).
+extern "C" __global__ __launch_bounds__(NT, 1) void inkling2_attn_fa2_prefill_gfx1201(
     const float* __restrict__ q,
     const float* __restrict__ rel,
     const float* __restrict__ sinks,
@@ -78,7 +132,8 @@ extern "C" __global__ __launch_bounds__(192, 1) void inkling2_attn_fa2_prefill_g
     float inv_sqrt_d)
 {
     const int kv_h = (int)blockIdx.y;
-    const int q0 = (int)blockIdx.x * QROWS;
+    // Longest-first: the last query tile has the longest causal key range.
+    const int q0 = ((int)gridDim.x - 1 - (int)blockIdx.x) * QROWS;
     if (kv_h >= IKV || q0 >= n_rows)
         return;
     const int tid = (int)threadIdx.x;
@@ -89,15 +144,13 @@ extern "C" __global__ __launch_bounds__(192, 1) void inkling2_attn_fa2_prefill_g
     const int hsub = wave % IGQA;
     const int qt = wave / IGQA;
     const int h = IGQA * kv_h + hsub;
-    const int qloc = qt * 16 + ml;
-    const int qi = q0 + qloc;
+    const int qi = q0 + qt * 16 + ml;
     const bool qlive = qi < n_rows;
     const int qpos = pos0 + qi;
     const int qlo = window > 0 ? max(0, qpos - window + 1) : 0;
 
-    __shared__ half8_t KV8[2048];   // K frags [0,1024), V frags [1024,2048)
-    __shared__ float TB[NREL][TW];
-    _Float16* V16 = (_Float16*)(KV8 + 1024);
+    __shared__ half8_t KV8[2][1024];          // per buffer: K frags [0,512), V frags [512,1024)
+    __shared__ float TB[TBR * TBS];           // relative-table ring: column d at (d & 127) * 20
 
     const unsigned short* kcb = kc.p[kv_h];
     const unsigned short* vcb = vc.p[kv_h];
@@ -133,13 +186,99 @@ extern "C" __global__ __launch_bounds__(192, 1) void inkling2_attn_fa2_prefill_g
     const int p_first = pos0 + q0;
     const int jlo = window > 0 ? max(0, p_first - window + 1) : 0;
     const int jhi = pos0 + q_last;
+    const int ntiles = (jhi - jlo) / KT + 1;
 
-    // Wave-uniform live query range (for whole-subtile skips).
+    // Wave-uniform live query range (subtile skips and the unmasked fast path).
     const int wq_first = q0 + qt * 16;
     const int wq_last = min(wq_first + 15, n_rows - 1);
     const bool wave_live = wq_first < n_rows;
+    const bool wave_full = wq_first + 15 < n_rows;
     const int w_key_hi = pos0 + wq_last;
     const int w_key_lo = window > 0 ? max(0, pos0 + wq_first - window + 1) : 0;
+    const int w_pos_lo = pos0 + wq_first;
+    const int w_qlo_hi = window > 0 ? max(0, pos0 + wq_last - window + 1) : 0;
+
+    // Prefetch registers: threads [0, VTH) stage V as 4 keys x 8 channels
+    // (transposed into the fragment layout with 8-byte stores), the rest
+    // stage K rows; every thread carries TPER relative-table entries.
+    half8_t pf[NPF];
+    float tpf[TPER];
+    auto load_tile = [&](int kt) {
+        if (tid < VTH) {
+            const int k0 = (tid >> 4) * 4;
+            const int c = tid & 15;
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                pf[i] = ip_load(vsb, vcb, kt + k0 + i, jhi, c, pos0, ring_rows);
+        } else {
+#pragma unroll
+            for (int i = 0; i < KPER; ++i) {
+                const int idx = (tid - VTH) + i * (NT - VTH);
+                pf[i] = ip_load(ksb, kcb, kt + (idx >> 4), jhi, idx & 15, pos0, ring_rows);
+            }
+        }
+        // New relative-table columns of this tile: d in [p_first - kt - KT + 1, +KT).
+        const int dnew = p_first - kt - (KT - 1);
+#pragma unroll
+        for (int i = 0; i < TPER; ++i) {
+            const int idx = tid + i * NT;
+            float x = 0.0f;
+            if (idx < NREL * KT) {
+                const int d = dnew + (idx & (KT - 1));
+                if (d >= 0 && d < n_extent)
+                    x = table[(size_t)(idx / KT) * n_extent + d];
+            }
+            tpf[i] = x;
+        }
+    };
+    auto store_tile = [&](int kt, int b) {
+        half8_t* KB = KV8[b];
+        if (tid < VTH) {
+            const int k0 = (tid >> 4) * 4;
+            const int c = tid & 15;
+            const int sub = k0 >> 4;
+            const int vkg = (k0 >> 3) & 1;
+            _Float16* V16 = (_Float16*)(KB + 512);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int d = c * 8 + i;
+                const half4_t w = {pf[0][i], pf[1][i], pf[2][i], pf[3][i]};
+                *(half4_t*)(V16 + ip_vfrag(sub, d >> 4, 16 * vkg + (d & 15)) * 8 + (k0 & 7)) = w;
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < KPER; ++i) {
+                const int idx = (tid - VTH) + i * (NT - VTH);
+                const int k = idx >> 4;
+                const int c = idx & 15;
+                KB[ip_kfrag(k >> 4, c >> 1, 16 * (c & 1) + (k & 15))] = pf[i];
+            }
+        }
+        const int dnew = p_first - kt - (KT - 1);
+#pragma unroll
+        for (int i = 0; i < TPER; ++i) {
+            const int idx = tid + i * NT;
+            if (idx < NREL * KT) {
+                const int d = dnew + (idx & (KT - 1));
+                TB[(d & (TBR - 1)) * TBS + idx / KT] = tpf[i];
+            }
+        }
+    };
+
+    // Prologue: tile 0 into buffer 0 with its whole table window, tile 1 into registers.
+    load_tile(jlo);
+    store_tile(jlo, 0);
+    {
+        const int d0 = p_first - jlo - (KT - 1);
+        for (int idx = tid; idx < NREL * (QROWS - 1); idx += NT) {
+            const int r = idx / (QROWS - 1);
+            const int d = d0 + KT + (idx - r * (QROWS - 1));
+            TB[(d & (TBR - 1)) * TBS + r] = (d >= 0 && d < n_extent) ? table[(size_t)r * n_extent + d] : 0.0f;
+        }
+    }
+    if (ntiles > 1)
+        load_tile(jlo + KT);
+    __syncthreads();
 
     float8_t Ofr[8];
 #pragma unroll
@@ -148,48 +287,18 @@ extern "C" __global__ __launch_bounds__(192, 1) void inkling2_attn_fa2_prefill_g
     float m_old = 0.0f;
     float l_val = 1.0f;
 
-    for (int kt = jlo; kt <= jhi; kt += 64) {
-        for (int idx = tid; idx < 1024; idx += 192) {
-            const int k = idx >> 4;
-            const int c = idx & 15;
-            const int j = kt + k;
-            half8_t kv = {0, 0, 0, 0, 0, 0, 0, 0};
-            half8_t vv = {0, 0, 0, 0, 0, 0, 0, 0};
-            if (j <= jhi) {
-                if (j >= pos0) {
-                    const size_t row = (size_t)(j - pos0) * ID + (size_t)c * 8;
-                    kv = *(const half8_t*)(ksb + row);
-                    vv = *(const half8_t*)(vsb + row);
-                } else {
-                    const size_t row = (size_t)(j % ring_rows) * ID + (size_t)c * 8;
-                    kv = *(const half8_t*)(kcb + row);
-                    vv = *(const half8_t*)(vcb + row);
-                }
-            }
-            const int sub = k >> 4;
-            KV8[ip_kfrag8(sub, c >> 1, 16 * (c & 1) + (k & 15))] = kv;
-            const int vkg = (k >> 3) & 1;
-            const int vj = k & 7;
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const int d = c * 8 + i;
-                V16[ip_vfrag8(sub, d >> 4, 16 * vkg + (d & 15)) * 8 + vj] = vv[i];
-            }
-        }
-        // Relative-table window: d = qpos - key spans [p_first - kt - 63,
-        // p_first + QROWS - 1 - kt]; entry c holds d = dbase + c.
-        const int dbase = p_first - kt - 63;
-        for (int idx = tid; idx < NREL * TW; idx += 192) {
-            const int r = idx / TW;
-            const int c = idx - r * TW;
-            const int d = dbase + c;
-            TB[r][c] = (d >= 0 && d < n_extent) ? table[(size_t)r * n_extent + d] : 0.0f;
-        }
-        __syncthreads();
+#pragma unroll 1
+    for (int t = 0; t < ntiles; ++t) {
+        const int kt = jlo + t * KT;
+        if (t + 1 < ntiles)
+            store_tile(kt + KT, (t + 1) & 1);
+        if (t + 2 < ntiles)
+            load_tile(kt + 2 * KT);
+        const half8_t* KB = KV8[t & 1];
 
         if (wave_live) {
 #pragma unroll 1
-            for (int sub = 0; sub < 4; ++sub) {
+            for (int sub = 0; sub < 2; ++sub) {
                 const int ks0 = kt + sub * 16;
                 if (ks0 > w_key_hi)
                     break;
@@ -198,28 +307,51 @@ extern "C" __global__ __launch_bounds__(192, 1) void inkling2_attn_fa2_prefill_g
                 float8_t sacc = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
                 for (int dc = 0; dc < 8; ++dc) {
-                    const half8_t kf = KV8[ip_kfrag8(sub, dc, lane)];
+                    const half8_t kf = KB[ip_kfrag(sub, dc, lane)];
                     sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(kf, qhi[dc], sacc);
                     sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(kf, qlw[dc], sacc);
                 }
                 float mx = -INFINITY;
+                const int kb = ks0 + 8 * kg;
+                if (wave_full && ks0 + 15 <= w_pos_lo && ks0 >= w_qlo_hi
+                    && w_key_hi - ks0 < n_extent) {
+                    // Interior subtile: every key is visible to every row and
+                    // inside the table extent; no mask, no extent test.
 #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const int key = ks0 + 8 * kg + j;
-                    float x = -INFINITY;
-                    if (qlive && key >= qlo && key <= qpos) {
-                        const int d = qpos - key;
-                        float v = 0.0f;
-                        if (d < n_extent) {
-                            const int ti = d - dbase;
-#pragma unroll
-                            for (int r = 0; r < NREL; ++r)
-                                v += TB[r][ti] * R[r];
-                        }
-                        x = sacc[j] * inv_sqrt_d + (v - sink);
+                    for (int j = 0; j < 8; ++j) {
+                        const float v = ip_rel(TB, qpos - kb - j, R);
+                        const float x = sacc[j] * inv_sqrt_d + (v - sink);
+                        sacc[j] = x;
+                        mx = fmaxf(mx, x);
                     }
-                    sacc[j] = x;
-                    mx = fmaxf(mx, x);
+                } else if (w_pos_lo - (ks0 + 15) >= n_extent) {
+                    // Every visible key is past the extent: relative term zero.
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int key = kb + j;
+                        float x = -INFINITY;
+                        if (qlive && key >= qlo && key <= qpos) {
+                            const float v = 0.0f;
+                            x = sacc[j] * inv_sqrt_d + (v - sink);
+                        }
+                        sacc[j] = x;
+                        mx = fmaxf(mx, x);
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int key = kb + j;
+                        float x = -INFINITY;
+                        if (qlive && key >= qlo && key <= qpos) {
+                            const int d = qpos - key;
+                            float v = 0.0f;
+                            if (d < n_extent)
+                                v = ip_rel(TB, d, R);
+                            x = sacc[j] * inv_sqrt_d + (v - sink);
+                        }
+                        sacc[j] = x;
+                        mx = fmaxf(mx, x);
+                    }
                 }
                 mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
                 const float m_new = fmaxf(m_old, mx);
@@ -236,10 +368,14 @@ extern "C" __global__ __launch_bounds__(192, 1) void inkling2_attn_fa2_prefill_g
                 }
                 sum += __shfl_xor(sum, 16, 32);
                 l_val = l_val * alpha + sum;
+                if (alpha != 1.0f) {
+#pragma unroll
+                    for (int dc = 0; dc < 8; ++dc)
+                        Ofr[dc] *= alpha;
+                }
 #pragma unroll
                 for (int dc = 0; dc < 8; ++dc) {
-                    const half8_t vf = KV8[1024 + ip_vfrag8(sub, dc, lane)];
-                    Ofr[dc] *= alpha;
+                    const half8_t vf = KB[512 + ip_vfrag(sub, dc, lane)];
                     Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vf, phi, Ofr[dc]);
                     Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(vf, plo, Ofr[dc]);
                 }
@@ -270,7 +406,9 @@ use hip_bridge::{HipError, HipResult};
 /// Relative-bias channels the prefill kernel is compiled for.
 pub const INKLING2_ATTN_PREFILL_REL: usize = 16;
 /// Query rows per workgroup.
-pub const INKLING2_ATTN_PREFILL_QROWS: usize = 32;
+pub const INKLING2_ATTN_PREFILL_QROWS: usize = 64;
+/// Threads per workgroup (twelve wave32s).
+const INKLING2_ATTN_PREFILL_THREADS: u32 = 384;
 
 #[repr(C)]
 struct KvPlanes([*const c_void; 8]);
@@ -409,7 +547,7 @@ impl Gpu {
         self.launch_maybe_blob(
             "inkling2_attn_fa2_prefill_gfx1201",
             [grid_x, kvh as u32, 1],
-            [192, 1, 1],
+            [INKLING2_ATTN_PREFILL_THREADS, 1, 1],
             0,
             &mut params,
             || {
