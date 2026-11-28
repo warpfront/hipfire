@@ -6814,8 +6814,10 @@ pub fn inkling_terminal(
 ///
 /// Stateless like `generate_maple`: every turn cold-resets the GPU session
 /// state and re-prefills the full rendered prompt from position 0, then
-/// decodes token by token through `inkling2::forward_decode_gpu` (the blocked
-/// body at one row on gfx1201 typed-XTS loads, `forward_token_gpu` elsewhere)
+/// decodes token by token through `inkling2::forward_plain_ar_gpu` (the HIP
+/// graph of the frozen blocked one-row body on the admitted gfx1201 typed-XTS
+/// row, the eager `forward_decode_gpu` elsewhere or when `HIPFIRE_GRAPH=0` /
+/// `HIPFIRE_AR_GRAPH=0`; `forward_token_gpu` on non-blocked loads)
 /// with the request's full sampler contract
 /// (`sampler::sample_cpu`: temp 0 reduces to argmax, matching 04's
 /// `generate_cpu`). No spec, no batch, no stop router on this route
@@ -7164,10 +7166,16 @@ pub fn generate_inkling(
 
         let step = {
             let b = m.inkling2_mut().unwrap();
-            inkling2::forward_decode_gpu(b, gpu, next_tok, prompt_len + generated_count - 1)
+            inkling2::forward_plain_ar_gpu(
+                b,
+                gpu,
+                next_tok,
+                prompt_len + generated_count - 1,
+                &mut last_logits,
+            )
         };
         match step {
-            Ok(logits) => last_logits = logits,
+            Ok(()) => {}
             Err(e) => {
                 dense_fail_closed_error(
                     m,
@@ -7250,6 +7258,160 @@ pub fn generate_inkling(
         }
     }
 }
+
+/// Daemon `bench_decode` for Inkling-2-Mini (arch_id=24): the synthetic
+/// resident decode probe through the SAME wrapper the generation loop calls
+/// (`inkling2::forward_plain_ar_gpu`), so the benchmark measures the served
+/// backend (graph or eager) and reports which one ran.
+///
+/// Primes `context_tokens` deterministic ids with the production prefill
+/// (`forward_prefill_gpu`, one `prefill_chunk_rows` block at a time), runs
+/// `warmup_iterations` (default 0, untimed; the arm cost of a new bucket) and
+/// then times `iterations` plain-AR steps from position `context_tokens +
+/// warmup_iterations`. With no warmup the timed span includes the one-time arm
+/// of the first bucket (a cold first turn); the ledger separates the route
+/// counts so the caller can tell. The retained-Redline modes (`redline_capture`,
+/// `redline_product_route`, `g0`) are not wired for this arch.
+pub fn bench_decode_inkling(
+    gpu: &mut rdna_compute::Gpu,
+    m: &mut LoadedModel,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    for key in ["redline_capture", "redline_product_route", "g0"] {
+        if msg
+            .get(key)
+            .is_some_and(|v| !v.is_null() && v != &serde_json::json!(false))
+        {
+            return Err(format!(
+                "bench_decode {key} is not supported for Inkling-2-Mini (the decode route is the HIP graph / eager wrapper)"
+            ));
+        }
+    }
+    let context = msg
+        .get("context_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(128) as usize;
+    let iterations = msg.get("iterations").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let warmup = msg
+        .get("warmup_iterations")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    if context == 0 || iterations == 0 {
+        return Err("bench_decode context_tokens and iterations must be non-zero".to_string());
+    }
+    if context
+        .saturating_add(warmup)
+        .saturating_add(iterations)
+        .saturating_add(32)
+        > m.physical_cap
+    {
+        return Err(format!(
+            "bench_decode context+warmup+iterations exceeds loaded physical_cap={}",
+            m.physical_cap
+        ));
+    }
+    if m.inkling2().is_none() {
+        return Err("bench_decode requires a loaded Inkling-2-Mini model".to_string());
+    }
+    let reset = |m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu| -> Result<(), String> {
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        m.inkling2_mut().unwrap().reset_session_state(gpu)
+    };
+    reset(m, gpu).map_err(|e| format!("bench_decode state reset failed: {e}"))?;
+    let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
+    let run = (|| -> Result<serde_json::Value, String> {
+        let chunk = inkling2::prefill_chunk_rows(m.inkling2().unwrap(), gpu);
+        let mut start = 0usize;
+        while start < synthetic.len() {
+            let end = (start + chunk).min(synthetic.len());
+            let b = m.inkling2_mut().unwrap();
+            inkling2::forward_prefill_gpu(
+                b,
+                gpu,
+                &synthetic[start..end],
+                start,
+                inkling2::PrefillLogits::None,
+            )
+            .map_err(|e| format!("bench_decode prefill prime failed: {e}"))?;
+            start = end;
+        }
+        let mut logits: Vec<f32> = Vec::new();
+        let mut step = |m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, i: usize| {
+            let token = 101 + (i as u32 % 1000);
+            let b = m.inkling2_mut().unwrap();
+            inkling2::forward_plain_ar_gpu(b, gpu, token, context + i, &mut logits)
+                .map_err(|e| format!("bench_decode forward failed: {e}"))
+        };
+        for i in 0..warmup {
+            step(m, gpu, i)?;
+        }
+        let before = inkling2::serve_stats(m.inkling2().unwrap());
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("bench_decode sync: {e}"))?;
+        let t0 = Instant::now();
+        for i in warmup..warmup + iterations {
+            step(m, gpu, i)?;
+        }
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("bench_decode sync: {e}"))?;
+        let elapsed = t0.elapsed().as_secs_f64();
+        let after = inkling2::serve_stats(m.inkling2().unwrap());
+        let c0 = before
+            .as_ref()
+            .map(|s| s.counts.clone())
+            .unwrap_or_default();
+        let c1 = after.as_ref().map(|s| s.counts.clone()).unwrap_or_default();
+        let g1 = after.as_ref().map(|s| s.graph.clone()).unwrap_or_default();
+        let last = after
+            .as_ref()
+            .and_then(|s| s.last_route.as_ref())
+            .map(|r| format!("{r:?}"));
+        let ledger = serde_json::json!({
+            "backend": if c1.graph_replays > c0.graph_replays { "graph" } else { "eager" },
+            "timed_steps": iterations,
+            "timed_graph_replays": c1.graph_replays - c0.graph_replays,
+            "timed_graph_arm_steps": c1.graph_arm_steps - c0.graph_arm_steps,
+            "timed_graph_capture_failed_steps":
+                c1.graph_capture_failed_steps - c0.graph_capture_failed_steps,
+            "timed_eager_steps": c1.eager - c0.eager,
+            "total": {
+                "graph_replays": c1.graph_replays,
+                "graph_arm_steps": c1.graph_arm_steps,
+                "eager": c1.eager,
+                "captures": g1.captures,
+                "capture_failures": g1.capture_failures,
+                "destroys": g1.destroys,
+                "nodes": g1.nodes,
+                "last_capture_ms": g1.last_capture_ns as f64 / 1e6,
+                "total_capture_ms": g1.total_capture_ns as f64 / 1e6,
+            },
+            "sticky": after.as_ref().and_then(|s| s.sticky.clone()),
+            "arena_refusal": after.as_ref().and_then(|s| s.arena_refusal.clone()),
+            "last_route": last,
+        });
+        Ok(serde_json::json!({
+            "type": "decode_result",
+            "context_tokens": context,
+            "iterations": iterations,
+            "warmup_iterations": warmup,
+            "ms": elapsed * 1000.0,
+            "us_per_token": elapsed * 1_000_000.0 / iterations as f64,
+            "tok_s": iterations as f64 / elapsed.max(f64::MIN_POSITIVE),
+            "inkling_decode": ledger,
+        }))
+    })();
+    let _ = gpu.hip.device_synchronize();
+    let rolled = reset(m, gpu);
+    match (run, rolled) {
+        (Ok(v), Ok(())) => Ok(v),
+        (Ok(_), Err(e)) => Err(format!("bench_decode state reset failed: {e}")),
+        (Err(e), _) => Err(e),
+    }
+}
+
 /// MiniMax-M2 (arch_id=10) generate path — minimal AR bring-up.
 ///
 /// Mirrors `generate_lfm2moe`'s shape (prefill loop / chunked batched prefill,

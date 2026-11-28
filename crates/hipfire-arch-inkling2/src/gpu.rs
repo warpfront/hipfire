@@ -1179,6 +1179,10 @@ pub struct Inkling2GpuState {
     /// ([`crate::decode_step::DecodeArena`]), created on demand by
     /// [`crate::decode_step::ensure_decode_arena`]; freed with the state.
     pub decode_arena: Option<crate::decode_step::DecodeArena>,
+    /// The serving state of the one-row plain-AR decode (graph executor,
+    /// counters; [`crate::decode_serve::forward_plain_ar_gpu`]), created on the
+    /// first served step and released before the arena, KV and weights it names.
+    pub decode_serve: Option<crate::decode_serve::DecodeServe>,
 }
 
 impl Inkling2GpuState {
@@ -1322,6 +1326,7 @@ impl Inkling2GpuState {
             prefill_routes: crate::gpu_prefill::PrefillRoutes::F16,
             prefill_scratch: None,
             decode_arena: None,
+            decode_serve: None,
         })
     }
 
@@ -1346,6 +1351,9 @@ impl Inkling2GpuState {
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        if let Some(mut s) = self.decode_serve {
+            s.release(gpu);
+        }
         for row in self.k_cache {
             for t in row {
                 let _ = gpu.free_tensor(t);

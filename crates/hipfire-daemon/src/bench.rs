@@ -375,6 +375,22 @@ pub(crate) fn handle_bench_decode(
             let _ = stdout.flush();
             return;
         }
+        hipfire_loader::BenchDecodeRoute::Inkling => {
+            // Inkling-2-Mini: the same plain-AR wrapper `serve` decodes with
+            // (HIP graph on the admitted row, eager elsewhere), with a ledger
+            // of which backend ran.
+            match hipfire_generate::dense::bench_decode_inkling(gpu, m, msg) {
+                Ok(mut response) => {
+                    response["topology"] = bench_topology.to_json();
+                    let _ = writeln!(stdout, "{response}");
+                }
+                Err(reason) => {
+                    emit_uncorrelated_error(stdout, None, &reason, "internal", false, false);
+                }
+            }
+            let _ = stdout.flush();
+            return;
+        }
         _ => {}
     }
     // arch 5/6 = Qwen3.5, arch 13 = Gemma4, arch 14 = Muse Glimmer, arch 16
