@@ -4656,7 +4656,7 @@ fn write_kernarg_u32(
 }
 
 /// Opaque snapshot of one completed recording's per-launch kernarg blocks.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RecordedKernargSnapshot {
     entries: Vec<SnapshotEntry>,
 }
@@ -5907,6 +5907,10 @@ pub struct ReplayController {
     /// Count of PM4 programs prepared by this controller: the check mode's
     /// once-per-program weights verification keys on it.
     pm4_generation: u64,
+    /// HIPF-297 prototype: the bitwise-identical eager verify routes
+    /// (lane-rows PM, router `_fast`, MoE down r4) may record into this
+    /// controller's tape. Only a secondary verify controller sets it.
+    verify_routes_recordable: bool,
 }
 
 /// Which executor the retained body uses on the next eligible forward.
@@ -5997,6 +6001,7 @@ impl ReplayController {
             railgun_shadow: railgun_shadow::RailgunShadow::from_config(),
             railgun_check: crate::railgun_check::CheckState::from_config().map(Box::new),
             pm4_generation: 0,
+            verify_routes_recordable: false,
         }
     }
 
@@ -6021,6 +6026,25 @@ impl ReplayController {
         // controller; the primary model controller retains its stricter cap.
         controller.max_recorded_launches = 8_192;
         controller
+    }
+
+    /// [`Self::new_manual_pm4`] with the automatic lifecycle: the model's
+    /// retained-body boundary opens the window and the commit closes it, as
+    /// for the AR controller. For a secondary verify-shape body (HIPF-297).
+    pub fn new_auto_pm4() -> Self {
+        let mut controller = Self::new_manual_pm4();
+        controller.auto_lifecycle = true;
+        controller
+    }
+
+    pub fn set_verify_routes_recordable(&mut self, on: bool) {
+        self.verify_routes_recordable = on;
+    }
+
+    /// A recording that must keep the incumbent kernels of the eager-only
+    /// verify routes (every recording, unless the controller admits them).
+    pub fn blocks_eager_verify_routes(&self) -> bool {
+        self.is_recording() && !self.verify_routes_recordable
     }
 
     /// Construct the AQL-packet twin of [`Self::new_manual_pm4`]. This exists

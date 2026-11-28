@@ -554,6 +554,9 @@ developer_callsite	*	HIPFIRE_QWEN4_TRUNK_IU4#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_QWEN4_TRUNK_OVERLAY#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_QWEN4_TRUNK_TIER#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_QWEN4_TURN_SNAPSHOTS#developer_bool=false
+developer_callsite	*	HIPFIRE_QWEN4_VERIFY_TAPE_CAL_GAP#developer_var=ok.and_then.unwrap_or(1)
+developer_callsite	*	HIPFIRE_QWEN4_VERIFY_TAPE_ROUTES#developer_var=map_or(true, |value| value != "0")
+developer_callsite	*	HIPFIRE_QWEN4_VERIFY_TAPE_ROWS#developer_var=ok
 developer_callsite	*	HIPFIRE_QWEN4_WIDE_GROUPED_DOWN#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN4_WIDE_GROUPED_MOE#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN4_WIDE_VERIFY_ROWS#developer_var=ok.as_deref

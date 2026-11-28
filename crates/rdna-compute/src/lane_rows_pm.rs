@@ -235,7 +235,7 @@ impl Gpu {
         self.flags.fn_lane_pm_rows_enabled()
             && self.arch_caps.is_gfx1151()
             && self.lane_rows_scope
-            && !self.replay.is_recording()
+            && !self.replay.blocks_eager_verify_routes()
             && !self.graphs.capture_mode
     }
 
