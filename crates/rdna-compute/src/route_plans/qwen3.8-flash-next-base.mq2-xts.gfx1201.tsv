@@ -3,6 +3,7 @@
 # (HIP: effective source; embedded: image). native_mtp rows include every ar row.
 # Re-pin (sources at origin/beta 536ea66081 + cons05-A1): HIP row sha256 updated in place for landed source edits, module sets and symbols unchanged from the walk: gated_delta_chunk_wmma (2c504b1aec causal F32 WY products), gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151 and gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4 (0291cb1747 dead-row stores), tensor_ops (c85a2bede1 / 3a87c48f4f / a3229fd274), qwen4_gemv_q8_0 (35ca891555).
 # Re-pin (sources at origin/beta-candidate 1958644c0d): HIP row sha256 updated in place for landed source edits, module sets and symbols unchanged from the walk: mq_rotate_x_i4 (48e43d95ec gfx1150 admission: `defined(__gfx1150__)` added to block_i4_128_quant.hip's arch guards; hipcc -E device text byte-identical on gfx1100/gfx1151/gfx1201).
+# HIPF-164 re-pin: qwen4_gemv_q8_0 source gained the gfx1151-only gemv_q8_0_rows kernel (commit "perf(gfx1151): few-row Q8_0 kernel for Gemma 4 EAGLE strict verify"); module set and symbols unchanged.
 #! family qwen3.8-flash-next
 #! model_arch 16
 #! arch gfx1201
@@ -129,7 +130,7 @@ native_mtp	hip	qsa_filter_select	qsa_filter_compact,qsa_filter_finish,qsa_filter
 native_mtp	hip	qwen4_gemv_bf16_xf32	gemv_bf16_xf32_bf16_scaled_add,gemv_bf16_xf32_k4,gemv_bf16_xf32_k4_rows_r2,gemv_bf16_xf32_k4_rows_r3,gemv_bf16_xf32_k4_rows_r4,gemv_bf16_xf32_k4_rows_r5,gemv_bf16_xf32_k4_rows_r6,gemv_bf16_xf32_k4_rows_r7,gemv_bf16_xf32_k4_rows_r8,gemv_bf16_xf32_k4_rows_tiled_r2,gemv_bf16_xf32_k4_rows_tiled_r3,gemv_bf16_xf32_k4_rows_tiled_r4,gemv_bf16_xf32_k4_rows_tiled_r5,gemv_bf16_xf32_k4_rows_tiled_r6,gemv_bf16_xf32_k4_rows_tiled_r7,gemv_bf16_xf32_k4_rows_tiled_r8,gemv_bf16_xf32_x4,gemv_bf16_xf32_x4_rows_r2,gemv_bf16_xf32_x4_rows_r3,gemv_bf16_xf32_x4_rows_r4,gemv_bf16_xf32_x4_rows_r5,gemv_bf16_xf32_x4_rows_r6,gemv_bf16_xf32_x4_rows_r7,gemv_bf16_xf32_x4_rows_r8,hyper_write_norm_f32	8a4b2c8402369979f8432599150ad24dbbfe337490d16aa893c516608ae6831b
 native_mtp	hip	qwen4_gemv_mq4g256	hyper_read_projected_rotate_f32	1fbb17ecfab27b67e9cec914af95dbf09993b5f096b69b8dc0e08912dd149e2e
 native_mtp	hip	qwen4_gemv_mq6g256v2	gemv_mq6g256v2_x4	7f1d4a49e921e57b21d3d669d517742c039e18c5fbdcaa771834ec9a1def28bc
-native_mtp	hip	qwen4_gemv_q8_0	gemv_q8_0_k2560_staged_rows_tiled,topk8_partial_f32	85e67d2af6d072fa3ba985960d7120402fd884a63754c4eb79c5f1889122db41
+native_mtp	hip	qwen4_gemv_q8_0	gemv_q8_0_k2560_staged_rows_tiled,topk8_partial_f32	e574ed164cbfef62eae056a0298c62866f9fcf8c1d5cfc928540130225c7959d
 native_mtp	hip	qwen4_hc_down_fused	qwen4_hc_down_fused_b64_k32	39ea91c9b0ab5d48d48aa9e7ab97f60fdee9212ca037f93191a92dd1c93f988e
 native_mtp	hip	qwen4_hc_streams_init_from_embed_batched	hc_streams_init_from_embed_batched_bf16	787acbd1a749e1fc28687fbcf31633eeb55da3b85c442e74f139199971744f39
 native_mtp	hip	qwen4_moe_scatter_stable_top10	qwen4_moe_group_prefix,qwen4_moe_group_ranks,qwen4_moe_group_scatter	c0db256b8e7b34be46cf15a14f232951394cb9c4f7d6673d5486066913824621
