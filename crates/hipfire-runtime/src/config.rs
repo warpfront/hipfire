@@ -134,6 +134,12 @@ pub fn retained_redline_default(
     if ep != 1 {
         return false;
     }
+    // Inkling-2-Mini is admitted only through [`inkling2_redline_default`] (its
+    // typed certificate and recipe, a fact of the load): never by a generic
+    // route-SKU, weight-format or file-name allowance.
+    if model_arch.eq_ignore_ascii_case("inkling2") {
+        return false;
+    }
     if model_arch.eq_ignore_ascii_case("muse_glimmer") || model_arch.eq_ignore_ascii_case("gemma4")
     {
         return false;
@@ -197,6 +203,29 @@ pub fn retained_redline_default(
         && tp == 1
         && !has_drafter
         && route == Some(RouteSku::Mq2r)
+}
+
+/// Automatic retained-Redline (PM4) default of Inkling-2-Mini (arch 24, the
+/// frozen one-row decode body). `qualified` is the load's own typed fact
+/// (`hipfire_arch_inkling2::retained_default_qualified`: gfx1201, the Mini fixed
+/// schedule, the typed-XTS certificate, A8 experts with the fused producer
+/// recipe, F16 KV, FA2 attention, and the single product switch
+/// `PM4_DEFAULT_ON`); this adds only the topology: one device (PP = TP = EP = 1)
+/// and no drafter. Every other model, tier or fixture stays on `retained_redline_default`.
+pub fn inkling2_redline_default(
+    gpu_arch: &str,
+    pp: usize,
+    tp: usize,
+    ep: usize,
+    draft: AttachedDraft,
+    qualified: bool,
+) -> bool {
+    qualified
+        && gpu_arch.eq_ignore_ascii_case("gfx1201")
+        && pp == 1
+        && tp == 1
+        && ep == 1
+        && draft == AttachedDraft::None
 }
 
 /// On-context (tokens) at or above which dense native MTP arms under `auto`

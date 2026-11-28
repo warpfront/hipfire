@@ -31,8 +31,8 @@ pub use arch_model::{Inkling2Bundle, Inkling2State};
 pub use carrier::{load_inkling2_bundle, INKLING2_MAX_CONTEXT};
 pub use config::{LoopConfig, ARCH_ID, MTP_SIDECAR_ARCH_ID};
 pub use decode_serve::{
-    admit_row, forward_plain_ar_gpu, release_decode_graph, serve_stats, DecodeBackend, DecodeServe,
-    EagerReason, ServeCounts, ServeRoute, ServeStats,
+    admit_row, forward_plain_ar_gpu, release_decode_graph, retained_default_qualified, serve_stats,
+    DecodeBackend, DecodeServe, EagerReason, ServeCounts, ServeRoute, ServeStats, PM4_DEFAULT_ON,
 };
 pub use decode_step::{
     enqueue_decode_body, enqueue_decode_body_trace, ensure_decode_arena, finish_decode_step,

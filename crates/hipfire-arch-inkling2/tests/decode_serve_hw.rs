@@ -37,7 +37,7 @@ mod oracle;
 use hip_bridge::{launch_counters, memory_effects};
 use hipfire_arch_inkling2::arch_model::{Inkling2Bundle, Inkling2State};
 use hipfire_arch_inkling2::config::Inkling2Config;
-use hipfire_arch_inkling2::decode_replay::{EagerWhy, StepRoute};
+use hipfire_arch_inkling2::decode_replay::{pm4_dev_opt_in, EagerWhy, Pm4Route, StepRoute};
 use hipfire_arch_inkling2::forward::{forward_token_cached, lm_head_logits, CpuDecodeState};
 use hipfire_arch_inkling2::gpu::upload;
 use hipfire_arch_inkling2::weights::Inkling2Weights;
@@ -65,7 +65,28 @@ fn set_graph_flags(gpu: &mut Gpu, graph_ar: bool, graph_forward: Option<bool>) {
     gpu.flags = std::sync::Arc::new(f);
 }
 
+/// The graph tests run with the replay controller on HIP
+/// (`HIPFIRE_REPLAY_BACKEND` unset / `hip`): the route the graph owns.
 fn init_gpu() -> Gpu {
+    let gpu = init_gpu_any();
+    assert!(
+        !pm4_dev_opt_in(&gpu),
+        "the graph tests need HIPFIRE_REPLAY_BACKEND unset or hip"
+    );
+    gpu
+}
+
+/// The PM4 tests run with `HIPFIRE_REPLAY_BACKEND=redline` (PM4 transport).
+fn init_gpu_pm4() -> Gpu {
+    let gpu = init_gpu_any();
+    assert!(
+        pm4_dev_opt_in(&gpu),
+        "the PM4 tests need HIPFIRE_REPLAY_BACKEND=redline (PM4 transport) on gfx1201"
+    );
+    gpu
+}
+
+fn init_gpu_any() -> Gpu {
     for var in ["HIPFIRE_GRAPH", "HIPFIRE_AR_GRAPH"] {
         assert_ne!(
             std::env::var(var).as_deref(),
@@ -136,6 +157,10 @@ struct Rig {
     key: Option<DecodeStepKey>,
     replays: usize,
     captured: usize,
+    /// The PM4 route is under test (warm / record / replay), not the graph.
+    pm4: bool,
+    /// The PM4 executor's eager warm token ran.
+    warmed: bool,
 }
 
 impl Rig {
@@ -146,6 +171,15 @@ impl Rig {
             key: None,
             replays: 0,
             captured: 0,
+            pm4: false,
+            warmed: false,
+        }
+    }
+
+    fn new_pm4(name: &str) -> Self {
+        Self {
+            pm4: true,
+            ..Self::new(name)
         }
     }
 }
@@ -156,6 +190,10 @@ fn route_name(r: &ServeRoute) -> &'static str {
         ServeRoute::Graph(StepRoute::EagerCaptured) => "eager+capture",
         ServeRoute::Graph(StepRoute::Eager(EagerWhy::Sticky(_))) => "graph-eager(sticky)",
         ServeRoute::Graph(StepRoute::Eager(_)) => "graph-eager",
+        ServeRoute::Pm4(Pm4Route::Replay) => "pm4-replay",
+        ServeRoute::Pm4(Pm4Route::Recorded) => "pm4-record",
+        ServeRoute::Pm4(Pm4Route::Warm) => "pm4-warm",
+        ServeRoute::Pm4(Pm4Route::Eager(_)) => "pm4-eager",
         ServeRoute::Eager(EagerReason::Killed) => "eager(killed)",
         ServeRoute::Eager(_) => "eager",
     }
@@ -214,7 +252,59 @@ fn step(
     let glaunch = launch_counters::graph_launch::count() - g0;
     let s1 = serve_stats(b).unwrap();
     let route = last_route(b);
-    if want_replay {
+    if rig.pm4 {
+        let obs = gpu.replay.replay_observation();
+        assert_eq!(glaunch, 0, "pos {pos}: the PM4 route launches no graph");
+        if want_replay {
+            assert_eq!(
+                route,
+                ServeRoute::Pm4(Pm4Route::Replay),
+                "pos {pos} bucket {bucket:?}: expected a replay of the retained PM4 tape"
+            );
+            assert_eq!(route.backend(), DecodeBackend::Pm4);
+            assert_eq!(
+                fxg.launches, 0,
+                "pos {pos}: a PM4 replay issues no HIP module launch"
+            );
+            assert_eq!(
+                (fxg.htod, fxg.dtoh, fxg.dtod, fxg.memset),
+                (1, 1, 0, 0),
+                "pos {pos}: PM4 replay effects {fxg:?}"
+            );
+            assert_eq!(s1.counts.pm4_replays, s0.counts.pm4_replays + 1);
+            assert_eq!(
+                (obs.count, obs.last_position, obs.failed),
+                (s1.counts.pm4_replays, Some(pos), false),
+                "pos {pos}: retained replay observation {obs:?}"
+            );
+            rig.replays += 1;
+        } else if !rig.warmed {
+            assert_eq!(
+                route,
+                ServeRoute::Pm4(Pm4Route::Warm),
+                "pos {pos}: the load's first PM4 step is the eager warm token"
+            );
+            assert_eq!(s1.counts.pm4_warm_steps, s0.counts.pm4_warm_steps + 1);
+            rig.warmed = true;
+        } else {
+            assert_eq!(
+                route,
+                ServeRoute::Pm4(Pm4Route::Recorded),
+                "pos {pos} bucket {bucket:?}: expected the recording token of a new key"
+            );
+            assert_eq!(route.backend(), DecodeBackend::Eager);
+            assert_eq!(
+                fxg.launches, EXPECT_NODES as u64,
+                "pos {pos}: the recording token is one real 1024-launch body"
+            );
+            assert_eq!(s1.counts.pm4_record_steps, s0.counts.pm4_record_steps + 1);
+            assert_eq!(s1.pm4.recordings, s0.pm4.recordings + 1);
+            assert_eq!(s1.pm4.nodes, EXPECT_NODES, "pos {pos}: 1024-dispatch tape");
+            rig.key = Some(plan.key.clone());
+            rig.captured += 1;
+        }
+        assert_eq!(s1.pm4.record_failures, 0, "pos {pos}: no record failure");
+    } else if want_replay {
         assert_eq!(
             route,
             ServeRoute::Graph(StepRoute::Replay),
@@ -316,13 +406,17 @@ fn prewarm(b: &mut Inkling2Bundle, gpu: &mut Gpu, toks: &[u32], max_seq: usize) 
     prefill(b, gpu, &toks[..max_seq.saturating_sub(1).min(2052)]);
 }
 
-fn run_matrix(max_seq: usize, segments: &[(usize, usize, Expect)], name: &str) {
-    let mut gpu = init_gpu();
+fn run_matrix(max_seq: usize, segments: &[(usize, usize, Expect)], name: &str, pm4: bool) {
+    let mut gpu = if pm4 { init_gpu_pm4() } else { init_gpu() };
     let mut b = load(&mut gpu, max_seq);
     admit_row(&b, &gpu).expect("the artifact must be in the admitted row");
     let toks = tokens(max_seq + 16);
     prewarm(&mut b, &mut gpu, &toks, max_seq);
-    let mut rig = Rig::new(name);
+    let mut rig = if pm4 {
+        Rig::new_pm4(name)
+    } else {
+        Rig::new(name)
+    };
     for &s in segments {
         segment(&mut b, &mut gpu, &mut rig, &toks, s);
         // The last legal row's successor and an out-of-order step are refused
@@ -335,28 +429,43 @@ fn run_matrix(max_seq: usize, segments: &[(usize, usize, Expect)], name: &str) {
     bad_state_refusals(&mut b, &mut gpu, &toks);
     let st = serve_stats(&b).unwrap();
     eprintln!(
-        "decode_serve_hw {name}: ALL BITWISE-EQUAL; {} replays, {} captures, {} destroys, {} graph launches, eager steps {} (killed arm), arm steps {}",
+        "decode_serve_hw {name}: ALL BITWISE-EQUAL; pm4 {} replays / {} recordings / {} releases, graph {} replays / {} captures / {} destroys / {} graph launches, eager steps {} (killed arm)",
+        st.counts.pm4_replays,
+        st.pm4.recordings,
+        st.pm4.releases,
         st.counts.graph_replays,
         st.graph.captures,
         st.graph.destroys,
         st.graph.graph_launches,
         st.counts.eager,
-        st.counts.graph_arm_steps
     );
-    assert_eq!(st.counts.graph_replays as usize, rig.replays);
-    assert_eq!(st.counts.graph_arm_steps as usize, rig.captured);
-    assert_eq!(st.graph.graph_launches, st.counts.graph_replays);
-    assert_eq!(st.graph.capture_failures, 0);
-    assert!(st.sticky.is_none());
-    release_decode_graph(&mut b, &mut gpu);
-    assert!(
-        gpu.graphs.graph_exec.is_none(),
-        "release destroyed the graph"
-    );
-    assert!(
-        gpu.graphs.ar_forward_blobs.is_empty(),
-        "release freed the graph-owned blobs"
-    );
+    if pm4 {
+        assert_eq!(st.counts.pm4_replays as usize, rig.replays);
+        assert_eq!(st.pm4.recordings as usize, rig.captured);
+        assert_eq!(st.counts.graph_replays + st.counts.graph_arm_steps, 0);
+        assert!(st.pm4_sticky.is_none() && !st.pm4_quarantined);
+        assert!(release_decode_graph(&mut b, &mut gpu));
+        assert!(
+            !gpu.replay.prepared_pm4_plan_ready(),
+            "release dropped the prepared tape"
+        );
+    } else {
+        assert_eq!(st.counts.graph_replays as usize, rig.replays);
+        assert_eq!(st.counts.graph_arm_steps as usize, rig.captured);
+        assert_eq!(st.graph.graph_launches, st.counts.graph_replays);
+        assert_eq!(st.graph.capture_failures, 0);
+        assert!(st.sticky.is_none());
+        assert_eq!(st.counts.pm4_replays + st.counts.pm4_warm_steps, 0);
+        assert!(release_decode_graph(&mut b, &mut gpu));
+        assert!(
+            gpu.graphs.graph_exec.is_none(),
+            "release destroyed the graph"
+        );
+        assert!(
+            gpu.graphs.ar_forward_blobs.is_empty(),
+            "release freed the graph-owned blobs"
+        );
+    }
 }
 
 fn refusals(b: &mut Inkling2Bundle, gpu: &mut Gpu, last_legal: usize) {
@@ -419,6 +528,7 @@ fn served_graph_vs_eager_clipped_2053() {
             (186, 198, Replay),
         ],
         "serve-clipped2053.jsonl",
+        false,
     );
 }
 
@@ -430,6 +540,7 @@ fn served_graph_vs_eager_4100() {
         4100,
         &[(4090, 4099, Expect::Captured)],
         "serve-cap4100.jsonl",
+        false,
     );
 }
 
@@ -441,6 +552,7 @@ fn served_graph_vs_eager_1024() {
         1024,
         &[(1010, 1023, Expect::Captured), (0, 30, Expect::Captured)],
         "serve-cap1024.jsonl",
+        false,
     );
 }
 
@@ -579,7 +691,7 @@ fn kill_switches_and_ineligible_rows_run_eager() {
         forward_plain_ar_gpu(&mut b, &mut gpu, toks[pos], pos, &mut l).unwrap();
         assert_eq!(last_route(&b), ServeRoute::Graph(StepRoute::Replay));
     }
-    release_decode_graph(&mut b, &mut gpu);
+    assert!(release_decode_graph(&mut b, &mut gpu));
 }
 
 /// A prompt prefill whose last block is ONE row (the one-row tail) runs the
@@ -662,7 +774,7 @@ fn prefill_one_row_tail_never_selects_the_graph() {
             Expect::Auto,
         );
     }
-    release_decode_graph(&mut b, &mut gpu);
+    assert!(release_decode_graph(&mut b, &mut gpu));
 }
 
 /// What the fail-closed rollback does to the Gpu (`invalidate_graph_state`)
@@ -683,10 +795,10 @@ fn rollback_and_release_invalidate_the_tape_without_panic() {
     reset(&mut b, &mut gpu);
     segment(&mut b, &mut gpu, &mut rig, &toks, (150, 153, Captured));
     // Explicit release (what free_gpu does), then the same step range.
-    release_decode_graph(&mut b, &mut gpu);
+    assert!(release_decode_graph(&mut b, &mut gpu));
     assert!(gpu.graphs.graph_exec.is_none());
     segment(&mut b, &mut gpu, &mut rig, &toks, (150, 153, Captured));
-    release_decode_graph(&mut b, &mut gpu);
+    assert!(release_decode_graph(&mut b, &mut gpu));
 }
 
 /// A capture failure after the warm token through the wrapper: that step's
@@ -740,7 +852,7 @@ fn capture_failure_is_sticky_through_the_wrapper() {
     ));
     let st = serve_stats(&b).unwrap();
     assert_eq!((st.graph.replays, st.graph.graph_launches), (0, 0));
-    release_decode_graph(&mut b, &mut gpu);
+    assert!(release_decode_graph(&mut b, &mut gpu));
 }
 
 /// Reload: freeing the load (`ArchModel::free_gpu`) quiesces and destroys its
@@ -785,7 +897,7 @@ fn reload_releases_the_graph_and_starts_a_fresh_executor() {
         &toks,
         (150, 154, Expect::Captured),
     );
-    release_decode_graph(&mut b2, &mut gpu);
+    assert!(release_decode_graph(&mut b2, &mut gpu));
     Box::new(b2).free_gpu(&mut gpu);
 }
 
@@ -818,9 +930,7 @@ fn argmax(v: &[f32]) -> usize {
 /// reference and bars as `gpu_parity::gate3b`) through the SERVED wrapper at
 /// the product default: position 0 arms the graph (eager warm token + capture),
 /// positions 1..3 are graph replays, and every one must clear the same bars.
-#[test]
-#[ignore = "needs the typed-XTS artifact + gfx1201; slow CPU reference"]
-fn gate3b_multi_token_logits_served_graph() {
+fn gate3b_served(pm4: bool) {
     const TOKENS: [u32; 4] = [5000, 12345, 777, 31274];
     const R_MIN: f32 = 0.99;
     let art = std::env::var("INKLING2_MQ4").expect("set INKLING2_MQ4");
@@ -841,7 +951,7 @@ fn gate3b_multi_token_logits_served_graph() {
             want.push(l[..vocab].to_vec());
         }
     }
-    let mut gpu = init_gpu();
+    let mut gpu = if pm4 { init_gpu_pm4() } else { init_gpu() };
     let (gw, gs) = upload(&weights, &cfg, &mut gpu, 64).expect("upload");
     let mut b = Inkling2Bundle {
         config: cfg,
@@ -872,13 +982,238 @@ fn gate3b_multi_token_logits_served_graph() {
         }
     }
     let st = serve_stats(&b).unwrap();
-    assert_eq!(
-        (st.counts.graph_arm_steps, st.counts.graph_replays),
-        (1, 3),
-        "the gate must exercise the graph: 1 arm + 3 replays"
-    );
-    release_decode_graph(&mut b, &mut gpu);
+    if pm4 {
+        assert_eq!(
+            (
+                st.counts.pm4_warm_steps,
+                st.counts.pm4_record_steps,
+                st.counts.pm4_replays
+            ),
+            (1, 1, 2),
+            "the gate must exercise PM4: warm + record + 2 replays"
+        );
+    } else {
+        assert_eq!(
+            (st.counts.graph_arm_steps, st.counts.graph_replays),
+            (1, 3),
+            "the gate must exercise the graph: 1 arm + 3 replays"
+        );
+    }
+    assert!(release_decode_graph(&mut b, &mut gpu));
     Box::new(b).free_gpu(&mut gpu);
     assert!(fails.is_empty(), "gate3b-served: {}", fails.join("; "));
     eprintln!("gate3b-served: PASS");
+}
+
+#[test]
+#[ignore = "needs the typed-XTS artifact + gfx1201; slow CPU reference"]
+fn gate3b_multi_token_logits_served_graph() {
+    gate3b_served(false);
+}
+
+#[test]
+#[ignore = "needs the typed-XTS artifact + gfx1201 + HIPFIRE_REPLAY_BACKEND=redline; slow CPU reference"]
+fn gate3b_multi_token_logits_served_pm4() {
+    gate3b_served(true);
+}
+
+/// The served PM4 route through the same lockstep oracle: warm token, recording
+/// token, retained PM4 replays (bucket crossings, wraps, resets), against the
+/// incumbent eager decode.
+#[test]
+#[ignore = "needs the typed-XTS artifact + gfx1201 + HIPFIRE_REPLAY_BACKEND=redline"]
+fn served_pm4_vs_eager_clipped_2053() {
+    use Expect::*;
+    run_matrix(
+        2053,
+        &[
+            (128, 191, Captured),
+            (190, 194, Replay),
+            (300, 380, Replay),
+            (1022, 1026, Replay),
+            (2046, 2052, Replay),
+            (96, 134, Captured),
+            (186, 198, Replay),
+        ],
+        "serve-pm4-clipped2053.jsonl",
+        true,
+    );
+}
+
+#[test]
+#[ignore = "needs the typed-XTS artifact + gfx1201 + HIPFIRE_REPLAY_BACKEND=redline"]
+fn served_pm4_vs_eager_4100() {
+    run_matrix(
+        4100,
+        &[(4090, 4099, Expect::Captured)],
+        "serve-pm4-cap4100.jsonl",
+        true,
+    );
+}
+
+#[test]
+#[ignore = "needs the typed-XTS artifact + gfx1201 + HIPFIRE_REPLAY_BACKEND=redline"]
+fn served_pm4_vs_eager_1024() {
+    run_matrix(
+        1024,
+        &[(1010, 1023, Expect::Captured), (0, 30, Expect::Captured)],
+        "serve-pm4-cap1024.jsonl",
+        true,
+    );
+}
+
+/// A refused PM4 record (injected: the replay controller is poisoned before
+/// the first step) returns that step's exact eager token once; the load then
+/// leaves PM4 (tape released, controller poisoned) and runs the HIP graph: arm,
+/// then replays, every step exact against the incumbent eager decode.
+#[test]
+#[ignore = "needs the typed-XTS artifact + gfx1201 + HIPFIRE_REPLAY_BACKEND=redline"]
+fn pm4_refusal_falls_back_to_the_graph() {
+    let mut gpu = init_gpu_pm4();
+    let mut b = load(&mut gpu, 400);
+    let toks = tokens(420);
+    prewarm(&mut b, &mut gpu, &toks, 400);
+    reset(&mut b, &mut gpu);
+    prefill(&mut b, &mut gpu, &toks[..140]);
+    gpu.replay
+        .poison("injected: controller poisoned before the first PM4 step");
+    let mut pos = 140;
+    // 1) the PM4 executor sees the poisoned controller: a sticky eager token.
+    let want = {
+        let pre = save_pre(&b, &gpu, pos);
+        let l = served(&mut b, &mut gpu, toks[pos], pos, false).unwrap();
+        restore(&mut b, &gpu, &pre);
+        l
+    };
+    let l = served(&mut b, &mut gpu, toks[pos], pos, true).unwrap();
+    assert!(
+        matches!(
+            last_route(&b),
+            ServeRoute::Pm4(Pm4Route::Eager(EagerWhy::Sticky(_)))
+        ),
+        "{:?}",
+        last_route(&b)
+    );
+    assert_eq!(sha(f32_bytes(&want)), sha(f32_bytes(&l)));
+    assert_eq!(
+        b.gpu_state.as_ref().unwrap().seq_pos,
+        pos + 1,
+        "committed once"
+    );
+    pos += 1;
+    // 2) the load leaves PM4: graph arm, then replays; all exact.
+    let mut rig = Rig::new("serve-pm4-fallback.jsonl");
+    for (i, p) in (pos..pos + 6).enumerate() {
+        let expect = if i == 0 {
+            Expect::Captured
+        } else {
+            Expect::Auto
+        };
+        let r = step(&mut b, &mut gpu, &mut rig, toks[p], p, false, expect);
+        assert!(matches!(r, ServeRoute::Graph(_)), "{r:?}");
+    }
+    let st = serve_stats(&b).unwrap();
+    assert!(st.pm4_sticky.is_some());
+    assert!(!st.pm4_quarantined);
+    assert_eq!((st.counts.graph_arm_steps, st.counts.graph_replays), (1, 5));
+    assert_eq!(st.counts.pm4_replays, 0);
+    assert!(release_decode_graph(&mut b, &mut gpu));
+}
+
+/// Prompt prefill (including a final one-row block) never selects PM4: no
+/// retained replay observation, no served step, and decode afterwards is exact.
+#[test]
+#[ignore = "needs the typed-XTS artifact + gfx1201 + HIPFIRE_REPLAY_BACKEND=redline"]
+fn pm4_prefill_one_row_tail_never_selects_the_route() {
+    let mut gpu = init_gpu_pm4();
+    let mut b = load(&mut gpu, 400);
+    let toks = tokens(420);
+    prewarm(&mut b, &mut gpu, &toks, 400);
+    let mut rig = Rig::new_pm4("serve-pm4-prefill-tail.jsonl");
+    segment(
+        &mut b,
+        &mut gpu,
+        &mut rig,
+        &toks,
+        (60, 65, Expect::Captured),
+    );
+    let s0 = serve_stats(&b).unwrap();
+    let obs0 = gpu.replay.replay_observation();
+    assert!(s0.counts.pm4_replays >= 3);
+    reset(&mut b, &mut gpu);
+    forward_prefill_gpu(&mut b, &mut gpu, &toks[..60], 0, PrefillLogits::None).unwrap();
+    let mut tail = Vec::new();
+    forward_prefill_gpu(
+        &mut b,
+        &mut gpu,
+        &toks[60..61],
+        60,
+        PrefillLogits::Last(&mut tail),
+    )
+    .unwrap();
+    let s1 = serve_stats(&b).unwrap();
+    assert_eq!(s0.counts, s1.counts, "no served step: nothing selected");
+    let obs1 = gpu.replay.replay_observation();
+    assert_eq!(
+        (obs0.count, obs0.last_position),
+        (obs1.count, obs1.last_position),
+        "the prefill tail issued a retained PM4 replay"
+    );
+    reset(&mut b, &mut gpu);
+    forward_prefill_gpu(&mut b, &mut gpu, &toks[..60], 0, PrefillLogits::None).unwrap();
+    let eager = forward_decode_gpu(&mut b, &mut gpu, toks[60], 60).unwrap();
+    assert_eq!(sha(f32_bytes(&tail)), sha(f32_bytes(&eager)));
+    reset(&mut b, &mut gpu);
+    forward_prefill_gpu(&mut b, &mut gpu, &toks[..61], 0, PrefillLogits::None).unwrap();
+    for pos in 61..66 {
+        step(
+            &mut b,
+            &mut gpu,
+            &mut rig,
+            toks[pos],
+            pos,
+            false,
+            Expect::Auto,
+        );
+    }
+    assert!(release_decode_graph(&mut b, &mut gpu));
+}
+
+/// Freeing the load (`ArchModel::free_gpu`) proves the queue idle and drops the
+/// prepared tape before the weights go; a fresh load starts a fresh executor
+/// (warm, record, replay) and is exact.
+#[test]
+#[ignore = "needs the typed-XTS artifact + gfx1201 + HIPFIRE_REPLAY_BACKEND=redline"]
+fn pm4_reload_releases_the_tape_and_starts_fresh() {
+    let mut gpu = init_gpu_pm4();
+    let mut b = load(&mut gpu, 400);
+    let toks = tokens(420);
+    prewarm(&mut b, &mut gpu, &toks, 400);
+    let mut rig = Rig::new_pm4("serve-pm4-reload.jsonl");
+    segment(
+        &mut b,
+        &mut gpu,
+        &mut rig,
+        &toks,
+        (150, 155, Expect::Captured),
+    );
+    assert!(gpu.replay.prepared_pm4_plan_ready(), "a PM4 tape is held");
+    Box::new(b).free_gpu(&mut gpu);
+    assert!(
+        !gpu.replay.prepared_pm4_plan_ready(),
+        "free_gpu released the tape before the weights"
+    );
+    let mut b2 = load(&mut gpu, 400);
+    assert!(serve_stats(&b2).is_none(), "no inherited serving state");
+    prewarm(&mut b2, &mut gpu, &toks, 400);
+    let mut rig2 = Rig::new_pm4("serve-pm4-reload2.jsonl");
+    segment(
+        &mut b2,
+        &mut gpu,
+        &mut rig2,
+        &toks,
+        (150, 155, Expect::Captured),
+    );
+    assert!(release_decode_graph(&mut b2, &mut gpu));
+    Box::new(b2).free_gpu(&mut gpu);
 }

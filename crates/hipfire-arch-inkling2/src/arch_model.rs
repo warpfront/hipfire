@@ -65,7 +65,11 @@ impl ArchModel for Inkling2Bundle {
     fn free_gpu(mut self: Box<Self>, gpu: &mut Gpu) {
         // The active decode graph names the weights, KV, conv, arena and
         // scratch below: quiesce and destroy it before any of them is freed.
-        crate::decode_serve::release_decode_graph(&mut self, gpu);
+        if !crate::decode_serve::release_decode_graph(&mut self, gpu) {
+            // Unproven retirement: quarantined, every owner is leaked.
+            std::mem::forget(self);
+            return;
+        }
         if let Some(gw) = self.gpu_weights {
             gw.free_gpu(gpu);
         }

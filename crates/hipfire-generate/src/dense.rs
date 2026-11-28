@@ -7199,12 +7199,16 @@ pub fn generate_inkling(
             .unwrap_or_default();
         let c1 = s1.as_ref().map(|s| s.counts.clone()).unwrap_or_default();
         eprintln!(
-            "[inkling2] turn decode route: steps={} graph_replays={} graph_arm_steps={} graph_capture_failed_steps={} eager={} sticky={:?}",
+            "[inkling2] turn decode route: steps={} pm4_replays={} pm4_record_steps={} pm4_failed_steps={} graph_replays={} graph_arm_steps={} graph_capture_failed_steps={} eager={} pm4_sticky={:?} graph_sticky={:?}",
             generated_count,
+            c1.pm4_replays - c0.pm4_replays,
+            c1.pm4_record_steps - c0.pm4_record_steps,
+            c1.pm4_failed_steps - c0.pm4_failed_steps,
             c1.graph_replays - c0.graph_replays,
             c1.graph_arm_steps - c0.graph_arm_steps,
             c1.graph_capture_failed_steps - c0.graph_capture_failed_steps,
             c1.eager - c0.eager,
+            s1.as_ref().and_then(|s| s.pm4_sticky.clone()),
             s1.and_then(|s| s.sticky)
         );
     }
@@ -7277,6 +7281,15 @@ pub fn generate_inkling(
             emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
         }
     }
+}
+
+/// Whether the daemon enables the load's retained replay controller (the PM4
+/// route) by default: the typed fact of the Inkling-2-Mini admitted row
+/// (`inkling2::retained_default_qualified`), `false` for every other model. The
+/// one switch is `inkling2::PM4_DEFAULT_ON`.
+pub fn inkling2_retained_default_qualified(m: &LoadedModel, gpu: &rdna_compute::Gpu) -> bool {
+    m.inkling2()
+        .is_some_and(|b| inkling2::retained_default_qualified(b, gpu))
 }
 
 /// Daemon `bench_decode` for Inkling-2-Mini (arch_id=24): the synthetic
@@ -7398,19 +7411,39 @@ pub fn bench_decode_inkling(
             .unwrap_or_default();
         let c1 = after.as_ref().map(|s| s.counts.clone()).unwrap_or_default();
         let g1 = after.as_ref().map(|s| s.graph.clone()).unwrap_or_default();
+        let p1 = after.as_ref().map(|s| s.pm4.clone()).unwrap_or_default();
         let last = after
             .as_ref()
             .and_then(|s| s.last_route.as_ref())
             .map(|r| format!("{r:?}"));
         let ledger = serde_json::json!({
-            "backend": if c1.graph_replays > c0.graph_replays { "graph" } else { "eager" },
+            "backend": if c1.pm4_replays > c0.pm4_replays {
+                "pm4"
+            } else if c1.graph_replays > c0.graph_replays {
+                "graph"
+            } else {
+                "eager"
+            },
             "timed_steps": iterations,
+            "timed_pm4_replays": c1.pm4_replays - c0.pm4_replays,
+            "timed_pm4_record_steps": c1.pm4_record_steps - c0.pm4_record_steps,
+            "timed_pm4_warm_steps": c1.pm4_warm_steps - c0.pm4_warm_steps,
+            "timed_pm4_failed_steps": c1.pm4_failed_steps - c0.pm4_failed_steps,
             "timed_graph_replays": c1.graph_replays - c0.graph_replays,
             "timed_graph_arm_steps": c1.graph_arm_steps - c0.graph_arm_steps,
             "timed_graph_capture_failed_steps":
                 c1.graph_capture_failed_steps - c0.graph_capture_failed_steps,
             "timed_eager_steps": c1.eager - c0.eager,
             "total": {
+                "pm4_replays": c1.pm4_replays,
+                "pm4_record_steps": c1.pm4_record_steps,
+                "pm4_warm_steps": c1.pm4_warm_steps,
+                "pm4_recordings": p1.recordings,
+                "pm4_record_failures": p1.record_failures,
+                "pm4_releases": p1.releases,
+                "pm4_nodes": p1.nodes,
+                "pm4_last_record_ms": p1.last_record_ns as f64 / 1e6,
+                "pm4_last_prepare_ms": p1.last_prepare_ns as f64 / 1e6,
                 "graph_replays": c1.graph_replays,
                 "graph_arm_steps": c1.graph_arm_steps,
                 "eager": c1.eager,
@@ -7421,6 +7454,7 @@ pub fn bench_decode_inkling(
                 "last_capture_ms": g1.last_capture_ns as f64 / 1e6,
                 "total_capture_ms": g1.total_capture_ns as f64 / 1e6,
             },
+            "pm4_sticky": after.as_ref().and_then(|s| s.pm4_sticky.clone()),
             "sticky": after.as_ref().and_then(|s| s.sticky.clone()),
             "arena_refusal": after.as_ref().and_then(|s| s.arena_refusal.clone()),
             "last_route": last,

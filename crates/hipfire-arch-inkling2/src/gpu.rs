@@ -1350,9 +1350,14 @@ impl Inkling2GpuState {
         Ok(())
     }
 
-    pub fn free_gpu(self, gpu: &mut Gpu) {
-        if let Some(mut s) = self.decode_serve {
-            s.release(gpu);
+    pub fn free_gpu(mut self, gpu: &mut Gpu) {
+        if let Some(mut s) = self.decode_serve.take() {
+            if !s.release(gpu) {
+                // Retirement of a retained PM4 submission is unproven: the
+                // tape's owners are never freed or reused (leaked, quarantined).
+                std::mem::forget(self);
+                return;
+            }
         }
         for row in self.k_cache {
             for t in row {

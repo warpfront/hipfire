@@ -2574,7 +2574,7 @@ fn main() {
                             drafter,
                             batched_spec_lanes,
                         );
-                        let redline_default = hipfire_runtime::config::retained_redline_default(
+                        let redline_default = (hipfire_runtime::config::retained_redline_default(
                             &gpu.arch,
                             arch,
                             route_sku,
@@ -2582,7 +2582,14 @@ fn main() {
                             pp,
                             tp, hipfire_loader::admission::effective_ep(m.arch_id),
                             attached,
-                        ) && hipfire_config::devices::redline_platform_refusal().map_or(true, |refusal| {
+                        ) || hipfire_runtime::config::inkling2_redline_default(
+                            &gpu.arch,
+                            pp,
+                            tp,
+                            hipfire_loader::admission::effective_ep(m.arch_id),
+                            attached,
+                            hipfire_generate::dense::inkling2_retained_default_qualified(&m, &gpu),
+                        )) && hipfire_config::devices::redline_platform_refusal().map_or(true, |refusal| {
                             eprintln!("[redline] retained default refused: {refusal}; using the HIP graph");
                             false
                         });
