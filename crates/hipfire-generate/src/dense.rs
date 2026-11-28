@@ -2326,7 +2326,7 @@ pub fn generate_gemma4(
         return;
     }
 
-    let spec = gemma4_eagle_admits(
+    let spec_declined = gemma4_eagle_declines(
         m.speculator.as_deref(),
         tools_nonempty,
         temp,
@@ -2334,6 +2334,10 @@ pub fn generate_gemma4(
         max_tokens,
         cache_cap,
     );
+    if let (Some(reason), Some(_)) = (spec_declined, m.speculator.as_ref()) {
+        crate::engine::fell_back(id, crate::engine::Fallback::SpecToAr, reason);
+    }
+    let spec = spec_declined.is_none();
     let route = if spec {
         hipfire_runtime::session_cache::SessionRoute::Mtp
     } else {
@@ -2346,9 +2350,13 @@ pub fn generate_gemma4(
     // G12: on the engine loop when the flag is set and the load admits it,
     // AR and EAGLE alike; a decline (nothing emitted) keeps the loops below.
     // Logprobs stay legacy.
-    if logprobs_top_k.is_none()
-        && crate::engine::runs_on_engine(crate::ar::GenerationRoute::Gemma4Ar)
-    {
+    if logprobs_top_k.is_some() {
+        crate::engine::fell_back(
+            id,
+            crate::engine::Fallback::NoAdmission,
+            "logprobs run on the legacy loop",
+        );
+    } else if crate::engine::runs_on_engine(crate::ar::GenerationRoute::Gemma4Ar) {
         let protocol = crate::engine::gemma::Gemma4Wire {
             enable_thinking,
             max_think_tokens,
@@ -2379,7 +2387,7 @@ pub fn generate_gemma4(
         ) {
             crate::engine::run::Outcome::Served => return,
             crate::engine::run::Outcome::Declined(reason) => {
-                eprintln!("[engine] gemma4_ar declined, legacy loop: {reason}");
+                crate::engine::fell_back(id, crate::engine::Fallback::EngineToLegacy, &reason);
             }
         }
     }
@@ -3052,28 +3060,40 @@ pub(crate) fn gemma4_eagle_engine_done(
     done["draft_len"] = s.block.into();
 }
 
-/// Whether a Gemma 4 request goes to the EAGLE speculator (`drafter`): the
-/// developer opt-in `HIPFIRE_GEMMA4_EAGLE=1`, tool-free, and one verify block
-/// past its budget fits `cache_cap`. Greedy ones commit the target's batched
-/// verify argmax, which can differ from AR decode on near-tied logits;
-/// sampled and penalized ones draw each verify row with the AR sampler.
-pub(crate) fn gemma4_eagle_admits(
+/// Why a Gemma 4 request does not go to the EAGLE speculator (`drafter`);
+/// `None`: it does. It needs the developer opt-in `HIPFIRE_GEMMA4_EAGLE=1`,
+/// no tools, and one verify block past its budget within `cache_cap`. Greedy
+/// ones commit the target's batched verify argmax, which can differ from AR
+/// decode on near-tied logits; sampled and penalized ones draw each verify
+/// row with the AR sampler.
+pub(crate) fn gemma4_eagle_declines(
     drafter: Option<&dyn hipfire_runtime::spec::Speculator>,
     tools: bool,
     temp: f32,
     prompt_len: usize,
     max_tokens: usize,
     cache_cap: usize,
-) -> bool {
-    !tools
-        && hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
-            .ok()
-            .as_deref()
-            == Some("1")
-        && drafter.is_some_and(|s| {
-            (temp <= 1e-6 || !s.requires_greedy())
-                && spec_ctx_request_fits(prompt_len, max_tokens, s.block_size(), cache_cap)
-        })
+) -> Option<&'static str> {
+    if tools {
+        return Some("a request with tools decodes AR");
+    }
+    if hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return Some("EAGLE verify needs HIPFIRE_GEMMA4_EAGLE=1");
+    }
+    let Some(s) = drafter else {
+        return Some("no speculator is attached");
+    };
+    if temp > 1e-6 && s.requires_greedy() {
+        return Some("the drafter verifies greedy requests only");
+    }
+    if !spec_ctx_request_fits(prompt_len, max_tokens, s.block_size(), cache_cap) {
+        return Some("prompt + budget + one verify block exceed max_seq");
+    }
+    None
 }
 
 /// Muse Glimmer dense text (arch_id=14) eager AR path.

@@ -3779,7 +3779,7 @@ pub fn generate_dflash(
         ) {
             crate::engine::run::Outcome::Served => return true,
             crate::engine::run::Outcome::Declined(reason) => {
-                eprintln!("[engine] qwen4_spec declined, legacy loop: {reason}");
+                crate::engine::fell_back(id, crate::engine::Fallback::EngineToLegacy, &reason);
             }
         }
     }
@@ -11986,7 +11986,7 @@ pub fn generate_qwen4_ar(
         ) {
             crate::engine::run::Outcome::Served => return,
             crate::engine::run::Outcome::Declined(reason) => {
-                eprintln!("[engine] {} declined, legacy loop: {reason}", route.name());
+                crate::engine::fell_back(id, crate::engine::Fallback::EngineToLegacy, &reason);
             }
         }
     }

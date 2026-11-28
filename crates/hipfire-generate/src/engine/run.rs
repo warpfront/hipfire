@@ -94,6 +94,60 @@ pub fn run(
     .unwrap_or_else(Outcome::Declined)
 }
 
+/// Whether this load serves an AR (`spec` false) or speculative request on
+/// the engine before the request's own constraints, on the devices [`run`]
+/// would use; `Err` is the decline [`run`] would give. For the load ack.
+pub(super) fn load_admits(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    spec: bool,
+) -> Result<(), String> {
+    let n_layers = m
+        .state
+        .as_deref_mut()
+        .and_then(|state| state.mesh_family())
+        .map(|family| family.n_layers())
+        .ok_or("the model declares no engine family")?;
+    if let Some(gpus) = m.pp_gpus.take() {
+        let admits = load_declines(m, &gpus, spec);
+        m.pp_gpus = Some(gpus);
+        return admits;
+    }
+    let mesh = match m.engine.as_ref().map(MeshRunner::mesh) {
+        Some(mesh) if mesh.n_devices() == 1 => mesh.clone(),
+        _ => DeviceMesh::single().map_err(|error| format!("one-owner mesh: {error}"))?,
+    };
+    Gpus::lend_single(gpu, &mesh, n_layers, |gpus| load_declines(m, gpus, spec))
+}
+
+/// The load's part of engine admission, before the request's own
+/// constraints: its drafter, model, family and devices. `Err` is the
+/// decline reason.
+fn load_declines(m: &mut LoadedModel, gpus: &Gpus, spec: bool) -> Result<(), String> {
+    if spec {
+        if gpus.devices.len() != 1 {
+            return Err("a pipeline mesh keeps the legacy speculative loop".into());
+        }
+        if m.speculator.is_none() {
+            return Err("no speculator is attached".into());
+        }
+    } else if m.speculator.is_some() {
+        // The engine's rollback attests the target only; a load with a
+        // drafter keeps its legacy loop, whose rollback resets both.
+        return Err("a speculator is attached".into());
+    }
+    let (Some(state), Some(_)) = (m.state.as_deref_mut(), m.tokenizer.as_ref()) else {
+        return Err("the model has no state or tokenizer".into());
+    };
+    if spec && state.spec_target().is_none() {
+        return Err("the model is no speculative target".into());
+    }
+    let family = state
+        .mesh_family()
+        .ok_or("the model declares no engine family")?;
+    family.admit(gpus)
+}
+
 /// Run `body` on the daemon's device lent as the load's one-owner mesh, with
 /// the load's runner on it. `Err`: no mesh or runner (nothing ran).
 pub(super) fn on_one_owner<R>(
@@ -141,6 +195,9 @@ impl Job<'_> {
         if self.request.spec.is_some() {
             return self.serve_spec(m, runner, gpus);
         }
+        if let Err(reason) = load_declines(m, gpus, false) {
+            return Outcome::Declined(reason);
+        }
         let Job {
             stdout,
             id,
@@ -157,28 +214,16 @@ impl Job<'_> {
             conversation_tokens,
             asst_turn_cache,
             spec_deferred_seed,
-            speculator,
             ..
         } = m;
-        // The engine's rollback attests the target only; a load with a drafter
-        // keeps its legacy loop, whose rollback resets both.
-        if speculator.is_some() {
-            return Outcome::Declined("a speculator is attached".into());
-        }
         if let Some(reason) = runner.quarantined() {
             let message = format!("engine mesh quarantined; process restart required: {reason}");
             emit_active_attempt_error(stdout, Some(id), &message, "gpu", false, false);
             return Outcome::Served;
         }
         let (Some(state), Some(tokenizer)) = (state.as_deref_mut(), tokenizer.as_ref()) else {
-            return Outcome::Declined("the model has no state or tokenizer".into());
+            unreachable!("load_declines checked state and tokenizer");
         };
-        let Some(family) = state.mesh_family() else {
-            return Outcome::Declined("the model declares no engine family".into());
-        };
-        if let Err(reason) = family.admit(gpus) {
-            return Outcome::Declined(reason);
-        }
         let budget = match admit_budget(
             prompt.len(),
             request.max_tokens,
@@ -373,6 +418,9 @@ impl Job<'_> {
     /// `Speculator` / `SpecTarget` seam on the one device; the session plan
     /// is the speculative one; a rollback also resets the drafter.
     fn serve_spec(self, m: &mut LoadedModel, runner: &mut MeshRunner, gpus: &mut Gpus) -> Outcome {
+        if let Err(reason) = load_declines(m, gpus, true) {
+            return Outcome::Declined(reason);
+        }
         let Job {
             stdout,
             id,
@@ -394,29 +442,17 @@ impl Job<'_> {
             speculator,
             ..
         } = m;
-        if gpus.devices.len() != 1 {
-            return Outcome::Declined("a pipeline mesh keeps the legacy speculative loop".into());
-        }
-        let Some(drafter) = speculator.as_mut() else {
-            return Outcome::Declined("no speculator is attached".into());
-        };
+        let drafter = speculator
+            .as_mut()
+            .expect("load_declines checked the drafter");
         if let Some(reason) = runner.quarantined() {
             let message = format!("engine mesh quarantined; process restart required: {reason}");
             emit_active_attempt_error(stdout, Some(id), &message, "gpu", false, false);
             return Outcome::Served;
         }
         let (Some(model), Some(tokenizer)) = (state.as_deref_mut(), tokenizer.as_ref()) else {
-            return Outcome::Declined("the model has no state or tokenizer".into());
+            unreachable!("load_declines checked state and tokenizer");
         };
-        if model.spec_target().is_none() {
-            return Outcome::Declined("the model is no speculative target".into());
-        }
-        let Some(family) = model.mesh_family() else {
-            return Outcome::Declined("the model declares no engine family".into());
-        };
-        if let Err(reason) = family.admit(gpus) {
-            return Outcome::Declined(reason);
-        }
         let budget = match admit_budget(
             prompt.len(),
             request.max_tokens,

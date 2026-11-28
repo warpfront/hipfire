@@ -441,9 +441,10 @@ pub fn wire_aborted(id: &str, reason: &str, attempt_id: u64) -> serde_json::Valu
 ///
 /// Field set matches the Qwen AR cancellation writer (prompt/decode timings
 /// zeroed; completion_tokens carries tokens generated before cancel). G12:
-/// `loop` is `legacy`; the engine loop's cancel writer overrides it.
+/// `loop` is `legacy`; the engine loop's cancel writer overrides it. The
+/// request's engine fallbacks ([`note_fallback`]) are stamped.
 pub fn wire_aborted_done(id: &str, completion_tokens: usize, attempt_id: u64) -> serde_json::Value {
-    serde_json::json!({
+    let mut done = serde_json::json!({
         "type": "done",
         "id": id,
         "finish_reason": "aborted",
@@ -453,7 +454,48 @@ pub fn wire_aborted_done(id: &str, completion_tokens: usize, attempt_id: u64) ->
         "decode_ms": 0,
         "attempt_id": attempt_id,
         "loop": "legacy",
-    })
+    });
+    if let Some(obj) = done.as_object_mut() {
+        stamp_fallback(obj, attempt_id);
+    }
+    done
+}
+
+thread_local! {
+    /// G12: the engine fallbacks of this thread's singleton request
+    /// (`id`, attempt), in the order they happened.
+    static FALLBACK: std::cell::RefCell<Option<(String, u64, Vec<serde_json::Value>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// G12, engine loop only: request `id` (`attempt_id`) left the route it
+/// asked for (`kind`, e.g. `engine_to_legacy`) because of `reason`. Its
+/// terminals list every such step as `fallback` ([`stamp_fallback`]); a
+/// request without one carries no `fallback`.
+pub fn note_fallback(id: &str, attempt_id: u64, kind: &str, reason: &str) {
+    if !crate::config::get().engine_loop {
+        return;
+    }
+    let step = serde_json::json!({ "kind": kind, "reason": reason });
+    FALLBACK.with(|cell| match &mut *cell.borrow_mut() {
+        Some((at, attempt, steps)) if at == id && *attempt == attempt_id => steps.push(step),
+        slot => *slot = Some((id.to_owned(), attempt_id, vec![step])),
+    });
+}
+
+/// Add the fallbacks noted for this terminal's request (`id` of `obj`,
+/// `attempt_id`) as `fallback`, unless `obj` carries its own.
+pub fn stamp_fallback(obj: &mut serde_json::Map<String, serde_json::Value>, attempt_id: u64) {
+    let Some(id) = obj.get("id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let steps = FALLBACK.with(|cell| match &*cell.borrow() {
+        Some((at, attempt, steps)) if at == id && *attempt == attempt_id => Some(steps.clone()),
+        _ => None,
+    });
+    if let Some(steps) = steps {
+        obj.entry("fallback").or_insert(steps.into());
+    }
 }
 
 #[cfg(test)]

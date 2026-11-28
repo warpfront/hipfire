@@ -21,7 +21,7 @@ use super::chatml::{ChatMl, ChatMlStream, Host, WireProtocol};
 use super::gemma::{Gemma4Stream, Gemma4Wire};
 use super::sched::{Batch, Ended, Place, Scheduler};
 use super::spec::{DraftForwards, Plan, SpecDone, SpecRequest};
-use super::{admit_budget, DoneMetrics, Exit, Finish, Next, RequestRun, Verdict};
+use super::{admit_budget, DoneMetrics, Exit, Fallback, Finish, Next, RequestRun, Verdict};
 use crate::ar::*;
 use crate::batch::{drain_qwen_batch_inbox, is_vmm_batch_request_eligible};
 use crate::common::{
@@ -121,6 +121,40 @@ struct Live {
     /// A speculative request in a window lane: its drafter's `done` fields
     /// at the park, its lane windows counted on.
     lane_spec: Option<SpecDone>,
+    /// The steps by which it left the route it asked for, once each.
+    fallback: Vec<(Fallback, String)>,
+}
+
+impl Live {
+    fn fell_back(&mut self, step: Fallback, reason: &str) {
+        if self.fallback.iter().all(|(s, _)| *s != step) {
+            eprintln!("[engine] {}: {} ({reason})", self.key.id, step.kind());
+            self.fallback.push((step, reason.to_string()));
+        }
+    }
+
+    /// Its fallbacks on `done` (and so on its `commit_ready`).
+    fn stamp_fallback(&self, done: &mut serde_json::Value) {
+        if !self.fallback.is_empty() {
+            done["fallback"] = self
+                .fallback
+                .iter()
+                .map(|(step, reason)| serde_json::json!({ "kind": step.kind(), "reason": reason }))
+                .collect();
+        }
+    }
+
+    /// Its fallbacks for the cancel's `done` ([`emit_engine_cancel`]).
+    fn publish_fallback(&self) {
+        for (step, reason) in &self.fallback {
+            hipfire_runtime::semantic::note_fallback(
+                &self.key.id,
+                self.key.attempt_id,
+                step.kind(),
+                reason,
+            );
+        }
+    }
 }
 
 /// A request's wire protocol and its stream state, as its route declares it.
@@ -144,6 +178,21 @@ enum Wire {
 }
 
 impl Wire {
+    /// Whether the request sets a minimum token count or a think budget: the
+    /// driver then forces tokens, which a lane's windows never are.
+    fn forces_tokens(&self) -> bool {
+        match self {
+            Wire::ChatMl {
+                min_tokens,
+                max_think_tokens,
+                ..
+            } => *min_tokens > 0 || *max_think_tokens > 0,
+            Wire::Gemma {
+                max_think_tokens, ..
+            } => *max_think_tokens > 0,
+        }
+    }
+
     fn emit(
         &mut self,
         host: &mut Host<'_>,
@@ -569,6 +618,10 @@ impl Driver {
             // A running speculative request holds the load's drafter.
             m.speculator.as_deref().or(self.core.drafter()),
         );
+        let (spec, declined) = match spec {
+            Ok(spec) => (Some(spec), None),
+            Err(declined) => (None, declined),
+        };
         let tag = NEXT_TAG
             .fetch_update(
                 std::sync::atomic::Ordering::Relaxed,
@@ -600,8 +653,12 @@ impl Driver {
             spec_route: None,
             invalidated: false,
             lane_spec: None,
+            fallback: Vec::new(),
         };
-        self.lives[idx] = Some(live);
+        let live = self.lives[idx].insert(live);
+        if let Some(reason) = declined {
+            live.fell_back(Fallback::SpecToAr, &reason);
+        }
         self.core.admit(idx);
         Ok(())
     }
@@ -637,6 +694,8 @@ impl Driver {
             let live = self.lives[idx]
                 .take()
                 .ok_or("awaiting terminal has no request")?;
+            // A cancel's `done` carries the request's fallbacks too.
+            live.publish_fallback();
             let _scope =
                 BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             if !commit {
@@ -871,7 +930,7 @@ fn lanes_of(m: &mut LoadedModel) -> Option<&mut dyn MeshLanes> {
 /// The speculative route a batched request takes on this load, as its
 /// singleton would: native Qwen4 MTP or DFlash2 (the route selector picks
 /// `Qwen4Spec`), or Gemma 4 EAGLE (the opt-in, one window past the budget
-/// fits). `None`: it decodes AR.
+/// fits). `Err(Some(reason))`: it decodes AR; `Err(None)`: no drafter.
 #[allow(clippy::too_many_arguments)]
 fn speculative(
     m: &LoadedModel,
@@ -884,26 +943,29 @@ fn speculative(
     stops: bool,
     gpu_arch: &str,
     drafter: Option<&dyn Speculator>,
-) -> Option<SpecRequest> {
-    let drafter = drafter?;
+) -> Result<SpecRequest, Option<String>> {
+    // `Err(None)`: no drafter; `Err(Some(reason))`: the request decodes AR.
+    let drafter = drafter.ok_or(None)?;
     if route == GenerationRoute::Gemma4Ar {
-        let cache_cap = m.gemma4()?.state.max_seq;
-        return crate::dense::gemma4_eagle_admits(
+        let cache_cap = m.gemma4().ok_or(None)?.state.max_seq;
+        if let Some(reason) = crate::dense::gemma4_eagle_declines(
             Some(drafter),
             false,
             sampler.temperature,
             prompt_len,
             budget,
             cache_cap,
-        )
-        .then(|| SpecRequest {
+        ) {
+            return Err(Some(reason.to_string()));
+        }
+        return Ok(SpecRequest {
             config: crate::dense::gemma4_spec_config(sampler, seed, false),
             stamp: crate::dense::gemma4_eagle_engine_done,
         });
     }
-    (crate::batch::batch_generation_route(&req.original_msg, m, Some(drafter))
-        == GenerationRoute::Qwen4Spec)
-        .then(|| SpecRequest {
+    let inputs = crate::batch::batch_route_inputs(&req.original_msg, m, Some(drafter));
+    match select_generation_route(&inputs) {
+        GenerationRoute::Qwen4Spec => Ok(SpecRequest {
             config: crate::qwen::qwen_spec_config(
                 m,
                 drafter,
@@ -914,7 +976,12 @@ fn speculative(
                 0.0,
             ),
             stamp: crate::qwen::qwen_spec_engine_done,
-        })
+        }),
+        other => Err(Some(qwen4_spec_declines(&inputs).map_or_else(
+            || format!("route {} does not verify drafts", other.name()),
+            str::to_string,
+        ))),
+    }
 }
 
 /// The record whose conversation `prompt` continues (the longest): its
@@ -1227,6 +1294,7 @@ impl<'a> Ctx<'a> {
         let mut live = self.lives[idx]
             .take()
             .expect("an ended request is admitted");
+        live.publish_fallback();
         let released = match place {
             Place::Resident if spec_reset => {
                 let cancel = matches!(exit, Exit::Aborted);
@@ -1354,6 +1422,7 @@ impl<'a> Ctx<'a> {
         };
         let mut done = metrics.done_value(&live.key.id, finish_reason);
         live.wire.stamp_done(&mut done, &metrics);
+        live.stamp_fallback(&mut done);
         if let (Some((spec_done, invalidated)), Some(spec)) = (spec, live.spec.as_ref()) {
             (spec.stamp)(&mut done, &spec_done);
             live.invalidated = invalidated;
@@ -1625,22 +1694,25 @@ impl Batch for Ctx<'_> {
             (lanes.windows(), lanes.sampled_windows())
         });
         let live = self.live(idx);
-        match &live.spec {
-            None => !windows,
-            Some(_) => {
-                windows
-                    && (live.sampler.temperature <= 0.0 || sampled)
-                    && hipfire_runtime::sampler::PenaltyTable::flags_for(&live.sampler) == 0
-                    && matches!(
-                        live.wire,
-                        Wire::ChatMl {
-                            min_tokens: 0,
-                            max_think_tokens: 0,
-                            ..
-                        }
-                    )
+        let declined = match &live.spec {
+            None if windows => Some("the lanes run speculative windows only"),
+            None => None,
+            Some(_) if !windows => Some("the lanes run no speculative windows"),
+            Some(_) if live.sampler.temperature > 0.0 && !sampled => {
+                Some("the lanes do not continue a sampled window stream")
             }
+            Some(_) if hipfire_runtime::sampler::PenaltyTable::flags_for(&live.sampler) != 0 => {
+                Some("lane windows apply no penalties")
+            }
+            Some(_) if live.wire.forces_tokens() => {
+                Some("a minimum token count or think budget forces tokens, lane windows do not")
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = declined {
+            live.fell_back(Fallback::LaneToResident, reason);
         }
+        declined.is_none()
     }
 
     /// The drafter's state moves into the lane with the resident state; the

@@ -1465,26 +1465,27 @@ pub fn emit_staged_terminal_done_outcome(
             claimed = true;
         }
     }
-    let stamped;
-    let pending_done = match pending_done.as_object() {
-        Some(obj) if !obj.contains_key("loop") => {
-            let mut obj = obj.clone();
-            stamp_legacy_loop(&mut obj);
-            stamped = serde_json::Value::Object(obj);
-            &stamped
-        }
-        _ => pending_done,
-    };
-    let delivered = writeln!(stdout, "{}", pending_done).is_ok() && stdout.flush().is_ok();
+    let mut stamped = pending_done.clone();
+    if let Some(obj) = stamped.as_object_mut() {
+        stamp_legacy_loop(obj);
+    }
+    let delivered = writeln!(stdout, "{}", stamped).is_ok() && stdout.flush().is_ok();
     TerminalEmitOutcome::new(claimed, delivered)
 }
 
 /// G12: every staged terminal names the loop that produced it. The engine
 /// loop stages its own `"loop": "engine"`, so a missing field is a legacy
-/// loop. Applied to `commit_ready` and `done` alike, so the client sees the
-/// same payload in both.
+/// loop. A request that fell back from the route it asked for lists why
+/// (`fallback`, [`hipfire_runtime::semantic::note_fallback`]). Applied to
+/// `commit_ready` and `done` alike, so the client sees the same payload in
+/// both.
 fn stamp_legacy_loop(obj: &mut serde_json::Map<String, serde_json::Value>) {
     obj.entry("loop").or_insert_with(|| "legacy".into());
+    let attempt_id = obj
+        .get("attempt_id")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_else(active_attempt_id);
+    hipfire_runtime::semantic::stamp_fallback(obj, attempt_id);
 }
 
 /// The `commit_ready` of a staged `done`: the same payload (the `loop` stamp

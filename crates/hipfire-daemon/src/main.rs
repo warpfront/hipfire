@@ -2958,6 +2958,7 @@ fn main() {
                                 seq_kv,
                             );
                             let ack = load_summary::ack_with_summary(ack, &summary);
+                            let ack = hipfire_generate::engine::loaded_ack(ack, &mut m, &mut gpu);
                             let _ = writeln!(stdout, "{ack}");
                         } else {
                             let ack = format!(
@@ -2999,6 +3000,7 @@ fn main() {
                                 staging.row_budget,
                                 &mut gpu,
                             );
+                            let ack = hipfire_generate::engine::loaded_ack(ack, &mut m, &mut gpu);
                             emit_load_phases();
                             let _ = writeln!(stdout, "{ack}");
                         }

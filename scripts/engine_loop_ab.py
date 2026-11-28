@@ -409,8 +409,13 @@ def strip_timing(v):
     return v
 
 
+# Route metadata, not output: `loop`, the engine `fallback` steps and the load
+# ack's `engine` capabilities differ by arm by design (HIPF-631).
+ROUTE_KEYS = ("loop", "fallback", "engine")
+
+
 def done_view(done):
-    return {k: v for k, v in strip_timing(done).items() if k != "loop"}
+    return {k: v for k, v in strip_timing(done).items() if k not in ROUTE_KEYS}
 
 
 # Note kinds. Only DIFF fails a scenario; UNEXERCISED marks a scenario that did not

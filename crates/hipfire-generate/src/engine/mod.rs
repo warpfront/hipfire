@@ -47,6 +47,150 @@ const ENGINE_ROUTES: &[crate::ar::GenerationRoute] = &[
     crate::ar::GenerationRoute::Gemma4Ar,
 ];
 
+/// How a request left the route it asked for on the engine loop. Each step is
+/// listed, in order, as `fallback` on its terminals (`done`, `commit_ready`,
+/// the cancel's `done`); a request that took its route lists none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fallback {
+    /// The engine loop is on, but the request's route or settings never ask it.
+    NoAdmission,
+    /// The engine declined the request; a legacy loop serves it.
+    EngineToLegacy,
+    /// A drafter is attached, but the request decodes AR.
+    SpecToAr,
+    /// The request stays on the resident state while peers decode in lanes.
+    LaneToResident,
+}
+
+impl Fallback {
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::NoAdmission => "no_admission",
+            Self::EngineToLegacy => "engine_to_legacy",
+            Self::SpecToAr => "spec_to_ar",
+            Self::LaneToResident => "lane_to_resident",
+        }
+    }
+}
+
+/// The active singleton request `id` fell back (`step`) for `reason`: its
+/// terminals carry it (engine loop only).
+pub fn fell_back(id: &str, step: Fallback, reason: &str) {
+    if !hipfire_runtime::config::get().engine_loop {
+        return;
+    }
+    eprintln!("[engine] {id}: {} ({reason})", step.kind());
+    hipfire_runtime::semantic::note_fallback(
+        id,
+        hipfire_engine::terminal::active_attempt_id(),
+        step.kind(),
+        reason,
+    );
+}
+
+/// The load ack with `engine`: what this load runs on the engine loop, by
+/// the same admission a request meets, for a greedy request without
+/// constraints. `ar` and `verify` (`null` without a drafter) each say whether
+/// that route runs on the engine and, if not, why; `session_reuse` whether a
+/// follow-up turn can restore its prefix; `lanes` (`null` unless the engine
+/// scheduler serves lanes) what its lanes hold and run. A request's own
+/// constraints can still decline it; its terminal then names the step
+/// ([`Fallback`]).
+pub fn loaded_ack(
+    ack: String,
+    m: &mut hipfire_loader::LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&ack) else {
+        return ack;
+    };
+    v["engine"] = capabilities(m, gpu);
+    v.to_string()
+}
+
+fn capabilities(
+    m: &mut hipfire_loader::LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> serde_json::Value {
+    use crate::ar::GenerationRoute;
+    let greedy = serde_json::json!({
+        "temperature": 0.0,
+        "repeat_penalty": 1.0,
+        "presence_penalty": 0.0,
+    });
+    let route = |m: &hipfire_loader::LoadedModel, drafter| {
+        crate::batch::batch_generation_route(&greedy, m, drafter)
+    };
+    let decision = |engine: Result<(), String>| match engine {
+        Ok(()) => serde_json::json!({ "engine": true }),
+        Err(reason) => serde_json::json!({ "engine": false, "reason": reason }),
+    };
+    let on_engine = |route: GenerationRoute| {
+        if runs_on_engine(route) {
+            Ok(())
+        } else {
+            Err(format!("route {} has no engine loop", route.name()))
+        }
+    };
+    let ar_route = route(m, None);
+    let ar = on_engine(ar_route).and_then(|()| run::load_admits(m, gpu, false));
+    let mut ar = decision(ar);
+    ar["route"] = ar_route.name().into();
+    let drafter = m.speculator.as_deref().map(|drafter| {
+        let spec_route = route(m, Some(drafter));
+        let admits = if spec_route == GenerationRoute::Gemma4Ar {
+            // A Gemma 4 request verifies inside its AR route.
+            let cap = m.max_seq;
+            match crate::dense::gemma4_eagle_declines(Some(drafter), false, 0.0, 0, 1, cap) {
+                Some(reason) => Err(reason.to_string()),
+                None => Ok(()),
+            }
+        } else if spec_route == GenerationRoute::Qwen4Spec {
+            Ok(())
+        } else {
+            Err(format!(
+                "route {} does not verify drafts",
+                spec_route.name()
+            ))
+        };
+        (drafter.name().to_string(), spec_route, admits)
+    });
+    let verify = match drafter {
+        None => serde_json::Value::Null,
+        Some((name, spec_route, admits)) => {
+            let verify = admits
+                .and_then(|()| on_engine(spec_route))
+                .and_then(|()| run::load_admits(m, gpu, true));
+            let mut verify = decision(verify);
+            verify["drafter"] = name.into();
+            verify["route"] = spec_route.name().into();
+            verify
+        }
+    };
+    let session_reuse = m
+        .state
+        .as_deref()
+        .is_some_and(|state| state.session_cache_attached());
+    let lanes = crate::batch::engine_lanes_route(m)
+        .and_then(|_| m.state.as_deref_mut()?.mesh_family()?.mesh_lanes())
+        .map_or(serde_json::Value::Null, |lanes| {
+            serde_json::json!({
+                "capacity": lanes.lane_capacity(),
+                "step_rows": lanes.lane_rows(),
+                "windows": lanes.windows(),
+                "sampled_windows": lanes.sampled_windows(),
+                "records": lanes.keeps_records(),
+            })
+        });
+    serde_json::json!({
+        "loop": if hipfire_runtime::config::get().engine_loop { "engine" } else { "legacy" },
+        "ar": ar,
+        "verify": verify,
+        "session_reuse": session_reuse,
+        "lanes": lanes,
+    })
+}
+
 /// The budget a request may decode, or the `context_length` refusal, decided
 /// before `gen_start`: `prompt + max_tokens + 1` trailer row must fit `max_seq`.
 pub fn admit_budget(

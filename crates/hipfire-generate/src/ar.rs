@@ -1844,6 +1844,70 @@ pub struct GenerationRouteInputs {
     pub kv_adaptive: bool,
 }
 
+/// Why a Qwen4 request (`i.arch_id` 16, not EP) decodes AR instead of
+/// verifying drafts; `None`: it takes `Qwen4Spec`. One decision for the
+/// route and the engine's `spec_to_ar` reason.
+///
+/// Qwen4 native MTP verifies greedy picks, and sampled requests too when the
+/// drafter reports `supports_temp_verify`: speculative rejection sampling
+/// against the AR sampler's own distribution (`llama::sample_top_k_p`:
+/// temperature, the request's top_k and min_p, top_p; the verifier's target
+/// applies the same cuts, so they do not demote the request). At temperature
+/// 0 the AR producer reduces to argmax and ignores top_p/top_k/min_p (see
+/// `greedy_on_gpu` in `generate_ar_with_forward`), so their presence on the
+/// wire must not demote the request: serve forwards top_p/top_k whenever the
+/// client or the registry sets one. Sampled verification applies the
+/// request's penalties to every target row against the full prompt + emitted
+/// history (`hipfire_runtime::spec_sampling::PenaltyHistory`), so a penalized
+/// sampled request keeps the MTP route. A penalized greedy request, adaptive
+/// KV, or a force-AR switch keeps the request on the ordinary Qwen4 producer
+/// (penalize-then-argmax). Qwen4 PP uses the same native driver for greedy
+/// requests and for unpenalized sampled Leviathan requests
+/// (distribution-exact; `supports_temp_verify` is false under the Q8-EF state
+/// gate and, under PP, for `HIPFIRE_MTP_SAMPLED_MODE=naive`, whose draws come
+/// from the process-wide sampler: those stay on the PP AR producer).
+/// Penalized requests stay on the PP AR producer too: the GPU penalty prepass
+/// refuses the mesh. Neither enters the Qwen3.5-only PP route.
+///
+/// The other Qwen4 speculator is DFlash2 (`--spec dflash`, single card): it
+/// verifies greedy picks, or sampled rows with the AR sampler's law
+/// (temperature, top_k, top_p, min_p), and applies no token penalties, so a
+/// penalized request keeps the AR producer. Any other speculator stays on AR.
+pub(crate) fn qwen4_spec_declines(i: &GenerationRouteInputs) -> Option<&'static str> {
+    if !i.has_speculator {
+        return Some("no speculator is attached");
+    }
+    if i.force_ar_chat {
+        return Some("HIPFIRE_DFLASH_CHAT=0 forces AR");
+    }
+    if i.kv_adaptive {
+        return Some("adaptive KV decodes AR");
+    }
+    let sampled = i.temp > 1e-6;
+    if sampled && !i.supports_temp_verify {
+        return Some("the drafter cannot verify this sampled request");
+    }
+    if i.speculator_is_mtp {
+        if i.nonneutral_penalties && i.pp > 1 {
+            return Some("a penalized request on a pipeline mesh decodes AR");
+        }
+        if i.nonneutral_penalties && !sampled {
+            return Some("a penalized greedy request decodes AR");
+        }
+        return None;
+    }
+    if i.speculator_is_dflash2 {
+        if i.pp > 1 {
+            return Some("DFlash2 runs on one card");
+        }
+        if i.nonneutral_penalties {
+            return Some("DFlash2 applies no token penalties");
+        }
+        return None;
+    }
+    Some("the drafter is neither native MTP nor DFlash2")
+}
+
 /// Pure production route selector. Precedence is intentional and exhaustive.
 pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     // 1. Expert-parallel first (before any arch short-circuit). Dense TP is the
@@ -1874,47 +1938,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     // 2. Arch short-circuits (Qwen2, DeepSeek4, LFM, Cohere, MiniMax, dots).
     match i.arch_id {
         16 => {
-            // Qwen4 native MTP verifies greedy picks, and sampled requests
-            // too when the drafter reports `supports_temp_verify`:
-            // speculative rejection sampling
-            // against the AR sampler's own distribution
-            // (`llama::sample_top_k_p`: temperature, the request's top_k and
-            // min_p, top_p; the verifier's target applies the same cuts, so
-            // they do not demote the request). At temperature 0 the AR producer
-            // reduces to argmax and ignores top_p/top_k/min_p (see
-            // `greedy_on_gpu` in `generate_ar_with_forward`), so their
-            // presence on the wire must not demote the request: serve
-            // forwards top_p/top_k whenever the client or the registry sets
-            // one. Sampled verification applies the request's penalties to
-            // every target row against the full prompt + emitted history
-            // (`hipfire_runtime::spec_sampling::PenaltyHistory`), so a
-            // penalized sampled request keeps the MTP route. A penalized
-            // greedy request, adaptive KV, or a force-AR switch keeps the
-            // request on the ordinary Qwen4 producer (penalize-then-argmax).
-            // Qwen4 PP uses the same native driver for greedy requests and
-            // for unpenalized sampled Leviathan requests (distribution-exact;
-            // `supports_temp_verify` is false under the Q8-EF state gate
-            // and, under PP, for `HIPFIRE_MTP_SAMPLED_MODE=naive`, whose draws
-            // come from the process-wide sampler: those stay on the PP AR
-            // producer). Penalized requests stay on the PP AR producer too:
-            // the GPU penalty prepass refuses the mesh. Neither enters the
-            // Qwen3.5-only PP route.
-            let mtp_ok = i.speculator_is_mtp
-                && (i.pp <= 1 || !i.nonneutral_penalties)
-                && (i.temp <= 1e-6 || i.supports_temp_verify)
-                && (!i.nonneutral_penalties || (i.temp > 1e-6 && i.supports_temp_verify));
-            // The other Qwen4 speculator is DFlash2 (`--spec dflash`, single
-            // card): it verifies greedy picks, or sampled rows with the AR
-            // sampler's law (temperature, top_k, top_p, min_p), and applies
-            // no token penalties, so a penalized request keeps the AR
-            // producer. Any other speculator stays on AR.
-            let dflash2_ok = i.speculator_is_dflash2
-                && i.pp <= 1
-                && !i.nonneutral_penalties
-                && (i.temp <= 1e-6 || i.supports_temp_verify);
-            let spec_ok =
-                i.has_speculator && (mtp_ok || dflash2_ok) && !i.force_ar_chat && !i.kv_adaptive;
-            return if spec_ok {
+            return if qwen4_spec_declines(i).is_none() {
                 GenerationRoute::Qwen4Spec
             } else {
                 GenerationRoute::Qwen4Ar
@@ -2775,6 +2799,17 @@ pub fn generate(
                  decode AR (greedy and unpenalized sampled leviathan requests run MTP)"
             );
         }
+    }
+    // G12: a Qwen4 request the drafter does not verify, or a route the engine
+    // loop does not run, says so on its terminal.
+    if selected_route == GenerationRoute::Qwen4Ar && route_inputs.has_speculator {
+        if let Some(reason) = qwen4_spec_declines(&route_inputs) {
+            crate::engine::fell_back(id, crate::engine::Fallback::SpecToAr, reason);
+        }
+    }
+    if !crate::engine::runs_on_engine(selected_route) {
+        let reason = format!("route {} has no engine loop", selected_route.name());
+        crate::engine::fell_back(id, crate::engine::Fallback::NoAdmission, &reason);
     }
     let tools_nonempty = tools.map(|t| !t.is_empty()).unwrap_or(false);
     if tools_nonempty && !selected_route.supports_tools() {
@@ -7066,6 +7101,35 @@ mod qwen4_pp_route_tests {
             supports_temp_verify: false,
             supports_chain_nucleus_verify: false,
             kv_adaptive: false,
+        }
+    }
+
+    /// `qwen4_spec_declines` gives a reason exactly when the route formula
+    /// it replaced kept a Qwen4 request on AR.
+    #[test]
+    fn qwen4_spec_declines_matches_the_route_formula() {
+        for bits in 0u32..1 << 9 {
+            let b = |n: u32| bits & (1 << n) != 0;
+            let mut i = inputs(16, if b(0) { 2 } else { 1 });
+            i.has_speculator = b(1);
+            i.speculator_is_mtp = b(2);
+            i.speculator_is_dflash2 = b(3) && !b(2);
+            i.temp = if b(4) { 0.7 } else { 0.0 };
+            i.nonneutral_penalties = b(5);
+            i.supports_temp_verify = b(6);
+            i.force_ar_chat = b(7);
+            i.kv_adaptive = b(8);
+            let mtp_ok = i.speculator_is_mtp
+                && (i.pp <= 1 || !i.nonneutral_penalties)
+                && (i.temp <= 1e-6 || i.supports_temp_verify)
+                && (!i.nonneutral_penalties || (i.temp > 1e-6 && i.supports_temp_verify));
+            let dflash2_ok = i.speculator_is_dflash2
+                && i.pp <= 1
+                && !i.nonneutral_penalties
+                && (i.temp <= 1e-6 || i.supports_temp_verify);
+            let spec_ok =
+                i.has_speculator && (mtp_ok || dflash2_ok) && !i.force_ar_chat && !i.kv_adaptive;
+            assert_eq!(qwen4_spec_declines(&i).is_none(), spec_ok, "{i:?}");
         }
     }
 

@@ -363,14 +363,23 @@ pub fn is_batch_request_eligible(
 }
 
 /// The generation route a batched request would take as a singleton
-/// ([`select_generation_route`] over the request's resolved sampling) with
-/// `drafter` as the load's speculator (passed explicitly: a speculative
-/// request on the engine holds the load's drafter while it runs).
+/// ([`select_generation_route`] over [`batch_route_inputs`]).
 pub(crate) fn batch_generation_route(
     msg: &serde_json::Value,
     m: &LoadedModel,
     drafter: Option<&dyn hipfire_runtime::spec::Speculator>,
 ) -> GenerationRoute {
+    select_generation_route(&batch_route_inputs(msg, m, drafter))
+}
+
+/// The route inputs of a batched request (its resolved sampling) with
+/// `drafter` as the load's speculator (passed explicitly: a speculative
+/// request on the engine holds the load's drafter while it runs).
+pub(crate) fn batch_route_inputs(
+    msg: &serde_json::Value,
+    m: &LoadedModel,
+    drafter: Option<&dyn hipfire_runtime::spec::Speculator>,
+) -> GenerationRouteInputs {
     let sampling = resolve_batch_sampling(msg, m);
     let user_explicit = [
         "top_p",
@@ -385,7 +394,7 @@ pub(crate) fn batch_generation_route(
     let ngram_can_sample = drafter.map(|s| !s.requires_greedy()).unwrap_or(false);
     let supports_temp_verify = drafter.is_some_and(|s| s.supports_temp_verify());
     let supports_chain_nucleus_verify = drafter.is_some_and(|s| s.supports_chain_nucleus_verify());
-    select_generation_route(&GenerationRouteInputs {
+    GenerationRouteInputs {
         arch_id: m.arch_id,
         ep: m.ep.is_some(),
         dense_tp: matches!(
@@ -409,7 +418,7 @@ pub(crate) fn batch_generation_route(
         supports_temp_verify,
         supports_chain_nucleus_verify,
         kv_adaptive: m.kv_adaptive.is_some(),
-    })
+    }
 }
 
 /// Batch eligibility predicate shape shared by the Qwen continuous-batch
