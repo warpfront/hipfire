@@ -134,12 +134,6 @@ pub fn retained_redline_default(
     if ep != 1 {
         return false;
     }
-    // Inkling-2-Mini is admitted only through [`inkling2_redline_default`] (its
-    // typed certificate and recipe, a fact of the load): never by a generic
-    // route-SKU, weight-format or file-name allowance.
-    if model_arch.eq_ignore_ascii_case("inkling2") {
-        return false;
-    }
     if model_arch.eq_ignore_ascii_case("muse_glimmer") || model_arch.eq_ignore_ascii_case("gemma4")
     {
         return false;
