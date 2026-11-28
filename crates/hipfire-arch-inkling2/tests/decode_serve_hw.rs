@@ -245,6 +245,7 @@ fn step(
     poison(b, gpu, rig.salt);
     let s0 = serve_stats(b).unwrap();
     let g0 = launch_counters::graph_launch::count();
+    let obs0 = gpu.replay.replay_observation();
     let fx0 = memory_effects::snapshot();
     let lg = served(b, gpu, tok, pos, true)
         .unwrap_or_else(|e| panic!("pos {pos}: graph arm failed: {e}"));
@@ -274,7 +275,7 @@ fn step(
             assert_eq!(s1.counts.pm4_replays, s0.counts.pm4_replays + 1);
             assert_eq!(
                 (obs.count, obs.last_position, obs.failed),
-                (s1.counts.pm4_replays, Some(pos), false),
+                (obs0.count + 1, Some(pos), false),
                 "pos {pos}: retained replay observation {obs:?}"
             );
             rig.replays += 1;
