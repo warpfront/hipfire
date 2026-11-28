@@ -161,6 +161,16 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
+    // One wave per 16x16 tile sister of MB8 (gemm_f16_wmma_n16_gfx12 over
+    // ceil(n / 16) column tiles; bitwise MB8): gfx12 source only.
+    registry.register(KernelVariant {
+        key: KernelKey::GemmF16WmmaColsGfx12,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
     // F32 batched — generic, runs on every arch.
     registry.register(KernelVariant {
         key: KernelKey::GemmF32Batched,

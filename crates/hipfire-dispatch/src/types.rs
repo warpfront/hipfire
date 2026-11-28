@@ -386,6 +386,9 @@ pub enum KernelKey {
     GemmF16,
     GemmF16Tiled,
     GemmF16WmmaMb8,
+    // gfx12 MB8 with one wave per 16x16 tile (`Gpu::gemm_f16_wmma_cols_gfx12`):
+    // bitwise MB8 at ceil(n / 16) times its waves (prefill row blocks).
+    GemmF16WmmaColsGfx12,
     GemmF32Batched,
     // BF16 x BF16 -> F32 via CDNA3 `v_mfma_f32_16x16x16bf16_1k`
     // (kernels/src/gemm_bf16_mfma.gfx942.hip). gfx942-only: the wrapper

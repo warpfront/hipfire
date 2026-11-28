@@ -28928,10 +28928,10 @@ impl Gpu {
         )
     }
 
-    /// Whether [`Self::gemm_f16_wmma_n16_gfx12`] can serve the shape: gfx12
-    /// WMMA, `1..=16` activation rows, `k % 16 == 0`, 16-byte aligned operands,
+    /// Whether [`Self::gemm_f16_wmma_cols_gfx12`] can serve the shape: gfx12
+    /// WMMA, `n >= 1` activation rows, `k % 16 == 0`, 16-byte aligned operands,
     /// full extents.
-    pub fn gemm_f16_wmma_n16_admitted(
+    pub fn gemm_f16_wmma_cols_admitted(
         &self,
         w: &GpuTensor,
         x: &GpuTensor,
@@ -28940,16 +28940,30 @@ impl Gpu {
         n: usize,
     ) -> bool {
         self.arch_caps.has_wmma_w32_gfx12()
-            && (1..=16).contains(&n)
+            && n > 0
             && m > 0
             && k > 0
             && k % 16 == 0
             && i32::try_from(m).is_ok()
             && i32::try_from(k).is_ok()
+            && i32::try_from(n).is_ok()
             && m.checked_mul(k).is_some_and(|e| w.buf.size() >= e * 2)
             && n.checked_mul(k).is_some_and(|e| x.buf.size() >= e * 4)
             && (w.buf.as_ptr() as usize) % 16 == 0
             && (x.buf.as_ptr() as usize) % 16 == 0
+    }
+
+    /// Whether [`Self::gemm_f16_wmma_n16_gfx12`] can serve the shape: the
+    /// [`Self::gemm_f16_wmma_cols_admitted`] contract with `1..=16` rows.
+    pub fn gemm_f16_wmma_n16_admitted(
+        &self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        n <= 16 && self.gemm_f16_wmma_cols_admitted(w, x, m, k, n)
     }
 
     /// One-column-tile sister of [`Self::gemm_f16_wmma_mb8`] on gfx12 for
@@ -28977,6 +28991,48 @@ impl Gpu {
                 ),
             ));
         }
+        self.launch_gemm_f16_wmma_cols(w, x, y, m, k, n)
+    }
+
+    /// [`Self::gemm_f16_wmma_mb8`] on gfx12 for any row count with one wave
+    /// per 16 x 16 output tile (see [`Self::gemm_f16_wmma_cols_admitted`]):
+    /// the same `wmma_f32_16x16x16_f16` chain per column tile, so `Y` is
+    /// bit-identical to `gemm_f16_wmma_mb8`, at `ceil(n / 16)` times its waves
+    /// (prefill row blocks: mb8 runs 32 waves for the 128 x 2304 router at 512
+    /// rows). Grid `[ceil(m / 16), ceil(n / 16)]`, block `[32]`.
+    pub fn gemm_f16_wmma_cols_gfx12(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.gemm_f16_wmma_cols_admitted(w, x, m, k, n)
+            || n.checked_mul(m).is_none_or(|e| y.buf.size() < e * 4)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_f16_wmma_cols_gfx12: shape m={m} k={k} n={n} not admitted on {} \
+                     (needs gfx12 WMMA, k % 16 == 0, 16-byte aligned operands, full extents)",
+                    self.arch
+                ),
+            ));
+        }
+        self.launch_gemm_f16_wmma_cols(w, x, y, m, k, n)
+    }
+
+    fn launch_gemm_f16_wmma_cols(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
             "gemm_f16_wmma_mb8_gfx12",
@@ -28997,11 +29053,11 @@ impl Gpu {
             &mut ki as *mut _ as *mut c_void,
             &mut ni as *mut _ as *mut c_void,
         ];
-        let grid_m = m.div_ceil(16) as u32;
+        let grid = [m.div_ceil(16) as u32, n.div_ceil(16) as u32, 1];
         launch_params_blob!(
             self,
             "gemm_f16_wmma_n16_gfx12",
-            [grid_m, 1, 1],
+            grid,
             [32, 1, 1],
             0,
             params; wp, xp, yp, mi, ki, ni

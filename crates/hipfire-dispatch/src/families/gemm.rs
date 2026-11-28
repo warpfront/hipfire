@@ -609,6 +609,9 @@ impl GemmFamily {
             K::GemmF16 => hip!(gpu.gemm_f16(w.buf, x, y, m, k, batch_size)),
             K::GemmF16Tiled => hip!(gpu.gemm_f16_tiled(w.buf, x, y, m, k, batch_size)),
             K::GemmF16WmmaMb8 => hip!(gpu.gemm_f16_wmma_mb8(w.buf, x, y, m, k, batch_size)),
+            K::GemmF16WmmaColsGfx12 => {
+                hip!(gpu.gemm_f16_wmma_cols_gfx12(w.buf, x, y, m, k, batch_size))
+            }
             K::GemmF32Batched => hip!(gpu.gemm_f32_batched(w.buf, x, y, m, k, batch_size)),
             // Pure BF16 x BF16 -> F32. Takes `&DeviceBuffer` rather than the
             // family's `&GpuTensor` convention, so reach through to the buffers.

@@ -185,3 +185,96 @@ fn gemm_f16_wmma_n16_matches_mb8_bitwise_hw() {
     gpu.free_tensor(wt).unwrap();
     gpu.free_tensor(xt).unwrap();
 }
+
+/// `gemm_f16_wmma_cols_gfx12` (the same kernel over ceil(n / 16) column tiles) against mb8
+/// at prefill row counts: bitwise, no write past `n` rows, and (router shape) timed.
+fn run_cols(gpu: &mut Gpu, g: &mut Lcg, m: usize, k: usize, ns: &[usize], time: bool) {
+    let w: Vec<f32> = (0..m * k).map(|_| g.unit() * 0.08).collect();
+    let (wt, _) = upload_f16(gpu, &w);
+    let n_max = *ns.iter().max().unwrap();
+    let x_all: Vec<f32> = (0..n_max * k)
+        .map(|i| {
+            let v = g.unit();
+            match i % 97 {
+                0 => v * 3.0e-6,
+                1 => v * 900.0,
+                _ => v * 1.7,
+            }
+        })
+        .collect();
+    let xt = gpu.upload_f32(&x_all, &[x_all.len()]).expect("upload x");
+    for &n in ns {
+        let sentinel = vec![f32::from_bits(SENTINEL); n * m + m];
+        let y_ref = gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y_ref");
+        let y_new = gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y_new");
+        let x_view = xt.sub_offset(0, n * k);
+        assert!(gpu.gemm_f16_wmma_cols_admitted(&wt, &x_view, m, k, n));
+        gpu.gemm_f16_wmma_mb8(&wt, &x_view, &y_ref, m, k, n)
+            .expect("mb8");
+        gpu.gemm_f16_wmma_cols_gfx12(&wt, &x_view, &y_new, m, k, n)
+            .expect("cols");
+        gpu.hip.device_synchronize().expect("sync");
+        let a = gpu.download_f32(&y_ref).expect("download");
+        let b = gpu.download_f32(&y_new).expect("download");
+        for i in 0..n * m {
+            assert_eq!(
+                a[i].to_bits(),
+                b[i].to_bits(),
+                "m {m} k {k} n {n}: cols differs from mb8 at {i}: {} vs {}",
+                b[i],
+                a[i]
+            );
+        }
+        for (i, v) in b.iter().enumerate().skip(n * m) {
+            assert_eq!(
+                v.to_bits(),
+                SENTINEL,
+                "m {m} k {k} n {n}: wrote past the output at {i}"
+            );
+        }
+        eprintln!("m {m:5} k {k:5} n {n:4}: cols bitwise == mb8");
+        if time && n == n_max {
+            let mb8 = median_ms(gpu, |g| {
+                g.gemm_f16_wmma_mb8(&wt, &x_view, &y_ref, m, k, n).unwrap()
+            });
+            let cols = median_ms(gpu, |g| {
+                g.gemm_f16_wmma_cols_gfx12(&wt, &x_view, &y_new, m, k, n)
+                    .unwrap()
+            });
+            eprintln!("    m {m} k {k} n {n}: ms mb8 {mb8:.4}  cols {cols:.4}");
+        }
+        for t in [y_ref, y_new] {
+            gpu.free_tensor(t).unwrap();
+        }
+    }
+    gpu.free_tensor(xt).unwrap();
+    gpu.free_tensor(wt).unwrap();
+}
+
+#[test]
+#[ignore = "needs a gfx12 GPU"]
+fn gemm_f16_wmma_cols_matches_mb8_bitwise_hw() {
+    let mut gpu = Gpu::init().expect("GPU required");
+    if !gpu.arch_caps.has_wmma_w32_gfx12() {
+        eprintln!("skip: {} has no gfx12 WMMA", gpu.arch);
+        return;
+    }
+    let mut g = Lcg(0x5eed_c015);
+    // Inkling-2 router (blocked prefill: 512-row blocks and ragged tails), ragged M, small K.
+    let ns = [1, 16, 17, 31, 100, 129, 511, 512];
+    run_cols(&mut gpu, &mut g, 128, 2304, &ns, true);
+    run_cols(&mut gpu, &mut g, 130, 2304, &[17, 200], false);
+    run_cols(&mut gpu, &mut g, 40, 272, &[33, 300], false);
+    let wt = gpu.alloc_tensor(&[64 * 24], DType::F32).unwrap();
+    let xt = gpu.alloc_tensor(&[17 * 24], DType::F32).unwrap();
+    assert!(
+        !gpu.gemm_f16_wmma_cols_admitted(&wt, &xt, 64, 24, 1),
+        "k % 16 != 0"
+    );
+    assert!(
+        !gpu.gemm_f16_wmma_cols_admitted(&wt, &xt, 16, 16, 0),
+        "n == 0"
+    );
+    gpu.free_tensor(wt).unwrap();
+    gpu.free_tensor(xt).unwrap();
+}

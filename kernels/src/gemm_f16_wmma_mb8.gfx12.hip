@@ -90,24 +90,28 @@ extern "C" __global__ void gemm_f16_wmma_mb8_gfx12(
     }
 }
 
-// N <= 16 sister of gemm_f16_wmma_mb8_gfx12 (one WMMA column tile; the F16
-// GEMV / small-batch lm_head shape behind `Gpu::gemm_f16_batched_lmhead`).
+// One-column-tile sister of gemm_f16_wmma_mb8_gfx12: block (x, y) computes the
+// 16 x 16 output tile at rows 16x, columns 16y. Launched with one column tile
+// for N <= 16 (the F16 GEMV / small-batch lm_head shape behind
+// `Gpu::gemm_f16_batched_lmhead`) and with ceil(N / 16) of them for prefill
+// row blocks (`Gpu::gemm_f16_wmma_cols_gfx12`, the blocked Inkling-2 router).
 //
-// Bit-identical to gemm_f16_wmma_mb8_gfx12 for 1 <= N <= 16: there grid.y is 1
-// and the only accumulator ever stored is acc[0] (the nb >= 1 tiles cover
-// columns >= 16 and are never written). This kernel issues the SAME
-// wmma_f32_16x16x16_f16 chain into that accumulator: same per-lane operand
-// mapping (lane_m = A row / B column, k_grp = K half), A taken bit for bit
-// from W, B rounded F32 -> F16 by the same conversion, zero operands for rows
-// >= M / columns >= N, ascending k0, zero-initialised, same stores.
+// Bit-identical to gemm_f16_wmma_mb8_gfx12 at every N: mb8 keeps column tile
+// t = 8 * blockIdx.y + nb in accumulator acc[nb] and stores it; this kernel
+// issues the SAME wmma_f32_16x16x16_f16 chain into its one accumulator for
+// tile blockIdx.y: same per-lane operand mapping (lane_m = A row / B column,
+// k_grp = K half), A taken bit for bit from W, B rounded F32 -> F16 by the
+// same conversion, zero operands for rows >= M / columns >= N, ascending k0,
+// zero-initialised, same stores.
 //
-// It differs only in scheduling: the seven dead column tiles are gone, and
-// each lane fetches its operands as 16-byte vectors N16_UNROLL steps ahead of
-// the chain (the mb8 body issues 8 scalar F16 loads per step and waits on them
+// It differs only in scheduling: one wave per 16 x 16 tile (mb8 runs one wave
+// per eight tiles: 32 waves for the M=128, K=2304, N=512 router), and each
+// lane fetches its operands as 16-byte vectors N16_UNROLL steps ahead of the
+// chain (the mb8 body issues 8 scalar F16 loads per step and waits on them
 // before each WMMA: ~93 us for M=128, K=2304, N=1 on gfx1201).
 //
 // Requires K % 16 == 0 and 16-byte aligned W / X (launcher-checked).
-// Grid: (ceil(M / 16), 1, 1). Block: 32 threads.
+// Grid: (ceil(M / 16), ceil(N / 16), 1). Block: 32 threads.
 
 #ifndef N16_UNROLL
 #define N16_UNROLL 16
@@ -119,7 +123,7 @@ typedef float        f32x4_t __attribute__((ext_vector_type(4)));
 __launch_bounds__(32)
 extern "C" __global__ void gemm_f16_wmma_n16_gfx12(
     const _Float16* __restrict__ W,   // [M, K] row-major F16 (weights)
-    const float*    __restrict__ X,   // [N, K] row-major F32 (input), N <= 16
+    const float*    __restrict__ X,   // [N, K] row-major F32 (input)
     float*          __restrict__ Y,   // [N, M] row-major F32 (transposed output)
     int M, int K, int N
 ) {
@@ -129,6 +133,12 @@ extern "C" __global__ void gemm_f16_wmma_n16_gfx12(
     const int k_grp = tid >> 4;
 
     if (row_start >= M) return;
+
+    // Column tile blockIdx.y: its 16 X rows / Y rows, N counted from there.
+    const int col_start = blockIdx.y * 16;
+    X += (long long)col_start * K;
+    Y += (long long)col_start * M;
+    N -= col_start;
 
     const bool a_in = row_start + lane_m < M;
     const bool b_in = lane_m < N;

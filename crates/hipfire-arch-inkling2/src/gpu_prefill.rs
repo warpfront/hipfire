@@ -1154,7 +1154,8 @@ fn linear(
 }
 
 /// F16 router `[n_experts, e]` over `rows` rows: the gfx12 F16 WMMA (`mb8`)
-/// chain the singleton router runs, one column per row (bitwise per row).
+/// chain the singleton router runs, one column per row (bitwise per row), at
+/// one wave per 16 x 16 tile (`GemmF16WmmaColsGfx12`: 256 waves at 512 rows).
 fn router_rows(
     gpu: &mut Gpu,
     w: &WeightTensor,
@@ -1180,7 +1181,7 @@ fn router_rows(
     };
     GEMM_FAMILY
         .run_key(
-            KernelKey::GemmF16WmmaMb8,
+            KernelKey::GemmF16WmmaColsGfx12,
             &ctx,
             gpu,
             &GemmParams {
