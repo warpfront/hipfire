@@ -406,6 +406,14 @@ impl Driver {
                 break;
             }
         }
+        // Peak requests holding state at once, for each of them
+        // (`continuous_batch.max_active_lanes`).
+        let active = self.core.active();
+        for &idx in &active {
+            if let Some(BatchLane::Running(lane)) = sched.lanes.get_mut(idx) {
+                lane.max_active_lanes = lane.max_active_lanes.max(active.len());
+            }
+        }
         let mut ctx = Ctx::of(
             &mut self.lives,
             self.max_batch_tokens,

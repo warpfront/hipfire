@@ -264,11 +264,13 @@ still hold it after its bench returned.
   one window (`rounds` > 0). An AR fallback fails the run instead of counting
   as a spec row (e.g. `"gemma4_eagle"`, HIPF-633). With `"gemma4_eagle"` and a
   legacy `ref`, G-tok compares token ids without positions (intended diff 6).
-- `require_overlap`: a k>1 engine cell with an overlap-rejected sample (the
-  bench's serialization check) fails. Without it the cell is listed as
-  `serialized` only: the bench reports a cell `ok` when its backend is
-  serialized by design. The receipt also lists `max_active_lanes` per cell
-  (the most lanes any request's `continuous_batch` saw).
+- `require_overlap`: a k>1 cell of an engine `batch` arm with an
+  overlap-rejected sample (the bench's serialization check) fails. A `noslots`
+  arm runs one request at a time by design and is not gated. Without the key
+  the cell is listed as `serialized` only: the bench reports a cell `ok` when
+  its backend is serialized by design. The receipt also lists
+  `max_active_lanes` per cell (the most requests that held state at the same
+  time as any request of the cell).
 
 Per cell (workload, k) the receipt reports the median over runs of output
 tok/s (Σ tokens / sample wall), TTFT p50/p99 from `t_send` (a client-side queue

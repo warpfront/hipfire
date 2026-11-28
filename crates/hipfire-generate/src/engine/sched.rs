@@ -227,6 +227,16 @@ impl Scheduler {
             || !self.queue.is_empty()
     }
 
+    /// Requests that hold state (resident or in a lane), by index.
+    pub fn active(&self) -> Vec<usize> {
+        self.reqs
+            .iter()
+            .enumerate()
+            .filter(|(_, req)| req.as_ref().is_some_and(|req| req.place != Place::Queued))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
     fn lanes(&self) -> impl Iterator<Item = usize> + '_ {
         self.reqs
             .iter()

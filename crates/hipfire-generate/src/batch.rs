@@ -2984,8 +2984,8 @@ fn qwen4_lone_request_takes_lane_for(msg: &serde_json::Value, m: &LoadedModel) -
 /// (Qwen4 single-card lanes; Gemma 4 lanes, staged only on the engine loop)
 /// and that route runs on the engine. A lone request enters it too: it
 /// decodes on the resident state, as the singleton does, until a peer
-/// arrives. Native-MTP lanes run the native MTP drafter's windows; other
-/// drafters' requests (DFlash2, EAGLE) verify on the resident state.
+/// arrives. Native-MTP lanes run the native MTP drafter's windows and Gemma 4
+/// lanes the EAGLE drafter's; DFlash2 requests verify on the resident state.
 pub fn engine_lanes_route(m: &LoadedModel) -> Option<GenerationRoute> {
     if !m
         .state
@@ -3179,8 +3179,12 @@ pub fn vmm_loaded_ack(
         v["continuous_batch_row_budget"] = serde_json::json!(row_budget);
         v["continuous_batch_row_budget_requested"] = serde_json::json!(p.max_batch_tokens);
         v["continuous_batch_exact"] = serde_json::json!(true);
-        v["continuous_batch_spec"] = serde_json::json!(false);
-        v["continuous_batch_spec_mode"] = serde_json::json!("off");
+        // An EAGLE drafter's requests run their windows in the lanes.
+        let windows = m
+            .gemma4()
+            .is_some_and(hipfire_runtime::mesh_family::MeshLanes::windows);
+        v["continuous_batch_spec"] = serde_json::json!(windows);
+        v["continuous_batch_spec_mode"] = serde_json::json!(if windows { "eagle" } else { "off" });
         return v.to_string();
     }
     if m.qwen4().is_some() {

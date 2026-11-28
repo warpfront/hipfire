@@ -105,32 +105,41 @@ pub fn stage_continuous_batch(
     if let Some(req) = vmm {
         if requested > 1 {
             // Gemma 4 batches only on the engine loop: its N-request
-            // scheduler over whole-step lanes (no legacy batch driver); an
-            // EAGLE drafter's requests verify on its resident state.
+            // scheduler over whole-step lanes (no legacy batch driver). With
+            // an EAGLE drafter (`serve_vmm_batch.spec`) the lanes run its
+            // windows.
             if hipfire_runtime::config::get().engine_loop {
                 let max_seq = m.max_seq;
-                if let Some(bundle) = m.gemma4_mut() {
-                    return Ok(
-                        match bundle.stage_engine_lanes(gpu, requested, req.sampled) {
-                            Ok(()) => {
-                                eprintln!("[daemon] gemma4 engine lanes staged: lanes={requested}");
-                                BatchStaging {
-                                    capable: true,
-                                    slots: requested,
-                                    lane_capacity: max_seq,
-                                    vmm: true,
-                                    row_budget: req.row_budget,
-                                    ..BatchStaging::default()
-                                }
+                let mut speculator = m.speculator.take();
+                let drafter = speculator
+                    .as_deref_mut()
+                    .filter(|_| req.spec)
+                    .map(|spec| spec as &mut dyn hipfire_runtime::spec::Speculator);
+                let windows = drafter.is_some();
+                let staged = m
+                    .gemma4_mut()
+                    .map(|bundle| bundle.stage_engine_lanes(gpu, requested, req.sampled, drafter));
+                m.speculator = speculator;
+                if let Some(staged) = staged {
+                    return Ok(match staged {
+                        Ok(()) => {
+                            eprintln!("[daemon] gemma4 engine lanes staged: lanes={requested} windows={windows}");
+                            BatchStaging {
+                                capable: true,
+                                slots: requested,
+                                lane_capacity: max_seq,
+                                vmm: true,
+                                row_budget: req.row_budget,
+                                ..BatchStaging::default()
                             }
-                            Err(error) => {
-                                eprintln!(
+                        }
+                        Err(error) => {
+                            eprintln!(
                                 "[daemon] gemma4 engine lanes refused: {error} — fallback to sequential"
                             );
-                                BatchStaging::default()
-                            }
-                        },
-                    );
+                            BatchStaging::default()
+                        }
+                    });
                 }
             }
             match crate::continuous_batch_route(m.arch_id) {

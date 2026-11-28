@@ -39,6 +39,7 @@ use hipfire_runtime::spec::{
 };
 use hipfire_runtime::spec_sampling::{accept_naive_prefix, naive_target_sampler, PenaltyHistory};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::sync::{Arc, Mutex};
 
 fn gemma4(target: &mut dyn SpecTarget) -> Result<&mut Gemma4Bundle, String> {
     target
@@ -112,15 +113,22 @@ impl TargetPolicy {
     }
 }
 
+/// The drafter's weights and per-round buffers. Every round restages the
+/// scratch, so the request drafter and the engine's window lanes share one
+/// copy ([`Gemma4Drafter::fork`]); their windows run one at a time.
+struct DraftCore {
+    weights: Gemma4DrafterWeights,
+    scratch: Gemma4DrafterScratch,
+    /// Per-row post-norm hidden of a verify block, `[(k + 1) · dim]`.
+    verify_hidden: GpuTensor,
+}
+
 /// The arch-22 EAGLE drafter riding a Gemma 4 target.
 pub struct Gemma4Drafter {
     config: Gemma4DrafterConfig,
-    weights: Gemma4DrafterWeights,
-    scratch: Gemma4DrafterScratch,
+    core: Arc<Mutex<DraftCore>>,
     /// Target post-norm hidden of the position before the pending seed.
     pending_hidden: GpuTensor,
-    /// Per-row post-norm hidden of a verify block, `[(k + 1) · dim]`.
-    verify_hidden: GpuTensor,
     /// The target's last forward wrote the pending seed's row (a verify row
     /// past the accepted prefix), so the next round's drafter attends it.
     seed_row_cached: bool,
@@ -195,10 +203,12 @@ impl Gemma4Drafter {
         };
         Ok(Self {
             config,
-            weights,
-            scratch,
+            core: Arc::new(Mutex::new(DraftCore {
+                weights,
+                scratch,
+                verify_hidden,
+            })),
             pending_hidden,
-            verify_hidden,
             seed_row_cached: false,
             k: draft_len,
             ctx_capacity: target.state.max_seq,
@@ -211,6 +221,62 @@ impl Gemma4Drafter {
 
     pub fn config(&self) -> &Gemma4DrafterConfig {
         &self.config
+    }
+
+    /// A greedy drafter for one engine window lane: this drafter's weights
+    /// and scratch, a conditioning hidden of its own.
+    pub(crate) fn fork(&self, gpu: &mut Gpu) -> Result<Self, String> {
+        let pending_hidden = gpu
+            .zeros(&[self.config.backbone_hidden], DType::F32)
+            .map_err(|e| format!("gemma4 drafter: lane hidden: {e:?}"))?;
+        Ok(Self {
+            config: self.config.clone(),
+            core: Arc::clone(&self.core),
+            pending_hidden,
+            seed_row_cached: false,
+            k: self.k,
+            ctx_capacity: self.ctx_capacity,
+            vocab: self.vocab,
+            policy: None,
+            logprobs: false,
+            rows: Vec::new(),
+        })
+    }
+
+    /// Take over `from`'s window state (the request moves into this fork's
+    /// lane): its conditioning hidden and whether its seed row is cached.
+    pub(crate) fn adopt_window(&mut self, gpu: &mut Gpu, from: &Self) -> Result<(), String> {
+        if !Arc::ptr_eq(&self.core, &from.core) {
+            return Err("gemma4 drafter: the lane forks another drafter".into());
+        }
+        if from.policy.is_some() || from.logprobs {
+            return Err("gemma4 drafter: a window lane verifies greedy windows only".into());
+        }
+        self.seed_row_cached = from.seed_row_cached;
+        gpu.hip
+            .memcpy_dtod_at(
+                &self.pending_hidden.buf,
+                0,
+                &from.pending_hidden.buf,
+                0,
+                self.config.backbone_hidden * 4,
+            )
+            .map_err(|e| format!("gemma4 drafter: lane hidden copy: {e:?}"))
+    }
+
+    /// The target holds the pending seed's row, which the next round attends.
+    pub(crate) fn seed_row_cached(&self) -> bool {
+        self.seed_row_cached
+    }
+
+    /// Free this drafter's buffers; the last fork frees the shared core.
+    pub(crate) fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.pending_hidden);
+        if let Some(core) = Arc::into_inner(self.core).and_then(|core| core.into_inner().ok()) {
+            let _ = gpu.free_tensor(core.verify_hidden);
+            core.scratch.free_gpu(gpu);
+            core.weights.free_gpu(gpu);
+        }
     }
 
     /// The target's post-norm hidden of its last processed position becomes
@@ -305,17 +371,25 @@ impl MtpDrafter for Gemma4Drafter {
             });
         }
         let k = k.min(self.k);
-        self.scratch
-            .begin_round(gpu, &self.pending_hidden, position, self.seed_row_cached)?;
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| "gemma4 drafter: a panicked window poisoned the drafter")?;
+        let DraftCore {
+            weights,
+            scratch,
+            verify_hidden,
+        } = &mut *core;
+        scratch.begin_round(gpu, &self.pending_hidden, position, self.seed_row_cached)?;
         let mut block = Vec::with_capacity(k + 1);
         block.push(seed);
         for _ in 0..k {
             let prev = *block.last().expect("seeded block");
             block.push(draft_step(
                 gpu,
-                &self.weights,
+                weights,
                 &self.config,
-                &mut self.scratch,
+                scratch,
                 &bundle.weights,
                 &bundle.state,
                 &bundle.config,
@@ -323,7 +397,7 @@ impl MtpDrafter for Gemma4Drafter {
                 position,
             )?);
         }
-        let hidden = self.verify_hidden.sub_offset(0, block.len() * dim);
+        let hidden = verify_hidden.sub_offset(0, block.len() * dim);
         let mut picks = Vec::with_capacity(block.len());
         let greedy = self.policy.is_none();
         let want_rows = !greedy || self.logprobs;
@@ -388,11 +462,7 @@ impl MtpDrafter for Gemma4Drafter {
     }
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
-        let d = *self;
-        let _ = gpu.free_tensor(d.pending_hidden);
-        let _ = gpu.free_tensor(d.verify_hidden);
-        d.scratch.free_gpu(gpu);
-        d.weights.free_gpu(gpu);
+        (*self).free_gpu(gpu);
     }
 
     fn k(&self) -> usize {

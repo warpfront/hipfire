@@ -843,9 +843,17 @@ def conc_self_test():
     assert sj(spec_arm("engine"))["ok"], sj(spec_arm("engine"))
     assert not sj(spec_arm("engine", spec=None))["ok"]
     assert not sj(spec_arm("engine", rounds=0))["ok"]
-    ser = sj(spec_arm("engine", rejected=1))
-    assert ser["fails"] == ["engine-noslots: serialized ['multiturn/4', 'stateless/4']"], ser["fails"]
-    assert sj(spec_arm("engine", rejected=1), {"spec": "gemma4_eagle"})["ok"]
+    # a noslots arm serializes by design; a serialized batch arm fails (HIPF-642)
+    assert sj(spec_arm("engine", rejected=1))["ok"]
+    batch = spec_arm("engine", rejected=1)
+    batch["backend"] = "batch"
+    ser = judge_conc({"legacy-noslots": spec_arm("legacy"), "engine-batch": batch}, eagle, True)
+    assert ser["fails"] == ["engine-batch: serialized ['multiturn/4', 'stateless/4']"], ser["fails"]
+    batch["backend"] = "noslots"
+    assert judge_conc({"legacy-noslots": spec_arm("legacy"), "engine-batch": batch}, eagle, True)["ok"]
+    batch["backend"] = "batch"
+    assert judge_conc({"legacy-noslots": spec_arm("legacy"), "engine-batch": batch},
+                      {"spec": "gemma4_eagle"}, True)["ok"]
     # intended diff 6 on an EAGLE route: positions may differ from legacy, ids may not
     shift = spec_arm("engine")
     for x in shift["reqs"].values():
@@ -1388,11 +1396,12 @@ def judge_conc(arms, c, expect_engine):
             fails.append(f"{tag}: require_reuse without multi-turn follow-ups")
         elif follow and not r["cache_hits"][0] and not c.get("require_reuse"):
             unexercised.append(f"{tag}: no multi-turn follow-up reused a prefix")
-        # `require_overlap`: a k>1 cell with an overlap-rejected (serialized) sample fails;
-        # the bench reports such a cell `ok` on a serialized_by_design backend (HIPF-633)
+        # `require_overlap`: a k>1 cell of a batch arm with an overlap-rejected (serialized)
+        # sample fails; the bench reports such a cell `ok` on a serialized_by_design backend
+        # (HIPF-633). A noslots arm runs one request at a time by design (HIPF-642).
         r["serialized"] = sorted(cell for cell, m in a["cells"].items() if int(cell.split("/")[1]) > 1
                                  and (m.get("overlap_rejected") or not m.get("samples")))
-        if c.get("require_overlap") and r["serialized"]:
+        if c.get("require_overlap") and a["backend"] == "batch" and r["serialized"]:
             fails.append(f"{tag}: serialized {r['serialized']}")
         r["max_active_lanes"] = {cell: max((x["done"].get("continuous_batch", {}).get("max_active_lanes") or 0
                                             for k, x in reqs.items() if k.startswith(cell + "/")), default=None)
