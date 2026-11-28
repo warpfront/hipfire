@@ -43,7 +43,10 @@ use hipfire_arch_inkling2::arch_model::Inkling2Bundle;
 use hipfire_arch_inkling2::decode_replay::{
     graph_dev_opt_in, pm4_dev_opt_in, DecodeGraph, DecodePm4, EagerWhy, Pm4Route, StepRoute,
 };
-use hipfire_arch_inkling2::{ensure_decode_arena, forward_decode_frozen, plan_decode_step};
+use hipfire_arch_inkling2::{
+    ensure_decode_arena, finish_decode_step, forward_decode_frozen, plan_decode_step,
+    stage_decode_input,
+};
 use oracle::{
     compare_post, f32_bytes, load, poison, post_state, prefill, reset, restore, save_pre, sha,
     tokens, witness, Receipt,
@@ -1403,6 +1406,144 @@ fn pm4_recordings_are_byte_identical_and_census() {
     );
     for s in &syms_a {
         eprintln!("    {s}");
+    }
+    p.release(&mut gpu).unwrap();
+}
+
+fn argmax_row(row: &[f32]) -> u32 {
+    row.iter()
+        .enumerate()
+        .max_by(|x, y| x.1.total_cmp(y.1))
+        .map_or(0, |(i, _)| i as u32)
+}
+
+/// Timer-honesty diagnostic (receipts/s4 RESULT.md, "Timer audit"): a real closed-loop
+/// greedy PM4 decode (each input is the previous step's argmax of the D2H'd logits).
+/// Per step it times the three host phases the bench timer covers (stage H2D, PM4
+/// submit + wait to retirement, logits D2H + commit) and prints the GPU-timestamp span
+/// the PM4 queue reports for the IB. Then it re-prepares the SAME recorded tape with
+/// per-dispatch timestamps (perturbing) and prints the GPU time of every dispatch,
+/// summed by kernel symbol. Not a parity test.
+#[test]
+#[ignore = "needs the typed-XTS artifact on a gfx1201 card"]
+fn pm4_gpu_side_timing_breakdown() {
+    use std::time::Instant;
+    let mut gpu = Gpu::init().expect("gpu");
+    assert!(pm4_dev_opt_in(&gpu));
+    let mut b = load(&mut gpu, 400);
+    let toks = tokens(420);
+    prewarm(&mut b, &mut gpu, &toks, 400);
+    reset(&mut b, &mut gpu);
+    prefill(&mut b, &mut gpu, &toks[..128]);
+    let mut p = DecodePm4::new(true, false);
+    let mut logits = Vec::new();
+    let mut next = toks[128];
+    let mut ids = vec![next];
+    for pos in 128..130 {
+        p.forward(&mut b, &mut gpu, next, pos, &mut logits).unwrap();
+        next = argmax_row(&logits);
+        ids.push(next);
+    }
+    let (mut stage, mut replay, mut fin, mut gpu_us) = (vec![], vec![], vec![], vec![]);
+    let step = |b: &mut Inkling2Bundle,
+                gpu: &mut Gpu,
+                pos: usize,
+                next: u32,
+                logits: &mut Vec<f32>,
+                profiled: bool|
+     -> (f64, f64, f64, f64, Vec<u64>) {
+        let gw = b.gpu_weights.as_ref().unwrap();
+        let gs = b.gpu_state.as_mut().unwrap();
+        let mut arena = gs.decode_arena.take().unwrap();
+        let t0 = Instant::now();
+        stage_decode_input(gpu, gw, &mut arena, next, pos as u32).unwrap();
+        let t1 = Instant::now();
+        let (span, spans) = if profiled {
+            let pr = unsafe { gpu.replay.replay_pm4_dispatch_profile(pos) }.unwrap();
+            (pr.timing.span_microseconds(), pr.spans_nanoseconds)
+        } else {
+            let tm = unsafe { gpu.replay.replay_pm4_checked(pos) }.unwrap();
+            (tm.span_microseconds(), vec![])
+        };
+        let t2 = Instant::now();
+        finish_decode_step(gpu, gs, &arena, pos, logits).unwrap();
+        let t3 = Instant::now();
+        gs.decode_arena = Some(arena);
+        let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f64() * 1e3;
+        (ms(t0, t1), ms(t1, t2), ms(t2, t3), span, spans)
+    };
+    for pos in 130..176 {
+        let (s, r, f, g, _) = step(&mut b, &mut gpu, pos, next, &mut logits, false);
+        stage.push(s);
+        replay.push(r);
+        fin.push(f);
+        gpu_us.push(g);
+        next = argmax_row(&logits);
+        ids.push(next);
+    }
+    let stat = |name: &str, v: &[f64], unit: &str| {
+        let mut s = v.to_vec();
+        s.sort_by(f64::total_cmp);
+        eprintln!(
+            "TIMER {name}: mean {:.4} median {:.4} min {:.4} max {:.4} {unit} (n={})",
+            v.iter().sum::<f64>() / v.len() as f64,
+            s[s.len() / 2],
+            s[0],
+            s[s.len() - 1],
+            v.len()
+        );
+    };
+    stat("stage_h2d_host_ms", &stage, "ms");
+    stat("pm4_submit_wait_host_ms", &replay, "ms");
+    stat("logits_d2h_commit_host_ms", &fin, "ms");
+    let tot: Vec<f64> = (0..stage.len())
+        .map(|i| stage[i] + replay[i] + fin[i])
+        .collect();
+    stat("step_total_host_ms", &tot, "ms");
+    let gms: Vec<f64> = gpu_us.iter().map(|u| u / 1e3).collect();
+    stat("pm4_ib_gpu_timestamp_span_ms", &gms, "ms");
+    eprintln!("TIMER ids {:?}", ids);
+    // Same tape, per-dispatch GPU timestamps (perturbing).
+    let n = gpu.replay.recorded_launches().len();
+    gpu.replay
+        .prepare_pm4_dispatch_profile(gpu.device_id as usize, n)
+        .expect("profile prepare");
+    let names: Vec<String> = gpu
+        .replay
+        .recorded_launches()
+        .iter()
+        .map(|l| l.kernel.clone())
+        .collect();
+    let mut by: std::collections::BTreeMap<String, (u64, f64)> = Default::default();
+    let (mut sums, mut ib) = (vec![], vec![]);
+    let mut host = vec![];
+    let nprof = 20usize;
+    for pos in 176..176 + nprof {
+        let (s, r, f, g, spans) = step(&mut b, &mut gpu, pos, next, &mut logits, true);
+        assert_eq!(spans.len(), names.len(), "one span per dispatch");
+        let tot: f64 = spans.iter().map(|&x| x as f64).sum::<f64>() / 1e3;
+        sums.push(tot / 1e3);
+        ib.push(g / 1e3);
+        host.push(s + r + f);
+        for (i, &x) in spans.iter().enumerate() {
+            let e = by.entry(names[i].clone()).or_default();
+            e.0 += 1;
+            e.1 += x as f64 / 1e3;
+        }
+        next = argmax_row(&logits);
+    }
+    stat("profiled_sum_of_dispatch_spans_ms", &sums, "ms");
+    stat("profiled_ib_gpu_timestamp_span_ms", &ib, "ms");
+    stat("profiled_step_total_host_ms", &host, "ms");
+    let mut rows: Vec<_> = by.into_iter().collect();
+    rows.sort_by(|a, c| c.1 .1.total_cmp(&a.1 .1));
+    for (k, (cnt, us)) in rows {
+        eprintln!(
+            "TIMER kernel {k}: launches/token {} us/token {:.1} us/launch {:.2}",
+            cnt / nprof as u64,
+            us / nprof as f64,
+            us / cnt as f64
+        );
     }
     p.release(&mut gpu).unwrap();
 }

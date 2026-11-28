@@ -123,7 +123,7 @@ const USAGE: &str = "usage:
   inkling_kld bench    --model CANDIDATE.hfq --ref REF.kldref --output OUT.json [--n 2048]
                        [--reps 3] [--prefill-routes ...] [--block-rows N (dev)]
   inkling_kld bench-decode --model CANDIDATE.hfq --ref REF.kldref --output OUT.json
-                       [--ctx 128] [--steps 64] [--reps 3] [--body stock|scalar|frozen|frozen-stream|graph|pm4|pm4-stream] [--prefill-routes ...]
+                       [--ctx 128] [--steps 64] [--reps 3] [--body stock|scalar|frozen|frozen-stream|graph|pm4|pm4-stream|pm4-blob] [--prefill-routes ...]
   inkling_kld pair     --base BASE.kldseq --cand CAND.kldseq [--output OUT.json] [--boot 20000] [--seed 1]";
 
 /// Receipt schema written beside every `.kldseq`.
@@ -3355,14 +3355,18 @@ fn bench_decode(a: &Args) -> Result<(), String> {
         Some("graph") => "graph",
         Some("pm4") => "pm4",
         Some("pm4-stream") => "pm4-stream",
+        Some("pm4-blob") => "pm4-blob",
         Some(other) => return Err(format!(
-            "--body: expected stock|scalar|frozen|frozen-stream|graph|pm4|pm4-stream, got {other}"
+            "--body: expected stock|scalar|frozen|frozen-stream|graph|pm4|pm4-stream|pm4-blob, got {other}"
         )),
     };
     let blocked = body != "scalar";
     let frozen = body == "frozen" || body == "frozen-stream";
     let graph = body == "graph";
-    let pm4 = body == "pm4" || body == "pm4-stream";
+    // `pm4-blob` (diagnostic): the PM4 executor's tape recorded, then every step
+    // replays the exact recorded HIP blobs on HIP (kernel-trace comparator).
+    let blob = body == "pm4-blob";
+    let pm4 = body == "pm4" || body == "pm4-stream" || blob;
     let (reference, mmap) = open_ref(&ref_path)?;
     let tokens = reference.tokens(&mmap).map_err(|e| e.to_string())?;
     if ctx == 0 || ctx > tokens.len() {
@@ -3460,7 +3464,15 @@ fn bench_decode(a: &Args) -> Result<(), String> {
                 }
                 &frow
             } else if pm4 {
-                let rep = dp.forward(b, &mut gpu, next, ctx + s, &mut frow)?;
+                let rep = if blob {
+                    match dp.forward_blob_oracle(b, &mut gpu, next, ctx + s, &mut frow) {
+                        Ok(r) => r,
+                        // No tape for this key yet (arena / warm / record steps).
+                        Err(_) => dp.forward(b, &mut gpu, next, ctx + s, &mut frow)?,
+                    }
+                } else {
+                    dp.forward(b, &mut gpu, next, ctx + s, &mut frow)?
+                };
                 match rep.route {
                     Pm4Route::Replay => routes[0] += 1,
                     Pm4Route::Recorded => {
@@ -3527,7 +3539,7 @@ fn bench_decode(a: &Args) -> Result<(), String> {
                 "bench-decode: graph/pm4 rep {r} was not all replay (replay/record/eager = {routes:?}): the run left its one-bucket envelope"
             ));
         }
-        if pm4 && obs != [steps as u64, 0] {
+        if pm4 && !blob && obs != [steps as u64, 0] {
             return Err(format!(
                 "bench-decode: pm4 rep {r} retained-replay observation (count, failed) = {obs:?}, expected [{steps}, 0]"
             ));
@@ -3559,7 +3571,7 @@ fn bench_decode(a: &Args) -> Result<(), String> {
         let s = dp.stats();
         serde_json::json!({
             "eager_steps": s.eager_steps, "warm_steps": s.warm_steps,
-            "replays": s.replays, "recordings": s.recordings,
+            "replays": s.replays, "blob_replays": s.blob_replays, "recordings": s.recordings,
             "record_failures": s.record_failures, "releases": s.releases,
             "nodes": s.nodes, "unique_symbols": s.unique_symbols,
             "eager_launches": s.eager_launches,
