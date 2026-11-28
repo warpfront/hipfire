@@ -594,6 +594,31 @@ def isolation_check(rows):
     return (c["events"], c.get("ids", [])) == (i["events"], i.get("ids", []))
 
 
+def tap_self_test():
+    """The wire tap shows a daemon exit while the client keeps stdin open (HIPF-644)."""
+    import select
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        daemon, tap = d / "daemon", d / "tap"
+        daemon.write_text('#!/usr/bin/env bash\nIFS= read -r request\necho reply\nexit 71\n')
+        tap.write_text(TAP)
+        for f in (daemon, tap):
+            f.chmod(0o755)
+        env = {**os.environ, "TAP_DAEMON": str(daemon), "TAP_OUT": str(d / "wire"), "TAP_FILTER": TAP_FILTER,
+               "TAP_LOAD": '{"spec": 3}'}
+        with subprocess.Popen([str(tap)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env) as p:
+            p.stdin.write(b'{"type": "load"}\n')
+            p.stdin.flush()
+            out = b""
+            while select.select([p.stdout], [], [], 5)[0] and (c := os.read(p.stdout.fileno(), 4096)):
+                out += c
+            assert out == b"reply\n" and p.wait(timeout=5) == 71, out  # EOF and status before stdin closes
+            p.stdin.close()
+        assert json.loads((d / "wire.in").read_text()) == {"type": "load", "params": {"spec": 3}}
+        assert (d / "wire").read_text() == "reply\n"
+
+
 def self_test():
     """GPU-free check of the diff rules and gates (`--self-test`)."""
     def r(text, typ="done", **done):
@@ -725,6 +750,7 @@ def self_test():
     assert isolation_check(part) == UNEXERCISED and ok(part, leg=part)
     part["isolation"][0]["done"]["cached_tokens"] = 5  # the whole prompt restored: judged
     assert isolation_check(part) is False
+    tap_self_test()
     conc_self_test()
     print("self-test ok")
 
