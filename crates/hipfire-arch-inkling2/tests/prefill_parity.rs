@@ -14,7 +14,26 @@
 //!    bytes, conv history, position tags, cursors, and the decode logits;
 //! 3. blocked prefill (`PrefillMode::Blocked`, product arithmetic): the same
 //!    structural state exactly (tags, cursors, `seq_pos`), numeric state and
-//!    logits within the reported budget (GEMM / grouped / FA2 arithmetic).
+//!    logits within an envelope relative to accepted arithmetic (below).
+//!
+//! **Blocked-arm envelope.** The prompt is random tokens, so a probe row can sit
+//! on a near-tie that any accepted arithmetic change flips, and different
+//! arithmetic flips different rows: the ungated grouped-only arm (Stage-1
+//! grouped experts) alone reaches r 0.99458 / KL 1.0e-2 at row 999 (visit 45;
+//! `blocked/runs/oracle3`, 2026-11-27), while rows 0..3 sit near KL 1e-7. So no
+//! absolute per-row r and no per-row KL ratio is a bar. The gated arm is held
+//! to the grouped-only reference arm, measured in this process on the same
+//! prompt (accepted arithmetic without the dense / projection sites the gated
+//! arm adds): per probe row `r >= r_ref(row) - 0.001`; pooled over the probe
+//! rows, `max KL <= max(1e-4, 1.5 * max KL_ref)` and
+//! `mean KL <= 1.5 * mean KL_ref` (the 1e-4 floor covers near-zero rows).
+//! Absolute floors catch gross breakage regardless: finite logits and
+//! r >= 0.99 at every probe row, argmax agreement >= 95%, decode r >= 0.995.
+//!
+//! **Planted fault.** `INKLING2_ORACLE_PLANT=ctrl-swap` swaps the gain and forget
+//! weights of every controller of the first core layer before the gated arms
+//! (the scalar reference keeps the true weights); the gate must then fail on
+//! blocked/512 and blocked/200.
 //!
 //! Probe rows span block boundaries, positions 1023/1024/1025 (relative-bias
 //! extent and the first SWA ring wrap at 1024 rows) and the partial tail.
@@ -313,12 +332,13 @@ fn exact_mismatch(s: &Arm, x: &Arm) -> Option<String> {
     None
 }
 
-/// Metrics of `got` against the scalar reference; structural mismatches and
-/// gate breaches are appended to `fails`.
-fn report(scalar: &Arm, got: &Arm, label: &str, fails: &mut Vec<String>) {
+/// Prints the arm's metrics, pushes structural and absolute-floor breaches to
+/// `fails`, and returns `(r, KL)` per probe row for the envelope gate.
+fn report(scalar: &Arm, got: &Arm, label: &str, fails: &mut Vec<String>) -> Vec<(f64, f64)> {
     if got.tags != scalar.tags || got.caps != scalar.caps || got.seq_pos != scalar.seq_pos {
         fails.push(format!("{label}: tags / cursors / seq_pos differ"));
     }
+    let mut rows = Vec::with_capacity(PROBES.len());
     let mut worst_visit = (0.0f64, 0usize, 0usize);
     for (i, &p) in PROBES.iter().enumerate() {
         let (vr, vi) = (0..scalar.visits[i].len())
@@ -334,9 +354,12 @@ fn report(scalar: &Arm, got: &Arm, label: &str, fails: &mut Vec<String>) {
             max_abs(g, s),
             if am { "=" } else { "DIFF" }
         );
-        if r < 0.995 {
-            fails.push(format!("{label} row {p}: logits r {r}"));
+        if !g.iter().all(|v| v.is_finite()) || r.is_nan() || r < 0.99 {
+            fails.push(format!(
+                "{label} row {p}: logits r {r} (floor 0.99, finite)"
+            ));
         }
+        rows.push((r, k));
     }
     let agree = scalar
         .argmax
@@ -372,6 +395,7 @@ fn report(scalar: &Arm, got: &Arm, label: &str, fails: &mut Vec<String>) {
         }
     }
     eprintln!("  {label}: decode mean KL {:.3e}", klsum / DECODE as f64);
+    rows
 }
 
 #[test]
@@ -421,6 +445,7 @@ fn blocked_prefill_oracle() {
     }
     // Noise reference: the accepted decode-route change (FA2 vs the scalar
     // attention kernel, `attn_fa2 = false`) on the same prompt, same metrics.
+    // (printed for scale; the envelope reference is the grouped-only arm)
     {
         b.gpu_state.as_mut().unwrap().attn_fa2 = false;
         let mut s0 = run_scalar(&mut b, &mut gpu, &toks);
@@ -441,7 +466,21 @@ fn blocked_prefill_oracle() {
         ("blocked", PrefillMode::BLOCKED, 512, true),
         ("blocked", PrefillMode::BLOCKED, 200, true),
     ];
+    let mut grouped: Vec<(f64, f64)> = Vec::new();
+    // Planted once: it stays in place for both gated arms.
+    let mut plant = std::env::var("INKLING2_ORACLE_PLANT").ok();
     for (name, mode, block, gate) in arms {
+        if gate && plant.take().as_deref() == Some("ctrl-swap") {
+            let gw = b.gpu_weights.as_mut().unwrap();
+            if let Some(cs) = gw.layers.iter_mut().find_map(|l| l.controllers.as_mut()) {
+                eprintln!(
+                    "PLANTED: gain/forget swapped on every controller of the first core layer"
+                );
+                for c in cs.iter_mut() {
+                    std::mem::swap(&mut c.gain, &mut c.forget);
+                }
+            }
+        }
         let mut blk = run_prefill(&mut b, &mut gpu, &toks, mode, block);
         decode(&mut b, &mut gpu, &cont, &mut blk);
         eprintln!(
@@ -451,8 +490,34 @@ fn blocked_prefill_oracle() {
         );
         let label = format!("{name}/{block}");
         let mut arm_fails = Vec::new();
-        report(&scalar, &blk, &label, &mut arm_fails);
+        let rows = report(&scalar, &blk, &label, &mut arm_fails);
+        if name == "grouped-only" {
+            grouped = rows.clone();
+        }
         if gate {
+            assert_eq!(
+                grouped.len(),
+                PROBES.len(),
+                "grouped-only runs before the gated arms"
+            );
+            for (i, &p) in PROBES.iter().enumerate() {
+                let (r, r_min) = (rows[i].0, grouped[i].0 - 0.001);
+                if !(r >= r_min) {
+                    arm_fails.push(format!("{label} row {p}: r {r:.7} < {r_min:.7}"));
+                }
+            }
+            let max_kl = |v: &[(f64, f64)]| v.iter().map(|x| x.1).fold(0.0f64, f64::max);
+            let mean_kl = |v: &[(f64, f64)]| v.iter().map(|x| x.1).sum::<f64>() / v.len() as f64;
+            let (kmax, kmax_bar) = (max_kl(&rows), 1e-4f64.max(1.5 * max_kl(&grouped)));
+            let (kmean, kmean_bar) = (mean_kl(&rows), 1.5 * mean_kl(&grouped));
+            eprintln!(
+                "  {label}: pooled KL max {kmax:.3e} (bar {kmax_bar:.3e}), mean {kmean:.3e} (bar {kmean_bar:.3e})"
+            );
+            if !(kmax <= kmax_bar && kmean <= kmean_bar) {
+                arm_fails.push(format!(
+                    "{label}: pooled KL max {kmax:.3e} / mean {kmean:.3e} over bars {kmax_bar:.3e} / {kmean_bar:.3e}"
+                ));
+            }
             fails.extend(arm_fails);
         }
     }
