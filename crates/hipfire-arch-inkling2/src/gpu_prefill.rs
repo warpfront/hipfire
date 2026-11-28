@@ -61,10 +61,10 @@ use rdna_compute::ffn_activation::{
     CombineOrder, FfnActivation, FfnActivationGrouped, FfnActivationGroupedI8, FfnActivationRows,
     FfnAwq, MoeCombine, MoeRouterTopK, RouterKind,
 };
-use rdna_compute::inkling2_attention::{inkling2_attn_fa2_splits, Fa2Bias};
+use rdna_compute::inkling2_attention::{inkling2_attn_fa2_splits, Fa2Bias, Inkling2Fa2DecodePos};
 use rdna_compute::inkling2_attention_prefill::{Inkling2PrefillAttn, INKLING2_ATTN_PREFILL_REL};
 use rdna_compute::inkling2_fuse::{FzRow, FzTarget, Inkling2FzMixNormRot};
-use rdna_compute::inkling2_fuse_post::{FzKv16, Inkling2FzAttnPost};
+use rdna_compute::inkling2_fuse_post::{FzKv16, Inkling2DecodeAddr, Inkling2FzAttnPost};
 use rdna_compute::inkling2_fuse_row::{FzGemvSeg, Inkling2FzRouteRow, FZ_ROUTE_MAX_K};
 use rdna_compute::inkling2_hilo::{Inkling2HiloBlend, Inkling2HiloGemm};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -225,7 +225,7 @@ const PF_SYMBOLS: [&str; 3] = [
     "ink_pf_rotate_awq_slots",
 ];
 
-fn ensure_pf_kernels(gpu: &mut Gpu) -> Result<(), String> {
+pub(crate) fn ensure_pf_kernels(gpu: &mut Gpu) -> Result<(), String> {
     for sym in PF_SYMBOLS {
         gpu.ensure_kernel_public(INKLING2_PF_MODULE, INKLING2_PF_HIP_SRC, sym)
             .map_err(|e| format!("inkling2 prefill: kernel {sym}: {e:?}"))?;
@@ -522,7 +522,7 @@ pub struct PrefillScratch {
 impl PrefillScratch {
     /// `(x_rot, y_gu, y_dn, msg)` F32 element counts and the embed staging
     /// bytes for `rows` block rows.
-    fn sizes(cfg: &Inkling2Config, rows: usize) -> ([usize; 4], usize) {
+    pub(crate) fn sizes(cfg: &Inkling2Config, rows: usize) -> ([usize; 4], usize) {
         let e = cfg.n_embd;
         let slots = rows * cfg.n_expert_used;
         let m_total = grouped_moe_m_total_bound(slots, cfg.n_experts);
@@ -584,6 +584,26 @@ impl PrefillScratch {
     /// Block rows this scratch serves.
     pub fn rows(&self) -> usize {
         self.rows
+    }
+
+    /// Non-owning one-row scratch over caller-owned regions (the frozen decode
+    /// arena's M=1 slices). Never passed to [`Self::free`]: the arena owns the
+    /// allocation the views alias.
+    pub(crate) fn decode_views(
+        x_rot: GpuTensor,
+        y_gu: GpuTensor,
+        y_dn: GpuTensor,
+        msg: GpuTensor,
+        embed: GpuTensor,
+    ) -> Self {
+        Self {
+            rows: 1,
+            x_rot,
+            y_gu,
+            y_dn,
+            msg,
+            embed,
+        }
     }
 
     /// Device bytes held.
@@ -863,6 +883,7 @@ fn prefill_blocks(
             rows: take,
             p,
             row_maps: row_maps.as_ref(),
+            frozen: None,
         };
         let mut o = Owned::default();
         let r = drive_block(gpu, &ctx, gs, block, &mut o, want, trace.as_deref_mut());
@@ -916,9 +937,39 @@ struct T(usize);
 #[derive(Default)]
 struct Arena {
     ts: Vec<Option<GpuTensor>>,
+    /// Frozen decode: temporaries are carved from a caller-owned slab instead
+    /// of allocated (no HIP allocation, stable addresses per visit kind).
+    bump: Option<Bump>,
 }
 
+/// Bump cursor over a caller-owned slab; 256 B aligned carves, range-checked.
+struct Bump {
+    slab: GpuTensor,
+    off: usize,
+    high: usize,
+}
+
+const BUMP_ALIGN: usize = 256;
+
 impl Arena {
+    /// Arena that carves every temporary from `slab` (never allocates).
+    fn over_slab(slab: GpuTensor) -> Self {
+        Self {
+            ts: Vec::with_capacity(128),
+            bump: Some(Bump {
+                slab,
+                off: 0,
+                high: 0,
+            }),
+        }
+    }
+    /// Forget every temporary and restart the slab cursor (visit boundary).
+    fn rewind(&mut self) {
+        self.ts.clear();
+        if let Some(b) = self.bump.as_mut() {
+            b.off = 0;
+        }
+    }
     fn alloc(
         &mut self,
         gpu: &mut Gpu,
@@ -926,9 +977,30 @@ impl Arena {
         dtype: DType,
         what: &str,
     ) -> Result<T, String> {
-        let t = gpu
-            .alloc_tensor(shape, dtype)
-            .map_err(|e| format!("inkling2 prefill: alloc {what}: {e:?}"))?;
+        let t = match self.bump.as_mut() {
+            Some(b) => {
+                let bytes = shape.iter().product::<usize>() * dtype.size();
+                let end = b.off + bytes;
+                if end > b.slab.buf.size() {
+                    return Err(format!(
+                        "inkling2 decode: arena slab exhausted carving {what} ({bytes} B at {} of {})",
+                        b.off,
+                        b.slab.buf.size()
+                    ));
+                }
+                let t = GpuTensor {
+                    buf: b.slab.buf.byte_view(b.off, bytes),
+                    shape: shape.to_vec(),
+                    dtype,
+                };
+                b.off = end.next_multiple_of(BUMP_ALIGN);
+                b.high = b.high.max(b.off);
+                t
+            }
+            None => gpu
+                .alloc_tensor(shape, dtype)
+                .map_err(|e| format!("inkling2 prefill: alloc {what}: {e:?}"))?,
+        };
         self.ts.push(Some(t));
         Ok(T(self.ts.len() - 1))
     }
@@ -988,6 +1060,25 @@ fn dup(gpu: &mut Gpu, src: &GpuTensor, n: usize, what: &str) -> Result<GpuTensor
         return Err(format!("inkling2 prefill: dup {what}: {e:?}"));
     }
     Ok(out)
+}
+
+/// `dup` into a caller-owned destination (the frozen decode banks): the same
+/// copy kernel, no allocation.
+fn dup_into(gpu: &mut Gpu, src: &GpuTensor, dst: &GpuTensor, n: usize) -> Result<(), String> {
+    if src.buf.size() < n * 4 || dst.buf.size() < n * 4 {
+        return Err("inkling2 decode: bank copy: short operand".into());
+    }
+    gpu.copy_rows_strided_f32(
+        &view(src, 0, &[n])?,
+        &view(dst, 0, &[n])?,
+        1,
+        n,
+        n,
+        n,
+        0,
+        None,
+    )
+    .map_err(|e| format!("inkling2 decode: bank copy: {e:?}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1429,6 +1520,44 @@ fn router_rows(
 // One visit over a block of rows
 // ---------------------------------------------------------------------------
 
+/// State access of a visit: the live state (stock prefill/decode, which stores
+/// tags and cursors as it goes) or the frozen decode body, which only reads it.
+enum Gs<'a> {
+    Live(&'a mut Inkling2GpuState),
+    Frozen(&'a Inkling2GpuState),
+}
+
+impl std::ops::Deref for Gs<'_> {
+    type Target = Inkling2GpuState;
+    fn deref(&self) -> &Inkling2GpuState {
+        match self {
+            Gs::Live(g) => g,
+            Gs::Frozen(g) => g,
+        }
+    }
+}
+
+impl Gs<'_> {
+    fn live(&mut self) -> Result<&mut Inkling2GpuState, String> {
+        match self {
+            Gs::Live(g) => Ok(&mut **g),
+            Gs::Frozen(_) => Err("inkling2 decode: the frozen body cannot mutate state".into()),
+        }
+    }
+}
+
+/// Frozen-body overlay of a one-row visit: the staged device position, the
+/// visit's FA2 grid width and its fixed destinations (no allocation, no host
+/// position, no tag mutation).
+pub(crate) struct FrozenVisit<'a> {
+    pub pos: &'a GpuTensor,
+    pub split_cap: usize,
+    /// `[n_embd]` F32 destination of the visit output.
+    pub visit_out: &'a GpuTensor,
+    /// `[n_embd]` F32 destination of the block push (first visit of a block).
+    pub push_dst: Option<&'a GpuTensor>,
+}
+
 struct BlockCtx<'a> {
     cfg: &'a Inkling2Config,
     gw: &'a Inkling2GpuWeights,
@@ -1439,6 +1568,8 @@ struct BlockCtx<'a> {
     p: usize,
     /// One-row call: the decode gather maps its attention runs over.
     row_maps: Option<&'a RowMaps>,
+    /// Frozen decode body (one row, device position); `None` on every stock path.
+    frozen: Option<&'a FrozenVisit<'a>>,
 }
 
 struct VisitOut {
@@ -1446,7 +1577,7 @@ struct VisitOut {
     push: Option<GpuTensor>,
 }
 
-type Msgs<'a> = (
+pub(crate) type Msgs<'a> = (
     &'a [GpuTensor],
     &'a GpuTensor,
     &'a GpuTensor,
@@ -1466,7 +1597,8 @@ fn run_visit_rows(
     gs: &mut Inkling2GpuState,
 ) -> Result<VisitOut, String> {
     let mut ar = Arena::default();
-    match visit_body(gpu, c, layer, x, blocks, visit, phys, msgs, gs, &mut ar) {
+    let mut g = Gs::Live(gs);
+    match visit_body(gpu, c, layer, x, blocks, visit, phys, msgs, &mut g, &mut ar) {
         Ok((vo, push)) => {
             let visit_out = ar.take(vo);
             let push = push.map(|p| ar.take(p));
@@ -1490,7 +1622,7 @@ fn visit_body(
     visit: usize,
     phys: usize,
     msgs: Option<Msgs<'_>>,
-    gs: &mut Inkling2GpuState,
+    gs: &mut Gs<'_>,
     ar: &mut Arena,
 ) -> Result<(T, Option<T>), String> {
     let cfg = c.cfg;
@@ -1711,7 +1843,7 @@ fn visit_body(
         Some((dk, dv, dw))
     };
     // Full-layer tau: exactly 1.0 below `log_floor`; fail closed beyond.
-    if !swa && !cfg.gpu_full_tau_supported(p + n - 1) {
+    if c.frozen.is_none() && !swa && !cfg.gpu_full_tau_supported(p + n - 1) {
         return Err(format!(
             "inkling2 prefill: full-layer tau {} at pos {} unimplemented",
             cfg.full_attention_tau(p + n - 1),
@@ -1729,7 +1861,7 @@ fn visit_body(
         gemm,
     )?;
     let ring = gs.visit_rows[visit];
-    if !swa && p + n > ring {
+    if c.frozen.is_none() && !swa && p + n > ring {
         return Err(format!(
             "inkling2 prefill: visit {visit} KV overflow at pos {} (rows {ring})",
             p + n - 1
@@ -1740,8 +1872,8 @@ fn visit_body(
     // K/V land: the cache slot (one-row block, committed before its decode
     // attention), F16 staging planes (blocked attention, committed after it)
     // or F32 rows (row-exact attention writes them per row).
-    let one_row = c.mode.blocked_attn && c.row_maps.is_some();
-    if c.mode.blocked_attn {
+    let one_row = c.mode.blocked_attn && (c.row_maps.is_some() || c.frozen.is_some());
+    if c.mode.blocked_attn && c.frozen.is_none() {
         check_pre_block_tags(gs, visit, swa, p)?;
     }
     let plane = nkv * n * hd;
@@ -1759,7 +1891,12 @@ fn visit_body(
         Some((ar.f32(gpu, n * ekv, "k_conv")?, ar.f32(gpu, n * ekv, "vc")?))
     };
     let kv16 = if one_row {
-        let slot = swa_slot(p, ring);
+        // Frozen decode passes the plane BASES: the device forms the slot.
+        let slot = if c.frozen.is_some() {
+            0
+        } else {
+            swa_slot(p, ring)
+        };
         let at = |t: &GpuTensor| t.buf.as_ptr().wrapping_byte_add(slot * hd * 2) as *const c_void;
         Some(FzKv16 {
             k: std::array::from_fn(|h| gs.k_cache[visit].get(h).map_or(std::ptr::null(), at)),
@@ -1787,51 +1924,92 @@ fn visit_body(
     {
         return Err(format!("inkling2 prefill: visit {visit} KV cache planes"));
     }
+    let post = Inkling2FzAttnPost {
+        q: ar.get(q),
+        q_scale: &layer.q_clip,
+        qk_clip: cfg.qk_clip,
+        rel: ar.get(r),
+        rel_scale: &layer.rel_clip,
+        rel_clip: cfg.rel_clip,
+        k_raw: ar.get(k_raw),
+        v_raw: ar.get(v_raw),
+        k_sw: &layer.k_conv,
+        v_sw: &layer.v_conv,
+        dyn_kv: dyn_kv.map(|(dk, dv, dw)| (ar.get(dk), ar.get(dv), dw)),
+        conv_scale: if swa { 1.0 / 5.0f32.sqrt() } else { 1.0 / 3.0 },
+        state: &gs.conv[visit],
+        state_stride: INKLING2_CONV_WIDTH,
+        k_off: 0,
+        v_off: ekv,
+        state_update: n == 1,
+        v_eps: eps,
+        k_f32: kv_f32.map(|(k, _)| ar.get(k)),
+        v_f32: kv_f32.map(|(_, v)| ar.get(v)),
+        kv16,
+        rows: n,
+        nh,
+        nkv,
+    };
     hip(
-        gpu.inkling2_fz_attn_post(&Inkling2FzAttnPost {
-            q: ar.get(q),
-            q_scale: &layer.q_clip,
-            qk_clip: cfg.qk_clip,
-            rel: ar.get(r),
-            rel_scale: &layer.rel_clip,
-            rel_clip: cfg.rel_clip,
-            k_raw: ar.get(k_raw),
-            v_raw: ar.get(v_raw),
-            k_sw: &layer.k_conv,
-            v_sw: &layer.v_conv,
-            dyn_kv: dyn_kv.map(|(dk, dv, dw)| (ar.get(dk), ar.get(dv), dw)),
-            conv_scale: if swa { 1.0 / 5.0f32.sqrt() } else { 1.0 / 3.0 },
-            state: &gs.conv[visit],
-            state_stride: INKLING2_CONV_WIDTH,
-            k_off: 0,
-            v_off: ekv,
-            state_update: n == 1,
-            v_eps: eps,
-            k_f32: kv_f32.map(|(k, _)| ar.get(k)),
-            v_f32: kv_f32.map(|(_, v)| ar.get(v)),
-            kv16,
-            rows: n,
-            nh,
-            nkv,
-        }),
+        match c.frozen {
+            Some(f) => gpu.inkling2_fz_attn_post_decode(
+                &post,
+                Inkling2DecodeAddr {
+                    pos: f.pos,
+                    ring_rows: ring as u32,
+                },
+            ),
+            None => gpu.inkling2_fz_attn_post(&post),
+        },
         "attention epilogue",
     )?;
-    if one_row {
-        kv_tags(gs, visit, p, 1);
+    if one_row && c.frozen.is_none() {
+        kv_tags(gs.live()?, visit, p, 1);
     }
     // Attention.
     let attn_heads = ar.f32(gpu, n * eattn, "attn_heads")?;
-    match (c.row_maps, staged, kv_f32) {
-        (Some(maps), _, _) if one_row => attn_one_row(
-            gpu, cfg, layer, gs, ar, maps, visit, q, r, sinks, attn_heads,
-        )?,
-        (_, Some(st), _) => attn_blocked(
-            gpu, cfg, layer, gs, ar, visit, swa, p, n, q, r, sinks, st, attn_heads,
-        )?,
-        (_, _, Some((k_conv, vc))) => attn_row_exact(
-            gpu, cfg, layer, gs, ar, visit, swa, p, n, q, r, sinks, k_conv, vc, attn_heads,
-        )?,
-        _ => return Err("inkling2 prefill: no attention route".into()),
+    if let Some(f) = c.frozen {
+        attn_one_row_pos(gpu, cfg, layer, gs, f, visit, ar, q, r, sinks, attn_heads)?;
+    } else {
+        match (c.row_maps, staged, kv_f32) {
+            (Some(maps), _, _) if one_row => attn_one_row(
+                gpu, cfg, layer, gs, ar, maps, visit, q, r, sinks, attn_heads,
+            )?,
+            (_, Some(st), _) => attn_blocked(
+                gpu,
+                cfg,
+                layer,
+                gs.live()?,
+                ar,
+                visit,
+                swa,
+                p,
+                n,
+                q,
+                r,
+                sinks,
+                st,
+                attn_heads,
+            )?,
+            (_, _, Some((k_conv, vc))) => attn_row_exact(
+                gpu,
+                cfg,
+                layer,
+                gs.live()?,
+                ar,
+                visit,
+                swa,
+                p,
+                n,
+                q,
+                r,
+                sinks,
+                k_conv,
+                vc,
+                attn_heads,
+            )?,
+            _ => return Err("inkling2 prefill: no attention route".into()),
+        }
     }
     // Output gate (sigmoid · mul folded into the `wo` producer), projection,
     // post conv + residual.
@@ -1861,8 +2039,19 @@ fn visit_body(
     // conv output as cur; the others add it to x.
     let has_push = phys % cfg.attn_res_block == 0;
     let push = if has_push {
-        let t = dup(gpu, x, ne, "block push")?;
-        Some(ar.push(t))
+        match c.frozen {
+            Some(f) => {
+                let dst = f
+                    .push_dst
+                    .ok_or("inkling2 decode: push visit without a bank destination")?;
+                dup_into(gpu, x, dst, ne)?;
+                Some(ar.push(view(dst, 0, &[ne])?))
+            }
+            None => {
+                let t = dup(gpu, x, ne, "block push")?;
+                Some(ar.push(t))
+            }
+        }
     } else {
         None
     };
@@ -1976,7 +2165,10 @@ fn visit_body(
         w: topk_w,
     };
     experts_rows(gpu, c, layer, ar, ffn_normed, route, moe_raw)?;
-    let visit_out = ar.f32(gpu, ne, "visit_out")?;
+    let visit_out = match c.frozen {
+        Some(f) => ar.push(view(f.visit_out, 0, &[ne])?),
+        None => ar.f32(gpu, ne, "visit_out")?,
+    };
     hip(
         gpu.inkling2_fz_conv_res(
             ar.get(moe_raw),
@@ -2125,7 +2317,7 @@ fn attn_row_exact(
 
 /// Fail closed unless every pre-block key the first query of a block at `p`
 /// reads carries its true position tag.
-fn check_pre_block_tags(
+pub(crate) fn check_pre_block_tags(
     gs: &Inkling2GpuState,
     visit: usize,
     swa: bool,
@@ -2320,7 +2512,7 @@ fn attn_one_row(
     gpu: &mut Gpu,
     cfg: &Inkling2Config,
     layer: &Inkling2GpuLayer,
-    gs: &mut Inkling2GpuState,
+    gs: &Inkling2GpuState,
     ar: &mut Arena,
     maps: &RowMaps,
     visit: usize,
@@ -3007,6 +3199,54 @@ fn drive_block(
     Ok(heads)
 }
 
+/// Final mix over the block streams and the final norm: `states` are the
+/// `[rows, e]` block views plus the last x; `hidden` receives `[rows, e]`.
+fn head_hidden(
+    gpu: &mut Gpu,
+    cfg: &Inkling2Config,
+    gw: &Inkling2GpuWeights,
+    states: &[&GpuTensor],
+    hidden: &GpuTensor,
+    rows: usize,
+) -> Result<(), String> {
+    let e = cfg.n_embd;
+    let row = FzRow {
+        raw: None,
+        targets: vec![FzTarget {
+            gamma: Some(&gw.norm),
+            eps: cfg.rms_norm_eps,
+            out: Some((hidden, e)),
+            rots: Vec::new(),
+        }],
+    };
+    fz(
+        gpu,
+        states,
+        Some(&gw.output_query),
+        &[row],
+        rows,
+        e,
+        cfg.rms_norm_eps,
+    )
+}
+
+/// LM head and softcap over `take` hidden rows into `logits [take, vocab]`.
+fn head_logits(
+    gpu: &mut Gpu,
+    cfg: &Inkling2Config,
+    gw: &Inkling2GpuWeights,
+    hidden: &GpuTensor,
+    logits: &GpuTensor,
+    take: usize,
+    gemm: bool,
+) -> Result<(), String> {
+    linear(gpu, &gw.unembed, hidden, logits, take, gemm)?;
+    hip(
+        gpu.logit_softcap_f32(logits, take * cfg.vocab_size, cfg.softcap),
+        "softcap",
+    )
+}
+
 /// Final mix over the block streams, final norm, LM head + softcap on the
 /// requested rows. `Last` runs the singleton head arithmetic on the last row.
 fn head_rows(
@@ -3043,24 +3283,7 @@ fn head_rows(
         }
         let refs: Vec<&GpuTensor> = states.iter().collect();
         let hidden = ar.f32(gpu, rows * e, "hidden")?;
-        let row = FzRow {
-            raw: None,
-            targets: vec![FzTarget {
-                gamma: Some(&gw.norm),
-                eps: cfg.rms_norm_eps,
-                out: Some((ar.get(hidden), e)),
-                rots: Vec::new(),
-            }],
-        };
-        fz(
-            gpu,
-            &refs,
-            Some(&gw.output_query),
-            &[row],
-            rows,
-            e,
-            cfg.rms_norm_eps,
-        )?;
+        head_hidden(gpu, cfg, gw, &refs, ar.get(hidden), rows)?;
         let vocab = cfg.vocab_size;
         let mut out = Vec::with_capacity(rows);
         const HEAD_ROWS: usize = 64;
@@ -3073,11 +3296,7 @@ fn head_rows(
             let take = HEAD_ROWS.min(rows - done);
             let logits = ar.push(view(ar.get(logits_buf), 0, &[take * vocab])?);
             let hv = view(ar.get(hidden), done * e, &[take, e])?;
-            linear(gpu, &gw.unembed, &hv, ar.get(logits), take, c.mode.gemm)?;
-            hip(
-                gpu.logit_softcap_f32(ar.get(logits), take * vocab, cfg.softcap),
-                "softcap",
-            )?;
+            head_logits(gpu, cfg, gw, &hv, ar.get(logits), take, c.mode.gemm)?;
             if take == 1 {
                 // One row (decode, `Last`): download the unpadded row itself.
                 let row = hip(
@@ -3101,6 +3320,182 @@ fn head_rows(
     })();
     ar.free(gpu);
     r
+}
+
+// ---------------------------------------------------------------------------
+// Frozen decode seam (driven by `decode_step`): the one-row visit and head of
+// this file over caller-owned memory, with no allocation and no state mutation.
+// ---------------------------------------------------------------------------
+
+/// Visit-temporary bump arena of the frozen body (host `Vec` capacity kept
+/// across visits and steps).
+pub(crate) struct FrozenScratch {
+    ar: Arena,
+}
+
+impl FrozenScratch {
+    pub(crate) fn over_slab(slab: GpuTensor) -> Self {
+        Self {
+            ar: Arena::over_slab(slab),
+        }
+    }
+
+    /// Largest slab extent any visit has carved so far (bytes).
+    pub(crate) fn high_water(&self) -> usize {
+        self.ar.bump.as_ref().map_or(0, |b| b.high)
+    }
+}
+
+/// The decode launch-selection scope of the stock one-row call: the dense
+/// activation arm pinned to the load's routes and the ordinary-prefill intent.
+pub(crate) struct FrozenScope {
+    saved: Arc<rdna_compute::feature_flags::FeatureFlags>,
+    ordinary: bool,
+}
+
+pub(crate) fn frozen_scope_enter(gpu: &mut Gpu, routes: PrefillRoutes) -> FrozenScope {
+    let saved = pin_dense_route(gpu, routes.dense);
+    let ordinary = gpu.ordinary_prefill_enter();
+    FrozenScope { saved, ordinary }
+}
+
+/// Restores the caller's flags and intent; call on every exit.
+pub(crate) fn frozen_scope_exit(gpu: &mut Gpu, scope: FrozenScope) {
+    gpu.ordinary_prefill_exit(scope.ordinary);
+    gpu.flags = scope.saved;
+}
+
+/// Copy `n` F32 words `src -> dst` with the stock bank-copy kernel.
+pub(crate) fn frozen_copy(
+    gpu: &mut Gpu,
+    src: &GpuTensor,
+    dst: &GpuTensor,
+    n: usize,
+) -> Result<(), String> {
+    dup_into(gpu, src, dst, n)
+}
+
+/// One frozen visit `visit` (phys layer from the loop schedule) of the one-row
+/// blocked body: input `x`, current blocks `blocks`, pass messages `msgs`;
+/// writes `f.visit_out` (and `f.push_dst` on a block-push visit).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn frozen_visit(
+    gpu: &mut Gpu,
+    cfg: &Inkling2Config,
+    gw: &Inkling2GpuWeights,
+    gs: &Inkling2GpuState,
+    scratch: &PrefillScratch,
+    routes: PrefillRoutes,
+    fs: &mut FrozenScratch,
+    f: &FrozenVisit<'_>,
+    x: &GpuTensor,
+    blocks: &[GpuTensor],
+    visit: usize,
+    msgs: Option<Msgs<'_>>,
+) -> Result<(), String> {
+    let phys = cfg.loop_cfg.layer_phys(visit);
+    fs.ar.rewind();
+    let ctx = BlockCtx {
+        cfg,
+        gw,
+        scratch,
+        mode: PrefillMode::BLOCKED,
+        routes,
+        rows: 1,
+        p: 0,
+        row_maps: None,
+        frozen: Some(f),
+    };
+    let mut g = Gs::Frozen(gs);
+    visit_body(
+        gpu,
+        &ctx,
+        &gw.layers[phys],
+        x,
+        blocks,
+        visit,
+        phys,
+        msgs,
+        &mut g,
+        &mut fs.ar,
+    )
+    .map(|_| ())
+}
+
+/// Final mix, norm, LM head and softcap of the frozen body: `hidden [e]` and
+/// `logits [vocab]` are caller-owned.
+pub(crate) fn frozen_head(
+    gpu: &mut Gpu,
+    cfg: &Inkling2Config,
+    gw: &Inkling2GpuWeights,
+    blocks: &[GpuTensor],
+    x: &GpuTensor,
+    hidden: &GpuTensor,
+    logits: &GpuTensor,
+) -> Result<(), String> {
+    let e = cfg.n_embd;
+    if gw.output_query.buf.size() / 4 != e {
+        return Err(format!(
+            "inkling2 decode: output_query len {} != {e}",
+            gw.output_query.buf.size() / 4
+        ));
+    }
+    let views: Vec<GpuTensor> = blocks
+        .iter()
+        .chain(std::iter::once(x))
+        .map(|b| view(b, 0, &[1, e]))
+        .collect::<Result<_, _>>()?;
+    let refs: Vec<&GpuTensor> = views.iter().collect();
+    head_hidden(gpu, cfg, gw, &refs, hidden, 1)?;
+    head_logits(gpu, cfg, gw, &view(hidden, 0, &[1, e])?, logits, 1, true)
+}
+
+/// Attention of a frozen one-row visit (its K/V already stored by the decode
+/// epilogue): the device-position split-KV FA2 over the visit's constant ring.
+#[allow(clippy::too_many_arguments)]
+fn attn_one_row_pos(
+    gpu: &mut Gpu,
+    cfg: &Inkling2Config,
+    layer: &Inkling2GpuLayer,
+    gs: &Inkling2GpuState,
+    f: &FrozenVisit<'_>,
+    visit: usize,
+    ar: &mut Arena,
+    q: T,
+    r: T,
+    sinks: T,
+    attn_heads: T,
+) -> Result<(), String> {
+    if !gs.attn_fa2 {
+        return Err("inkling2 decode: the frozen body needs the FA2 decode attention".into());
+    }
+    let nh = cfg.n_head;
+    let hd = cfg.head_dim;
+    let rel = view(ar.get(r), 0, &[nh, cfg.n_rel])?;
+    let sink = view(ar.get(sinks), 0, &[nh])?;
+    let qv = view(ar.get(q), 0, &[nh, hd])?;
+    let out = view(ar.get(attn_heads), 0, &[nh * hd])?;
+    hip(
+        gpu.inkling2_attn_decode_fa2_pos(&Inkling2Fa2DecodePos {
+            q: &qv,
+            k_cache: &gs.k_cache[visit],
+            v_cache: &gs.v_cache[visit],
+            rel: &rel,
+            table: &layer.rel_table,
+            sink: &sink,
+            lse: &gs.fa2_lse,
+            oacc: &gs.fa2_oacc,
+            out: &out,
+            addr: Inkling2DecodeAddr {
+                pos: f.pos,
+                ring_rows: gs.visit_rows[visit] as u32,
+            },
+            n_rel: cfg.n_rel,
+            n_extent: cfg.n_extent,
+            split_cap: f.split_cap,
+        }),
+        "attn fa2 pos",
+    )
 }
 
 #[cfg(test)]

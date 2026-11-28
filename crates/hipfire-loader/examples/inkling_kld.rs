@@ -3336,11 +3336,18 @@ fn bench_decode(a: &Args) -> Result<(), String> {
     let reps = a.num("reps", 3)?.max(1);
     let ctx = a.num("ctx", 128)?;
     let steps = a.num("steps", 64)?.max(1);
-    let blocked = match a.0.get("body").map(String::as_str) {
-        None | Some("blocked") => true,
-        Some("scalar") => false,
-        Some(other) => return Err(format!("--body: expected scalar|blocked, got {other}")),
+    let body = match a.0.get("body").map(String::as_str) {
+        None | Some("blocked") => "blocked",
+        Some("scalar") => "scalar",
+        Some("frozen") => "frozen",
+        Some(other) => {
+            return Err(format!(
+                "--body: expected scalar|blocked|frozen, got {other}"
+            ))
+        }
     };
+    let blocked = body != "scalar";
+    let frozen = body == "frozen";
     let (reference, mmap) = open_ref(&ref_path)?;
     let tokens = reference.tokens(&mmap).map_err(|e| e.to_string())?;
     if ctx == 0 || ctx > tokens.len() {
@@ -3378,17 +3385,23 @@ fn bench_decode(a: &Args) -> Result<(), String> {
             // Every step's logits row, so a bitwise-preserving body change can
             // be checked by digest identity (outside the timed region).
             let mut digest = Sha256::new();
+            let mut frow: Vec<f32> = Vec::new();
             for s in 0..steps {
                 gen.push(next);
                 let t0 = Instant::now();
-                let row = if blocked {
-                    hipfire_arch_inkling2::forward_decode_gpu(b, &mut gpu, next, ctx + s)?
+                let row = if frozen {
+                    hipfire_arch_inkling2::forward_decode_frozen(b, &mut gpu, next, ctx + s, &mut frow)?;
+                    &frow
+                } else if blocked {
+                    frow = hipfire_arch_inkling2::forward_decode_gpu(b, &mut gpu, next, ctx + s)?;
+                    &frow
                 } else {
-                    hipfire_arch_inkling2::forward_token_gpu(b, &mut gpu, next, ctx + s)?
+                    frow = hipfire_arch_inkling2::forward_token_gpu(b, &mut gpu, next, ctx + s)?;
+                    &frow
                 };
                 ms.push(t0.elapsed().as_secs_f64() * 1e3);
-                digest.update(f32_bytes(&row));
-                next = argmax(&row);
+                digest.update(f32_bytes(row));
+                next = argmax(row);
             }
             Ok((ms, gen, format!("{:x}", digest.finalize())))
         };
@@ -3427,7 +3440,8 @@ fn bench_decode(a: &Args) -> Result<(), String> {
         "reference": artifact_id(&ref_path)?,
         "evaluator": {"binary": artifact_id(&std::env::current_exe().map_err(|e| e.to_string())?)?,
                       "engine_commit": engine_commit()},
-        "body": if blocked { "blocked" } else { "scalar" },
+        "body": body,
+        "decode_arena_bytes": b.gpu_state.as_ref().and_then(|s| s.decode_arena.as_ref()).map(|a| a.bytes()),
         "ctx": ctx,
         "steps": steps,
         "prefill_routes": b.gpu_state.as_ref().map(|s| format!("{:?}", s.prefill_routes)),
@@ -3443,7 +3457,7 @@ fn bench_decode(a: &Args) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     eprintln!(
         "inkling_kld bench-decode: {} ctx {ctx} median {median:.2} tok/s -> {}",
-        if blocked { "blocked" } else { "scalar" },
+        body,
         output.display()
     );
     Ok(())

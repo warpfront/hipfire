@@ -708,6 +708,26 @@ impl EmbedPacked {
         }
         Ok(())
     }
+
+    /// Packed bytes of one qt44 row (`cols / 256` groups of 136 bytes).
+    pub fn row_bytes(&self) -> usize {
+        self.cols / 256 * 136
+    }
+
+    /// Copy one token's packed row into `dst` (exactly [`Self::row_bytes`]
+    /// long): the decode step's staged embedding record, no allocation.
+    pub fn copy_row(&self, token: u32, dst: &mut [u8]) -> Result<(), String> {
+        let src = self.packed_row(token)?;
+        if dst.len() != src.len() {
+            return Err(format!(
+                "inkling2: embed row dst {} != {} bytes",
+                dst.len(),
+                src.len()
+            ));
+        }
+        dst.copy_from_slice(src);
+        Ok(())
+    }
 }
 
 /// Exact VRAM census of one load: every byte below was uploaded by name.
@@ -1155,6 +1175,10 @@ pub struct Inkling2GpuState {
     /// limit at the block size, and the packed embed staging. Counted in
     /// [`VramSummary::prefill_scratch_bytes`].
     pub prefill_scratch: Option<crate::gpu_prefill::PrefillScratch>,
+    /// The frozen decode step's dedicated M=1 arena
+    /// ([`crate::decode_step::DecodeArena`]), created on demand by
+    /// [`crate::decode_step::ensure_decode_arena`]; freed with the state.
+    pub decode_arena: Option<crate::decode_step::DecodeArena>,
 }
 
 impl Inkling2GpuState {
@@ -1297,6 +1321,7 @@ impl Inkling2GpuState {
             fa2_oacc,
             prefill_routes: crate::gpu_prefill::PrefillRoutes::F16,
             prefill_scratch: None,
+            decode_arena: None,
         })
     }
 
@@ -1338,6 +1363,9 @@ impl Inkling2GpuState {
         let _ = gpu.free_tensor(self.fa2_oacc);
         if let Some(s) = self.prefill_scratch {
             s.free(gpu);
+        }
+        if let Some(a) = self.decode_arena {
+            a.free(gpu);
         }
     }
 }

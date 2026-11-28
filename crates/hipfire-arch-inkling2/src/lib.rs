@@ -13,6 +13,7 @@ pub mod arch;
 pub mod arch_model;
 pub mod carrier;
 pub mod config;
+pub mod decode_step;
 pub mod dspark_body;
 pub mod dspark_weights;
 pub mod forward;
@@ -27,6 +28,11 @@ pub use arch::Inkling2;
 pub use arch_model::{Inkling2Bundle, Inkling2State};
 pub use carrier::{load_inkling2_bundle, INKLING2_MAX_CONTEXT};
 pub use config::{LoopConfig, ARCH_ID, MTP_SIDECAR_ARCH_ID};
+pub use decode_step::{
+    enqueue_decode_body, enqueue_decode_body_trace, ensure_decode_arena, finish_decode_step,
+    forward_decode_frozen, plan_decode_step, stage_decode_input, DecodeArena, DecodeBucket,
+    DecodeSchedule, DecodeStepKey, DecodeStepPlan,
+};
 pub use dspark_weights::{
     InklingDsparkConfig, InklingDsparkSource, InklingDsparkTargetIdentity, InklingDsparkWeights,
 };
