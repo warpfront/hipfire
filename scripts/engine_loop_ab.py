@@ -815,6 +815,13 @@ def conc_self_test():
     ser = sj(spec_arm("engine", rejected=1))
     assert ser["fails"] == ["engine-noslots: serialized ['multiturn/4', 'stateless/4']"], ser["fails"]
     assert sj(spec_arm("engine", rejected=1), {"spec": "gemma4_eagle"})["ok"]
+    # intended diff 6 on an EAGLE route: positions may differ from legacy, ids may not
+    shift = spec_arm("engine")
+    for x in shift["reqs"].values():
+        x["ids"] = [[t, p + 50] for t, p in x["ids"]]
+    assert sj(shift)["ok"] and not sj(shift, {})["ok"]
+    shift["reqs"]["stateless/1/1/0/0"]["ids"][0][0] += 1
+    assert not sj(shift)["ok"]
     assert not cj(eng=conc_arm("engine", "noslots", tau=2.9), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
     assert cj(eng=conc_arm("engine", "noslots", tau=2.98), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
     # k=1 bound is 2 % (HIPF-619 S1)
@@ -1322,7 +1329,10 @@ def judge_conc(arms, c, expect_engine):
         # since a reused prefix and a cold prefill are not token-exact
         refs = {k: next((y for y in (rr.get(at(k, kk)) for kk in [k.split("/")[1], *ks])
                          if y is not None and cached(y) == cached(x)), None) for k, x in reqs.items()}
-        r["ne_ref"] = sorted(k for k, x in reqs.items() if k not in rr or (refs[k] and not same(x, refs[k])))
+        # intended diff 6: legacy Gemma 4 EAGLE stamps positions from the first generated token
+        tok_eq = ((lambda x, y: x["events"] == y["events"] and toks(x) == toks(y))
+                  if c.get("spec") == "gemma4_eagle" and (ref or {}).get("loop") == "legacy" else same)
+        r["ne_ref"] = sorted(k for k, x in reqs.items() if k not in rr or (refs[k] and not tok_eq(x, refs[k])))
         r["ref_reuse_unmatched"] = sorted(k for k in reqs if k in rr and refs[k] is None)
         if r["ref_reuse_unmatched"]:
             unexercised.append(f"{tag}: {len(r['ref_reuse_unmatched'])} requests reused a prefix length no ref "

@@ -262,7 +262,8 @@ still hold it after its bench returned.
   with `--conc-only` (its top-level `load.drafter` is sent unexpanded).
 - `spec`: the `done.spec` every request of every arm must report, with at least
   one window (`rounds` > 0). An AR fallback fails the run instead of counting
-  as a spec row (e.g. `"gemma4_eagle"`, HIPF-633).
+  as a spec row (e.g. `"gemma4_eagle"`, HIPF-633). With `"gemma4_eagle"` and a
+  legacy `ref`, G-tok compares token ids without positions (intended diff 6).
 - `require_overlap`: a k>1 engine cell with an overlap-rejected sample (the
   bench's serialization check) fails. Without it the cell is listed as
   `serialized` only: the bench reports a cell `ok` when its backend is
