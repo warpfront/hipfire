@@ -29,7 +29,7 @@ use peacemaker_npu::kernels::gemm_array::ArrayDesign;
 use peacemaker_npu::kernels::gemm_core::{Control, Epilogue};
 use peacemaker_npu::kernels::gemm_g80::design_g80;
 use peacemaker_npu::kernels::gemm_g80_n512::design_g80_n512;
-use peacemaker_npu::kernels::{gemm_g80::pack_b_bf16, w8a8_epi::grid15_up};
+use peacemaker_npu::kernels::{gemm_g80::pack_b_bf16, w8a8_epi::w8_direct_row};
 
 use super::shapes::{
     ColumnMap, Family, FamilyMask, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS, PANEL_COLS, TRUNK_K,
@@ -142,14 +142,11 @@ fn quantize_scaled_row(
     direct: bool,
 ) -> (f32, (u16, i16)) {
     decode_row(row, w);
+    if direct {
+        return w8_direct_row(w, out);
+    }
     let absmax = w.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
-    let raw = ((absmax as f64) / 127.0) as f32;
-    let grid = if direct { grid15_up(raw) } else { (0, 0) };
-    let ws = if direct {
-        (f64::from(grid.0) * 2f64.powi(i32::from(grid.1))) as f32
-    } else {
-        raw
-    };
+    let ws = ((absmax as f64) / 127.0) as f32;
     if ws == 0.0 {
         out.fill(0);
     } else {
@@ -158,7 +155,7 @@ fn quantize_scaled_row(
             *o = ((x / ws).round_ties_even() as i32).clamp(-127, 127) as i8;
         }
     }
-    (ws, grid)
+    (ws, (0, 0))
 }
 
 /// W8 codes `[m][k]` row-major and per-row scales of an MQ6G256V2 matrix.

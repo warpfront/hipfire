@@ -458,6 +458,7 @@ developer_callsite	*	HIPFIRE_QWEN2_VERIFY_SEQ#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD#developer_var=ok.and_then.or.unwrap_or(0.1f32)
 developer_callsite	*	HIPFIRE_QWEN35_FINITE_TRACE#developer_var_os=is_none
 developer_callsite	*	HIPFIRE_QWEN35_GRAMMAR#developer_var=ok.as_deref
+developer_callsite	*	HIPFIRE_QWEN35_NPU_TRUNK_FAULT_CHAIN#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD#developer_var=ok.and_then.or.unwrap_or(0.1f32)
 developer_callsite	*	HIPFIRE_QWEN4_APPEND_WMMA_MIN_ROWS#developer_var=ok.and_then.filter.unwrap_or(QWEN4_APPEND_WMMA_MIN_ROWS_DEFAULT)
 developer_callsite	*	HIPFIRE_QWEN4_COMPACT_FORCE_UNVERIFIED#developer_bool=false
