@@ -186,7 +186,7 @@ pub const GL_CB3: [f32; 8] = [
 /// instrumented sweep.
 pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
 
-fn pm4_dynamic_grid_enabled() -> bool {
+pub(crate) fn pm4_dynamic_grid_enabled() -> bool {
     // Multi-spelling ("1"/"true"/"yes"/"on") predicate preserved verbatim;
     // only the process-global cache is gone (the snapshot is the cache now).
     hipfire_config::process_value("HIPFIRE_REPLAY_PM4_DYNAMIC_GRID")

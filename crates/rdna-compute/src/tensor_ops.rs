@@ -7335,16 +7335,18 @@ fn indexed_attention_select_batch_impl(
         gpu.arch_caps.has_qwen4_parallel_qsa_gdn() && shape_blocks > 0 && !select_forced_serial();
     // Live F32 launches use the score/select pair. Covered BF16 launches use
     // the builder score with the builder select. The opt-in exact selector
-    // keeps its route.
+    // keeps its route. On exact gfx1151 a recorder takes the same pair over
+    // the shape bound with position-bound kernargs (HIPF-289); other archs
+    // keep their recorded routes.
     if parallel
         && !*QWEN4_QSA_SELECT_EXACT
         && (p.pooled.dtype == DType::F32 || qsa_select_pm_fits(gpu, p))
-        && !gpu.replay.is_recording()
+        && (!gpu.replay.is_recording() || gpu.arch_caps.is_gfx1151())
         && !gpu.graphs.capture_mode
         && p.index_heads == 4
         && p.index_dim.is_multiple_of(4)
         && p.index_dim <= 128
-        && p.block_count > 0
+        && qsa_rows8_extent(gpu, p) > 0
         && p.budget_blocks <= QSA_SELECT_FROM_SCORES_MAX_BUDGET
     {
         let pm = qsa_select_pm_arm(gpu, p);
@@ -7615,6 +7617,17 @@ fn qsa_select_exact_arch(caps: &crate::arch_caps::ArchCaps) -> bool {
     caps.has_gfx11_plus_simt()
 }
 
+/// Pooled blocks the score/select pair of `p` covers: the shape bound under a
+/// recorder (a retained tape replays at every position up to it; its kernels
+/// mask by the position-bound block count), else the live block count.
+fn qsa_rows8_extent(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> usize {
+    if gpu.replay.is_recording() {
+        p.shape_blocks
+    } else {
+        p.block_count
+    }
+}
+
 /// Whether the builder pair covers the live-pair call `p`: exact gfx1151,
 /// admitted rows, the fixed four-head / 128-dim F32-query geometry with F32 or
 /// BF16 pooled keys, and every buffer addressed through 32-bit raw-buffer
@@ -7629,7 +7642,7 @@ fn qsa_select_pm_fits(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> bool {
         rows,
         p.index_heads,
         p.index_dim,
-        p.block_count,
+        qsa_rows8_extent(gpu, p),
         p.query_row_stride,
         p.capacity,
     )
@@ -7870,16 +7883,21 @@ fn indexed_attention_select_rows8_core(
     if let Some(knobs) = filter {
         qsa_filter_cfg_check(knobs)?;
     }
-    let stride = p.block_count;
+    // Score row stride, score grid and scratch: the live count, or the shape
+    // bound under a recorder (`qsa_rows8_extent`).
+    let stride = qsa_rows8_extent(gpu, p);
     // PM scores sixteen rows per tile for every admitted call (thirty-two with
     // `HIPFIRE_QWEN4_QSA_SCORE_ROWS32` on 17..=32 verify rows). The hipcc
     // fallback retains eight-row scoring for decode and few-row verify.
     // A BF16 copy of an F32 pooled arena feeds the BF16 PM score when the call
-    // would run the PM F32 score; it is never read otherwise.
+    // would run the PM F32 score; it is never read otherwise. A recorder never
+    // reads it: the mirror converter does not run under a recorder, so a
+    // replayed read would see stale blocks.
     let bf16_copy = p.pooled_bf16.filter(|m| {
         m.dtype == DType::BF16
             && p.pooled.dtype == DType::F32
             && pm.score()
+            && !gpu.replay.is_recording()
             && p.block_count
                 .checked_mul(p.index_dim)
                 .is_some_and(|elements| m.numel() >= elements)
@@ -7923,12 +7941,13 @@ fn indexed_attention_select_rows8_core(
         (group, s.scores, s.cand, s.ctl)
     } else {
         let group = score_group.min(p.rows);
-        if gpu.arch_caps.is_gfx1201() && p.shape_blocks > stride {
+        if p.shape_blocks > stride {
             // The block count grows by one every compress-ratio tokens: an exact-size
             // request regrows the shared scratch (device sync + free + malloc, and the
             // captured-state invalidation) every few decode steps (served EP2 MTP:
             // ~0.6 per rank per step). Reserve the call's shape bound once; the scores
-            // below keep their exact view.
+            // below keep their exact view. A recorder's shape-bound request then finds
+            // the slot already sized, so no retained tape sees it grow.
             let bound = p.shape_blocks;
             let bound_group = (QSA_SELECT_SCORE_SCRATCH_BYTES / (bound * 4) / 16 * 16)
                 .max(16)
@@ -7973,7 +7992,20 @@ fn indexed_attention_select_rows8_core(
     let mirror =
         mirror.filter(|m| m.numel() * m.dtype.size() >= p.capacity * std::mem::size_of::<i32>());
     let block_count = checked_i32(p.block_count, "QSA batch select blocks")?;
-    let block_tiles = checked_u32(p.block_count.div_ceil(256), "QSA select block tiles")?;
+    let score_stride = checked_i32(stride, "QSA select score stride")?;
+    let block_tiles = checked_u32(stride.div_ceil(256), "QSA select block tiles")?;
+    // Under a recorder the score grid narrows to the replay position's tiles
+    // (`ceil((position + rows) / (256 * compress))` covers every live block;
+    // tiles past the live count return).
+    let score_grid_binding = crate::dispatch::pm4_dynamic_grid_enabled()
+        .then(|| -> HipResult<_> {
+            Ok(crate::replay::ReplayGridBinding::PositionCeilDiv {
+                axis: 0,
+                addend: checked_u32(p.rows, "QSA batch select rows")?,
+                divisor: checked_u32(256 * p.compress, "QSA select tile divisor")?,
+            })
+        })
+        .transpose()?;
     let mut g0 = 0usize;
     while g0 < p.rows {
         let n = group.min(p.rows - g0);
@@ -7986,8 +8018,8 @@ fn indexed_attention_select_rows8_core(
         let position_start = checked_i32(p.position_start + g0, "QSA batch select position")?;
         let rows = checked_i32(n, "QSA batch select rows")?;
         let query_row_stride = checked_i32(p.query_row_stride, "QSA batch select query stride")?;
-        // No live block: nothing to score (a zero grid is not launchable).
-        if p.block_count > 0 {
+        // No block to score (a zero grid is not launchable).
+        if stride > 0 {
             let mut args = KernargBlob::new();
             args.push_ptr(query);
             args.push_ptr(pooled_ptr);
@@ -7995,11 +8027,15 @@ fn indexed_attention_select_rows8_core(
             args.push_i32(rows);
             args.push_i32(query_row_stride);
             args.push_i32(block_count);
+            let block_count_offset = args.len() - 4;
             args.push_i32(checked_i32(p.index_dim, "QSA batch select dim")?);
             args.push_i32(checked_i32(p.compress, "QSA batch select compress")?);
             args.push_i32(position_start);
-            args.push_i32(block_count);
+            let position_offset = args.len() - 4;
+            args.push_i32(score_stride);
             args.pad_to(16);
+            let bindings =
+                qsa_position_bindings(p.rows, g0, p.compress, block_count_offset, position_offset)?;
             if gpu.flags.qwen4_qsa_extent_check {
                 qsa_sel_ext_score(
                     gpu,
@@ -8010,7 +8046,7 @@ fn indexed_attention_select_rows8_core(
                     score_sym.pooled_live_guarded,
                     scores,
                     "fp16_x_scratch",
-                    p.block_count,
+                    stride,
                     score_kernel,
                     false,
                 );
@@ -8025,7 +8061,10 @@ fn indexed_attention_select_rows8_core(
                 [256, 1, 1],
                 0,
                 args.as_mut_slice(),
-                crate::dispatch::ReplayLaunchBindings::NONE,
+                crate::dispatch::ReplayLaunchBindings {
+                    grid: score_grid_binding,
+                    kernargs: &bindings,
+                },
             )?;
             if gpu.flags.qwen4_qsa_extent_check {
                 qsa_sel_ext_score(
@@ -8037,7 +8076,7 @@ fn indexed_attention_select_rows8_core(
                     score_sym.pooled_live_guarded,
                     scores,
                     "fp16_x_scratch",
-                    p.block_count,
+                    stride,
                     score_kernel,
                     true,
                 );
@@ -8082,16 +8121,20 @@ fn indexed_attention_select_rows8_core(
         }
         let mut args = KernargBlob::new();
         args.push_ptr(scores);
-        args.push_i32(block_count);
+        args.push_i32(score_stride);
         args.push_ptr(selected);
         args.push_i32(rows);
         args.push_i32(block_count);
+        let block_count_offset = args.len() - 4;
         args.push_i32(checked_i32(p.budget_blocks, "QSA batch select budget")?);
         args.push_i32(checked_i32(p.compress, "QSA batch select compress")?);
         args.push_i32(position_start);
+        let position_offset = args.len() - 4;
         args.push_i32(checked_i32(p.capacity, "QSA batch select capacity")?);
         args.push_ptr(mirror_ptr);
         args.pad_to(16);
+        let bindings =
+            qsa_position_bindings(p.rows, g0, p.compress, block_count_offset, position_offset)?;
         if gpu.flags.qwen4_qsa_extent_check {
             qsa_sel_ext_from_scores(
                 gpu,
@@ -8100,7 +8143,7 @@ fn indexed_attention_select_rows8_core(
                 n,
                 scores,
                 "fp16_x_scratch",
-                p.block_count,
+                stride,
                 mirror.filter(|_| last),
                 select_kernel,
                 false,
@@ -8112,7 +8155,10 @@ fn indexed_attention_select_rows8_core(
             [256, 1, 1],
             0,
             args.as_mut_slice(),
-            crate::dispatch::ReplayLaunchBindings::NONE,
+            crate::dispatch::ReplayLaunchBindings {
+                grid: None,
+                kernargs: &bindings,
+            },
         )?;
         if gpu.flags.qwen4_qsa_extent_check {
             qsa_sel_ext_from_scores(
@@ -8122,7 +8168,7 @@ fn indexed_attention_select_rows8_core(
                 n,
                 scores,
                 "fp16_x_scratch",
-                p.block_count,
+                stride,
                 None,
                 select_kernel,
                 true,
@@ -8341,7 +8387,7 @@ pub fn reserve_qsa_bf16_split_scratch(gpu: &mut Gpu, pooled: DType) -> HipResult
     Ok(layout.total)
 }
 
-/// Declarations of a split-route launch's two position-derived slots: the
+/// Declarations of a split-route or rows8-route launch's two position-derived slots: the
 /// active block count `(position + call_rows) / compress` and this group's
 /// `position_start` (`position + first_row`), exactly the fused selector's.
 fn qsa_position_bindings(
@@ -17551,6 +17597,136 @@ mod tests {
         gpu.free_tensor(pooled).expect("free pooled");
         gpu.free_tensor(query).expect("free query");
         gpu.free_tensor(selected).expect("free selected");
+    }
+
+    /// HIPF-289: on exact gfx1151 a recorder takes the PM score/select pair over
+    /// the shape bound. One tape, replayed at every position class (no live
+    /// block, inside a tile, across a 256-block tile edge, the last position),
+    /// must write the selected rows and mirror bytes the eager call writes at
+    /// that position. Eager reads the BF16 mirror; the tape never does.
+    #[test]
+    fn qsa_rows8_recorded_replays_eager_bytes_at_every_position_gfx1151() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() || !gpu.arch_caps.has_qwen4_parallel_qsa_gdn() {
+            eprintln!("skip: needs exact gfx1151");
+            return;
+        }
+        let (heads, dim, compress, budget, capacity, shape) =
+            (4usize, 128usize, 4usize, 64usize, 384usize, 1100usize);
+        let mut seed = 0x2890_u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        // BF16-exact keys (the pool/RoPE contract) on a coarse grid, so ties occur.
+        let pooled: Vec<f32> = (0..shape * dim)
+            .map(|_| f32::from_bits(((next() % 64) as f32 * 0.125 - 4.0).to_bits() & 0xffff_0000))
+            .collect();
+        let mirror_bytes: Vec<u8> = pooled
+            .iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let pooled_gpu = gpu.upload_f32(&pooled, &[shape * dim]).expect("pooled");
+        let mut mirror_bf16 = gpu
+            .upload_raw(&mirror_bytes, &[shape * dim])
+            .expect("bf16 mirror");
+        mirror_bf16.dtype = DType::BF16;
+        let max_rows = 3usize;
+        let query: Vec<f32> = (0..max_rows * heads * dim)
+            .map(|_| (next() % 33) as f32 * 0.0625 - 1.0)
+            .collect();
+        let query_gpu = gpu.upload_f32(&query, &[query.len()]).expect("query");
+        let selected_bytes = max_rows * capacity * std::mem::size_of::<i32>();
+        let selected = gpu.zeros(&[selected_bytes], DType::Raw).expect("selected");
+        let mirror = gpu.zeros(&[capacity], DType::F32).expect("mirror");
+        let call = |rows: usize, position: usize, bf16: bool| IndexedAttentionSelectBatch {
+            pooled_bf16: bf16.then_some(&mirror_bf16),
+            pooled_bf16_valid_blocks: 0,
+            query: &query_gpu,
+            pooled: &pooled_gpu,
+            selected: &selected,
+            rows,
+            query_row_stride: heads * dim,
+            block_count: (position + rows) / compress,
+            index_heads: heads,
+            index_dim: dim,
+            budget_blocks: budget,
+            compress,
+            position_start: position,
+            capacity,
+            shape_blocks: shape,
+        };
+        let clear = |gpu: &mut Gpu| {
+            gpu.hip
+                .memset(&selected.buf, 0x5a, selected_bytes)
+                .expect("clear");
+            gpu.hip
+                .memset(&mirror.buf, 0x5a, capacity * 4)
+                .expect("clear");
+        };
+        let read = |gpu: &mut Gpu| {
+            gpu.hip.device_synchronize().expect("sync");
+            let mut out = gpu.download_raw_bytes(&selected).expect("selected");
+            out.extend(gpu.download_raw_bytes(&mirror).expect("mirror"));
+            out
+        };
+        for rows in [1usize, max_rows] {
+            let last = shape * compress - rows;
+            let positions = [
+                0, 1, 2, 3, 4, 7, 1019, 1020, 1023, 1024, 2047, 2048, 3000, last,
+            ];
+            gpu.replay = crate::replay::ReplayController::new_armed(
+                crate::replay::ReplayBackendRequest::Auto,
+            );
+            gpu.replay.begin_capture().expect("open recording window");
+            indexed_attention_select_batch_mirrored(&mut gpu, &call(rows, 2001, true), &mirror)
+                .expect("recorded select");
+            gpu.replay.finish_capture().expect("close recording window");
+            let launches = gpu.replay.recorded_launches();
+            let kernels: Vec<&str> = launches.iter().map(|l| l.kernel.as_str()).collect();
+            assert_eq!(
+                kernels,
+                [
+                    "indexed_attention_select_scores_rows16_f32_pm_gfx1151",
+                    "indexed_attention_select_from_scores_pm_gfx1151"
+                ],
+                "rows {rows}: the recorder must take the PM pair over F32 keys"
+            );
+            assert_eq!(launches[0].grid[0], shape.div_ceil(256) as u32);
+            for launch in launches {
+                assert_eq!(
+                    launch.declared_kernarg_bindings().len(),
+                    2,
+                    "{}",
+                    launch.kernel
+                );
+            }
+            let count = launches.len();
+            for position in positions {
+                clear(&mut gpu);
+                indexed_attention_select_batch_mirrored(
+                    &mut gpu,
+                    &call(rows, position, true),
+                    &mirror,
+                )
+                .expect("eager select");
+                let eager = read(&mut gpu);
+                clear(&mut gpu);
+                gpu.replay_recorded_hip_prefix_at(count, position)
+                    .expect("replay");
+                let replayed = read(&mut gpu);
+                assert!(
+                    eager == replayed,
+                    "rows {rows} position {position}: replayed bytes differ from eager"
+                );
+            }
+        }
+        for t in [pooled_gpu, mirror_bf16, query_gpu, selected, mirror] {
+            gpu.free_tensor(t).expect("free");
+        }
     }
 
     /// A retained PM4 tape owns raw device addresses, not allocations. The QSA
