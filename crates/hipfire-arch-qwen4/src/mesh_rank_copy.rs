@@ -476,10 +476,16 @@ pub(crate) fn owe_lane_head_row(
             head.position()
         ));
     }
-    let src = hidden.sub_offset(dec_row * wide, wide);
-    let dst = lag.hidden.sub_offset(row * wide, wide);
-    gpu.copy_d2d(&src, &dst, wide * std::mem::size_of::<f32>())
-        .map_err(|e| format!("owe_lane_head_row: hidden copy: {e}"))?;
+    // The prepare fence covers this copy; do not wait once per retired lane.
+    let bytes = wide * std::mem::size_of::<f32>();
+    gpu.memcpy_dtod_at_ordered_async(
+        &lag.hidden.buf,
+        row * bytes,
+        &hidden.buf,
+        dec_row * bytes,
+        bytes,
+    )
+    .map_err(|e| format!("owe_lane_head_row: hidden copy: {e}"))?;
     lag.book.push(position, seed);
     Ok(())
 }

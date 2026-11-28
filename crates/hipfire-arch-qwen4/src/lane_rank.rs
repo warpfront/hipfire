@@ -1775,6 +1775,35 @@ mod tests {
         assert_eq!(start.lanes[0].head, HeadState::Free);
     }
 
+    // A retired singleton parks with a caught-up head. Its first lane
+    // window must keep that head so it can owe rows after the park.
+    #[test]
+    fn retired_promotion_with_owed_rows_keeps_the_head_aligned() {
+        let mut proto = LaneProto::new(None, "gfx1151").unwrap();
+        let agreement: &[(f32, f32)] = &[(0.5, 4.0); K];
+        proto
+            .admit_decoding(DecodeAdmission {
+                epoch: epoch(1),
+                position: 40,
+                seed: 3,
+                eos: None,
+                rng_seed: 0,
+                prompt: &[1, 2],
+                spec_k: Some(K),
+                promoted: Some((agreement, true)),
+                owes_rows: true,
+            })
+            .unwrap();
+        let mut owed = budgets(LabRoutes::Floor);
+        owed.head_lag_rows = 8;
+        let start = proto
+            .root
+            .plan_window(None, &[Single::request(1, 7)], &owed)
+            .unwrap();
+        assert_eq!(start.lanes[0].route, LaneRoute::ArRetired);
+        assert_eq!(start.lanes[0].head, HeadState::Aligned);
+    }
+
     #[test]
     fn single_world_validation() {
         let one = RankOwnership::single();
