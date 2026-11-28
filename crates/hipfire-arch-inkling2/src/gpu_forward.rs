@@ -58,7 +58,7 @@ use hipfire_runtime::llama::{rotate_x_mq_for, weight_gemv};
 use rdna_compute::ffn_activation::{
     CombineOrder, FfnActivation, FfnActivationRows, FfnAwq, MoeCombine, MoeRouterTopK, RouterKind,
 };
-use rdna_compute::inkling2_attention::inkling2_attn_fa2_splits;
+use rdna_compute::inkling2_attention::{inkling2_attn_fa2_splits, Fa2Bias};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -1121,7 +1121,7 @@ fn run_visit(
                     &qv,
                     &gs.k_cache[visit],
                     &gs.v_cache[visit],
-                    &tmp[rel_bias],
+                    Fa2Bias::Rows(&tmp[rel_bias]),
                     &tmp[si],
                     &gs.fa2_lse,
                     &gs.fa2_oacc,

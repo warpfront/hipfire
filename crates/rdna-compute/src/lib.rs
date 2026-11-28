@@ -84,6 +84,7 @@ pub mod inkling2_clip;
 pub mod inkling2_control;
 pub mod inkling2_fuse;
 pub mod inkling2_fuse_post;
+pub mod inkling2_fuse_row;
 pub mod inkling2_hilo;
 pub mod inkling2_mix;
 pub mod inkling2_rel_bias;

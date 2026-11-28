@@ -18,7 +18,7 @@ use hipfire_arch_inkling2::gpu::{swa_gather_map, upload};
 use hipfire_arch_inkling2::weights::Inkling2Weights;
 use hipfire_arch_inkling2::{forward_token_gpu, forward_token_gpu_capture};
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::inkling2_attention::inkling2_attn_fa2_splits;
+use rdna_compute::inkling2_attention::{inkling2_attn_fa2_splits, Fa2Bias};
 use rdna_compute::{DType, Gpu};
 use std::io::Write;
 
@@ -101,7 +101,7 @@ fn main() {
             &tq,
             &gs.k_cache[visit],
             &gs.v_cache[visit],
-            &tb,
+            Fa2Bias::Rows(&tb),
             &ts,
             &tl,
             &to,

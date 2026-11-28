@@ -31,7 +31,13 @@
 
 pub const INKLING2_ATTN_FA2_MODULE: &str = "inkling2_attention_fa2";
 
-pub const INKLING2_ATTN_FA2_HIP_SRC: &str = r#"
+/// Module of the partial kernel with the relative bias folded in
+/// ([`Fa2Bias::Rel`]): the same source built with `INK_FA2_RELB`.
+pub const INKLING2_ATTN_FA2_RELB_MODULE: &str = "inkling2_attention_fa2_relb";
+
+macro_rules! fa2_src {
+    () => {
+        r#"
 #include <hip/hip_runtime.h>
 
 #define IH 24
@@ -58,8 +64,44 @@ __device__ __forceinline__ int ik_vfrag8(int sub, int dc, int lane)
     return (sub * 8 + dc) * 32 + lane;
 }
 
+#ifdef INK_FA2_RELB
+// `inkling2_rel_bias_gather_f32`'s element (h, key) at distance `d0`.
+__device__ __forceinline__ float ink_fa2_relb(
+    const float* __restrict__ rrow, const float* __restrict__ table, float sk,
+    int d0, int n_rel, int n_extent)
+{
+    float v = 0.0f;
+    if (d0 >= 0 && d0 < n_extent) {
+        for (int r = 0; r < n_rel; ++r) {
+            v += table[r * n_extent + d0] * rrow[r];
+        }
+    }
+    return v - sk;
+}
+#endif
+
 // Grid (n_splits, 8), block 128 (four wave32s; every wave fills, wave w owns
-// KT16 subtile w of each KT64 tile).
+// KT16 subtile w of each KT64 tile). Built with INK_FA2_RELB (module
+// `inkling2_attention_fa2_relb`), the biased score is computed in place from
+// the rel row, rel table, sink and distances instead of read from `bias`.
+#ifdef INK_FA2_RELB
+extern "C" __global__ __launch_bounds__(128, 1) void inkling2_attn_fa2_partial_relb_gfx1201(
+    const float* __restrict__ q,
+    KvPlanes kp,
+    KvPlanes vp,
+    const float* __restrict__ rel,
+    const float* __restrict__ table,
+    const float* __restrict__ sink,
+    const int* __restrict__ dists,
+    int n_rel,
+    int n_extent,
+    const int* __restrict__ slots,
+    float* __restrict__ lse,
+    float* __restrict__ oacc,
+    int n_kv,
+    int n_splits,
+    float inv_sqrt_d)
+#else
 extern "C" __global__ __launch_bounds__(128, 1) void inkling2_attn_fa2_partial_gfx1201(
     const float* __restrict__ q,
     KvPlanes kp,
@@ -71,6 +113,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void inkling2_attn_fa2_partial_g
     int n_kv,
     int n_splits,
     float inv_sqrt_d)
+#endif
 {
     const int split = (int)blockIdx.x;
     const int kv_h = (int)blockIdx.y;
@@ -92,7 +135,13 @@ extern "C" __global__ __launch_bounds__(128, 1) void inkling2_attn_fa2_partial_g
 
     const bool live = ml < IGQA;
     const int h = IGQA * kv_h + (live ? ml : 0);
+#ifdef INK_FA2_RELB
+    // The tile's biased scores of the three live heads, computed once by the
+    // whole block (64 keys x 3 heads) during the K/V fill.
+    __shared__ float relb[IGQA][64];
+#else
     const float* brow = bias + (size_t)h * (size_t)n_kv;
+#endif
 
     half8_t qhi[8];
     half8_t qlo[8];
@@ -150,6 +199,16 @@ extern "C" __global__ __launch_bounds__(128, 1) void inkling2_attn_fa2_partial_g
                 V16[ik_vfrag8(sub, d >> 4, 16 * vkg + (d & 15)) * 8 + vj] = vv[i];
             }
         }
+#ifdef INK_FA2_RELB
+        for (int idx = tid; idx < IGQA * 64; idx += 128) {
+            const int hh = idx >> 6;
+            const int kk = idx & 63;
+            const int hq = IGQA * kv_h + hh;
+            if (kt + kk < key_end)
+                relb[hh][kk] = ink_fa2_relb(rel + (size_t)hq * (size_t)n_rel, table, sink[hq],
+                                            dists[kt + kk], n_rel, n_extent);
+        }
+#endif
         __syncthreads();
 
         const int ks = kt + wave * 16;
@@ -165,9 +224,15 @@ extern "C" __global__ __launch_bounds__(128, 1) void inkling2_attn_fa2_partial_g
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const int key = ks + 8 * kg + j;
+#ifdef INK_FA2_RELB
+                const float x = (live && key < key_end)
+                    ? sacc[j] * inv_sqrt_d + relb[ml][key - kt]
+                    : -INFINITY;
+#else
                 const float x = (live && key < key_end)
                     ? sacc[j] * inv_sqrt_d + brow[key]
                     : -INFINITY;
+#endif
                 sacc[j] = x;
                 mx = fmaxf(mx, x);
             }
@@ -233,6 +298,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void inkling2_attn_fa2_partial_g
     }
 }
 
+#ifndef INK_FA2_RELB
 // Grid 24, block 128. The sink is one synthetic key, score 0 and value 0.
 extern "C" __global__ __launch_bounds__(128) void inkling2_attn_fa2_merge_gfx1201(
     const float* __restrict__ lse,
@@ -262,7 +328,14 @@ extern "C" __global__ __launch_bounds__(128) void inkling2_attn_fa2_merge_gfx120
     }
     out[(size_t)h * ID + d] = num / den;
 }
-"#;
+#endif
+"#
+    };
+}
+
+pub const INKLING2_ATTN_FA2_HIP_SRC: &str = fa2_src!();
+
+pub const INKLING2_ATTN_FA2_RELB_HIP_SRC: &str = concat!("#define INK_FA2_RELB 1\n", fa2_src!());
 
 use std::ffi::c_void;
 
@@ -289,6 +362,22 @@ pub fn inkling2_attn_fa2_splits(n_kv: usize) -> usize {
 #[repr(C)]
 struct KvPlanes([*const c_void; 8]);
 
+/// Biased scores `rel - sink` of [`Gpu::inkling2_attn_decode_fa2`].
+pub enum Fa2Bias<'a> {
+    /// Precomputed `[24, n_kv]` ([`Gpu::inkling2_rel_bias_gather_f32`]).
+    Rows(&'a GpuTensor),
+    /// Computed in the partial kernel, bitwise the gather: `rel [24, n_rel]`,
+    /// `table [n_rel, n_extent]`, `sink [24]`, i32 distances `[n_kv]`.
+    Rel {
+        rel: &'a GpuTensor,
+        table: &'a GpuTensor,
+        sink: &'a GpuTensor,
+        dists: &'a GpuTensor,
+        n_rel: usize,
+        n_extent: usize,
+    },
+}
+
 impl Gpu {
     /// Split-KV FA2 decode attention for one Inkling-2 query row.
     /// `out [24,128]` F32; `lse`/`oacc` are caller-owned scratch of at least
@@ -299,7 +388,7 @@ impl Gpu {
         q: &GpuTensor,
         k_cache: &[GpuTensor],
         v_cache: &[GpuTensor],
-        bias: &GpuTensor,
+        bias: Fa2Bias<'_>,
         slots: &GpuTensor,
         lse: &GpuTensor,
         oacc: &GpuTensor,
@@ -332,9 +421,25 @@ impl Gpu {
             ));
         }
         let f32_len = |t: &GpuTensor| t.buf.size() / 4;
+        let bias_ok = match &bias {
+            Fa2Bias::Rows(b) => f32_len(b) >= h * n_kv,
+            Fa2Bias::Rel {
+                rel,
+                table,
+                sink,
+                dists,
+                n_rel,
+                n_extent,
+            } => {
+                f32_len(rel) >= h * n_rel
+                    && f32_len(table) >= n_rel * n_extent
+                    && f32_len(sink) >= h
+                    && dists.buf.size() >= n_kv * 4
+            }
+        };
         if f32_len(q) < h * d
             || f32_len(out) < h * d
-            || f32_len(bias) < h * n_kv
+            || !bias_ok
             || slots.buf.size() < n_kv * 4
             || f32_len(lse) < splits * h
             || f32_len(oacc) < splits * h * d
@@ -344,11 +449,24 @@ impl Gpu {
                 "inkling2_attn_decode_fa2: operand too small",
             ));
         }
-        self.ensure_kernel(
-            INKLING2_ATTN_FA2_MODULE,
-            INKLING2_ATTN_FA2_HIP_SRC,
-            "inkling2_attn_fa2_partial_gfx1201",
-        )?;
+        let partial = match bias {
+            Fa2Bias::Rows(_) => {
+                self.ensure_kernel(
+                    INKLING2_ATTN_FA2_MODULE,
+                    INKLING2_ATTN_FA2_HIP_SRC,
+                    "inkling2_attn_fa2_partial_gfx1201",
+                )?;
+                "inkling2_attn_fa2_partial_gfx1201"
+            }
+            Fa2Bias::Rel { .. } => {
+                self.ensure_kernel(
+                    INKLING2_ATTN_FA2_RELB_MODULE,
+                    INKLING2_ATTN_FA2_RELB_HIP_SRC,
+                    "inkling2_attn_fa2_partial_relb_gfx1201",
+                )?;
+                "inkling2_attn_fa2_partial_relb_gfx1201"
+            }
+        };
         self.ensure_kernel(
             INKLING2_ATTN_FA2_MODULE,
             INKLING2_ATTN_FA2_HIP_SRC,
@@ -362,7 +480,6 @@ impl Gpu {
         let vp = KvPlanes(std::array::from_fn(|i| {
             v_cache[i].buf.as_ptr() as *const c_void
         }));
-        let bias_ptr = bias.buf.as_ptr();
         let slots_ptr = slots.buf.as_ptr();
         let lse_ptr = lse.buf.as_ptr();
         let oacc_ptr = oacc.buf.as_ptr();
@@ -370,20 +487,44 @@ impl Gpu {
         let n_kv_val = n_kv as i32;
         let splits_val = splits as i32;
         let isd = 1.0f32 / (d as f32).sqrt();
+        // Bias operands: one pointer (rows), or rel / table / sink / dists
+        // pointers then n_rel, n_extent.
+        let (bias_ptrs, bias_ints): (Vec<*mut c_void>, Vec<i32>) = match &bias {
+            Fa2Bias::Rows(b) => (vec![b.buf.as_ptr()], Vec::new()),
+            Fa2Bias::Rel {
+                rel,
+                table,
+                sink,
+                dists,
+                n_rel,
+                n_extent,
+            } => (
+                vec![
+                    rel.buf.as_ptr(),
+                    table.buf.as_ptr(),
+                    sink.buf.as_ptr(),
+                    dists.buf.as_ptr(),
+                ],
+                vec![*n_rel as i32, *n_extent as i32],
+            ),
+        };
         let mut params: Vec<*mut c_void> = vec![
             &q_ptr as *const _ as *mut c_void,
             &kp as *const _ as *mut c_void,
             &vp as *const _ as *mut c_void,
-            &bias_ptr as *const _ as *mut c_void,
+        ];
+        params.extend(bias_ptrs.iter().map(|p| p as *const _ as *mut c_void));
+        params.extend(bias_ints.iter().map(|v| v as *const _ as *mut c_void));
+        params.extend([
             &slots_ptr as *const _ as *mut c_void,
             &lse_ptr as *const _ as *mut c_void,
             &oacc_ptr as *const _ as *mut c_void,
             &n_kv_val as *const _ as *mut c_void,
             &splits_val as *const _ as *mut c_void,
             &isd as *const _ as *mut c_void,
-        ];
+        ]);
         self.launch_maybe_blob(
-            "inkling2_attn_fa2_partial_gfx1201",
+            partial,
             [splits as u32, kvh as u32, 1],
             [128, 1, 1],
             0,
@@ -394,7 +535,12 @@ impl Gpu {
                 for p in kp.0.iter().chain(vp.0.iter()) {
                     b.push_ptr(*p);
                 }
-                b.push_ptr(bias_ptr);
+                for p in &bias_ptrs {
+                    b.push_ptr(*p);
+                }
+                for v in &bias_ints {
+                    b.push_i32(*v);
+                }
                 b.push_ptr(slots_ptr);
                 b.push_ptr(lse_ptr);
                 b.push_ptr(oacc_ptr);

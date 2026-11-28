@@ -953,11 +953,13 @@ module	indexer_top_k_buf_parallel_gfx942_bounded	non-target-arch	Only non-target
 module	indexer_top_k_buf_unrolled	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:21996
 module	indexer_topk_twostage	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:22083
 module	inkling2_attention_fa2	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 decode attention; rdna-compute/src/inkling2_attention.rs:347
+module	inkling2_attention_fa2_relb	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 one-row decode attention with the relative bias folded in; rdna-compute/src/inkling2_attention.rs:452
 module	inkling2_attention_prefill	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 blocked prefill attention; rdna-compute/src/inkling2_attention_prefill.rs:362
 module	inkling2_clip	non-core-family	Non-core family route: Inkling-2-Mini (arch 24); rdna-compute/src/inkling2_clip.rs:274
 module	inkling2_control_blend	non-core-family	Non-core family route: Inkling-2-Mini (arch 24); rdna-compute/src/inkling2_control.rs:421
 module	inkling2_fuse	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 blocked-body fused mix/norm/producer glue; rdna-compute/src/inkling2_fuse.rs:461
 module	inkling2_fuse_post	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 blocked-body fused attention epilogue / gate / conv glue; rdna-compute/src/inkling2_fuse_post.rs:308
+module	inkling2_fuse_row	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 one-row fused projections and routing; rdna-compute/src/inkling2_fuse_row.rs:267
 module	inkling2_gpu_forward	non-core-family	Non-core family route: Inkling-2-Mini (arch 24); hipfire-arch-inkling2/src/gpu_forward.rs:170
 module	inkling2_gpu_prefill	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), blocked prefill row kernels; hipfire-arch-inkling2/src/gpu_prefill.rs:437
 module	inkling2_hilo_gemm	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx12 blocked prefill hi/lo-F16 F32 projections; rdna-compute/src/inkling2_hilo.rs:369

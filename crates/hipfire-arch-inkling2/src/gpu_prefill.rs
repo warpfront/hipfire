@@ -61,14 +61,18 @@ use rdna_compute::ffn_activation::{
     CombineOrder, FfnActivation, FfnActivationGrouped, FfnActivationGroupedI8, FfnActivationRows,
     FfnAwq, MoeCombine, MoeRouterTopK, RouterKind,
 };
-use rdna_compute::inkling2_attention::inkling2_attn_fa2_splits;
+use rdna_compute::inkling2_attention::{inkling2_attn_fa2_splits, Fa2Bias};
 use rdna_compute::inkling2_attention_prefill::{Inkling2PrefillAttn, INKLING2_ATTN_PREFILL_REL};
 use rdna_compute::inkling2_fuse::{FzRow, FzTarget, Inkling2FzMixNormRot};
 use rdna_compute::inkling2_fuse_post::{FzKv16, Inkling2FzAttnPost};
+use rdna_compute::inkling2_fuse_row::{FzGemvSeg, Inkling2FzRouteRow, FZ_ROUTE_MAX_K};
 use rdna_compute::inkling2_hilo::{Inkling2HiloBlend, Inkling2HiloGemm};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::ffi::c_void;
 use std::sync::{Arc, LazyLock};
+
+/// Renormalization epsilon of the sigmoid + bias router.
+const INKLING2_ROUTE_EPS: f32 = 1e-20;
 
 // ---------------------------------------------------------------------------
 // Dedicated HIP (row-batched twins of the singleton kernels)
@@ -935,6 +939,36 @@ fn linear_rot(
     Ok(())
 }
 
+/// One-row [`linear_rot`]s `(w, x_rot [k], y [m])` with a common `k` in one
+/// launch ([`Gpu::inkling2_fz_gemv_segs`]): each segment is bitwise the
+/// singleton gfx1201 `gemv_mq4g256v2_multirow_r2` that `weight_gemv_prerotated`
+/// runs at one row.
+fn gemv_one_row(
+    gpu: &mut Gpu,
+    ps: &[(&WeightTensor, &GpuTensor, &GpuTensor)],
+) -> Result<(), String> {
+    let k = ps.first().map_or(0, |p| p.0.k);
+    if let Some(&(w, _, _)) = ps
+        .iter()
+        .find(|p| p.0.gpu_dtype != DType::MQ4G256V2 || p.0.awq_scale.is_none() || p.0.k != k)
+    {
+        return Err(format!(
+            "inkling2 prefill: one-row projections need MQ4G256V2 + AWQ at k {k}, got {:?} k {}",
+            w.gpu_dtype, w.k
+        ));
+    }
+    let segs: Vec<FzGemvSeg<'_>> = ps
+        .iter()
+        .map(|&(w, x_rot, y)| FzGemvSeg {
+            w: &w.buf,
+            x_rot,
+            y,
+            m: w.m,
+        })
+        .collect();
+    hip(gpu.inkling2_fz_gemv_segs(&segs, k), "one-row projections")
+}
+
 /// [`Gpu::inkling2_fz_mix_norm_rot`] over `n` rows of width `e`.
 fn fz(
     gpu: &mut Gpu,
@@ -1342,15 +1376,32 @@ fn visit_body(
         }
         (Some(_), None) => return Err("inkling2 prefill: phys 0 has no base".into()),
     }
-    // Projections.
+    // Projections. One row (gfx1201): q, k, v, rel and the output gate in one
+    // launch, each bitwise its singleton GEMV.
     let q = ar.f32(gpu, n * eattn, "q")?;
     let k_raw = ar.f32(gpu, n * ekv, "k_raw")?;
     let v_raw = ar.f32(gpu, n * ekv, "v_raw")?;
     let r = ar.f32(gpu, n * erel, "r")?;
-    linear_rot(gpu, &layer.wq, ar.get(rot_q), ar.get(q), n, gemm)?;
-    linear_rot(gpu, &layer.wk, ar.get(rot_k), ar.get(k_raw), n, gemm)?;
-    linear_rot(gpu, &layer.wv, ar.get(rot_v), ar.get(v_raw), n, gemm)?;
-    linear_rot(gpu, &layer.wr, ar.get(rot_r), ar.get(r), n, gemm)?;
+    let gate = ar.f32(gpu, n * eattn, "gate")?;
+    let projs = [
+        (&layer.wq, rot_q, q),
+        (&layer.wk, rot_k, k_raw),
+        (&layer.wv, rot_v, v_raw),
+        (&layer.wr, rot_r, r),
+        (&layer.wgate, rot_g, gate),
+    ];
+    let one_row_proj = n == 1 && gpu.arch_caps.is_gfx1201();
+    if one_row_proj {
+        let ps: Vec<_> = projs
+            .iter()
+            .map(|&(w, x, y)| (w, ar.get(x), ar.get(y)))
+            .collect();
+        gemv_one_row(gpu, &ps)?;
+    } else {
+        for &(w, x, y) in &projs[..4] {
+            linear_rot(gpu, w, ar.get(x), ar.get(y), n, gemm)?;
+        }
+    }
     // Dynamic conv taps (full layers).
     let dyn_kv = if swa {
         None
@@ -1497,8 +1548,9 @@ fn visit_body(
     }
     // Output gate (sigmoid · mul folded into the `wo` producer), projection,
     // post conv + residual.
-    let gate = ar.f32(gpu, n * eattn, "gate")?;
-    linear_rot(gpu, &layer.wgate, ar.get(rot_g), ar.get(gate), n, gemm)?;
+    if !one_row_proj {
+        linear_rot(gpu, &layer.wgate, ar.get(rot_g), ar.get(gate), n, gemm)?;
+    }
     let rot_o = ar.f32(gpu, n * eattn, "rot_o")?;
     let wo_awq = layer
         .wo
@@ -1630,24 +1682,13 @@ fn visit_body(
     )?;
     let topk_idx = ar.f32(gpu, n * k_top, "topk_idx")?;
     let topk_w = ar.f32(gpu, n * k_top, "topk_w")?;
-    hip(
-        gpu.ffn_moe_router_topk_f32(&MoeRouterTopK {
-            kind: RouterKind::SigmoidBiasRenorm {
-                eps: 1e-20,
-                scale: cfg.route_scale,
-            },
-            logits: ar.get(router_logits),
-            correction_bias: layer.router_bias.as_ref(),
-            topk_indices: ar.get(topk_idx),
-            topk_weights: ar.get(topk_w),
-            rows: n,
-            n_experts: n_exp,
-            top_k: k_top,
-        }),
-        "router topk",
-    )?;
     let moe_raw = ar.f32(gpu, ne, "moe_raw")?;
-    experts_rows(gpu, c, layer, ar, ffn_normed, topk_idx, topk_w, moe_raw)?;
+    let route = Route {
+        logits: router_logits,
+        idx: topk_idx,
+        w: topk_w,
+    };
+    experts_rows(gpu, c, layer, ar, ffn_normed, route, moe_raw)?;
     let visit_out = ar.f32(gpu, ne, "visit_out")?;
     hip(
         gpu.inkling2_fz_conv_res(
@@ -1767,7 +1808,7 @@ fn attn_row_exact(
                     &qv,
                     &gs.k_cache[visit],
                     &gs.v_cache[visit],
-                    ar.get(rel_bias),
+                    Fa2Bias::Rows(ar.get(rel_bias)),
                     ar.get(si),
                     &gs.fa2_lse,
                     &gs.fa2_oacc,
@@ -2004,12 +2045,42 @@ fn attn_one_row(
     let nh = cfg.n_head;
     let hd = cfg.head_dim;
     let (n_kv, slots, dists) = maps.get(gs.visit_rows[visit])?;
+    let rel = view(ar.get(r), 0, &[nh, cfg.n_rel])?;
+    let sink = view(ar.get(sinks), 0, &[nh])?;
+    let qv = view(ar.get(q), 0, &[nh, hd])?;
+    let out = view(ar.get(attn_heads), 0, &[nh * hd])?;
+    if gs.attn_fa2 {
+        // The relative bias is computed inside the partial kernel (bitwise
+        // `inkling2_rel_bias_gather_f32`).
+        return hip(
+            gpu.inkling2_attn_decode_fa2(
+                &qv,
+                &gs.k_cache[visit],
+                &gs.v_cache[visit],
+                Fa2Bias::Rel {
+                    rel: &rel,
+                    table: &layer.rel_table,
+                    sink: &sink,
+                    dists: &dists,
+                    n_rel: cfg.n_rel,
+                    n_extent: cfg.n_extent,
+                },
+                &slots,
+                &gs.fa2_lse,
+                &gs.fa2_oacc,
+                &out,
+                n_kv,
+                inkling2_attn_fa2_splits(n_kv),
+            ),
+            "attn fa2",
+        );
+    }
     let rel_bias = ar.alloc(gpu, &[nh, n_kv], DType::F32, "rel_bias")?;
     hip(
         gpu.inkling2_rel_bias_gather_f32(
-            &view(ar.get(r), 0, &[nh, cfg.n_rel])?,
+            &rel,
             &layer.rel_table,
-            &view(ar.get(sinks), 0, &[nh])?,
+            &sink,
             &dists,
             ar.get(rel_bias),
             cfg.n_rel,
@@ -2019,43 +2090,34 @@ fn attn_one_row(
         ),
         "rel_bias",
     )?;
-    let qv = view(ar.get(q), 0, &[nh, hd])?;
-    let out = view(ar.get(attn_heads), 0, &[nh * hd])?;
-    if gs.attn_fa2 {
-        hip(
-            gpu.inkling2_attn_decode_fa2(
-                &qv,
-                &gs.k_cache[visit],
-                &gs.v_cache[visit],
-                ar.get(rel_bias),
-                &slots,
-                &gs.fa2_lse,
-                &gs.fa2_oacc,
-                &out,
-                n_kv,
-                inkling2_attn_fa2_splits(n_kv),
-            ),
-            "attn fa2",
-        )
-    } else {
-        launch_attn(
-            gpu,
-            &qv,
-            &gs.k_cache[visit],
-            &gs.v_cache[visit],
-            ar.get(rel_bias),
-            &slots,
-            &out,
-            n_kv,
-            nh,
-            hd,
-        )
-    }
+    launch_attn(
+        gpu,
+        &qv,
+        &gs.k_cache[visit],
+        &gs.v_cache[visit],
+        ar.get(rel_bias),
+        &slots,
+        &out,
+        n_kv,
+        nh,
+        hd,
+    )
 }
 
-/// Routed experts over the block: per-slot AWQ+FWHT producer, then the grouped
-/// GEMMs at the route's tier (blocked) or the indexed decode chain batched over
-/// rows (row-exact), SiTU with the per-expert down AWQ, rank-order combine.
+/// Router outputs of one visit: the logits, and the top-k ids / weights the
+/// experts consume (written by [`experts_rows`]).
+struct Route {
+    logits: T,
+    idx: T,
+    w: T,
+}
+
+/// Routed experts over the block: top-k, per-slot AWQ+FWHT producer, then the
+/// grouped GEMMs at the route's tier (blocked) or the indexed decode chain
+/// batched over rows (row-exact), SiTU with the per-expert down AWQ,
+/// rank-order combine. A one-row grouped A8 visit on gfx1201 runs top-k,
+/// scatter, producer and gate/up quantization as one launch
+/// ([`Gpu::inkling2_fz_route_row`]), bitwise the four launches.
 #[allow(clippy::too_many_arguments)]
 fn experts_rows(
     gpu: &mut Gpu,
@@ -2063,8 +2125,7 @@ fn experts_rows(
     layer: &Inkling2GpuLayer,
     ar: &mut Arena,
     ffn_normed: T,
-    topk_idx: T,
-    topk_w: T,
+    route: Route,
     moe_raw: T,
 ) -> Result<(), String> {
     let cfg = c.cfg;
@@ -2079,49 +2140,77 @@ fn experts_rows(
     let k_top = cfg.n_expert_used;
     let n_exp = cfg.n_experts;
     let slots = n * k_top;
+    let (topk_idx, topk_w) = (route.idx, route.w);
+    let route_row = n == 1
+        && c.mode.grouped
+        && c.routes.experts == PrefillActTier::A8
+        && gpu.arch_caps.is_gfx1201()
+        && k_top <= FZ_ROUTE_MAX_K;
     // Per-slot producer: row s = FWHT256(ffn_normed[s / 8] / S_gu[ids[s]]).
-    let x_rot = ar.alloc(gpu, &[slots, e], DType::F32, "xts_x_rot")?;
-    hip(gpu.ensure_mq_signs(), "mq signs")?;
-    let s1 = gpu
-        .scratch
-        .mq_signs1
-        .as_ref()
-        .ok_or("inkling2 prefill: no mq signs")?
-        .buf
-        .as_ptr();
-    let s2 = gpu
-        .scratch
-        .mq_signs2
-        .as_ref()
-        .ok_or("inkling2 prefill: no mq signs")?
-        .buf
-        .as_ptr();
-    let mut b = KernargBlob::new();
-    b.push_ptr(ptr(ar.get(ffn_normed)));
-    b.push_ptr(ptr(ar.get(x_rot)));
-    b.push_ptr(ptr(&xl.gu_awq_ptrs));
-    b.push_ptr(ptr(ar.get(topk_idx)));
-    b.push_ptr(s1 as *const c_void);
-    b.push_ptr(s2 as *const c_void);
-    b.push_i32(e as i32);
-    b.push_i32(n_exp as i32);
-    b.push_i32(k_top as i32);
-    launch(
-        gpu,
-        "ink_pf_rotate_awq_slots",
-        [grid_u32((e / 256) * slots, "awq slots")?, 1, 1],
-        [32, 1, 1],
-        0,
-        b,
-    )?;
-    gpu.scratch
-        .invalidate_x_caches_for(ar.get(x_rot).buf.as_ptr());
+    let x_rot = if route_row {
+        None
+    } else {
+        hip(
+            gpu.ffn_moe_router_topk_f32(&MoeRouterTopK {
+                kind: RouterKind::SigmoidBiasRenorm {
+                    eps: INKLING2_ROUTE_EPS,
+                    scale: cfg.route_scale,
+                },
+                logits: ar.get(route.logits),
+                correction_bias: layer.router_bias.as_ref(),
+                topk_indices: ar.get(topk_idx),
+                topk_weights: ar.get(topk_w),
+                rows: n,
+                n_experts: n_exp,
+                top_k: k_top,
+            }),
+            "router topk",
+        )?;
+        let x_rot = ar.alloc(gpu, &[slots, e], DType::F32, "xts_x_rot")?;
+        hip(gpu.ensure_mq_signs(), "mq signs")?;
+        let s1 = gpu
+            .scratch
+            .mq_signs1
+            .as_ref()
+            .ok_or("inkling2 prefill: no mq signs")?
+            .buf
+            .as_ptr();
+        let s2 = gpu
+            .scratch
+            .mq_signs2
+            .as_ref()
+            .ok_or("inkling2 prefill: no mq signs")?
+            .buf
+            .as_ptr();
+        let mut b = KernargBlob::new();
+        b.push_ptr(ptr(ar.get(ffn_normed)));
+        b.push_ptr(ptr(ar.get(x_rot)));
+        b.push_ptr(ptr(&xl.gu_awq_ptrs));
+        b.push_ptr(ptr(ar.get(topk_idx)));
+        b.push_ptr(s1 as *const c_void);
+        b.push_ptr(s2 as *const c_void);
+        b.push_i32(e as i32);
+        b.push_i32(n_exp as i32);
+        b.push_i32(k_top as i32);
+        launch(
+            gpu,
+            "ink_pf_rotate_awq_slots",
+            [grid_u32((e / 256) * slots, "awq slots")?, 1, 1],
+            [32, 1, 1],
+            0,
+            b,
+        )?;
+        gpu.scratch
+            .invalidate_x_caches_for(ar.get(x_rot).buf.as_ptr());
+        Some(x_rot)
+    };
     let situ = FfnActivation::Situ {
         gate_beta: cfg.situ_beta,
         value_beta: cfg.situ_linear_beta,
     };
     match c.mode.grouped {
         false => {
+            let x_rot = x_rot.ok_or("inkling2 prefill: no slot producer")?;
             let gu = ar.f32(gpu, slots * 2 * inter, "xts_gate_up")?;
             run_uniform_moe_down_expanded(
                 gpu,
@@ -2189,21 +2278,6 @@ fn experts_rows(
             let sorted = ar.f32(gpu, m_total, "moe_sorted")?;
             let tiles = ar.f32(gpu, m_total / MOE_GROUPED_BLOCK_M, "moe_tiles")?;
             let inv = ar.f32(gpu, slots, "moe_inv")?;
-            hip(
-                gpu.moe_scatter_fused_k8(
-                    ar.get(topk_idx),
-                    ar.get(counts),
-                    ar.get(offsets),
-                    ar.get(sorted),
-                    ar.get(tiles),
-                    ar.get(inv),
-                    slots,
-                    n_exp,
-                    m_total,
-                    MOE_GROUPED_BLOCK_M,
-                ),
-                "moe scatter",
-            )?;
             let y_gu = ar.f32(gpu, m_total * 2 * inter, "moe_y_gu")?;
             let gu_tables = GroupedQt44Tables {
                 expert_weight_ptrs: &xl.gu_ptrs,
@@ -2211,18 +2285,78 @@ fn experts_rows(
                 expert_offsets: ar.get(offsets),
                 sorted_slot_index: ar.get(sorted),
             };
-            grouped_qt44_gemm_tier(
-                gpu,
-                tier,
-                &gu_tables,
-                ar.get(x_rot),
-                ar.get(y_gu),
-                2 * inter,
-                e,
-                1,
-                m_total,
-                slots,
-            )
+            match x_rot {
+                None => {
+                    let prepared = hip(
+                        gpu.inkling2_fz_route_row(&Inkling2FzRouteRow {
+                            logits: ar.get(route.logits),
+                            correction_bias: layer.router_bias.as_ref(),
+                            eps: INKLING2_ROUTE_EPS,
+                            scale: cfg.route_scale,
+                            topk_idx: ar.get(topk_idx),
+                            topk_w: ar.get(topk_w),
+                            counts: ar.get(counts),
+                            offsets: ar.get(offsets),
+                            sorted: ar.get(sorted),
+                            tiles: ar.get(tiles),
+                            inverse: ar.get(inv),
+                            x: ar.get(ffn_normed),
+                            awq_ptrs: &xl.gu_awq_ptrs,
+                            n_experts: n_exp,
+                            top_k: k_top,
+                            k: e,
+                            m_total_max: m_total,
+                            block_m: MOE_GROUPED_BLOCK_M,
+                        }),
+                        "route row",
+                    )?;
+                    let xq = hip(
+                        gpu.int8_mmq_prepared_ptr(&prepared, e, slots),
+                        "int8 prepared",
+                    )?;
+                    grouped_qt44_gemm_prepared(
+                        gpu,
+                        tier,
+                        &gu_tables,
+                        xq,
+                        ar.get(y_gu),
+                        2 * inter,
+                        e,
+                        1,
+                        m_total,
+                        slots,
+                    )
+                }
+                Some(x_rot) => {
+                    hip(
+                        gpu.moe_scatter_fused_k8(
+                            ar.get(topk_idx),
+                            ar.get(counts),
+                            ar.get(offsets),
+                            ar.get(sorted),
+                            ar.get(tiles),
+                            ar.get(inv),
+                            slots,
+                            n_exp,
+                            m_total,
+                            MOE_GROUPED_BLOCK_M,
+                        ),
+                        "moe scatter",
+                    )?;
+                    grouped_qt44_gemm_tier(
+                        gpu,
+                        tier,
+                        &gu_tables,
+                        ar.get(x_rot),
+                        ar.get(y_gu),
+                        2 * inter,
+                        e,
+                        1,
+                        m_total,
+                        slots,
+                    )
+                }
+            }
             .map_err(|e2| format!("inkling2 prefill: grouped gate_up: {e2}"))?;
             let y_dn = ar.f32(gpu, m_total * e, "moe_y_dn")?;
             let fused =
