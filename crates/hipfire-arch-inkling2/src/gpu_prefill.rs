@@ -67,7 +67,7 @@ use rdna_compute::inkling2_fuse::{FzRow, FzTarget, Inkling2FzMixNormRot};
 use rdna_compute::inkling2_fuse_post::{FzKv16, Inkling2DecodeAddr, Inkling2FzAttnPost};
 use rdna_compute::inkling2_fuse_row::{FzGemvSeg, Inkling2FzRouteRow, FZ_ROUTE_MAX_K};
 use rdna_compute::inkling2_hilo::{Inkling2HiloBlend, Inkling2HiloGemm};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, Int8MmqPrepared};
 use std::ffi::c_void;
 use std::sync::{Arc, LazyLock};
 
@@ -217,12 +217,129 @@ __global__ void ink_pf_rotate_awq_slots(
     x_out_b[base + 6] = v6 * s * signs2[d0 + 6];
     x_out_b[base + 7] = v7 * s * signs2[d0 + 7];
 }
+
+// `ink_pf_rotate_awq_slots` fused with `quantize_int8_mmq_ds128`: the producer's
+// final f32 values (lane tid owns 8p..8p+7 of the 256-group, p = tid) never leave
+// registers. Lanes 0-15 form 128-block 2*group, lanes 16-31 block 2*group+1.
+// Sidecar: block_i8_128 record (2*group + half) * n_slots + slot, byte-identical
+// to the standalone quantizer's [K/128, rows] layout (d, s, qs in nibble-pair
+// order: dword 2j = {q0,q2,q4,q6}, dword 2j+1 = {q1,q3,q5,q7}).
+struct block_i8_128 {
+    float d;
+    int s;
+    signed char qs[128];
+};
+extern "C" __launch_bounds__(32, 16)
+__global__ void ink_pf_rotate_awq_slots_i8(
+    const float* __restrict__ x_in,
+    block_i8_128* __restrict__ y,
+    const unsigned long long* __restrict__ scale_ptrs,
+    const int* __restrict__ expert_ids,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int K, int n_exp, int top_k, int n_slots)
+{
+    const int tid = threadIdx.x;
+    const int groups_total = K / 256;
+    if (groups_total <= 0) return;
+    const unsigned bx = blockIdx.x;
+    const int slot = (int)(bx / (unsigned)groups_total);
+    const int group = (int)(bx - (unsigned)slot * (unsigned)groups_total);
+    const int expert_id = expert_ids[slot];
+    const float* __restrict__ xr = x_in + (long long)(slot / top_k) * K;
+    const int d0 = tid * 8;
+    const int base = group * 256 + d0;
+    float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f, v4 = 0.0f, v5 = 0.0f, v6 = 0.0f, v7 = 0.0f;
+    // expert_id is wave-uniform; an invalid id leaves the zero row (zero block: d = 0, q = 0).
+    if (expert_id >= 0 && expert_id < n_exp) {
+        const float* __restrict__ awq_scale =
+            reinterpret_cast<const float*>(scale_ptrs[expert_id]);
+        v0 = (xr[base    ] / awq_scale[base    ]) * signs1[d0    ];
+        v1 = (xr[base + 1] / awq_scale[base + 1]) * signs1[d0 + 1];
+        v2 = (xr[base + 2] / awq_scale[base + 2]) * signs1[d0 + 2];
+        v3 = (xr[base + 3] / awq_scale[base + 3]) * signs1[d0 + 3];
+        v4 = (xr[base + 4] / awq_scale[base + 4]) * signs1[d0 + 4];
+        v5 = (xr[base + 5] / awq_scale[base + 5]) * signs1[d0 + 5];
+        v6 = (xr[base + 6] / awq_scale[base + 6]) * signs1[d0 + 6];
+        v7 = (xr[base + 7] / awq_scale[base + 7]) * signs1[d0 + 7];
+        float t;
+        t = v0; v0 = v0 + v1; v1 = t - v1;
+        t = v2; v2 = v2 + v3; v3 = t - v3;
+        t = v4; v4 = v4 + v5; v5 = t - v5;
+        t = v6; v6 = v6 + v7; v7 = t - v7;
+        t = v0; v0 = v0 + v2; v2 = t - v2;
+        t = v1; v1 = v1 + v3; v3 = t - v3;
+        t = v4; v4 = v4 + v6; v6 = t - v6;
+        t = v5; v5 = v5 + v7; v7 = t - v7;
+        t = v0; v0 = v0 + v4; v4 = t - v4;
+        t = v1; v1 = v1 + v5; v5 = t - v5;
+        t = v2; v2 = v2 + v6; v6 = t - v6;
+        t = v3; v3 = v3 + v7; v7 = t - v7;
+        #define HBFLY(v, pat, str) do { \
+            float _p = __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), (pat))); \
+            if (tid & (str)) { (v) = _p - (v); } else { (v) = (v) + _p; } \
+        } while(0)
+        #define HBFLY8(pat, str) \
+            HBFLY(v0,pat,str); HBFLY(v1,pat,str); HBFLY(v2,pat,str); HBFLY(v3,pat,str); \
+            HBFLY(v4,pat,str); HBFLY(v5,pat,str); HBFLY(v6,pat,str); HBFLY(v7,pat,str)
+        HBFLY8(0x041F, 1);
+        HBFLY8(0x081F, 2);
+        HBFLY8(0x101F, 4);
+        HBFLY8(0x201F, 8);
+        HBFLY8(0x401F, 16);
+        #undef HBFLY8
+        #undef HBFLY
+        const float s = 0.0625f;
+        v0 = v0 * s * signs2[d0    ];
+        v1 = v1 * s * signs2[d0 + 1];
+        v2 = v2 * s * signs2[d0 + 2];
+        v3 = v3 * s * signs2[d0 + 3];
+        v4 = v4 * s * signs2[d0 + 4];
+        v5 = v5 * s * signs2[d0 + 5];
+        v6 = v6 * s * signs2[d0 + 6];
+        v7 = v7 * s * signs2[d0 + 7];
+    }
+    // block_i8_128 quantizer (block_i8_128_quant.hip contract): amax over the 16-lane
+    // half (max is order-free), d = RN(amax/127), q = clamp(rintf(RN(x/d)), +-127).
+    const float x[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
+    float amax = fmaxf(fmaxf(fmaxf(fabsf(x[0]), fabsf(x[1])), fmaxf(fabsf(x[2]), fabsf(x[3]))),
+                       fmaxf(fmaxf(fabsf(x[4]), fabsf(x[5])), fmaxf(fabsf(x[6]), fabsf(x[7]))));
+    amax = fmaxf(amax, __shfl_xor(amax, 8, 32));
+    amax = fmaxf(amax, __shfl_xor(amax, 4, 32));
+    amax = fmaxf(amax, __shfl_xor(amax, 2, 32));
+    amax = fmaxf(amax, __shfl_xor(amax, 1, 32));
+    const bool zero = amax == 0.0f;
+    const float d = zero ? 0.0f : __fdiv_rn(amax, 127.0f);
+    int q[8];
+    int sq = 0;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const float qf = zero ? 0.0f : fminf(fmaxf(rintf(__fdiv_rn(x[e], d)), -127.0f), 127.0f);
+        q[e] = (int)qf;
+        sq += q[e];
+    }
+    sq += __shfl_xor(sq, 8, 32);
+    sq += __shfl_xor(sq, 4, 32);
+    sq += __shfl_xor(sq, 2, 32);
+    sq += __shfl_xor(sq, 1, 32);
+    const unsigned lo = ((unsigned)q[0] & 255u) | (((unsigned)q[2] & 255u) << 8)
+                      | (((unsigned)q[4] & 255u) << 16) | ((unsigned)q[6] << 24);
+    const unsigned hi = ((unsigned)q[1] & 255u) | (((unsigned)q[3] & 255u) << 8)
+                      | (((unsigned)q[5] & 255u) << 16) | ((unsigned)q[7] << 24);
+    block_i8_128* out = y + (long long)(2 * group + (tid >> 4)) * n_slots + slot;
+    const int j = tid & 15;
+    reinterpret_cast<uint2*>(out->qs)[j] = make_uint2(lo, hi);
+    if (j == 0) {
+        *reinterpret_cast<uint2*>(out) = make_uint2(__float_as_uint(d), (unsigned)sq);
+    }
+}
 "#;
 
-const PF_SYMBOLS: [&str; 3] = [
+const PF_SYMBOLS: [&str; 4] = [
     "ink_pf_gemv_f32_rows",
     "ink_pf_kv_commit_f16",
     "ink_pf_rotate_awq_slots",
+    "ink_pf_rotate_awq_slots_i8",
 ];
 
 pub(crate) fn ensure_pf_kernels(gpu: &mut Gpu) -> Result<(), String> {
@@ -2591,12 +2708,30 @@ struct Route {
     w: T,
 }
 
+/// Device pointers of the two MQ sign tables (ensured).
+fn mq_signs_ptrs(gpu: &mut Gpu) -> Result<(*const c_void, *const c_void), String> {
+    hip(gpu.ensure_mq_signs(), "mq signs")?;
+    match (
+        gpu.scratch.mq_signs1.as_ref(),
+        gpu.scratch.mq_signs2.as_ref(),
+    ) {
+        (Some(a), Some(b)) => Ok((
+            a.buf.as_ptr() as *const c_void,
+            b.buf.as_ptr() as *const c_void,
+        )),
+        _ => Err("inkling2 prefill: no mq signs".to_string()),
+    }
+}
+
 /// Routed experts over the block: top-k, per-slot AWQ+FWHT producer, then the
 /// grouped GEMMs at the route's tier (blocked) or the indexed decode chain
 /// batched over rows (row-exact), SiTU with the per-expert down AWQ,
 /// rank-order combine. A one-row grouped A8 visit on gfx1201 runs top-k,
 /// scatter, producer and gate/up quantization as one launch
-/// ([`Gpu::inkling2_fz_route_row`]), bitwise the four launches.
+/// ([`Gpu::inkling2_fz_route_row`]), bitwise the four launches. A blocked grouped
+/// A8 visit with producer-quant fusion on runs top-k, scatter, then one launch
+/// (`ink_pf_rotate_awq_slots_i8`) that produces the AWQ+FWHT rows and quantizes
+/// them into the A8 sidecar, bitwise the producer + `quantize_int8_mmq_ds128`.
 #[allow(clippy::too_many_arguments)]
 fn experts_rows(
     gpu: &mut Gpu,
@@ -2625,10 +2760,13 @@ fn experts_rows(
         && c.routes.experts == PrefillActTier::A8
         && gpu.arch_caps.is_gfx1201()
         && k_top <= FZ_ROUTE_MAX_K;
-    // Per-slot producer: row s = FWHT256(ffn_normed[s / 8] / S_gu[ids[s]]).
-    let x_rot = if route_row {
-        None
-    } else {
+    // Top-k, then (unless the producer fuses the A8 quantization) the f32 per-slot
+    // producer: row s = FWHT256(ffn_normed[s / 8] / S_gu[ids[s]]).
+    let fused_gu = !route_row
+        && c.mode.grouped
+        && c.routes.experts == PrefillActTier::A8
+        && gpu.flags.gfx12_producer_quant_fused_enabled();
+    if !route_row {
         hip(
             gpu.ffn_moe_router_topk_f32(&MoeRouterTopK {
                 kind: RouterKind::SigmoidBiasRenorm {
@@ -2645,29 +2783,19 @@ fn experts_rows(
             }),
             "router topk",
         )?;
+    }
+    let x_rot = if route_row || fused_gu {
+        None
+    } else {
         let x_rot = ar.push(view(&c.scratch.x_rot, 0, &[slots, e])?);
-        hip(gpu.ensure_mq_signs(), "mq signs")?;
-        let s1 = gpu
-            .scratch
-            .mq_signs1
-            .as_ref()
-            .ok_or("inkling2 prefill: no mq signs")?
-            .buf
-            .as_ptr();
-        let s2 = gpu
-            .scratch
-            .mq_signs2
-            .as_ref()
-            .ok_or("inkling2 prefill: no mq signs")?
-            .buf
-            .as_ptr();
+        let (s1, s2) = mq_signs_ptrs(gpu)?;
         let mut b = KernargBlob::new();
         b.push_ptr(ptr(ar.get(ffn_normed)));
         b.push_ptr(ptr(ar.get(x_rot)));
         b.push_ptr(ptr(&xl.gu_awq_ptrs));
         b.push_ptr(ptr(ar.get(topk_idx)));
-        b.push_ptr(s1 as *const c_void);
-        b.push_ptr(s2 as *const c_void);
+        b.push_ptr(s1);
+        b.push_ptr(s2);
         b.push_i32(e as i32);
         b.push_i32(n_exp as i32);
         b.push_i32(k_top as i32);
@@ -2766,29 +2894,71 @@ fn experts_rows(
             };
             match x_rot {
                 None => {
-                    let prepared = hip(
-                        gpu.inkling2_fz_route_row(&Inkling2FzRouteRow {
-                            logits: ar.get(route.logits),
-                            correction_bias: layer.router_bias.as_ref(),
-                            eps: INKLING2_ROUTE_EPS,
-                            scale: cfg.route_scale,
-                            topk_idx: ar.get(topk_idx),
-                            topk_w: ar.get(topk_w),
-                            counts: ar.get(counts),
-                            offsets: ar.get(offsets),
-                            sorted: ar.get(sorted),
-                            tiles: ar.get(tiles),
-                            inverse: ar.get(inv),
-                            x: ar.get(ffn_normed),
-                            awq_ptrs: &xl.gu_awq_ptrs,
-                            n_experts: n_exp,
-                            top_k: k_top,
-                            k: e,
-                            m_total_max: m_total,
-                            block_m: MOE_GROUPED_BLOCK_M,
-                        }),
-                        "route row",
-                    )?;
+                    let prepared = if route_row {
+                        hip(
+                            gpu.inkling2_fz_route_row(&Inkling2FzRouteRow {
+                                logits: ar.get(route.logits),
+                                correction_bias: layer.router_bias.as_ref(),
+                                eps: INKLING2_ROUTE_EPS,
+                                scale: cfg.route_scale,
+                                topk_idx: ar.get(topk_idx),
+                                topk_w: ar.get(topk_w),
+                                counts: ar.get(counts),
+                                offsets: ar.get(offsets),
+                                sorted: ar.get(sorted),
+                                tiles: ar.get(tiles),
+                                inverse: ar.get(inv),
+                                x: ar.get(ffn_normed),
+                                awq_ptrs: &xl.gu_awq_ptrs,
+                                n_experts: n_exp,
+                                top_k: k_top,
+                                k: e,
+                                m_total_max: m_total,
+                                block_m: MOE_GROUPED_BLOCK_M,
+                            }),
+                            "route row",
+                        )?
+                    } else {
+                        // Blocked A8 gfx1201: scatter, then the producer quantizes
+                        // straight into the A8 sidecar (no f32 `x_rot` round trip).
+                        hip(
+                            gpu.moe_scatter_fused_k8(
+                                ar.get(topk_idx),
+                                ar.get(counts),
+                                ar.get(offsets),
+                                ar.get(sorted),
+                                ar.get(tiles),
+                                ar.get(inv),
+                                slots,
+                                n_exp,
+                                m_total,
+                                MOE_GROUPED_BLOCK_M,
+                            ),
+                            "moe scatter",
+                        )?;
+                        let reservation = hip(gpu.reserve_int8_mmq(e, slots), "int8 reserve")?;
+                        let (s1, s2) = mq_signs_ptrs(gpu)?;
+                        let mut b = KernargBlob::new();
+                        b.push_ptr(ptr(ar.get(ffn_normed)));
+                        b.push_ptr(reservation.ptr() as *const c_void);
+                        b.push_ptr(ptr(&xl.gu_awq_ptrs));
+                        b.push_ptr(ptr(ar.get(topk_idx)));
+                        b.push_ptr(s1);
+                        b.push_ptr(s2);
+                        b.push_i32(e as i32);
+                        b.push_i32(n_exp as i32);
+                        b.push_i32(k_top as i32);
+                        b.push_i32(slots as i32);
+                        launch(
+                            gpu,
+                            "ink_pf_rotate_awq_slots_i8",
+                            [grid_u32((e / 256) * slots, "awq slots i8")?, 1, 1],
+                            [32, 1, 1],
+                            0,
+                            b,
+                        )?;
+                        Int8MmqPrepared::from_reservation(reservation)
+                    };
                     let xq = hip(
                         gpu.int8_mmq_prepared_ptr(&prepared, e, slots),
                         "int8 prepared",
