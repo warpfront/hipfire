@@ -13,6 +13,7 @@ pub mod arch;
 pub mod arch_model;
 pub mod carrier;
 pub mod config;
+pub mod decode_replay;
 pub mod decode_step;
 pub mod dspark_body;
 pub mod dspark_weights;

@@ -1173,8 +1173,17 @@ pub fn finish_decode_step(
             state.seq_pos
         ));
     }
-    gpu.download_f32_into(&arena.logits_row, logits)
-        .map_err(|e| format!("inkling2 decode: logits download: {e:?}"))?;
+    // On an owned stream (the graph route) the readback is ordered on it: one
+    // wait, no legacy-stream hop (the blocking copy makes the runtime join the
+    // null queue with the decode queue, which can time-slice every dispatch of
+    // the step). With no stream it is the blocking copy, unchanged.
+    let read = if gpu.active_stream.is_some() {
+        logits.clear();
+        gpu.download_f32_stream_ordered_append(&mut [(&arena.logits_row, &mut *logits)])
+    } else {
+        gpu.download_f32_into(&arena.logits_row, logits)
+    };
+    read.map_err(|e| format!("inkling2 decode: logits download: {e:?}"))?;
     for d in &arena.schedule.visits {
         let v = d.visit as usize;
         let ring = state.visit_rows[v];

@@ -123,7 +123,7 @@ const USAGE: &str = "usage:
   inkling_kld bench    --model CANDIDATE.hfq --ref REF.kldref --output OUT.json [--n 2048]
                        [--reps 3] [--prefill-routes ...] [--block-rows N (dev)]
   inkling_kld bench-decode --model CANDIDATE.hfq --ref REF.kldref --output OUT.json
-                       [--ctx 128] [--steps 64] [--reps 3] [--body blocked|scalar] [--prefill-routes ...]
+                       [--ctx 128] [--steps 64] [--reps 3] [--body stock|scalar|frozen|frozen-stream|graph] [--prefill-routes ...]
   inkling_kld pair     --base BASE.kldseq --cand CAND.kldseq [--output OUT.json] [--boot 20000] [--seed 1]";
 
 /// Receipt schema written beside every `.kldseq`.
@@ -3325,10 +3325,16 @@ fn bench(a: &Args) -> Result<(), String> {
 
 /// Decode speed at real context on one load: per rep, `reset_session_state`,
 /// blocked prefill of the reference's first `ctx` tokens (head on the last row),
-/// then `steps` greedy decode steps through `--body scalar` (`forward_token_gpu`)
-/// or `--body blocked` (`forward_decode_gpu`, the blocked body at one row). Each
-/// step's forward call is timed (host argmax excluded). One untimed warm-up rep;
-/// every rep must generate the warm-up's token ids.
+/// then `steps` greedy decode steps through one of the bodies:
+/// `--body stock` (alias `blocked`; `forward_decode_gpu`, the blocked body at one
+/// row), `scalar` (`forward_token_gpu`), `frozen` (the S2 stage/body/finish on
+/// the ordinary stream), `frozen-stream` (the same on the Gpu's owned stream,
+/// to separate the stream effect from the graph effect) or `graph`
+/// (`decode_replay::DecodeGraph` over the frozen body; a dev opt-in that needs
+/// `HIPFIRE_GRAPH=1`). Each step's forward call is timed (host argmax excluded).
+/// One untimed warm-up rep (its per-step times are reported as the cold first
+/// turn; for `graph` it holds the eager token and the capture); every timed rep
+/// must generate the warm-up's token ids, and a graph rep must be all replay.
 fn bench_decode(a: &Args) -> Result<(), String> {
     let model = a.path("model")?;
     let ref_path = a.path("ref")?;
@@ -3337,17 +3343,20 @@ fn bench_decode(a: &Args) -> Result<(), String> {
     let ctx = a.num("ctx", 128)?;
     let steps = a.num("steps", 64)?.max(1);
     let body = match a.0.get("body").map(String::as_str) {
-        None | Some("blocked") => "blocked",
+        None | Some("blocked") | Some("stock") => "stock",
         Some("scalar") => "scalar",
         Some("frozen") => "frozen",
+        Some("frozen-stream") => "frozen-stream",
+        Some("graph") => "graph",
         Some(other) => {
             return Err(format!(
-                "--body: expected scalar|blocked|frozen, got {other}"
+                "--body: expected stock|scalar|frozen|frozen-stream|graph, got {other}"
             ))
         }
     };
     let blocked = body != "scalar";
-    let frozen = body == "frozen";
+    let frozen = body == "frozen" || body == "frozen-stream";
+    let graph = body == "graph";
     let (reference, mmap) = open_ref(&ref_path)?;
     let tokens = reference.tokens(&mmap).map_err(|e| e.to_string())?;
     if ctx == 0 || ctx > tokens.len() {
@@ -3369,49 +3378,119 @@ fn bench_decode(a: &Args) -> Result<(), String> {
             .max_by(|x, y| x.1.total_cmp(y.1))
             .map_or(0, |(i, _)| i as u32)
     };
-    let mut run = |b: &mut hipfire_arch_inkling2::Inkling2Bundle|
-     -> Result<(Vec<f64>, Vec<u32>, String), String> {
-            b.reset_session_state(&mut gpu)?;
-            let mut last = Vec::new();
-            hipfire_arch_inkling2::forward_prefill_gpu(
-                b,
-                &mut gpu,
-                ids,
-                0,
-                hipfire_arch_inkling2::PrefillLogits::Last(&mut last),
-            )?;
-            let mut next = argmax(&last);
-            let (mut ms, mut gen) = (Vec::with_capacity(steps), Vec::with_capacity(steps));
-            // Every step's logits row, so a bitwise-preserving body change can
-            // be checked by digest identity (outside the timed region).
-            let mut digest = Sha256::new();
-            let mut frow: Vec<f32> = Vec::new();
-            for s in 0..steps {
-                gen.push(next);
-                let t0 = Instant::now();
-                let row = if frozen {
-                    hipfire_arch_inkling2::forward_decode_frozen(b, &mut gpu, next, ctx + s, &mut frow)?;
-                    &frow
-                } else if blocked {
-                    frow = hipfire_arch_inkling2::forward_decode_gpu(b, &mut gpu, next, ctx + s)?;
-                    &frow
-                } else {
-                    frow = hipfire_arch_inkling2::forward_token_gpu(b, &mut gpu, next, ctx + s)?;
-                    &frow
-                };
-                ms.push(t0.elapsed().as_secs_f64() * 1e3);
-                digest.update(f32_bytes(row));
-                next = argmax(row);
-            }
-            Ok((ms, gen, format!("{:x}", digest.finalize())))
-        };
-    let (_, warm_gen, warm_sha) = run(b)?;
+    if graph && !hipfire_arch_inkling2::decode_replay::graph_dev_opt_in(&gpu) {
+        return Err(
+            "bench-decode --body graph is a dev opt-in: run with HIPFIRE_GRAPH=1 (and HIPFIRE_AR_GRAPH not 0)"
+                .into(),
+        );
+    }
+    if body == "frozen-stream" {
+        gpu.ensure_capture_stream()
+            .map_err(|e| format!("owned stream: {e:?}"))?;
+    }
+    let mut dg = hipfire_arch_inkling2::decode_replay::DecodeGraph::new(graph);
+    struct RepOut {
+        ms: Vec<f64>,
+        gen: Vec<u32>,
+        sha: String,
+        /// Steps that replayed / ran eager + capture / ran eager.
+        routes: [u32; 3],
+        capture_ms: f64,
+        /// Host time inside the launch calls per step: hipModuleLaunchKernel
+        /// (us, count) and hipGraphLaunch (us, count).
+        host: [f64; 4],
+    }
+    let mut run = |b: &mut hipfire_arch_inkling2::Inkling2Bundle| -> Result<RepOut, String> {
+        use hipfire_arch_inkling2::decode_replay::StepRoute;
+        b.reset_session_state(&mut gpu)?;
+        let mut last = Vec::new();
+        hipfire_arch_inkling2::forward_prefill_gpu(
+            b,
+            &mut gpu,
+            ids,
+            0,
+            hipfire_arch_inkling2::PrefillLogits::Last(&mut last),
+        )?;
+        let mut next = argmax(&last);
+        let (mut ms, mut gen) = (Vec::with_capacity(steps), Vec::with_capacity(steps));
+        let (mut routes, mut capture_ms) = ([0u32; 3], 0.0f64);
+        // Every step's logits row, so a bitwise-preserving body change can
+        // be checked by digest identity (outside the timed region).
+        let mut digest = Sha256::new();
+        let mut frow: Vec<f32> = Vec::new();
+        hip_bridge::launch_counters::reset();
+        for s in 0..steps {
+            gen.push(next);
+            let t0 = Instant::now();
+            let row = if frozen {
+                hipfire_arch_inkling2::forward_decode_frozen(
+                    b,
+                    &mut gpu,
+                    next,
+                    ctx + s,
+                    &mut frow,
+                )?;
+                &frow
+            } else if graph {
+                let rep = dg.forward(b, &mut gpu, next, ctx + s, &mut frow)?;
+                match rep.route {
+                    StepRoute::Replay => routes[0] += 1,
+                    StepRoute::EagerCaptured => {
+                        routes[1] += 1;
+                        capture_ms += rep.capture_ns as f64 / 1e6;
+                    }
+                    StepRoute::Eager(_) => routes[2] += 1,
+                }
+                &frow
+            } else if blocked {
+                frow = hipfire_arch_inkling2::forward_decode_gpu(b, &mut gpu, next, ctx + s)?;
+                &frow
+            } else {
+                frow = hipfire_arch_inkling2::forward_token_gpu(b, &mut gpu, next, ctx + s)?;
+                &frow
+            };
+            ms.push(t0.elapsed().as_secs_f64() * 1e3);
+            digest.update(f32_bytes(row));
+            next = argmax(row);
+        }
+        let per = |v: u64| v as f64 / steps as f64;
+        let host = [
+            per(hip_bridge::launch_counters::launch_kernel::time_ns()) / 1e3,
+            per(hip_bridge::launch_counters::launch_kernel::count()),
+            per(hip_bridge::launch_counters::graph_launch::time_ns()) / 1e3,
+            per(hip_bridge::launch_counters::graph_launch::count()),
+        ];
+        Ok(RepOut {
+            ms,
+            gen,
+            sha: format!("{:x}", digest.finalize()),
+            routes,
+            capture_ms,
+            host,
+        })
+    };
+    // The warm-up rep is also the cold first turn: first-use JIT, arena
+    // creation, and (graph) the eager token plus the capture.
+    let cold = run(b)?;
+    let (warm_gen, warm_sha) = (cold.gen.clone(), cold.sha.clone());
     let mut per_rep = Vec::with_capacity(reps);
     for r in 0..reps {
-        let (ms, gen, sha) = run(b)?;
+        let RepOut {
+            ms,
+            gen,
+            sha,
+            routes,
+            host,
+            ..
+        } = run(b)?;
         if gen != warm_gen || sha != warm_sha {
             return Err(format!(
                 "bench-decode: rep {r} generated ids or logits differ from the warm-up's"
+            ));
+        }
+        if graph && routes != [steps as u32, 0, 0] {
+            return Err(format!(
+                "bench-decode: graph rep {r} was not all replay (replay/capture/eager = {routes:?}): the run left its one-bucket envelope"
             ));
         }
         let total: f64 = ms.iter().sum();
@@ -3424,10 +3503,31 @@ fn bench_decode(a: &Args) -> Result<(), String> {
         );
         per_rep.push(serde_json::json!({
             "total_ms": total,
+            "ms_per_token": total / steps as f64,
             "tok_s": steps as f64 * 1e3 / total,
             "median_step_ms": sorted[sorted.len() / 2],
+            "routes": {"replay": routes[0], "eager_capture": routes[1], "eager": routes[2]},
+            "host_launch_us_per_step": host[0],
+            "host_launches_per_step": host[1],
+            "host_graph_launch_us_per_step": host[2],
+            "host_graph_launches_per_step": host[3],
             "step_ms": ms,
         }));
+    }
+    let cold_total: f64 = cold.ms.iter().sum();
+    let graph_stats = {
+        let s = dg.stats();
+        serde_json::json!({
+            "eager_steps": s.eager_steps, "replays": s.replays, "captures": s.captures,
+            "capture_failures": s.capture_failures, "destroys": s.destroys,
+            "nodes": s.nodes, "eager_launches": s.eager_launches,
+            "graph_launches": s.graph_launches,
+            "last_capture_ms": s.last_capture_ns as f64 / 1e6,
+            "sticky_reason": dg.sticky_reason(),
+        })
+    };
+    if graph {
+        dg.release(&mut gpu)?;
     }
     let mut tok_s: Vec<f64> = per_rep
         .iter()
@@ -3447,6 +3547,15 @@ fn bench_decode(a: &Args) -> Result<(), String> {
         "prefill_routes": b.gpu_state.as_ref().map(|s| format!("{:?}", s.prefill_routes)),
         "reps": per_rep,
         "median_tok_s": median,
+        "median_ms_per_token": 1e3 / median,
+        "cold_first_turn": {
+            "total_ms": cold_total,
+            "first_step_ms": cold.ms[0],
+            "step_ms": cold.ms,
+            "routes": {"replay": cold.routes[0], "eager_capture": cold.routes[1], "eager": cold.routes[2]},
+            "capture_ms": cold.capture_ms,
+        },
+        "graph": graph_stats,
         "generated_ids": warm_gen,
         "decode_logits_sha256": warm_sha,
     });

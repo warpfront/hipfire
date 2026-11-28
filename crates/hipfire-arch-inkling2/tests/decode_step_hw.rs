@@ -46,7 +46,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
 
-fn tokens(n: usize) -> Vec<u32> {
+pub(crate) fn tokens(n: usize) -> Vec<u32> {
     // Deterministic ids inside the vocabulary (LCG); content is irrelevant to parity.
     let mut s = 0x1234_5678_9abc_def0u64;
     (0..n)
@@ -59,7 +59,7 @@ fn tokens(n: usize) -> Vec<u32> {
         .collect()
 }
 
-fn load(gpu: &mut Gpu, max_seq: usize) -> Inkling2Bundle {
+pub(crate) fn load(gpu: &mut Gpu, max_seq: usize) -> Inkling2Bundle {
     assert_eq!(
         std::env::var("HIPFIRE_GRAPH").as_deref(),
         Ok("0"),
@@ -83,7 +83,7 @@ fn load(gpu: &mut Gpu, max_seq: usize) -> Inkling2Bundle {
     }
 }
 
-fn reset(b: &mut Inkling2Bundle, gpu: &mut Gpu) {
+pub(crate) fn reset(b: &mut Inkling2Bundle, gpu: &mut Gpu) {
     b.state.seq_pos = 0;
     b.gpu_state
         .as_mut()
@@ -92,17 +92,17 @@ fn reset(b: &mut Inkling2Bundle, gpu: &mut Gpu) {
         .expect("reset");
 }
 
-fn prefill(b: &mut Inkling2Bundle, gpu: &mut Gpu, toks: &[u32]) {
+pub(crate) fn prefill(b: &mut Inkling2Bundle, gpu: &mut Gpu, toks: &[u32]) {
     if !toks.is_empty() {
         forward_prefill_gpu(b, gpu, toks, 0, PrefillLogits::None).expect("prefill");
     }
 }
 
-fn sha(bytes: &[u8]) -> String {
+pub(crate) fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn f32_bytes(v: &[f32]) -> &[u8] {
+pub(crate) fn f32_bytes(v: &[f32]) -> &[u8] {
     // SAFETY: f32 has no padding; the slice is plain bytes.
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
@@ -120,7 +120,7 @@ fn slot_view(plane: &GpuTensor, slot: usize, hd: usize) -> GpuTensor {
 }
 
 /// Everything one step can change on device or host, as of before it.
-struct Pre {
+pub(crate) struct Pre {
     pos: usize,
     conv: Vec<Vec<u8>>,
     /// `[visit][plane 0..16]` slot bytes (K planes then V planes).
@@ -135,7 +135,7 @@ fn planes(b: &Inkling2Bundle, v: usize) -> Vec<&GpuTensor> {
     gs.k_cache[v].iter().chain(gs.v_cache[v].iter()).collect()
 }
 
-fn save_pre(b: &Inkling2Bundle, gpu: &Gpu, pos: usize) -> Pre {
+pub(crate) fn save_pre(b: &Inkling2Bundle, gpu: &Gpu, pos: usize) -> Pre {
     let gs = b.gpu_state.as_ref().unwrap();
     let hd = b.config.head_dim;
     let n = gs.k_cache.len();
@@ -165,7 +165,7 @@ fn save_pre(b: &Inkling2Bundle, gpu: &Gpu, pos: usize) -> Pre {
     p
 }
 
-fn restore(b: &mut Inkling2Bundle, gpu: &Gpu, p: &Pre) {
+pub(crate) fn restore(b: &mut Inkling2Bundle, gpu: &Gpu, p: &Pre) {
     let hd = b.config.head_dim;
     let n = p.conv.len();
     for v in 0..n {
@@ -188,8 +188,8 @@ fn restore(b: &mut Inkling2Bundle, gpu: &Gpu, p: &Pre) {
 }
 
 /// Post-step state (everything a step may have written).
-struct Post {
-    logits: Vec<f32>,
+pub(crate) struct Post {
+    pub(crate) logits: Vec<f32>,
     conv: Vec<Vec<u8>>,
     slot_rows: Vec<Vec<Vec<u8>>>,
     tags: Vec<Vec<u32>>,
@@ -197,7 +197,7 @@ struct Post {
     seq_pos: usize,
 }
 
-fn post_state(b: &Inkling2Bundle, gpu: &Gpu, pos: usize, logits: Vec<f32>) -> Post {
+pub(crate) fn post_state(b: &Inkling2Bundle, gpu: &Gpu, pos: usize, logits: Vec<f32>) -> Post {
     let p = save_pre(b, gpu, pos);
     let gs = b.gpu_state.as_ref().unwrap();
     Post {
@@ -218,7 +218,7 @@ fn first_diff_u8(a: &[u8], b: &[u8]) -> Option<usize> {
 }
 
 /// First differing site of `want` (stock) vs `got` (frozen), or `None`.
-fn compare_post(want: &Post, got: &Post) -> Option<String> {
+pub(crate) fn compare_post(want: &Post, got: &Post) -> Option<String> {
     if want.logits.len() != got.logits.len() {
         return Some(format!(
             "logits length {} != {}",
@@ -285,7 +285,7 @@ fn compare_post(want: &Post, got: &Post) -> Option<String> {
 
 /// Hash of every live K/V row of every visit EXCEPT the write slot of `pos`
 /// (rows `[0, min(pos, ring))`): unchanged by a step.
-fn witness(b: &Inkling2Bundle, gpu: &Gpu, pos: usize) -> String {
+pub(crate) fn witness(b: &Inkling2Bundle, gpu: &Gpu, pos: usize) -> String {
     let gs = b.gpu_state.as_ref().unwrap();
     let hd = b.config.head_dim;
     let mut h = Sha256::new();
@@ -309,7 +309,7 @@ fn witness(b: &Inkling2Bundle, gpu: &Gpu, pos: usize) -> String {
 // Poison
 // ---------------------------------------------------------------------------
 
-fn poison(b: &mut Inkling2Bundle, gpu: &mut Gpu, salt: u32) {
+pub(crate) fn poison(b: &mut Inkling2Bundle, gpu: &mut Gpu, salt: u32) {
     let gs = b.gpu_state.as_ref().unwrap();
     // Distinct, changing NaN-adjacent payloads: a merge that reads an inactive
     // partial, or a body that reads unwritten arena rows, cannot match.
@@ -507,16 +507,16 @@ struct Opts {
     plant: u8,
 }
 
-struct Receipt(Option<std::fs::File>);
+pub(crate) struct Receipt(Option<std::fs::File>);
 
 impl Receipt {
-    fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         Receipt(std::env::var("INKLING2_RECEIPT_DIR").ok().map(|d| {
             std::fs::create_dir_all(&d).ok();
             std::fs::File::create(std::path::Path::new(&d).join(name)).expect("receipt file")
         }))
     }
-    fn line(&mut self, s: String) {
+    pub(crate) fn line(&mut self, s: String) {
         if let Some(f) = self.0.as_mut() {
             writeln!(f, "{s}").unwrap();
         }
