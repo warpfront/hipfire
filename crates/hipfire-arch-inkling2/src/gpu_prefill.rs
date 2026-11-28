@@ -56,13 +56,15 @@ use hipfire_dispatch::pipeline::{
     GroupedQt44Tables, PrefillActTier,
 };
 use hipfire_dispatch::types::KernelKey;
-use hipfire_runtime::llama::{weight_gemm, weight_gemv, WeightTensor};
+use hipfire_runtime::llama::{weight_gemm, weight_gemv, weight_gemv_prerotated, WeightTensor};
 use rdna_compute::ffn_activation::{
     CombineOrder, FfnActivation, FfnActivationGrouped, FfnActivationGroupedI8, FfnActivationRows,
     FfnAwq, MoeCombine, MoeRouterTopK, RouterKind,
 };
 use rdna_compute::inkling2_attention::inkling2_attn_fa2_splits;
 use rdna_compute::inkling2_attention_prefill::{Inkling2PrefillAttn, INKLING2_ATTN_PREFILL_REL};
+use rdna_compute::inkling2_fuse::{FzRow, FzTarget, Inkling2FzMixNormRot};
+use rdna_compute::inkling2_fuse_post::{FzKv16, Inkling2FzAttnPost};
 use rdna_compute::inkling2_hilo::{Inkling2HiloBlend, Inkling2HiloGemm};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::ffi::c_void;
@@ -77,204 +79,6 @@ const INKLING2_PF_MODULE: &str = "inkling2_gpu_prefill";
 const INKLING2_PF_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-
-// Short conv over `rows` consecutive rows, one thread per (row, channel).
-// Row r convolves x = [x_{r-3}, x_{r-2}, x_{r-1}, x_r] where x_{<0} come from
-// the visit history (state row 0 oldest). Per-row arithmetic is the singleton
-// `inkling2_gf_conv_f32`. The history is read only here; ink_pf_conv_state_f32
-// advances it afterwards.
-extern "C" __global__ void ink_pf_conv_rows_f32(
-    const float* __restrict__ cur, int cur_ld,
-    const float* __restrict__ sw,
-    const float* __restrict__ dyn_w, int dyn_ld,
-    const float* __restrict__ state,
-    float* __restrict__ out, int out_ld,
-    int state_stride, int col_off, int channels,
-    int dyn_heads, int head_dim, float inv_scale, int rows)
-{
-    const int ch = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    const int r = (int)blockIdx.y;
-    if (ch >= channels || r >= rows) return;
-    const float x0 = r >= 3 ? cur[(size_t)(r - 3) * cur_ld + ch]
-                            : state[(size_t)r * state_stride + col_off + ch];
-    const float x1 = r >= 2 ? cur[(size_t)(r - 2) * cur_ld + ch]
-                            : state[(size_t)(r + 1) * state_stride + col_off + ch];
-    const float x2 = r >= 1 ? cur[(size_t)(r - 1) * cur_ld + ch]
-                            : state[(size_t)(r + 2) * state_stride + col_off + ch];
-    const float xc = cur[(size_t)r * cur_ld + ch];
-    float acc;
-    if (dyn_heads == 0) {
-        acc = x0 * sw[ch] + x1 * sw[channels + ch]
-            + x2 * sw[channels * 2 + ch] + xc * sw[channels * 3 + ch];
-    } else {
-        const int h = ch / head_dim;
-        const float* drow = dyn_w + (size_t)r * dyn_ld + (size_t)h * 4;
-        acc = x0 * sw[ch] + x1 * sw[channels + ch]
-            + x2 * sw[channels * 2 + ch] + xc * sw[channels * 3 + ch]
-            + xc * drow[0] + x2 * drow[1] + x1 * drow[2] + x0 * drow[3];
-    }
-    out[(size_t)r * out_ld + ch] = (acc + xc) * inv_scale;
-}
-
-// History after `rows` more raw inputs: the last three of [hist0, hist1,
-// hist2, cur_0 .. cur_{rows-1}].
-extern "C" __global__ void ink_pf_conv_state_f32(
-    const float* __restrict__ cur, int cur_ld,
-    float* __restrict__ state,
-    int state_stride, int col_off, int channels, int rows)
-{
-    const int ch = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (ch >= channels) return;
-    float seq[3];
-    for (int i = 0; i < 3; ++i) {
-        const int j = rows + i;  // index into [hist0, hist1, hist2, cur...]
-        seq[i] = j >= 3 ? cur[(size_t)(j - 3) * cur_ld + ch]
-                        : state[(size_t)j * state_stride + col_off + ch];
-    }
-    state[col_off + ch] = seq[0];
-    state[state_stride + col_off + ch] = seq[1];
-    state[state_stride * 2 + col_off + ch] = seq[2];
-}
-
-// mix() over `rows` rows: block (row b, query q). States s are separate
-// [rows, n_embd] tensors. Per row the arithmetic is the singleton pair
-// `inkling2_rmsnorm_nogamma_f32` + `inkling2_mix_query_row_f32` (blockDim 256).
-// out[(q * rows + b) * n_embd + i].
-struct Ptr6 { const float* p[6]; };
-extern "C" __global__ void ink_pf_mix_rows_f32(
-    Ptr6 st, int n_states,
-    const float* __restrict__ query,
-    float* __restrict__ out,
-    int rows, int n_embd, float inv_sqrt_embd, float eps)
-{
-    const int b = (int)blockIdx.x;
-    const int q = (int)blockIdx.y;
-    const int t = threadIdx.x;
-    if (b >= rows) return;
-    __shared__ float sh[256];
-    __shared__ float w[6];
-    float inv[6];
-#pragma unroll
-    for (int s = 0; s < 6; ++s) {
-        inv[s] = 0.0f;
-        if (s < n_states) {
-            const float* xr = st.p[s] + (size_t)b * n_embd;
-            float acc = 0.0f;
-            for (int i = t; i < n_embd; i += blockDim.x) {
-                const float v = xr[i];
-                acc += v * v;
-            }
-            sh[t] = acc;
-            __syncthreads();
-            for (int s2 = blockDim.x >> 1; s2 > 0; s2 >>= 1) {
-                if (t < s2) sh[t] += sh[t + s2];
-                __syncthreads();
-            }
-            inv[s] = 1.0f / sqrtf(sh[0] / (float)n_embd + eps);
-            __syncthreads();
-        }
-    }
-    const float* qq = query + (size_t)q * n_embd;
-#pragma unroll
-    for (int s = 0; s < 6; ++s) {
-        if (s < n_states) {
-            const float* xr = st.p[s] + (size_t)b * n_embd;
-            float acc = 0.0f;
-            for (int i = t; i < n_embd; i += blockDim.x) {
-                const float ns = xr[i] * inv[s];
-                acc += ns * qq[i];
-            }
-            sh[t] = acc;
-            __syncthreads();
-            for (int s2 = blockDim.x >> 1; s2 > 0; s2 >>= 1) {
-                if (t < s2) sh[t] += sh[t + s2];
-                __syncthreads();
-            }
-            if (t == 0) w[s] = sh[0] * inv_sqrt_embd;
-            __syncthreads();
-        }
-    }
-    if (t == 0) {
-        float mx = w[0];
-        for (int s = 1; s < n_states; ++s) {
-            if (w[s] > mx) mx = w[s];
-        }
-        float sum = 0.0f;
-        for (int s = 0; s < n_states; ++s) {
-            w[s] = expf(w[s] - mx);
-            sum += w[s];
-        }
-        for (int s = 0; s < n_states; ++s) w[s] /= sum;
-    }
-    __syncthreads();
-    float* oq = out + ((size_t)q * rows + b) * n_embd;
-    for (int i = t; i < n_embd; i += blockDim.x) {
-        float acc = 0.0f;
-#pragma unroll
-        for (int s = 0; s < 6; ++s) {
-            if (s < n_states) {
-                const float ns = st.p[s][(size_t)b * n_embd + i] * inv[s];
-                acc += w[s] * ns;
-            }
-        }
-        oq[i] = acc;
-    }
-}
-
-// `inkling2_l2_clip_rows_f32` with the per-channel scale indexed by
-// `r % scale_rows` (one [heads, dim] scale shared by every block row).
-extern "C" __global__ void ink_pf_l2_clip_rows_f32(
-    float* __restrict__ rows_buf,
-    const float* __restrict__ scale,
-    int n_rows, int dim, int scale_rows,
-    float threshold, int has_scale)
-{
-    const int r = blockIdx.x;
-    if (r >= n_rows) return;
-    const int t = threadIdx.x;
-    extern __shared__ float sh[];
-    float v = rows_buf[r * dim + t];
-    if (has_scale) v *= scale[(r % scale_rows) * dim + t];
-    sh[t] = v * v;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (t < s) sh[t] += sh[t + s];
-        __syncthreads();
-    }
-    const float norm = sqrtf(sh[0]) + 1e-6f;
-    float factor = threshold / norm;
-    if (factor > 1.0f) factor = 1.0f;
-    rows_buf[r * dim + t] = v * factor;
-}
-
-// `inkling2_rmsnorm_nogamma_f32` with row strides (controller gate halves).
-extern "C" __global__ void ink_pf_rmsnorm_nogamma_ld_f32(
-    const float* __restrict__ x, int x_ld,
-    float* __restrict__ out, int out_ld,
-    int batch, int n, float eps)
-{
-    const int r = blockIdx.x;
-    if (r >= batch) return;
-    const float* xr = x + (size_t)r * x_ld;
-    float* orow = out + (size_t)r * out_ld;
-    const int t = threadIdx.x;
-    __shared__ float sh[256];
-    float acc = 0.0f;
-    for (int i = t; i < n; i += blockDim.x) {
-        const float v = xr[i];
-        acc += v * v;
-    }
-    sh[t] = acc;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (t < s) sh[t] += sh[t + s];
-        __syncthreads();
-    }
-    const float inv = 1.0f / sqrtf(sh[0] / (float)n + eps);
-    for (int i = t; i < n; i += blockDim.x) {
-        orow[i] = xr[i] * inv;
-    }
-}
 
 // `gemv_f32` (y = A x, A [M, K] F32) for up to 8 activation rows per block:
 // block (m, row group); every row keeps the singleton lane-strided K loop and
@@ -314,22 +118,6 @@ extern "C" __global__ void ink_pf_gemv_f32_rows(
         __syncthreads();
     }
     if (t < PF_GR && r0 + t < rows) y[(size_t)(r0 + t) * y_ld + m] = sdata[t * bs];
-}
-
-// Block K/V F32 [rows, 8, 128] -> F16 staging planes [8, rows, 128]
-// (the singleton cache write's `(_Float16)` conversion).
-extern "C" __global__ void ink_pf_kv_stage_f16(
-    const float* __restrict__ k, const float* __restrict__ v,
-    _Float16* __restrict__ ks, _Float16* __restrict__ vs, int rows)
-{
-    const int idx = (int)(blockIdx.x * 256 + threadIdx.x);
-    if (idx >= rows * 1024) return;
-    const int r = idx >> 10;
-    const int h = (idx >> 7) & 7;
-    const int d = idx & 127;
-    const size_t o = ((size_t)h * rows + r) * 128 + d;
-    ks[o] = (_Float16)k[idx];
-    vs[o] = (_Float16)v[idx];
 }
 
 // Commit staged rows [first_row, rows) to the cache ring (slot = pos % ring).
@@ -427,14 +215,8 @@ __global__ void ink_pf_rotate_awq_slots(
 }
 "#;
 
-const PF_SYMBOLS: [&str; 9] = [
-    "ink_pf_conv_rows_f32",
-    "ink_pf_conv_state_f32",
-    "ink_pf_mix_rows_f32",
-    "ink_pf_l2_clip_rows_f32",
-    "ink_pf_rmsnorm_nogamma_ld_f32",
+const PF_SYMBOLS: [&str; 3] = [
     "ink_pf_gemv_f32_rows",
-    "ink_pf_kv_stage_f16",
     "ink_pf_kv_commit_f16",
     "ink_pf_rotate_awq_slots",
 ];
@@ -922,108 +704,6 @@ fn dup(gpu: &mut Gpu, src: &GpuTensor, n: usize, what: &str) -> Result<GpuTensor
 // Row-batched primitives
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn conv_rows(
-    gpu: &mut Gpu,
-    cur: &GpuTensor,
-    static_w: &GpuTensor,
-    dyn_w: Option<(&GpuTensor, usize)>,
-    state: &GpuTensor,
-    out: &GpuTensor,
-    col_off: usize,
-    channels: usize,
-    dyn_heads: usize,
-    head_dim: usize,
-    inv_scale: f32,
-    rows: usize,
-) -> Result<(), String> {
-    let mut b = KernargBlob::new();
-    b.push_ptr(ptr(cur));
-    b.push_i32(channels as i32);
-    b.push_ptr(ptr(static_w));
-    match dyn_w {
-        Some((t, ld)) => {
-            b.push_ptr(ptr(t));
-            b.push_i32(ld as i32);
-        }
-        None => {
-            b.push_ptr(std::ptr::null());
-            b.push_i32(0);
-        }
-    }
-    b.push_ptr(ptr(state));
-    b.push_ptr(ptr(out));
-    b.push_i32(channels as i32);
-    b.push_i32(INKLING2_CONV_WIDTH as i32);
-    b.push_i32(col_off as i32);
-    b.push_i32(channels as i32);
-    b.push_i32(dyn_heads as i32);
-    b.push_i32(head_dim as i32);
-    b.push_f32(inv_scale);
-    b.push_i32(rows as i32);
-    let gx = grid_u32(channels.div_ceil(256), "conv")?;
-    launch(
-        gpu,
-        "ink_pf_conv_rows_f32",
-        [gx, grid_u32(rows, "conv")?, 1],
-        [256, 1, 1],
-        0,
-        b,
-    )?;
-    let mut s = KernargBlob::new();
-    s.push_ptr(ptr(cur));
-    s.push_i32(channels as i32);
-    s.push_ptr(ptr(state));
-    s.push_i32(INKLING2_CONV_WIDTH as i32);
-    s.push_i32(col_off as i32);
-    s.push_i32(channels as i32);
-    s.push_i32(rows as i32);
-    launch(gpu, "ink_pf_conv_state_f32", [gx, 1, 1], [256, 1, 1], 0, s)
-}
-
-/// mix() of `rows` rows: `states` (oldest first, `cur` last) are `[rows, e]`;
-/// `query [qr, e]`; `out [qr, rows, e]`.
-#[allow(clippy::too_many_arguments)]
-fn mix_rows(
-    gpu: &mut Gpu,
-    states: &[&GpuTensor],
-    query: &GpuTensor,
-    out: &GpuTensor,
-    rows: usize,
-    e: usize,
-    qr: usize,
-    eps: f32,
-) -> Result<(), String> {
-    if !(1..=6).contains(&states.len()) {
-        return Err(format!(
-            "inkling2 prefill: mix states {} exceeds 6",
-            states.len()
-        ));
-    }
-    if query.buf.size() < qr * e * 4 || out.buf.size() < qr * rows * e * 4 {
-        return Err("inkling2 prefill: mix operand too small".into());
-    }
-    let mut b = KernargBlob::new();
-    for i in 0..6 {
-        b.push_ptr(states.get(i).map(|t| ptr(t)).unwrap_or(std::ptr::null()));
-    }
-    b.push_i32(states.len() as i32);
-    b.push_ptr(ptr(query));
-    b.push_ptr(ptr(out));
-    b.push_i32(rows as i32);
-    b.push_i32(e as i32);
-    b.push_f32(1.0 / (e as f32).sqrt());
-    b.push_f32(eps);
-    launch(
-        gpu,
-        "ink_pf_mix_rows_f32",
-        [grid_u32(rows, "mix")?, qr as u32, 1],
-        [256, 1, 1],
-        0,
-        b,
-    )
-}
-
 /// `y [rows, M] = x [rows, K] . A^T`, singleton `gemv_f32` arithmetic per row.
 #[allow(clippy::too_many_arguments)]
 fn gemv_rows(
@@ -1060,34 +740,6 @@ fn gemv_rows(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn clip_rows(
-    gpu: &mut Gpu,
-    rows_buf: &GpuTensor,
-    scale: Option<&GpuTensor>,
-    n_rows: usize,
-    dim: usize,
-    scale_rows: usize,
-    threshold: f32,
-) -> Result<(), String> {
-    let mut b = KernargBlob::new();
-    b.push_ptr(ptr(rows_buf));
-    b.push_ptr(scale.map(ptr).unwrap_or(std::ptr::null()));
-    b.push_i32(n_rows as i32);
-    b.push_i32(dim as i32);
-    b.push_i32(scale_rows.max(1) as i32);
-    b.push_f32(threshold);
-    b.push_i32(scale.is_some() as i32);
-    launch(
-        gpu,
-        "ink_pf_l2_clip_rows_f32",
-        [grid_u32(n_rows, "clip")?, 1, 1],
-        [dim as u32, 1, 1],
-        (dim * 4) as u32,
-        b,
-    )
-}
-
 /// `y [rows, m] = x [rows, k] . A^T` for every `(A, x, y)`: one hi/lo-F16
 /// WMMA GEMM launch over all of them (blocked), or the singleton `gemv_f32`
 /// arithmetic per row (row-exact).
@@ -1116,6 +768,9 @@ fn proj_rows(
 type CtrlIn<'a> = (&'a GpuTensor, &'a GpuTensor, &'a Inkling2Controller);
 
 /// Fused controller steps over `rows` rows, one `out [rows, e]` per input.
+/// `gates[i]` is input i's gate input `[rows, 2e]`: the gamma-less RMSNorms
+/// of cur | msg (`INKLING2_CONTROL_EPS`), written by the mix launch that
+/// produces cur or msg ([`Gpu::inkling2_fz_mix_norm_rot`]).
 /// Row-exact: the singleton `inkling2_control_f32_gpu` arithmetic per row.
 /// Blocked (`gemm`): the down projections of every input in one hi/lo-F16
 /// WMMA GEMM launch, then their gain/forget projections and blend in another.
@@ -1124,38 +779,20 @@ fn control_rows(
     gpu: &mut Gpu,
     ar: &mut Arena,
     ins: &[CtrlIn<'_>],
+    gates: &[T],
     e: usize,
     rank: usize,
     rows: usize,
     gemm: bool,
 ) -> Result<Vec<T>, String> {
-    let eps = rdna_compute::inkling2_control::INKLING2_CONTROL_EPS;
-    let mut gates = Vec::with_capacity(ins.len());
+    if gates.len() != ins.len() {
+        return Err("inkling2 prefill: one controller gate per input".into());
+    }
     let mut gs = Vec::with_capacity(ins.len());
     let mut outs = Vec::with_capacity(ins.len());
-    for &(cur, msg, _) in ins {
-        let gate = ar.f32(gpu, rows * 2 * e, "ctrl_gate")?;
-        gates.push(gate);
+    for _ in ins {
         gs.push(ar.f32(gpu, rows * rank, "ctrl_g")?);
         outs.push(ar.f32(gpu, rows * e, "ctrl_out")?);
-        for (half, x) in [(0usize, cur), (1, msg)] {
-            let mut b = KernargBlob::new();
-            b.push_ptr(ptr(x));
-            b.push_i32(e as i32);
-            b.push_ptr(ar.get(gate).buf.as_ptr().wrapping_byte_add(half * e * 4) as *const c_void);
-            b.push_i32((2 * e) as i32);
-            b.push_i32(rows as i32);
-            b.push_i32(e as i32);
-            b.push_f32(eps);
-            launch(
-                gpu,
-                "ink_pf_rmsnorm_nogamma_ld_f32",
-                [grid_u32(rows, "ctrl norm")?, 1, 1],
-                [256, 1, 1],
-                0,
-                b,
-            )?;
-        }
     }
     let downs: Vec<_> = ins
         .iter()
@@ -1243,6 +880,188 @@ fn linear(
         hip(weight_gemv(gpu, w, &xr, &yr), "gemv")?;
     }
     Ok(())
+}
+
+/// [`linear`] of a typed-XTS (MQ4G256V2 + AWQ) weight over rows whose AWQ
+/// divide + FWHT256 producer already ran (`x_rot [rows, K]`): the GEMM /
+/// GEMV `weight_gemm` / `weight_gemv` run after their own producer.
+fn linear_rot(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x_rot: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+    gemm: bool,
+) -> Result<(), String> {
+    if w.gpu_dtype != DType::MQ4G256V2 || w.awq_scale.is_none() {
+        return Err(format!(
+            "inkling2 prefill: pre-rotated linear needs MQ4G256V2 + AWQ, got {:?}",
+            w.gpu_dtype
+        ));
+    }
+    if gemm && rows > 1 {
+        hip(gpu.ensure_mq_signs(), "mq signs")?;
+        let ctx = DispatchCtx::new(gpu);
+        let wr = WeightRef {
+            buf: &w.buf,
+            dtype: w.gpu_dtype,
+            m: w.m,
+            k: w.k,
+            row_stride: 0,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
+        };
+        return GEMM_FAMILY
+            .run_key(
+                KernelKey::GemmMq4G256V2BatchedLmhead,
+                &ctx,
+                gpu,
+                &GemmParams {
+                    w: &wr,
+                    x: x_rot,
+                    y,
+                    batch_size: rows,
+                },
+            )
+            .map_err(|e| format!("inkling2 prefill: pre-rotated gemm: {e}"));
+    }
+    for r in 0..rows {
+        let xr = view(x_rot, r * w.k, &[w.k])?;
+        let yr = view(y, r * w.m, &[w.m])?;
+        hip(weight_gemv_prerotated(gpu, w, &xr, Some(&xr), &yr), "gemv")?;
+    }
+    Ok(())
+}
+
+/// [`Gpu::inkling2_fz_mix_norm_rot`] over `n` rows of width `e`.
+fn fz(
+    gpu: &mut Gpu,
+    states: &[&GpuTensor],
+    query: Option<&GpuTensor>,
+    out: &[FzRow<'_>],
+    n: usize,
+    e: usize,
+    mix_eps: f32,
+) -> Result<(), String> {
+    hip(
+        gpu.inkling2_fz_mix_norm_rot(&Inkling2FzMixNormRot {
+            states,
+            query,
+            out,
+            rows: n,
+            n: e,
+            mix_eps,
+        }),
+        "mix/norm/producer",
+    )
+}
+
+/// One attention input (q, k or v): its source row among the launch's rows,
+/// norm gamma, normed output (if read later) and producers.
+struct Role<'a> {
+    src: usize,
+    gamma: &'a GpuTensor,
+    out: Option<&'a GpuTensor>,
+    rots: Vec<(&'a GpuTensor, &'a GpuTensor)>,
+}
+
+/// Gamma-less norm target written at row stride `ld` (controller gate halves).
+fn nogamma_target(out: &GpuTensor, eps: f32, ld: usize) -> FzTarget<'_> {
+    FzTarget {
+        gamma: None,
+        eps,
+        out: Some((out, ld)),
+        rots: Vec::new(),
+    }
+}
+
+/// Norm targets of `roles` over `n_src` launch rows: roles on the same row
+/// with the same gamma share one norm (and so one normed output).
+fn role_rows(n_src: usize, roles: Vec<Role<'_>>, e: usize, eps: f32) -> Vec<FzRow<'_>> {
+    let mut rows: Vec<FzRow<'_>> = (0..n_src).map(|_| FzRow::default()).collect();
+    for r in roles {
+        let row = &mut rows[r.src];
+        let gp = r.gamma.buf.as_ptr();
+        let hit = row.targets.iter_mut().find(|t| {
+            t.gamma.map(|g| g.buf.as_ptr()) == Some(gp) && (t.out.is_none() || r.out.is_none())
+        });
+        match hit {
+            Some(t) => {
+                if t.out.is_none() {
+                    t.out = r.out.map(|o| (o, e));
+                }
+                t.rots.extend(r.rots);
+            }
+            None => row.targets.push(FzTarget {
+                gamma: Some(r.gamma),
+                eps,
+                out: r.out.map(|o| (o, e)),
+                rots: r.rots,
+            }),
+        }
+    }
+    rows
+}
+
+/// Attention-input buffers of one visit: normed inputs and producer outputs.
+struct AttnIn<'a> {
+    swa: bool,
+    /// q, k, v input-norm gammas.
+    gammas: [&'a GpuTensor; 3],
+    qi: T,
+    ki: T,
+    vi: T,
+    rot_q: T,
+    rot_r: T,
+    rot_g: T,
+    rot_k: T,
+    rot_v: T,
+}
+
+impl<'a> AttnIn<'a> {
+    /// The q, k, v roles with source rows `src`.
+    fn roles<'b>(
+        &self,
+        ar: &'b Arena,
+        layer: &'b Inkling2GpuLayer,
+        src: [usize; 3],
+    ) -> Result<Vec<Role<'b>>, String>
+    where
+        'a: 'b,
+    {
+        let awq = |w: &'b WeightTensor, what: &str| {
+            w.awq_scale
+                .as_ref()
+                .ok_or_else(|| format!("inkling2 prefill: {what} without its AWQ sidecar"))
+        };
+        let mut rots_q = vec![(awq(&layer.wq, "wq")?, ar.get(self.rot_q))];
+        if !layer.qrg_awq_shared {
+            rots_q.push((awq(&layer.wr, "wr")?, ar.get(self.rot_r)));
+            rots_q.push((awq(&layer.wgate, "wgate")?, ar.get(self.rot_g)));
+        }
+        Ok(vec![
+            Role {
+                src: src[0],
+                gamma: self.gammas[0],
+                out: Some(ar.get(self.qi)),
+                rots: rots_q,
+            },
+            Role {
+                src: src[1],
+                gamma: self.gammas[1],
+                out: (!self.swa).then(|| ar.get(self.ki)),
+                rots: vec![(awq(&layer.wk, "wk")?, ar.get(self.rot_k))],
+            },
+            Role {
+                src: src[2],
+                gamma: self.gammas[2],
+                out: (!self.swa).then(|| ar.get(self.vi)),
+                rots: vec![(awq(&layer.wv, "wv")?, ar.get(self.rot_v))],
+            },
+        ])
+    }
 }
 
 /// F16 router `[n_experts, e]` over `rows` rows: the gfx12 F16 WMMA (`mb8`)
@@ -1367,79 +1186,12 @@ fn visit_body(
     let swa = cfg.swa_layers[phys];
     let ne = n * e;
 
-    // --- attention input: AttnRes mix (visit 0 / phys 0 takes x itself) ---
-    let bases: Option<[GpuTensor; 3]> = if phys == 0 {
-        None
-    } else {
-        let aq = layer.attn_query.as_ref().ok_or_else(|| {
-            format!("inkling2 prefill: visit {visit} phys {phys} missing attn_query")
-        })?;
-        let total = aq.buf.size() / 4;
-        if total % e != 0 {
-            return Err(format!(
-                "inkling2 prefill: attn_query len {total} not a multiple of {e}"
-            ));
-        }
-        let qr = if total / e >= 3 { 3 } else { 1 };
-        let mixed = ar.f32(gpu, qr * ne, "attn_mix")?;
-        let states: Vec<&GpuTensor> = blocks.iter().chain(std::iter::once(x)).collect();
-        mix_rows(gpu, &states, aq, ar.get(mixed), n, e, qr, eps)?;
-        let m = ar.get(mixed);
-        Some(if qr >= 3 {
-            [
-                view(m, 0, &[n, e])?,
-                view(m, ne, &[n, e])?,
-                view(m, 2 * ne, &[n, e])?,
-            ]
-        } else {
-            [
-                view(m, 0, &[n, e])?,
-                view(m, 0, &[n, e])?,
-                view(m, 0, &[n, e])?,
-            ]
-        })
-    };
-    // Loop messages (pass > 0): control each input.
-    let mut mids: Option<T> = None;
-    let (qc0, kc0, vc0): (GpuTensor, GpuTensor, GpuTensor) = match (&msgs, &bases) {
-        (Some((bank, prev_out, cross, ctrls)), Some([bq, bk, bv])) => {
-            if cross.buf.size() / 4 < 4 * e {
-                return Err(format!(
-                    "inkling2 prefill: cross len {} < 4*{e}",
-                    cross.buf.size() / 4
-                ));
-            }
-            let msg = ar.f32(gpu, 4 * ne, "msg_mix")?;
-            let states: Vec<&GpuTensor> = bank.iter().chain(std::iter::once(*prev_out)).collect();
-            mix_rows(gpu, &states, cross, ar.get(msg), n, e, 4, eps)?;
-            mids = Some(msg);
-            let rank = cfg.loop_cfg.gate_rank;
-            let mjs = (0..3)
-                .map(|j| view(ar.get(msg), j * ne, &[n, e]))
-                .collect::<Result<Vec<_>, _>>()?;
-            let ins: Vec<CtrlIn<'_>> = [bq, bk, bv]
-                .into_iter()
-                .zip(&mjs)
-                .zip(ctrls.iter())
-                .map(|((base, mj), ctrl)| (base, mj, ctrl))
-                .collect();
-            let mut outs = control_rows(gpu, ar, &ins, e, rank, n, c.mode.gemm)?
-                .into_iter()
-                .map(|o| view(ar.get(o), 0, &[n, e]))
-                .collect::<Result<Vec<_>, _>>()?;
-            let v = outs.pop().unwrap();
-            let k = outs.pop().unwrap();
-            let q = outs.pop().unwrap();
-            (q, k, v)
-        }
-        (Some(_), None) => return Err("inkling2 prefill: phys 0 has no base".into()),
-        (None, None) => (
-            view(x, 0, &[n, e])?,
-            view(x, 0, &[n, e])?,
-            view(x, 0, &[n, e])?,
-        ),
-        (None, Some([bq, bk, bv])) => (bq.clone_view(), bk.clone_view(), bv.clone_view()),
-    };
+    // --- attention inputs: AttnRes mix (visit 0 / phys 0 takes x itself),
+    // loop controllers (pass > 0), input norms and the dense AWQ+FWHT
+    // producers. Each norm/producer stage is one `inkling2_fz_mix_norm_rot`
+    // launch, bitwise the unfused mix / norm / `rotate_x_mq_awq` chain.
+    let gemm = c.mode.gemm;
+    let ctrl_eps = rdna_compute::inkling2_control::INKLING2_CONTROL_EPS;
     // Norms: SWA applies attn_norm to all three inputs; full layers the three
     // input norms. Identical (input, gamma) pairs are normalized once.
     let (wq_n, wk_n, wv_n) = if swa {
@@ -1458,68 +1210,150 @@ fn visit_body(
             _ => return Err("inkling2 prefill: full layer missing input norms".into()),
         }
     };
-    let mut normed: Vec<(*mut c_void, *mut c_void, T)> = Vec::new();
-    let mut norm_of =
-        |gpu: &mut Gpu, ar: &mut Arena, src: &GpuTensor, w: &GpuTensor| -> Result<T, String> {
-            let key = (src.buf.as_ptr(), w.buf.as_ptr());
-            if let Some(&(_, _, t)) = normed.iter().find(|(a, b, _)| (*a, *b) == key) {
-                return Ok(t);
+    // Producer outputs: Q, shared with Rel and gate when their AWQ sidecars
+    // match (`qrg_awq_shared`), K and V. Normed inputs: Q's feeds the sinks;
+    // full layers' dynamic K/V taps read the normed K/V inputs.
+    let shared = layer.qrg_awq_shared;
+    let rot_q = ar.f32(gpu, ne, "rot_q")?;
+    let qi = ar.f32(gpu, ne, "q_in")?;
+    let ai = AttnIn {
+        swa,
+        gammas: [wq_n, wk_n, wv_n],
+        qi,
+        ki: if swa { qi } else { ar.f32(gpu, ne, "k_in")? },
+        vi: if swa { qi } else { ar.f32(gpu, ne, "v_in")? },
+        rot_q,
+        rot_r: if shared {
+            rot_q
+        } else {
+            ar.f32(gpu, ne, "rot_r")?
+        },
+        rot_g: if shared {
+            rot_q
+        } else {
+            ar.f32(gpu, ne, "rot_gate")?
+        },
+        rot_k: ar.f32(gpu, ne, "rot_k")?,
+        rot_v: ar.f32(gpu, ne, "rot_v")?,
+    };
+    let (ki, vi, rot_r, rot_g, rot_k, rot_v) =
+        (ai.ki, ai.vi, ai.rot_r, ai.rot_g, ai.rot_k, ai.rot_v);
+    // Pass > 0: controller gate inputs `[n, 2e]` (gamma-less normed cur | msg)
+    // of the q, k, v and FFN controllers, written by the mixes below.
+    let gates: Vec<T> = if msgs.is_some() {
+        (0..4)
+            .map(|_| ar.f32(gpu, n * 2 * e, "ctrl_gate"))
+            .collect::<Result<_, _>>()?
+    } else {
+        Vec::new()
+    };
+    let (msg_buf, attn_mixed) = match (&msgs, phys) {
+        (Some(_), 0) => return Err("inkling2 prefill: phys 0 has no base".into()),
+        (Some(_), _) => (
+            Some(ar.f32(gpu, 4 * ne, "msg_mix")?),
+            Some(ar.f32(gpu, 3 * ne, "attn_mix")?),
+        ),
+        (None, _) => (None, None),
+    };
+    let attn_query = if phys == 0 {
+        None
+    } else {
+        let aq = layer.attn_query.as_ref().ok_or_else(|| {
+            format!("inkling2 prefill: visit {visit} phys {phys} missing attn_query")
+        })?;
+        let total = aq.buf.size() / 4;
+        if total % e != 0 {
+            return Err(format!(
+                "inkling2 prefill: attn_query len {total} not a multiple of {e}"
+            ));
+        }
+        Some((aq, if total / e >= 3 { 3 } else { 1 }))
+    };
+    let states: Vec<&GpuTensor> = blocks.iter().chain(std::iter::once(x)).collect();
+    match (&msgs, attn_query) {
+        (None, None) => {
+            let rows = role_rows(1, ai.roles(ar, layer, [0, 0, 0])?, e, eps);
+            fz(gpu, &[x], None, &rows, n, e, eps)?
+        }
+        (None, Some((aq, qr))) => {
+            let src = if qr >= 3 { [0, 1, 2] } else { [0, 0, 0] };
+            let rows = role_rows(qr, ai.roles(ar, layer, src)?, e, eps);
+            fz(gpu, &states, Some(aq), &rows, n, e, eps)?
+        }
+        (Some((bank, prev_out, cross, ctrls)), Some((aq, qr))) => {
+            if cross.buf.size() / 4 < 4 * e {
+                return Err(format!(
+                    "inkling2 prefill: cross len {} < 4*{e}",
+                    cross.buf.size() / 4
+                ));
             }
-            let out = ar.f32(gpu, ne, "inp_norm")?;
-            hip(
-                gpu.rmsnorm_batched(src, w, ar.get(out), n, e, eps),
-                "input norm",
-            )?;
-            normed.push((key.0, key.1, out));
-            Ok(out)
-        };
-    let qi = norm_of(gpu, ar, &qc0, wq_n)?;
-    let ki = norm_of(gpu, ar, &kc0, wk_n)?;
-    let vi = norm_of(gpu, ar, &vc0, wv_n)?;
+            let (msg_buf, attn_mixed) = (msg_buf.unwrap(), attn_mixed.unwrap());
+            let gate_half =
+                |j: usize, half: usize| view(ar.get(gates[j]), half * e, &[n * 2 * e - e]);
+            // Attention mix: raw bases (the blends' `cur`) + gamma-less norms
+            // into the controllers' cur halves.
+            let cur_halves = (0..3)
+                .map(|j| gate_half(j, 0))
+                .collect::<Result<Vec<_>, _>>()?;
+            let bases = (0..qr)
+                .map(|j| view(ar.get(attn_mixed), j * ne, &[n, e]))
+                .collect::<Result<Vec<_>, _>>()?;
+            let rows_a: Vec<FzRow<'_>> = (0..qr)
+                .map(|j| FzRow {
+                    raw: Some((&bases[j], e)),
+                    targets: if qr >= 3 {
+                        vec![nogamma_target(&cur_halves[j], ctrl_eps, 2 * e)]
+                    } else {
+                        cur_halves
+                            .iter()
+                            .map(|h| nogamma_target(h, ctrl_eps, 2 * e))
+                            .collect()
+                    },
+                })
+                .collect();
+            fz(gpu, &states, Some(aq), &rows_a, n, e, eps)?;
+            // Message mix: raw messages + norms into the msg halves (FFN's included).
+            let msg_halves = (0..4)
+                .map(|j| gate_half(j, 1))
+                .collect::<Result<Vec<_>, _>>()?;
+            let msgs_v = (0..4)
+                .map(|j| view(ar.get(msg_buf), j * ne, &[n, e]))
+                .collect::<Result<Vec<_>, _>>()?;
+            let rows_m: Vec<FzRow<'_>> = (0..4)
+                .map(|j| FzRow {
+                    raw: Some((&msgs_v[j], e)),
+                    targets: vec![nogamma_target(&msg_halves[j], ctrl_eps, 2 * e)],
+                })
+                .collect();
+            let mstates: Vec<&GpuTensor> = bank.iter().chain(std::iter::once(*prev_out)).collect();
+            fz(gpu, &mstates, Some(cross), &rows_m, n, e, eps)?;
+            let rank = cfg.loop_cfg.gate_rank;
+            let ins: Vec<CtrlIn<'_>> = (0..3)
+                .map(|j| (&bases[if qr >= 3 { j } else { 0 }], &msgs_v[j], &ctrls[j]))
+                .collect();
+            let outs = control_rows(gpu, ar, &ins, &gates[..3], e, rank, n, gemm)?;
+            let outs_v = outs
+                .iter()
+                .map(|&o| view(ar.get(o), 0, &[n, e]))
+                .collect::<Result<Vec<_>, _>>()?;
+            let srcs: Vec<&GpuTensor> = outs_v.iter().collect();
+            let rows = role_rows(3, ai.roles(ar, layer, [0, 1, 2])?, e, eps);
+            fz(gpu, &srcs, None, &rows, n, e, eps)?;
+        }
+        (Some(_), None) => return Err("inkling2 prefill: phys 0 has no base".into()),
+    }
     // Projections.
     let q = ar.f32(gpu, n * eattn, "q")?;
     let k_raw = ar.f32(gpu, n * ekv, "k_raw")?;
     let v_raw = ar.f32(gpu, n * ekv, "v_raw")?;
     let r = ar.f32(gpu, n * erel, "r")?;
-    let gemm = c.mode.gemm;
-    linear(gpu, &layer.wq, ar.get(qi), ar.get(q), n, gemm)?;
-    linear(gpu, &layer.wk, ar.get(ki), ar.get(k_raw), n, gemm)?;
-    linear(gpu, &layer.wv, ar.get(vi), ar.get(v_raw), n, gemm)?;
-    linear(gpu, &layer.wr, ar.get(qi), ar.get(r), n, gemm)?;
-    // Convs (static on SWA; dynamic taps on full layers).
-    let k_conv = ar.f32(gpu, n * ekv, "k_conv")?;
-    let v_conv = ar.f32(gpu, n * ekv, "v_conv")?;
-    let conv_state = &gs.conv[visit];
-    if swa {
-        let s = 1.0 / 5.0f32.sqrt();
-        conv_rows(
-            gpu,
-            ar.get(k_raw),
-            &layer.k_conv,
-            None,
-            conv_state,
-            ar.get(k_conv),
-            0,
-            ekv,
-            0,
-            hd,
-            s,
-            n,
-        )?;
-        conv_rows(
-            gpu,
-            ar.get(v_raw),
-            &layer.v_conv,
-            None,
-            conv_state,
-            ar.get(v_conv),
-            ekv,
-            ekv,
-            0,
-            hd,
-            s,
-            n,
-        )?;
+    linear_rot(gpu, &layer.wq, ar.get(rot_q), ar.get(q), n, gemm)?;
+    linear_rot(gpu, &layer.wk, ar.get(rot_k), ar.get(k_raw), n, gemm)?;
+    linear_rot(gpu, &layer.wv, ar.get(rot_v), ar.get(v_raw), n, gemm)?;
+    linear_rot(gpu, &layer.wr, ar.get(rot_r), ar.get(r), n, gemm)?;
+    // Dynamic conv taps (full layers).
+    let dyn_kv = if swa {
+        None
     } else {
         let (kp, vp) = match (&layer.k_proj, &layer.v_proj) {
             (Some(a), Some(b)) => (a, b),
@@ -1536,61 +1370,8 @@ fn visit_body(
             n,
             gemm,
         )?;
-        let s = 1.0 / 3.0;
-        conv_rows(
-            gpu,
-            ar.get(k_raw),
-            &layer.k_conv,
-            Some((ar.get(dk), dw)),
-            conv_state,
-            ar.get(k_conv),
-            0,
-            ekv,
-            nkv,
-            hd,
-            s,
-            n,
-        )?;
-        conv_rows(
-            gpu,
-            ar.get(v_raw),
-            &layer.v_conv,
-            Some((ar.get(dv), dw)),
-            conv_state,
-            ar.get(v_conv),
-            ekv,
-            ekv,
-            nkv,
-            hd,
-            s,
-            n,
-        )?;
-    }
-    // Clips + V head-norm.
-    clip_rows(
-        gpu,
-        ar.get(q),
-        Some(&layer.q_clip),
-        n * nh,
-        hd,
-        nh,
-        cfg.qk_clip,
-    )?;
-    clip_rows(gpu, ar.get(k_conv), None, n * nkv, hd, 1, cfg.qk_clip)?;
-    clip_rows(
-        gpu,
-        ar.get(r),
-        Some(&layer.rel_clip),
-        n * nh,
-        cfg.n_rel,
-        nh,
-        cfg.rel_clip,
-    )?;
-    let vc = ar.f32(gpu, n * ekv, "vc")?;
-    hip(
-        gpu.inkling2_rmsnorm_nogamma_f32(ar.get(v_conv), ar.get(vc), n * nkv, hd, eps),
-        "v norm",
-    )?;
+        Some((dk, dv, dw))
+    };
     // Full-layer tau: exactly 1.0 below `log_floor`; fail closed beyond.
     if !swa && !cfg.gpu_full_tau_supported(p + n - 1) {
         return Err(format!(
@@ -1609,7 +1390,6 @@ fn visit_body(
         n,
         gemm,
     )?;
-    // KV + attention.
     let ring = gs.visit_rows[visit];
     if !swa && p + n > ring {
         return Err(format!(
@@ -1617,44 +1397,129 @@ fn visit_body(
             p + n - 1
         ));
     }
-    let attn_heads = ar.f32(gpu, n * eattn, "attn_heads")?;
-    match (c.mode.blocked_attn, c.row_maps) {
-        (true, Some(maps)) => attn_one_row(
-            gpu, cfg, layer, gs, ar, maps, visit, swa, p, q, r, sinks, k_conv, vc, attn_heads,
-        )?,
-        (true, None) => attn_blocked(
-            gpu, cfg, layer, gs, ar, visit, swa, p, n, q, r, sinks, k_conv, vc, attn_heads,
-        )?,
-        (false, _) => attn_row_exact(
-            gpu, cfg, layer, gs, ar, visit, swa, p, n, q, r, sinks, k_conv, vc, attn_heads,
-        )?,
+    // K/V convs (static on SWA; plus the dynamic taps on full layers), K clip,
+    // V head-norm, the K/V stores and the Q / Rel clips: one launch. Where the
+    // K/V land: the cache slot (one-row block, committed before its decode
+    // attention), F16 staging planes (blocked attention, committed after it)
+    // or F32 rows (row-exact attention writes them per row).
+    let one_row = c.mode.blocked_attn && c.row_maps.is_some();
+    if c.mode.blocked_attn {
+        check_pre_block_tags(gs, visit, swa, p)?;
     }
-    // Output gate + projection + post conv.
-    let gate = ar.f32(gpu, n * eattn, "gate")?;
-    linear(gpu, &layer.wgate, ar.get(qi), ar.get(gate), n, gemm)?;
-    hip(gpu.sigmoid_f32(ar.get(gate)), "gate sigmoid")?;
+    let plane = nkv * n * hd;
+    let staged = if c.mode.blocked_attn && !one_row {
+        Some((
+            ar.alloc(gpu, &[plane], DType::F16, "k_stage")?,
+            ar.alloc(gpu, &[plane], DType::F16, "v_stage")?,
+        ))
+    } else {
+        None
+    };
+    let kv_f32 = if c.mode.blocked_attn {
+        None
+    } else {
+        Some((ar.f32(gpu, n * ekv, "k_conv")?, ar.f32(gpu, n * ekv, "vc")?))
+    };
+    let kv16 = if one_row {
+        let slot = swa_slot(p, ring);
+        let at = |t: &GpuTensor| t.buf.as_ptr().wrapping_byte_add(slot * hd * 2) as *const c_void;
+        Some(FzKv16 {
+            k: std::array::from_fn(|h| gs.k_cache[visit].get(h).map_or(std::ptr::null(), at)),
+            v: std::array::from_fn(|h| gs.v_cache[visit].get(h).map_or(std::ptr::null(), at)),
+            row_ld: 0,
+        })
+    } else {
+        staged.map(|(ks, vs)| {
+            let at = |t: T, h: usize| {
+                ar.get(t).buf.as_ptr().wrapping_byte_add(h * n * hd * 2) as *const c_void
+            };
+            FzKv16 {
+                k: std::array::from_fn(|h| if h < nkv { at(ks, h) } else { std::ptr::null() }),
+                v: std::array::from_fn(|h| if h < nkv { at(vs, h) } else { std::ptr::null() }),
+                row_ld: hd,
+            }
+        })
+    };
+    if one_row
+        && (0..nkv).any(|h| {
+            [&gs.k_cache[visit], &gs.v_cache[visit]]
+                .iter()
+                .any(|c| c.get(h).is_none_or(|t| t.buf.size() < ring * hd * 2))
+        })
+    {
+        return Err(format!("inkling2 prefill: visit {visit} KV cache planes"));
+    }
     hip(
-        gpu.mul_f32(ar.get(attn_heads), ar.get(gate), ar.get(attn_heads)),
-        "gate mul",
+        gpu.inkling2_fz_attn_post(&Inkling2FzAttnPost {
+            q: ar.get(q),
+            q_scale: &layer.q_clip,
+            qk_clip: cfg.qk_clip,
+            rel: ar.get(r),
+            rel_scale: &layer.rel_clip,
+            rel_clip: cfg.rel_clip,
+            k_raw: ar.get(k_raw),
+            v_raw: ar.get(v_raw),
+            k_sw: &layer.k_conv,
+            v_sw: &layer.v_conv,
+            dyn_kv: dyn_kv.map(|(dk, dv, dw)| (ar.get(dk), ar.get(dv), dw)),
+            conv_scale: if swa { 1.0 / 5.0f32.sqrt() } else { 1.0 / 3.0 },
+            state: &gs.conv[visit],
+            state_stride: INKLING2_CONV_WIDTH,
+            k_off: 0,
+            v_off: ekv,
+            state_update: n == 1,
+            v_eps: eps,
+            k_f32: kv_f32.map(|(k, _)| ar.get(k)),
+            v_f32: kv_f32.map(|(_, v)| ar.get(v)),
+            kv16,
+            rows: n,
+            nh,
+            nkv,
+        }),
+        "attention epilogue",
+    )?;
+    if one_row {
+        kv_tags(gs, visit, p, 1);
+    }
+    // Attention.
+    let attn_heads = ar.f32(gpu, n * eattn, "attn_heads")?;
+    match (c.row_maps, staged, kv_f32) {
+        (Some(maps), _, _) if one_row => attn_one_row(
+            gpu, cfg, layer, gs, ar, maps, visit, q, r, sinks, attn_heads,
+        )?,
+        (_, Some(st), _) => attn_blocked(
+            gpu, cfg, layer, gs, ar, visit, swa, p, n, q, r, sinks, st, attn_heads,
+        )?,
+        (_, _, Some((k_conv, vc))) => attn_row_exact(
+            gpu, cfg, layer, gs, ar, visit, swa, p, n, q, r, sinks, k_conv, vc, attn_heads,
+        )?,
+        _ => return Err("inkling2 prefill: no attention route".into()),
+    }
+    // Output gate (sigmoid · mul folded into the `wo` producer), projection,
+    // post conv + residual.
+    let gate = ar.f32(gpu, n * eattn, "gate")?;
+    linear_rot(gpu, &layer.wgate, ar.get(rot_g), ar.get(gate), n, gemm)?;
+    let rot_o = ar.f32(gpu, n * eattn, "rot_o")?;
+    let wo_awq = layer
+        .wo
+        .awq_scale
+        .as_ref()
+        .ok_or("inkling2 prefill: wo without its AWQ sidecar")?;
+    hip(
+        gpu.inkling2_fz_gate_rot(
+            ar.get(attn_heads),
+            ar.get(gate),
+            wo_awq,
+            ar.get(rot_o),
+            eattn,
+            n,
+        ),
+        "gate producer",
     )?;
     let wo_out = ar.f32(gpu, ne, "wo_out")?;
-    linear(gpu, &layer.wo, ar.get(attn_heads), ar.get(wo_out), n, gemm)?;
-    let attn_res = ar.f32(gpu, ne, "attn_res")?;
-    conv_rows(
-        gpu,
-        ar.get(wo_out),
-        &layer.attn_post_conv,
-        None,
-        &gs.conv[visit],
-        ar.get(attn_res),
-        2 * ekv,
-        e,
-        0,
-        hd,
-        1.0 / 5.0f32.sqrt(),
-        n,
-    )?;
-    // AttnRes bookkeeping: first visit of a block pushes x, others add.
+    linear_rot(gpu, &layer.wo, ar.get(rot_o), ar.get(wo_out), n, gemm)?;
+    // AttnRes bookkeeping: first visit of a block pushes x and takes the
+    // conv output as cur; the others add it to x.
     let has_push = phys % cfg.attn_res_block == 0;
     let push = if has_push {
         let t = dup(gpu, x, ne, "block push")?;
@@ -1662,16 +1527,23 @@ fn visit_body(
     } else {
         None
     };
-    let cur = if has_push {
-        attn_res
-    } else {
-        let cur = ar.f32(gpu, ne, "cur")?;
-        hip(
-            gpu.add_f32(&view(x, 0, &[ne])?, ar.get(attn_res), ar.get(cur)),
-            "attn residual",
-        )?;
-        cur
-    };
+    let cur = ar.f32(gpu, ne, "cur")?;
+    hip(
+        gpu.inkling2_fz_conv_res(
+            ar.get(wo_out),
+            &layer.attn_post_conv,
+            &gs.conv[visit],
+            INKLING2_CONV_WIDTH,
+            2 * ekv,
+            e,
+            1.0 / 5.0f32.sqrt(),
+            if has_push { None } else { Some(x) },
+            ar.get(cur),
+            n,
+            n == 1,
+        ),
+        "attn post conv",
+    )?;
     // --- MoE: mix over blocks + push + cur, control (pass > 0), norm ---
     if layer.mlp_query.buf.size() / 4 != e {
         return Err(format!(
@@ -1679,45 +1551,71 @@ fn visit_body(
             layer.mlp_query.buf.size() / 4
         ));
     }
-    let ffn_mixed = ar.f32(gpu, ne, "ffn_mix")?;
+    // Mix, then the FFN norm (no controller) or the gamma-less controller
+    // input norm into the FFN controller's cur half (pass > 0), one launch.
+    let ffn_normed = ar.f32(gpu, ne, "ffn_normed")?;
+    let ffn_mixed = match msgs {
+        Some(_) => Some(ar.f32(gpu, ne, "ffn_mix")?),
+        None => None,
+    };
     {
         let mut states: Vec<&GpuTensor> = blocks.iter().collect();
         if let Some(pi) = push {
             states.push(ar.get(pi));
         }
         states.push(ar.get(cur));
-        mix_rows(
-            gpu,
-            &states,
-            &layer.mlp_query,
-            ar.get(ffn_mixed),
-            n,
-            e,
-            1,
-            eps,
-        )?;
+        let cur_half = match &ffn_mixed {
+            Some(_) => Some(view(ar.get(gates[3]), 0, &[n * 2 * e - e])?),
+            None => None,
+        };
+        let row = match (ffn_mixed, &cur_half) {
+            (Some(fm), Some(h)) => FzRow {
+                raw: Some((ar.get(fm), e)),
+                targets: vec![FzTarget {
+                    gamma: None,
+                    eps: ctrl_eps,
+                    out: Some((h, 2 * e)),
+                    rots: Vec::new(),
+                }],
+            },
+            _ => FzRow {
+                raw: None,
+                targets: vec![FzTarget {
+                    gamma: Some(&layer.mlp_norm),
+                    eps,
+                    out: Some((ar.get(ffn_normed), e)),
+                    rots: Vec::new(),
+                }],
+            },
+        };
+        fz(gpu, &states, Some(&layer.mlp_query), &[row], n, e, eps)?;
     }
-    let ffn_in = match (&msgs, mids) {
-        (Some((_, _, _, ctrls)), Some(m)) => {
-            let m3 = view(ar.get(m), 3 * ne, &[n, e])?;
-            let fm = view(ar.get(ffn_mixed), 0, &[n, e])?;
-            let ins: [CtrlIn<'_>; 1] = [(&fm, &m3, &ctrls[3])];
-            control_rows(gpu, ar, &ins, e, cfg.loop_cfg.gate_rank, n, c.mode.gemm)?[0]
-        }
-        _ => ffn_mixed,
-    };
-    let ffn_normed = ar.f32(gpu, ne, "ffn_normed")?;
-    hip(
-        gpu.rmsnorm_batched(
-            &view(ar.get(ffn_in), 0, &[n, e])?,
-            &layer.mlp_norm,
-            ar.get(ffn_normed),
-            n,
+    if let (Some((_, _, _, ctrls)), Some(m), Some(fm)) = (&msgs, msg_buf, ffn_mixed) {
+        let m3 = view(ar.get(m), 3 * ne, &[n, e])?;
+        let fmv = view(ar.get(fm), 0, &[n, e])?;
+        let ins: [CtrlIn<'_>; 1] = [(&fmv, &m3, &ctrls[3])];
+        let ffn_in = control_rows(
+            gpu,
+            ar,
+            &ins,
+            &gates[3..],
             e,
-            eps,
-        ),
-        "ffn norm",
-    )?;
+            cfg.loop_cfg.gate_rank,
+            n,
+            gemm,
+        )?[0];
+        let inp = view(ar.get(ffn_in), 0, &[n, e])?;
+        let row = FzRow {
+            raw: None,
+            targets: vec![FzTarget {
+                gamma: Some(&layer.mlp_norm),
+                eps,
+                out: Some((ar.get(ffn_normed), e)),
+                rots: Vec::new(),
+            }],
+        };
+        fz(gpu, &[&inp], None, &[row], n, e, eps)?;
+    }
     // Router + top-8.
     let n_exp = cfg.n_experts;
     let k_top = cfg.n_expert_used;
@@ -1750,41 +1648,42 @@ fn visit_body(
     )?;
     let moe_raw = ar.f32(gpu, ne, "moe_raw")?;
     experts_rows(gpu, c, layer, ar, ffn_normed, topk_idx, topk_w, moe_raw)?;
-    let moe_conv = ar.f32(gpu, ne, "moe_conv")?;
-    conv_rows(
-        gpu,
-        ar.get(moe_raw),
-        &layer.mlp_post_conv,
-        None,
-        &gs.conv[visit],
-        ar.get(moe_conv),
-        2 * ekv + e,
-        e,
-        0,
-        hd,
-        1.0 / 5.0f32.sqrt(),
-        n,
-    )?;
     let visit_out = ar.f32(gpu, ne, "visit_out")?;
     hip(
-        gpu.add_f32(ar.get(cur), ar.get(moe_conv), ar.get(visit_out)),
-        "moe residual",
+        gpu.inkling2_fz_conv_res(
+            ar.get(moe_raw),
+            &layer.mlp_post_conv,
+            &gs.conv[visit],
+            INKLING2_CONV_WIDTH,
+            2 * ekv + e,
+            e,
+            1.0 / 5.0f32.sqrt(),
+            Some(ar.get(cur)),
+            ar.get(visit_out),
+            n,
+            n == 1,
+        ),
+        "moe post conv",
     )?;
-    Ok((visit_out, push))
-}
-
-trait CloneView {
-    fn clone_view(&self) -> GpuTensor;
-}
-
-impl CloneView for GpuTensor {
-    fn clone_view(&self) -> GpuTensor {
-        GpuTensor {
-            buf: self.buf.byte_view(0, self.buf.size()),
-            shape: self.shape.clone(),
-            dtype: self.dtype,
-        }
+    // A multi-row visit advances its four conv histories once every conv has
+    // read the old ones (a one-row visit shifted them in its conv launches).
+    if n > 1 {
+        hip(
+            gpu.inkling2_fz_conv_state(
+                &[
+                    (ar.get(k_raw), 0, ekv),
+                    (ar.get(v_raw), ekv, ekv),
+                    (ar.get(wo_out), 2 * ekv, e),
+                    (ar.get(moe_raw), 2 * ekv + e, e),
+                ],
+                &gs.conv[visit],
+                INKLING2_CONV_WIDTH,
+                n,
+            ),
+            "conv history",
+        )?;
     }
+    Ok((visit_out, push))
 }
 
 /// Row-exact attention: the singleton KV write, gather map, relative bias and
@@ -1919,35 +1818,6 @@ fn check_pre_block_tags(
     Ok(())
 }
 
-/// Stage the block's K (`k_conv`) and V (`vc`) rows as F16 planes `[nkv, n, hd]`.
-fn kv_stage(
-    gpu: &mut Gpu,
-    cfg: &Inkling2Config,
-    ar: &mut Arena,
-    n: usize,
-    k_conv: T,
-    vc: T,
-) -> Result<(T, T), String> {
-    let plane = cfg.n_head_kv * n * cfg.head_dim;
-    let ks = ar.alloc(gpu, &[plane], DType::F16, "k_stage")?;
-    let vs = ar.alloc(gpu, &[plane], DType::F16, "v_stage")?;
-    let mut b = KernargBlob::new();
-    b.push_ptr(ptr(ar.get(k_conv)));
-    b.push_ptr(ptr(ar.get(vc)));
-    b.push_ptr(ptr(ar.get(ks)));
-    b.push_ptr(ptr(ar.get(vs)));
-    b.push_i32(n as i32);
-    launch(
-        gpu,
-        "ink_pf_kv_stage_f16",
-        [grid_u32(plane.div_ceil(256), "kv stage")?, 1, 1],
-        [256, 1, 1],
-        0,
-        b,
-    )?;
-    Ok((ks, vs))
-}
-
 /// Commit the staged block to the cache ring and its position tags: only the
 /// trailing `ring` rows survive a block wider than the ring.
 #[allow(clippy::too_many_arguments)]
@@ -1992,17 +1862,25 @@ fn kv_commit(
         0,
         b,
     )?;
-    for i in first..n {
+    kv_tags(gs, visit, p, n);
+    Ok(())
+}
+
+/// Position tags and cursor of `n` rows from `p` stored in the cache ring of
+/// `visit` (only the trailing `ring` rows survive a block wider than the ring).
+fn kv_tags(gs: &mut Inkling2GpuState, visit: usize, p: usize, n: usize) {
+    let ring = gs.visit_rows[visit];
+    for i in n.saturating_sub(ring)..n {
         let pos = p + i;
         gs.visit_pos_tags[visit][swa_slot(pos, ring)] = pos as u32;
     }
     gs.visit_cap[visit] = p + n;
-    Ok(())
 }
 
-/// Blocked attention: stage the block's K/V as F16, run the causal FA2 prefill
-/// over cache (pre-block) + staging (in-block) keys, then commit the block to
-/// the cache ring and its position tags.
+/// Blocked attention over the block's F16-staged K/V (`[nkv, n, hd]`): the
+/// causal FA2 prefill over cache (pre-block) + staging (in-block) keys, then
+/// the block's commit to the cache ring and its position tags. The caller
+/// checked the pre-block tags before staging.
 #[allow(clippy::too_many_arguments)]
 fn attn_blocked(
     gpu: &mut Gpu,
@@ -2017,14 +1895,11 @@ fn attn_blocked(
     q: T,
     r: T,
     sinks: T,
-    k_conv: T,
-    vc: T,
+    staged: (T, T),
     attn_heads: T,
 ) -> Result<(), String> {
-    check_pre_block_tags(gs, visit, swa, p)?;
     let ring = gs.visit_rows[visit];
     let window = if swa { ring } else { 0 };
-    let staged = kv_stage(gpu, cfg, ar, n, k_conv, vc)?;
     hip(
         gpu.inkling2_attn_prefill_fa2(&Inkling2PrefillAttn {
             q: ar.get(q),
@@ -2106,11 +1981,12 @@ impl RowMaps {
     }
 }
 
-/// Attention of a one-row block (decode): commit the row's K/V first, then the
-/// split-KV FA2 decode attention of the scalar decode visit over the call's
-/// [`RowMaps`]. The blocked FA2 prefill kernel tiles queries only, so one row
-/// is one tile per head over every key (8.2 ms per token at 2K context against
-/// 1.2 ms for the decode kernels, `decode1-runs/runs/j1`).
+/// Attention of a one-row block (decode), whose K/V the visit's attention
+/// epilogue already stored in its cache slot: the split-KV FA2 decode
+/// attention of the scalar decode visit over the call's [`RowMaps`]. The
+/// blocked FA2 prefill kernel tiles queries only, so one row would be one tile
+/// per head over every key (8.2 ms per token at 2K context against 1.2 ms for
+/// the decode kernels, `decode1-runs/runs/j1`).
 #[allow(clippy::too_many_arguments)]
 fn attn_one_row(
     gpu: &mut Gpu,
@@ -2120,20 +1996,13 @@ fn attn_one_row(
     ar: &mut Arena,
     maps: &RowMaps,
     visit: usize,
-    swa: bool,
-    p: usize,
     q: T,
     r: T,
     sinks: T,
-    k_conv: T,
-    vc: T,
     attn_heads: T,
 ) -> Result<(), String> {
     let nh = cfg.n_head;
     let hd = cfg.head_dim;
-    check_pre_block_tags(gs, visit, swa, p)?;
-    let staged = kv_stage(gpu, cfg, ar, 1, k_conv, vc)?;
-    kv_commit(gpu, cfg, gs, ar, visit, p, 1, staged)?;
     let (n_kv, slots, dists) = maps.get(gs.visit_rows[visit])?;
     let rel_bias = ar.alloc(gpu, &[nh, n_kv], DType::F32, "rel_bias")?;
     hip(
@@ -2749,28 +2618,24 @@ fn head_rows(
             states.push(view(b, r0 * e, &[rows, e])?);
         }
         let refs: Vec<&GpuTensor> = states.iter().collect();
-        let mixed = ar.f32(gpu, rows * e, "final_mix")?;
-        mix_rows(
+        let hidden = ar.f32(gpu, rows * e, "hidden")?;
+        let row = FzRow {
+            raw: None,
+            targets: vec![FzTarget {
+                gamma: Some(&gw.norm),
+                eps: cfg.rms_norm_eps,
+                out: Some((ar.get(hidden), e)),
+                rots: Vec::new(),
+            }],
+        };
+        fz(
             gpu,
             &refs,
-            &gw.output_query,
-            ar.get(mixed),
+            Some(&gw.output_query),
+            &[row],
             rows,
             e,
-            1,
             cfg.rms_norm_eps,
-        )?;
-        let hidden = ar.f32(gpu, rows * e, "hidden")?;
-        hip(
-            gpu.rmsnorm_batched(
-                &view(ar.get(mixed), 0, &[rows, e])?,
-                &gw.norm,
-                ar.get(hidden),
-                rows,
-                e,
-                cfg.rms_norm_eps,
-            ),
-            "final norm",
         )?;
         let vocab = cfg.vocab_size;
         let mut out = Vec::with_capacity(rows);

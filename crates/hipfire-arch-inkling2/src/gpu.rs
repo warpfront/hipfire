@@ -597,6 +597,9 @@ pub struct Inkling2GpuLayer {
     pub experts: Vec<Inkling2Expert>,   // n_experts
     /// `Some` iff the file is the typed XTS layout; see [`Inkling2XtsLayer`].
     pub xts: Option<Inkling2XtsLayer>,
+    /// Typed layout: `wq`, `wr` and `wgate` (which share their input) carry
+    /// byte-identical AWQ sidecars, so one AWQ+FWHT producer serves all three.
+    pub qrg_awq_shared: bool,
 }
 
 impl Inkling2GpuLayer {
@@ -1537,6 +1540,7 @@ struct LayerSlots {
     wv: usize,
     wr: usize,
     wgate: usize,
+    qrg_awq_shared: bool,
     wo: usize,
     sink: usize,
     rel_table: usize,
@@ -1756,6 +1760,13 @@ pub fn upload(
                 )?;
             }
         }
+        let qrg_awq_shared = xts && {
+            let side = |stem: &str| {
+                raw(weights, &crate::weights::awq_sidecar_name(&nm(stem))).map(|t| &t.data)
+            };
+            let q = side("attn.wq_du.weight")?;
+            q == side("attn.wr_du.weight")? && q == side("attn.gate_attn.weight")?
+        };
         let g = unsafe { &mut *tx.gpu };
         let sink =
             tx.hold_tensor(acc.f32t(g, weights, &nm("attn.attn_sink_proj.weight"), &[nh, e])?);
@@ -1942,6 +1953,7 @@ pub fn upload(
             wr,
             wgate,
             wo,
+            qrg_awq_shared,
             sink,
             rel_table,
             q_clip,
@@ -2052,6 +2064,7 @@ pub fn upload(
             });
         }
         layers.push(Inkling2GpuLayer {
+            qrg_awq_shared: s.qrg_awq_shared,
             wq: take_w(&mut tx, s.wq)?,
             wk: take_w(&mut tx, s.wk)?,
             wv: take_w(&mut tx, s.wv)?,
