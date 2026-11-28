@@ -7296,6 +7296,12 @@ pub fn bench_decode_inkling(
         .get("warmup_iterations")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
+    // Folds every step's logits into one FNV-1a digest (identity of the served
+    // backends); the fold is host work, so a digest run is not a timing run.
+    let want_digest = msg
+        .get("logits_digest")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if context == 0 || iterations == 0 {
         return Err("bench_decode context_tokens and iterations must be non-zero".to_string());
     }
@@ -7337,11 +7343,18 @@ pub fn bench_decode_inkling(
             start = end;
         }
         let mut logits: Vec<f32> = Vec::new();
+        let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
         let mut step = |m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, i: usize| {
             let token = 101 + (i as u32 % 1000);
             let b = m.inkling2_mut().unwrap();
             inkling2::forward_plain_ar_gpu(b, gpu, token, context + i, &mut logits)
-                .map_err(|e| format!("bench_decode forward failed: {e}"))
+                .map_err(|e| format!("bench_decode forward failed: {e}"))?;
+            if want_digest {
+                for x in &logits {
+                    digest = (digest ^ u64::from(x.to_bits())).wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+            Ok::<(), String>(())
         };
         for i in 0..warmup {
             step(m, gpu, i)?;
@@ -7392,7 +7405,7 @@ pub fn bench_decode_inkling(
             "arena_refusal": after.as_ref().and_then(|s| s.arena_refusal.clone()),
             "last_route": last,
         });
-        Ok(serde_json::json!({
+        let mut response = serde_json::json!({
             "type": "decode_result",
             "context_tokens": context,
             "iterations": iterations,
@@ -7401,7 +7414,11 @@ pub fn bench_decode_inkling(
             "us_per_token": elapsed * 1_000_000.0 / iterations as f64,
             "tok_s": iterations as f64 / elapsed.max(f64::MIN_POSITIVE),
             "inkling_decode": ledger,
-        }))
+        });
+        if want_digest {
+            response["logits_fnv64"] = serde_json::json!(format!("{digest:016x}"));
+        }
+        Ok(response)
     })();
     let _ = gpu.hip.device_synchronize();
     let rolled = reset(m, gpu);
