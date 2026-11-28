@@ -81,7 +81,9 @@ use hip_bridge::{DeviceBuffer, HostAllocOwner};
 use rdna_compute::tensor_ops::{copy_regions, CopyRegion};
 use rdna_compute::Gpu;
 
-use crate::checkpoint_pool::{prefix_fingerprint, CheckpointBlob, CheckpointPool};
+use crate::checkpoint_pool::{
+    prefix_fingerprint, prefix_fingerprints, CheckpointBlob, CheckpointPool,
+};
 use crate::serve_contract::{CacheDomain, CheckpointId};
 
 mod disk;
@@ -1628,18 +1630,23 @@ impl SessionCache {
             .max()
             .unwrap_or(0);
         // Only a strictly deeper pool snapshot beats the resident one (no row
-        // copy, see `begin`); each probe hashes its whole prefix.
+        // copy, see `begin`). A snapshot of an earlier, shorter prompt sits
+        // at a boundary of that prompt, which need not be a boundary of this
+        // one (Gemma 4 grid end), so probe every p that is a boundary of the
+        // prompt cut at p. One hash pass covers every probe.
         let exact = session_exact_domain(&domain);
-        let planned = state
-            .snapshot_boundaries(prompt, resident, prompt.len() - 1)
-            .into_iter()
+        let probes: Vec<usize> = (resident + 1..prompt.len())
+            .filter(|&p| state.snapshot_boundaries(&prompt[..p], p - 1, p).last() == Some(&p))
+            .collect();
+        let planned = probes
+            .iter()
+            .zip(prefix_fingerprints(prompt, &probes))
             .rev()
-            .find(|&p| {
-                let fp = prefix_fingerprint(&prompt[..p]);
+            .find(|&(&p, fp)| {
                 self.usable(state, route, &domain, p as u64, fp)
                     || self.usable(state, route, &exact, p as u64, fp)
             })
-            .unwrap_or(resident);
+            .map_or(resident, |(&p, _)| p);
         if planned > 0
             && hipfire_config::developer_bool("HIPFIRE_QWEN_CACHE_TRACE", false)
             && self.tail.as_ref().is_some_and(|tail| {
@@ -6158,6 +6165,8 @@ mod tests {
         /// Fixed buffer A, fixed buffer B, token rows, pooled rows.
         bufs: Vec<Vec<u8>>,
         position: usize,
+        /// Prefill width whose grid end is a boundary; 0 = none.
+        grid: usize,
     }
 
     impl HostState {
@@ -6171,6 +6180,7 @@ mod tests {
                     vec![GUARD; HOST_TOKENS.div_ceil(POOL_RATIO) * HOST_POOL_ROW_BYTES],
                 ],
                 position: 0,
+                grid: 0,
             }
         }
 
@@ -6244,7 +6254,15 @@ mod tests {
             Some(format!("{}/{route:?}", self.scope))
         }
         fn snapshot_boundaries(&self, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize> {
-            stride_boundaries(STRIDE, prompt, None, after, up_to)
+            let mut boundaries = stride_boundaries(STRIDE, prompt, None, after, up_to);
+            // Gemma 4 style: the prompt length rounded down to the prefill width.
+            let grid_end = prompt.len() / self.grid.max(1) * self.grid;
+            if self.grid > 0 && grid_end > after && grid_end <= up_to {
+                boundaries.push(grid_end);
+                boundaries.sort_unstable();
+                boundaries.dedup();
+            }
+            boundaries
         }
         fn snapshot_restorable(&self, _route: SessionRoute, meta: &[u8]) -> bool {
             meta != REFUSED_META
@@ -6438,6 +6456,26 @@ mod tests {
         let mut side_full = side.clone();
         side_full.extend(prompt(8, SIDE_THROUGH - SIDE_PROMPT));
         (main_prompt, consumed, side, side_full)
+    }
+
+    #[test]
+    fn plan_finds_a_shorter_prompts_grid_end_snapshot() {
+        // HIPF-628: a longer prompt with the same prefix has no boundary at
+        // the shorter prompt's grid end (64), but its cold prefill passes it.
+        let mut state = HostState::new("host");
+        state.grid = 32;
+        let scope = state.snapshot_scope(AR).unwrap();
+        let mut cache = SessionCache::new(domain(), 1 << 20);
+        let mut long = prompt(1, 70);
+        long.extend(prompt(2, 300));
+        assert_eq!(
+            state.snapshot_boundaries(&long, 0, long.len() - 1),
+            [128, 256, 352]
+        );
+        publish(&mut cache, &scope, true, &long, 64);
+        // Off the grid: a prompt end, never a cold prefill split of `long`.
+        publish(&mut cache, &scope, true, &long, 70);
+        assert_eq!(cache.plan(&state, &long, AR), 64);
     }
 
     #[test]

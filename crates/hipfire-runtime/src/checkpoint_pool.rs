@@ -108,6 +108,25 @@ pub fn prefix_fingerprint_chain(head: &[u32], tail: &[u32]) -> u64 {
     u64::from_le_bytes(d[..8].try_into().expect("sha256 >= 8 bytes"))
 }
 
+/// [`prefix_fingerprint`] of `tokens[..p]` for each ascending `p` of
+/// `positions`, in one pass over `tokens`.
+pub fn prefix_fingerprints(tokens: &[u32], positions: &[usize]) -> Vec<u64> {
+    use sha2::{Digest as Sha256Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut at = 0;
+    positions
+        .iter()
+        .map(|&p| {
+            for &t in &tokens[at..p] {
+                h.update(t.to_le_bytes());
+            }
+            at = p;
+            let d = h.clone().finalize();
+            u64::from_le_bytes(d[..8].try_into().expect("sha256 >= 8 bytes"))
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 struct CheckpointEntry<B> {
     id: CheckpointId,
