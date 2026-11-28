@@ -527,6 +527,7 @@ fn kill_switches_and_ineligible_rows_run_eager() {
     // Out-of-row: the F16 expert tier is not A8. Typed reason, exact eager
     // logits (it IS the incumbent), the armed tape untouched.
     let armed = serve_stats(&b).unwrap().graph.clone();
+    let epoch0 = rdna_compute::scratch::scratch_growth_epoch();
     let saved = b.gpu_state.as_ref().unwrap().prefill_routes;
     b.gpu_state.as_mut().unwrap().prefill_routes =
         PrefillRoutes::parse("dense=f16,experts=f16").unwrap();
@@ -552,13 +553,32 @@ fn kill_switches_and_ineligible_rows_run_eager() {
     );
     pos += 1;
 
-    // Re-admitted: the same tape (same key, same state layout) replays.
+    // Re-admitted. The F16-tier steps may have grown the shared scratch (a new
+    // layout epoch = a new key): then the tape re-arms, otherwise the retained
+    // tape replays. Either way the graph backend is back and the step is exact.
+    let want = {
+        let pre = save_pre(&b, &gpu, pos);
+        let l = served(&mut b, &mut gpu, toks[pos], pos, false).unwrap();
+        restore(&mut b, &gpu, &pre);
+        l
+    };
+    let epoch_moved = rdna_compute::scratch::scratch_growth_epoch() != epoch0;
     forward_plain_ar_gpu(&mut b, &mut gpu, toks[pos], pos, &mut l).unwrap();
     assert_eq!(
         last_route(&b),
-        ServeRoute::Graph(StepRoute::Replay),
-        "the retained tape survived the ineligible steps"
+        ServeRoute::Graph(if epoch_moved {
+            StepRoute::EagerCaptured
+        } else {
+            StepRoute::Replay
+        }),
+        "re-admission: the key rule (scratch epoch moved: {epoch_moved})"
     );
+    assert_eq!(sha(f32_bytes(&want)), sha(f32_bytes(&l)));
+    pos += 1;
+    if epoch_moved {
+        forward_plain_ar_gpu(&mut b, &mut gpu, toks[pos], pos, &mut l).unwrap();
+        assert_eq!(last_route(&b), ServeRoute::Graph(StepRoute::Replay));
+    }
     release_decode_graph(&mut b, &mut gpu);
 }
 
