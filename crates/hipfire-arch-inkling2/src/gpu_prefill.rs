@@ -560,7 +560,10 @@ impl PrefillRoutes {
 
 /// Routes the blocked prefill runs when no Qwen activation knob is set
 /// ([`crate::gpu::resolve_prefill_routes`]).
-pub const PREFILL_ROUTES_DEFAULT: PrefillRoutes = PrefillRoutes::F16;
+pub const PREFILL_ROUTES_DEFAULT: PrefillRoutes = PrefillRoutes {
+    dense: PrefillActTier::A8,
+    experts: PrefillActTier::A8,
+};
 
 /// Whether [`forward_prefill_gpu`] runs the blocked path for this load: gfx1201,
 /// typed-XTS layout (symmetric qt44 + AWQ sidecars, F16 router), Mini geometry.
