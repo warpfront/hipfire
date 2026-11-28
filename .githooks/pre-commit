@@ -116,7 +116,13 @@ if echo "$CHANGED" | grep -qE "$PP_HOTSPOT"; then
     PP_TOUCHED=1
 fi
 
-if ! echo "$CHANGED" | grep -qE "$HOTSPOT"; then
+# Data files (benchmarks/, *.json) hold no daemon code. Names such as
+# qwen4-mq4xts-mtp.lane-tau.json match `mq4` but must not start the GPU gates.
+# Exclude them with Git pathspecs, so non-ASCII names (quoted by Git when
+# core.quotePath=true) cannot slip past a regex on the printed names.
+HOT_CHANGED=$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACM \
+    -- . ':(exclude)benchmarks' ':(exclude,glob)**/*.json')
+if ! echo "$HOT_CHANGED" | grep -qE "$HOTSPOT"; then
     exit 0
 fi
 
