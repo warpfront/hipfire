@@ -627,7 +627,9 @@ INKLING2_ARMS = {
     # name: (extra env, backend the bench ledger must report, log marker)
     "pm4": (
         {
-            "HIPFIRE_REPLAY_BACKEND": None,
+            # PM4 is an explicit opt-in while `PM4_DEFAULT_ON` is false.
+            "HIPFIRE_REPLAY_BACKEND": "redline",
+            "HIPFIRE_REPLAY_TRANSPORT": "pm4",
             "HIPFIRE_REPLAY_MANUAL_CAPTURE": None,
             "HIPFIRE_AR_GRAPH": None,
             "HIPFIRE_GRAPH": None,

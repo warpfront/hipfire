@@ -33,7 +33,7 @@
 //! Kill switch: the existing graph switches. `HIPFIRE_GRAPH=0` or
 //! `HIPFIRE_AR_GRAPH=0` (the process-config spelling `experimental.graph.*`)
 //! make every step eager (PM4 included). `HIPFIRE_REPLAY_BACKEND=hip` keeps the
-//! graph. There is no new flag; the default is ON for the admitted row.
+//! graph. There is no new flag; the HIP graph is the default for the admitted row.
 //!
 //! Failure policy (inherited from the executors): a step refused before
 //! submission returns its error with the state untouched; a PM4 record /
@@ -68,7 +68,7 @@ use rdna_compute::{DType, Gpu};
 /// the default decode route of the admitted row (the daemon enables the load's
 /// replay controller for it, `inkling2_retained_default`); `false` keeps the HIP
 /// graph the default and leaves PM4 to an explicit `HIPFIRE_REPLAY_BACKEND=redline`.
-pub const PM4_DEFAULT_ON: bool = true;
+pub const PM4_DEFAULT_ON: bool = false;
 
 /// The decode backends of a load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
