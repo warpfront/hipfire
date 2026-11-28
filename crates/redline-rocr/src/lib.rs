@@ -25,6 +25,7 @@ use libloading::Library;
 compile_error!("the manual ROCr ABI currently supports only 64-bit little-endian hosts");
 
 pub mod abi;
+pub mod eviction;
 #[doc(hidden)]
 pub mod packet;
 mod pm4;

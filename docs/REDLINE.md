@@ -568,6 +568,37 @@ campaign must state its promotion rule in advance.
 Never describe a replay-execution error as “the same token retried through HIP.”
 That behavior does not exist.
 
+### Bounded replay wait and KFD eviction
+
+The retained-PM4 replay wait (`SingleQueuePm4Ib::wait_replay_checked`, behind
+`replay_and_wait_checked` and the railgun lowering) has a 5 s base deadline
+(`redline_rocr::DEFAULT_WAIT_TIMEOUT`; it is a compile-time constant, and
+`HIPFIRE_REDLINE_QUEUE_TIMEOUT` is only the tag of the diagnostic line printed
+when it expires, not an environment override). KFD evicts all of a process's
+queues while it migrates or compacts host pages the runtime registered with the
+GPU (kcompactd bursts on userptr BOs); a replay in flight stalls for the whole
+eviction while HIP's unbounded wait just waits. Measured episodes reach 2.2 s,
+and one gfx1201 lane flake hit the 5 s bound this way.
+
+The wait is therefore eviction-aware (`redline_rocr::eviction`). Nothing changes
+on the normal path: no sysfs file is read until a wait has already run 250 ms
+(27 decode steps). Then the process's
+`/sys/class/kfd/kfd/proc/<pid>/stats_*/evicted_ms` (summed over GPUs) is sampled
+as a baseline, and sampled again each time a deadline expires. If it rose, the
+deadline is extended by one base window and
+`HIPFIRE_REDLINE_EVICT_WAIT_EXTENDED evicted_ms_delta=… extension_ms=…
+deadline_ms=… ceiling_ms=…` is printed once per extension; the total never
+exceeds `EVICTION_WAIT_CEILING` (60 s, 27x the longest observed episode; a
+process that is evicted without end still fails in a minute with the usual
+`HIPFIRE_REDLINE_QUEUE_TIMEOUT` and quiescence teardown). A flat counter, an
+unreadable counter or a host without the KFD sysfs files (non-Linux, no
+`/sys/class/kfd`) fails at exactly 5 s as before. A queue fault still ends the
+wait immediately. Setting `HSA_USERPTR_FOR_PAGED_MEM=0` avoids the evictions
+altogether (`hip-bridge/src/ffi.rs`); this wait only keeps an eviction that does
+happen from becoming a failed turn. Only `wait_replay_checked` is eviction-aware;
+the AQL recorded-graph waits and the multi-queue phased PM4 wait keep their
+fixed bounds.
+
 ## 4. Retained tape, ABI, lifetime, and dynamic-state contract
 
 A retained route is valid only when all of the following hold.

@@ -11,6 +11,10 @@ use hipfire_config::devices::{RDNA_CU_MASK_BAN, cu_mask_refused_on};
 use hipfire_config::emu_budget;
 
 use super::abi;
+use super::eviction::{
+    EVICTION_WAIT_CEILING, EvictionCounter, EvictionDeadline, KfdEvictionCounter, WaitEnd,
+    wait_extending,
+};
 use super::packet::{AQL_PACKET_BYTES, KernelMetadata, LaunchGeometry, PacketImage};
 use super::pm4_gfx10_scratch::{Gfx10Scratch, Gfx10ScratchTopology};
 
@@ -1943,6 +1947,64 @@ impl QueueSet {
             }
             bounded_poll_pause(&mut polls);
         }
+    }
+
+    /// [`Self::wait_signal`] whose deadline is extended while KFD reports
+    /// that this process's queues are being evicted (see
+    /// [`crate::eviction`]). Identical to `wait_signal(signal, timeout)` when
+    /// the eviction counter is flat or unreadable, and the normal path never
+    /// reads it. The reported timeout is the deadline that was reached.
+    pub fn wait_signal_evict_aware(
+        &self,
+        signal: &CompletionSignal,
+        timeout: Duration,
+    ) -> Result<(), RuntimeError> {
+        self.wait_signal_evict_aware_with(
+            signal,
+            timeout,
+            EVICTION_WAIT_CEILING,
+            &mut KfdEvictionCounter::for_current_process(),
+        )
+    }
+
+    /// [`Self::wait_signal_evict_aware`] with an injected counter and ceiling.
+    pub fn wait_signal_evict_aware_with(
+        &self,
+        signal: &CompletionSignal,
+        timeout: Duration,
+        ceiling: Duration,
+        counter: &mut dyn EvictionCounter,
+    ) -> Result<(), RuntimeError> {
+        let started = Instant::now();
+        let mut polls = 0_u32;
+        let mut deadline = EvictionDeadline::new(counter, timeout, ceiling);
+        let end = wait_extending(
+            &mut deadline,
+            || started.elapsed(),
+            || {
+                self.check_faults()?;
+                Ok(signal.is_complete())
+            },
+            || bounded_poll_pause(&mut polls),
+        )?;
+        let WaitEnd::Expired(timeout) = end else {
+            return Ok(());
+        };
+        let queue_state = self
+            .queues
+            .iter()
+            .map(AqlQueue::timeout_diagnostic)
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "HIPFIRE_REDLINE_QUEUE_TIMEOUT signal=0x{:x} signal_value={} {queue_state}",
+            signal.raw().0,
+            signal.value_scacquire(),
+        );
+        Err(RuntimeError::SignalTimeout {
+            signal: signal.raw().0,
+            timeout,
+        })
     }
 
     /// Wait until every completion signal reaches zero under one shared

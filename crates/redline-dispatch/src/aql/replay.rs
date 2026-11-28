@@ -796,13 +796,19 @@ impl SingleQueuePm4Ib {
     /// and quiescence semantics. `Ok(())` immediately when no replay is in
     /// flight. On timeout or queue fault the queues are inactivated and the
     /// error carries `Proven` only when that teardown succeeded.
+    ///
+    /// The 5 s bound is eviction-aware: when it expires while the process's
+    /// KFD `evicted_ms` counter is still rising, the deadline is extended by
+    /// one window per rising window up to `EVICTION_WAIT_CEILING` (60 s), as
+    /// HIP's unbounded wait would survive a transient eviction. A flat or
+    /// unreadable counter fails at 5 s exactly as before.
     pub fn wait_replay_checked(&mut self) -> Result<(), (ReplayError, Quiescence)> {
         if !self.in_flight {
             return Ok(());
         }
         match self
             .queues
-            .wait_signal(&self.completion, DEFAULT_WAIT_TIMEOUT)
+            .wait_signal_evict_aware(&self.completion, DEFAULT_WAIT_TIMEOUT)
         {
             Ok(()) => {
                 apply_quiescence_transition(
