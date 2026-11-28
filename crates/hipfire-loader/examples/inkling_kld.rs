@@ -117,10 +117,13 @@ const USAGE: &str = "usage:
   inkling_kld captest  --source MODEL.safetensors --model ARTIFACT.hfq --slice TEXT --out-dir DIR
                        [--n-ctx 64] [--chunks 2] [--layers 5,6] [--sliding-window W] [--log-floor F]
   inkling_kld eval     --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq
-                       [--max-chunks N] [--chunks-per-process 1] [--route ar|prefill]
+                       [--max-chunks N] [--chunks-per-process 1]
+                       [--route ar|prefill|decode-scalar|decode-blocked]
                        [--prefill-routes dense=f16|fp8|a8|a4,experts=f16|fp8|a8|a4]
   inkling_kld bench    --model CANDIDATE.hfq --ref REF.kldref --output OUT.json [--n 2048]
                        [--reps 3] [--prefill-routes ...]
+  inkling_kld bench-decode --model CANDIDATE.hfq --ref REF.kldref --output OUT.json
+                       [--ctx 128] [--steps 64] [--reps 3] [--body blocked|scalar] [--prefill-routes ...]
   inkling_kld pair     --base BASE.kldseq --cand CAND.kldseq [--output OUT.json] [--boot 20000] [--seed 1]";
 
 /// Receipt schema written beside every `.kldseq`.
@@ -2437,13 +2440,47 @@ impl Args {
     }
 }
 
-/// `--route ar` (default: one `forward_token_gpu` per position) or `--route
-/// prefill` (blocked `forward_prefill_gpu` over the window, head on the scored rows).
-fn route_is_prefill(a: &Args) -> Result<bool, String> {
-    match a.0.get("route").map(String::as_str) {
-        None | Some("ar") => Ok(false),
-        Some("prefill") => Ok(true),
-        Some(other) => Err(format!("--route: expected ar|prefill, got {other}")),
+/// Scoring route of `eval` / `eval-worker` (`--route`, default `ar`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// One `forward_token_gpu` per position.
+    Ar,
+    /// Blocked `forward_prefill_gpu` over the window, head on the scored rows.
+    Prefill,
+    /// Decode order: blocked prefill of `[0, score_from)`, then one decode
+    /// step per scored position, through `forward_token_gpu` (`decode-scalar`)
+    /// or the blocked body at one row (`decode-blocked`, `forward_decode_gpu`).
+    DecodeScalar,
+    DecodeBlocked,
+}
+
+impl Route {
+    fn parse(a: &Args) -> Result<Self, String> {
+        match a.0.get("route").map(String::as_str) {
+            None | Some("ar") => Ok(Self::Ar),
+            Some("prefill") => Ok(Self::Prefill),
+            Some("decode-scalar") => Ok(Self::DecodeScalar),
+            Some("decode-blocked") => Ok(Self::DecodeBlocked),
+            Some(other) => Err(format!(
+                "--route: expected ar|prefill|decode-scalar|decode-blocked, got {other}"
+            )),
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ar => "ar",
+            Self::Prefill => "prefill",
+            Self::DecodeScalar => "decode-scalar",
+            Self::DecodeBlocked => "decode-blocked",
+        }
+    }
+    fn receipt(self) -> &'static str {
+        match self {
+            Self::Ar => "hipfire_loader::load_model + reset_session_state + forward_token_gpu per position (product AR n=1, F16 KV)",
+            Self::Prefill => "hipfire_loader::load_model + reset_session_state + forward_prefill_gpu over [0, score_to), head on the scored rows (blocked prefill, F16 KV)",
+            Self::DecodeScalar => "hipfire_loader::load_model + reset_session_state + forward_prefill_gpu over [0, score_from), then forward_token_gpu per scored position (decode order, scalar body, F16 KV)",
+            Self::DecodeBlocked => "hipfire_loader::load_model + reset_session_state + forward_prefill_gpu over [0, score_from), then forward_decode_gpu per scored position (decode order, blocked body at one row, F16 KV)",
+        }
     }
 }
 
@@ -2874,9 +2911,9 @@ fn eval_worker(a: &Args) -> Result<(), String> {
     let (from, to) = (h.window.score_from, h.window.score_to);
     let mut gpu = rdna_compute::Gpu::init().map_err(|e| format!("gpu init: {e:?}"))?;
     let routes = prefill_routes_arg(a)?;
-    let prefill = route_is_prefill(a)?;
-    if routes.is_some() && !prefill {
-        return Err("--prefill-routes needs --route prefill".into());
+    let route = Route::parse(a)?;
+    if routes.is_some() && route == Route::Ar {
+        return Err("--prefill-routes needs a blocked route".into());
     }
     let mut m = load_inkling(&model, &mut gpu, routes)?;
     let mut results = Vec::new();
@@ -2917,25 +2954,50 @@ fn eval_worker(a: &Args) -> Result<(), String> {
             top1 += usize::from(argmax == Some(blk.top[0].0));
             Ok(())
         };
-        if prefill {
-            // Blocked prefill over [0, score_to), the head on the scored rows.
-            if !hipfire_arch_inkling2::prefill_supported(b, &gpu) {
-                return Err("--route prefill: blocked prefill not supported on this load".into());
+        if route != Route::Ar && !hipfire_arch_inkling2::prefill_supported(b, &gpu) {
+            return Err(format!(
+                "--route {}: blocked prefill not supported on this load",
+                route.name()
+            ));
+        }
+        match route {
+            Route::Prefill => {
+                // Blocked prefill over [0, score_to), the head on the scored rows.
+                hipfire_arch_inkling2::forward_prefill_gpu(
+                    b,
+                    &mut gpu,
+                    &chunk[..to],
+                    0,
+                    hipfire_arch_inkling2::PrefillLogits::Rows {
+                        from,
+                        sink: &mut score,
+                    },
+                )?;
             }
-            hipfire_arch_inkling2::forward_prefill_gpu(
-                b,
-                &mut gpu,
-                &chunk[..to],
-                0,
-                hipfire_arch_inkling2::PrefillLogits::Rows {
-                    from,
-                    sink: &mut score,
-                },
-            )?;
-        } else {
-            for (pos, &id) in chunk[..to].iter().enumerate() {
-                let row = hipfire_arch_inkling2::forward_token_gpu(b, &mut gpu, id, pos)?;
-                if pos >= from {
+            Route::Ar => {
+                for (pos, &id) in chunk[..to].iter().enumerate() {
+                    let row = hipfire_arch_inkling2::forward_token_gpu(b, &mut gpu, id, pos)?;
+                    if pos >= from {
+                        score(pos, &row)?;
+                    }
+                }
+            }
+            Route::DecodeScalar | Route::DecodeBlocked => {
+                // The product order: the prompt [0, score_from) as one blocked
+                // prefill, then one decode step per scored position.
+                hipfire_arch_inkling2::forward_prefill_gpu(
+                    b,
+                    &mut gpu,
+                    &chunk[..from],
+                    0,
+                    hipfire_arch_inkling2::PrefillLogits::None,
+                )?;
+                for (pos, &id) in chunk.iter().enumerate().take(to).skip(from) {
+                    let row = if route == Route::DecodeBlocked {
+                        hipfire_arch_inkling2::forward_decode_gpu(b, &mut gpu, id, pos)?
+                    } else {
+                        hipfire_arch_inkling2::forward_token_gpu(b, &mut gpu, id, pos)?
+                    };
                     score(pos, &row)?;
                 }
             }
@@ -3005,14 +3067,7 @@ fn eval(a: &Args) -> Result<(), String> {
                 "--chunk-end",
                 &c1.to_string(),
             ])
-            .args([
-                "--route",
-                if route_is_prefill(a)? {
-                    "prefill"
-                } else {
-                    "ar"
-                },
-            ])
+            .args(["--route", Route::parse(a)?.name()])
             .args(
                 a.0.get("prefill-routes")
                     .map(|r| ["--prefill-routes", r.as_str()])
@@ -3080,11 +3135,7 @@ fn eval(a: &Args) -> Result<(), String> {
             "window": h.window, "oracle": h.oracle, "arch": h.arch, "engine_commit": h.engine_commit,
         },
         "evaluator": {"binary": exe_id, "engine_commit": engine_commit()},
-        "route": if route_is_prefill(a)? {
-            "hipfire_loader::load_model + reset_session_state + forward_prefill_gpu over [0, score_to), head on the scored rows (blocked prefill, F16 KV)"
-        } else {
-            "hipfire_loader::load_model + reset_session_state + forward_token_gpu per position (product AR n=1, F16 KV)"
-        },
+        "route": Route::parse(a)?.receipt(),
         "kv_dtype": format!("{:?}", hipfire_arch_inkling2::INKLING2_KV_DTYPE),
         "prefill_routes": prefill_routes_arg(a)?.map(|r| format!("{r:?}")),
         "max_seq": hipfire_arch_inkling2::INKLING2_MAX_CONTEXT,
@@ -3210,6 +3261,127 @@ fn bench(a: &Args) -> Result<(), String> {
     eprintln!(
         "inkling_kld bench: pp{n} median {median:.1} ms = {:.1} tok/s ({executed:?}) -> {}",
         n as f64 * 1e3 / median,
+        output.display()
+    );
+    Ok(())
+}
+
+/// Decode speed at real context on one load: per rep, `reset_session_state`,
+/// blocked prefill of the reference's first `ctx` tokens (head on the last row),
+/// then `steps` greedy decode steps through `--body scalar` (`forward_token_gpu`)
+/// or `--body blocked` (`forward_decode_gpu`, the blocked body at one row). Each
+/// step's forward call is timed (host argmax excluded). One untimed warm-up rep;
+/// every rep must generate the warm-up's token ids.
+fn bench_decode(a: &Args) -> Result<(), String> {
+    let model = a.path("model")?;
+    let ref_path = a.path("ref")?;
+    let output = a.path("output")?;
+    let reps = a.num("reps", 3)?.max(1);
+    let ctx = a.num("ctx", 128)?;
+    let steps = a.num("steps", 64)?.max(1);
+    let blocked = match a.0.get("body").map(String::as_str) {
+        None | Some("blocked") => true,
+        Some("scalar") => false,
+        Some(other) => return Err(format!("--body: expected scalar|blocked, got {other}")),
+    };
+    let (reference, mmap) = open_ref(&ref_path)?;
+    let tokens = reference.tokens(&mmap).map_err(|e| e.to_string())?;
+    if ctx == 0 || ctx > tokens.len() {
+        return Err(format!("--ctx {ctx}: expected 1..={}", tokens.len()));
+    }
+    let ids = &tokens[..ctx];
+    let routes = prefill_routes_arg(a)?;
+    let mut gpu = rdna_compute::Gpu::init().map_err(|e| format!("gpu init: {e:?}"))?;
+    let mut m = load_inkling(&model, &mut gpu, routes)?;
+    let b = m
+        .inkling2_mut()
+        .ok_or("loaded model has no Inkling-2 bundle")?;
+    if !hipfire_arch_inkling2::prefill_supported(b, &gpu) {
+        return Err("bench-decode: blocked prefill not supported on this load".into());
+    }
+    let argmax = |row: &[f32]| {
+        row.iter()
+            .enumerate()
+            .max_by(|x, y| x.1.total_cmp(y.1))
+            .map_or(0, |(i, _)| i as u32)
+    };
+    let mut run =
+        |b: &mut hipfire_arch_inkling2::Inkling2Bundle| -> Result<(Vec<f64>, Vec<u32>), String> {
+            b.reset_session_state(&mut gpu)?;
+            let mut last = Vec::new();
+            hipfire_arch_inkling2::forward_prefill_gpu(
+                b,
+                &mut gpu,
+                ids,
+                0,
+                hipfire_arch_inkling2::PrefillLogits::Last(&mut last),
+            )?;
+            let mut next = argmax(&last);
+            let (mut ms, mut gen) = (Vec::with_capacity(steps), Vec::with_capacity(steps));
+            for s in 0..steps {
+                gen.push(next);
+                let t0 = Instant::now();
+                let row = if blocked {
+                    hipfire_arch_inkling2::forward_decode_gpu(b, &mut gpu, next, ctx + s)?
+                } else {
+                    hipfire_arch_inkling2::forward_token_gpu(b, &mut gpu, next, ctx + s)?
+                };
+                ms.push(t0.elapsed().as_secs_f64() * 1e3);
+                next = argmax(&row);
+            }
+            Ok((ms, gen))
+        };
+    let (_, warm_gen) = run(b)?;
+    let mut per_rep = Vec::with_capacity(reps);
+    for r in 0..reps {
+        let (ms, gen) = run(b)?;
+        if gen != warm_gen {
+            return Err(format!(
+                "bench-decode: rep {r} generated ids differ from the warm-up's"
+            ));
+        }
+        let total: f64 = ms.iter().sum();
+        let mut sorted = ms.clone();
+        sorted.sort_by(f64::total_cmp);
+        eprintln!(
+            "  rep {r}: ctx {ctx} {steps} steps {total:.1} ms = {:.2} tok/s, median step {:.2} ms",
+            steps as f64 * 1e3 / total,
+            sorted[sorted.len() / 2]
+        );
+        per_rep.push(serde_json::json!({
+            "total_ms": total,
+            "tok_s": steps as f64 * 1e3 / total,
+            "median_step_ms": sorted[sorted.len() / 2],
+            "step_ms": ms,
+        }));
+    }
+    let mut tok_s: Vec<f64> = per_rep
+        .iter()
+        .map(|r| r["tok_s"].as_f64().unwrap())
+        .collect();
+    tok_s.sort_by(f64::total_cmp);
+    let median = tok_s[tok_s.len() / 2];
+    let receipt = serde_json::json!({
+        "model": artifact_id(&model)?,
+        "reference": artifact_id(&ref_path)?,
+        "evaluator": {"binary": artifact_id(&std::env::current_exe().map_err(|e| e.to_string())?)?,
+                      "engine_commit": engine_commit()},
+        "body": if blocked { "blocked" } else { "scalar" },
+        "ctx": ctx,
+        "steps": steps,
+        "prefill_routes": b.gpu_state.as_ref().map(|s| format!("{:?}", s.prefill_routes)),
+        "reps": per_rep,
+        "median_tok_s": median,
+        "generated_ids": warm_gen,
+    });
+    std::fs::write(
+        &output,
+        serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())? + "\n",
+    )
+    .map_err(|e| e.to_string())?;
+    eprintln!(
+        "inkling_kld bench-decode: {} ctx {ctx} median {median:.2} tok/s -> {}",
+        if blocked { "blocked" } else { "scalar" },
         output.display()
     );
     Ok(())
@@ -3909,6 +4081,7 @@ fn main() {
         "eval" => eval(&a),
         "eval-worker" => eval_worker(&a),
         "bench" => bench(&a),
+        "bench-decode" => bench_decode(&a),
         "pair" => pair(&a),
         _ => Err(USAGE.to_string()),
     });

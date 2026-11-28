@@ -6813,9 +6813,10 @@ pub fn inkling_terminal(
 /// Inkling-2-Mini (arch_id=24) generate path — plain GPU AR.
 ///
 /// Stateless like `generate_maple`: every turn cold-resets the GPU session
-/// state and re-prefills the full rendered prompt from position 0 through
-/// `forward_token_gpu` (one token in, logits out), then decodes token by
-/// token with the request's full sampler contract
+/// state and re-prefills the full rendered prompt from position 0, then
+/// decodes token by token through `inkling2::forward_decode_gpu` (the blocked
+/// body at one row on gfx1201 typed-XTS loads, `forward_token_gpu` elsewhere)
+/// with the request's full sampler contract
 /// (`sampler::sample_cpu`: temp 0 reduces to argmax, matching 04's
 /// `generate_cpu`). No spec, no batch, no stop router on this route
 /// (refused upstream by the capability gates). The model writes its
@@ -6827,8 +6828,8 @@ pub fn inkling_terminal(
 /// the client and the sampled ids are untouched. Tools render through the
 /// template from [`inkling_template_messages`]. `reasoning_effort` is the
 /// template variable (thinking off is `"none"`, `None` the template
-/// default). Prefill loops one token at a time — the GPU forward only does
-/// single-token steps, no prefill kernel exists here.
+/// default). Prefill runs `forward_prefill_gpu` (blocked rows where
+/// supported, one scalar step per row elsewhere).
 #[allow(clippy::too_many_arguments)]
 pub fn generate_inkling(
     m: &mut LoadedModel,
@@ -7166,7 +7167,7 @@ pub fn generate_inkling(
 
         let step = {
             let b = m.inkling2_mut().unwrap();
-            inkling2::forward_token_gpu(b, gpu, next_tok, prompt_len + generated_count - 1)
+            inkling2::forward_decode_gpu(b, gpu, next_tok, prompt_len + generated_count - 1)
         };
         match step {
             Ok(logits) => last_logits = logits,

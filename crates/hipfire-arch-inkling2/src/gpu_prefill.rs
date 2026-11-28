@@ -26,6 +26,9 @@
 //! GEMMs, `rdna_compute::inkling2_hilo`), the routed experts (grouped
 //! weight-only WMMA) and the attention (blocked causal FA2, hi/lo Q/P, no
 //! partition merge). The router stays bitwise (the `mb8` chain per tile).
+//! A one-row block (decode, [`forward_decode_gpu`]) commits its key/value
+//! first and runs the split-KV FA2 decode attention of the scalar visit: the
+//! prefill kernel tiles queries only, so one row would be one tile per head.
 //!
 //! **KV ring.** A block's keys/values are staged as F16 and the attention
 //! reads pre-block keys from the cache and in-block keys from the staging
@@ -39,8 +42,8 @@
 use crate::arch_model::Inkling2Bundle;
 use crate::config::Inkling2Config;
 use crate::gpu::{
-    swa_gather_map, swa_slot, Inkling2Controller, Inkling2GpuLayer, Inkling2GpuState,
-    Inkling2GpuWeights, INKLING2_CONV_WIDTH,
+    swa_gather_map, swa_slot, swa_window_len, Inkling2Controller, Inkling2GpuLayer,
+    Inkling2GpuState, Inkling2GpuWeights, INKLING2_CONV_WIDTH,
 };
 use crate::gpu_forward::{ensure_kernels, launch_attn};
 use hip_bridge::KernargBlob;
@@ -649,6 +652,29 @@ fn scalar_prefill(
     Ok(())
 }
 
+/// One decode step: `token_id` at `pos` (the session cursor), host logits of
+/// the unpadded vocab. Runs the blocked body at one row when
+/// [`prefill_supported`] (the load's prefill routes: dense GEMV at M=1, routed
+/// experts as grouped GEMMs, blocked FA2 attention), otherwise
+/// [`crate::forward_token_gpu`]. Row-exact or replay-identity callers use
+/// [`crate::forward_token_gpu`] directly.
+pub fn forward_decode_gpu(
+    bundle: &mut Inkling2Bundle,
+    gpu: &mut Gpu,
+    token_id: u32,
+    pos: usize,
+) -> Result<Vec<f32>, String> {
+    let mut logits = Vec::new();
+    forward_prefill_gpu(
+        bundle,
+        gpu,
+        &[token_id],
+        pos,
+        PrefillLogits::Last(&mut logits),
+    )?;
+    Ok(logits)
+}
+
 /// Evidence entry: explicit mode, routes and block size; `trace` receives
 /// every visit's `visit_out` rows (`[visit][row * n_embd]`, all rows of the call).
 #[allow(clippy::too_many_arguments)]
@@ -754,6 +780,12 @@ fn prefill_blocks(
                 }
             }
         };
+        // A one-row blocked call (decode) attends through the decode kernels.
+        let row_maps = if take == 1 && mode.blocked_attn {
+            Some(RowMaps::upload(gpu, gs, p)?)
+        } else {
+            None
+        };
         let ctx = BlockCtx {
             cfg,
             gw,
@@ -761,10 +793,14 @@ fn prefill_blocks(
             routes,
             rows: take,
             p,
+            row_maps: row_maps.as_ref(),
         };
         let mut o = Owned::default();
         let r = drive_block(gpu, &ctx, gs, block, &mut o, want, trace.as_deref_mut());
         o.free(gpu);
+        if let Some(m) = row_maps {
+            m.free(gpu);
+        }
         let heads = r?;
         match logits {
             PrefillLogits::None => {}
@@ -1261,6 +1297,8 @@ struct BlockCtx<'a> {
     routes: PrefillRoutes,
     rows: usize,
     p: usize,
+    /// One-row call: the decode gather maps its attention runs over.
+    row_maps: Option<&'a RowMaps>,
 }
 
 struct VisitOut {
@@ -1580,14 +1618,16 @@ fn visit_body(
         ));
     }
     let attn_heads = ar.f32(gpu, n * eattn, "attn_heads")?;
-    if c.mode.blocked_attn {
-        attn_blocked(
+    match (c.mode.blocked_attn, c.row_maps) {
+        (true, Some(maps)) => attn_one_row(
+            gpu, cfg, layer, gs, ar, maps, visit, swa, p, q, r, sinks, k_conv, vc, attn_heads,
+        )?,
+        (true, None) => attn_blocked(
             gpu, cfg, layer, gs, ar, visit, swa, p, n, q, r, sinks, k_conv, vc, attn_heads,
-        )?;
-    } else {
-        attn_row_exact(
+        )?,
+        (false, _) => attn_row_exact(
             gpu, cfg, layer, gs, ar, visit, swa, p, n, q, r, sinks, k_conv, vc, attn_heads,
-        )?;
+        )?,
     }
     // Output gate + projection + post conv.
     let gate = ar.f32(gpu, n * eattn, "gate")?;
@@ -1856,6 +1896,110 @@ fn attn_row_exact(
     Ok(())
 }
 
+/// Fail closed unless every pre-block key the first query of a block at `p`
+/// reads carries its true position tag.
+fn check_pre_block_tags(
+    gs: &Inkling2GpuState,
+    visit: usize,
+    swa: bool,
+    p: usize,
+) -> Result<(), String> {
+    let ring = gs.visit_rows[visit];
+    let lo = if swa { (p + 1).saturating_sub(ring) } else { 0 };
+    let tags = &gs.visit_pos_tags[visit];
+    for j in lo..p {
+        let slot = swa_slot(j, ring);
+        if tags[slot] as usize != j {
+            return Err(format!(
+                "inkling2 prefill: visit {visit} tag mismatch at slot {slot}: tag {} != key_pos {j}",
+                tags[slot]
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Stage the block's K (`k_conv`) and V (`vc`) rows as F16 planes `[nkv, n, hd]`.
+fn kv_stage(
+    gpu: &mut Gpu,
+    cfg: &Inkling2Config,
+    ar: &mut Arena,
+    n: usize,
+    k_conv: T,
+    vc: T,
+) -> Result<(T, T), String> {
+    let plane = cfg.n_head_kv * n * cfg.head_dim;
+    let ks = ar.alloc(gpu, &[plane], DType::F16, "k_stage")?;
+    let vs = ar.alloc(gpu, &[plane], DType::F16, "v_stage")?;
+    let mut b = KernargBlob::new();
+    b.push_ptr(ptr(ar.get(k_conv)));
+    b.push_ptr(ptr(ar.get(vc)));
+    b.push_ptr(ptr(ar.get(ks)));
+    b.push_ptr(ptr(ar.get(vs)));
+    b.push_i32(n as i32);
+    launch(
+        gpu,
+        "ink_pf_kv_stage_f16",
+        [grid_u32(plane.div_ceil(256), "kv stage")?, 1, 1],
+        [256, 1, 1],
+        0,
+        b,
+    )?;
+    Ok((ks, vs))
+}
+
+/// Commit the staged block to the cache ring and its position tags: only the
+/// trailing `ring` rows survive a block wider than the ring.
+#[allow(clippy::too_many_arguments)]
+fn kv_commit(
+    gpu: &mut Gpu,
+    cfg: &Inkling2Config,
+    gs: &mut Inkling2GpuState,
+    ar: &Arena,
+    visit: usize,
+    p: usize,
+    n: usize,
+    (ks, vs): (T, T),
+) -> Result<(), String> {
+    let nkv = cfg.n_head_kv;
+    let ring = gs.visit_rows[visit];
+    let first = n.saturating_sub(ring);
+    let mut b = KernargBlob::new();
+    b.push_ptr(ptr(ar.get(ks)));
+    b.push_ptr(ptr(ar.get(vs)));
+    for h in 0..nkv {
+        b.push_ptr(ptr(&gs.k_cache[visit][h]));
+    }
+    for h in 0..nkv {
+        b.push_ptr(ptr(&gs.v_cache[visit][h]));
+    }
+    b.push_i32(n as i32);
+    b.push_i32(first as i32);
+    b.push_i32(p as i32);
+    b.push_i32(ring as i32);
+    launch(
+        gpu,
+        "ink_pf_kv_commit_f16",
+        [
+            grid_u32(
+                ((n - first) * nkv * cfg.head_dim).div_ceil(256),
+                "kv commit",
+            )?,
+            1,
+            1,
+        ],
+        [256, 1, 1],
+        0,
+        b,
+    )?;
+    for i in first..n {
+        let pos = p + i;
+        gs.visit_pos_tags[visit][swa_slot(pos, ring)] = pos as u32;
+    }
+    gs.visit_cap[visit] = p + n;
+    Ok(())
+}
+
 /// Blocked attention: stage the block's K/V as F16, run the causal FA2 prefill
 /// over cache (pre-block) + staging (in-block) keys, then commit the block to
 /// the cache ring and its position tags.
@@ -1877,39 +2021,10 @@ fn attn_blocked(
     vc: T,
     attn_heads: T,
 ) -> Result<(), String> {
-    let nkv = cfg.n_head_kv;
-    let hd = cfg.head_dim;
+    check_pre_block_tags(gs, visit, swa, p)?;
     let ring = gs.visit_rows[visit];
     let window = if swa { ring } else { 0 };
-    // Pre-block keys the first query reads must carry their true positions.
-    let lo = if swa { (p + 1).saturating_sub(ring) } else { 0 };
-    let tags = &gs.visit_pos_tags[visit];
-    for j in lo..p {
-        let slot = swa_slot(j, ring);
-        if tags[slot] as usize != j {
-            return Err(format!(
-                "inkling2 prefill: visit {visit} tag mismatch at slot {slot}: tag {} != key_pos {j}",
-                tags[slot]
-            ));
-        }
-    }
-    let plane = nkv * n * hd;
-    let ks = ar.alloc(gpu, &[plane], DType::F16, "k_stage")?;
-    let vs = ar.alloc(gpu, &[plane], DType::F16, "v_stage")?;
-    let mut b = KernargBlob::new();
-    b.push_ptr(ptr(ar.get(k_conv)));
-    b.push_ptr(ptr(ar.get(vc)));
-    b.push_ptr(ptr(ar.get(ks)));
-    b.push_ptr(ptr(ar.get(vs)));
-    b.push_i32(n as i32);
-    launch(
-        gpu,
-        "ink_pf_kv_stage_f16",
-        [grid_u32((n * nkv * hd).div_ceil(256), "kv stage")?, 1, 1],
-        [256, 1, 1],
-        0,
-        b,
-    )?;
+    let staged = kv_stage(gpu, cfg, ar, n, k_conv, vc)?;
     hip(
         gpu.inkling2_attn_prefill_fa2(&Inkling2PrefillAttn {
             q: ar.get(q),
@@ -1918,8 +2033,8 @@ fn attn_blocked(
             table: &layer.rel_table,
             k_cache: &gs.k_cache[visit],
             v_cache: &gs.v_cache[visit],
-            k_stage: ar.get(ks),
-            v_stage: ar.get(vs),
+            k_stage: ar.get(staged.0),
+            v_stage: ar.get(staged.1),
             out: ar.get(attn_heads),
             rows: n,
             pos0: p,
@@ -1929,39 +2044,144 @@ fn attn_blocked(
         }),
         "attn prefill",
     )?;
-    // Commit: only the trailing `ring` rows survive a block wider than the ring.
-    let first = n.saturating_sub(ring);
-    let mut b = KernargBlob::new();
-    b.push_ptr(ptr(ar.get(ks)));
-    b.push_ptr(ptr(ar.get(vs)));
-    for h in 0..nkv {
-        b.push_ptr(ptr(&gs.k_cache[visit][h]));
+    kv_commit(gpu, cfg, gs, ar, visit, p, n, staged)
+}
+
+/// Decode gather maps of a one-row call at `pos`, one per distinct ring size
+/// (SWA ring, full-layer rows): key slots oldest to newest, then relative
+/// distances, the [`swa_gather_map`] of a ring whose tags hold their true
+/// positions (each visit checks its tags before use). One pooled buffer and one
+/// upload per call, before the call's first launch.
+struct RowMaps {
+    buf: GpuTensor,
+    /// `(ring rows, n_kv, slots byte offset, dists byte offset)`.
+    rings: Vec<(usize, usize, usize, usize)>,
+}
+
+impl RowMaps {
+    fn upload(gpu: &mut Gpu, gs: &Inkling2GpuState, pos: usize) -> Result<Self, String> {
+        let mut rings: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut bytes: Vec<u8> = Vec::new();
+        for &ring in &gs.visit_rows {
+            if rings.iter().any(|r| r.0 == ring) {
+                continue;
+            }
+            let n_kv = swa_window_len(pos, ring);
+            let start = pos + 1 - n_kv;
+            let slots_off = bytes.len();
+            for j in start..=pos {
+                bytes.extend_from_slice(&(swa_slot(j, ring) as i32).to_le_bytes());
+            }
+            let dists_off = bytes.len();
+            for j in start..=pos {
+                bytes.extend_from_slice(&((pos - j) as i32).to_le_bytes());
+            }
+            rings.push((ring, n_kv, slots_off, dists_off));
+        }
+        let buf = hip(gpu.alloc_tensor(&[bytes.len()], DType::Raw), "row maps")?;
+        if let Err(e) = gpu.memcpy_htod_auto(&buf.buf, &bytes) {
+            let _ = gpu.free_tensor(buf);
+            return Err(format!("inkling2 prefill: row maps upload: {e:?}"));
+        }
+        Ok(Self { buf, rings })
     }
-    for h in 0..nkv {
-        b.push_ptr(ptr(&gs.v_cache[visit][h]));
+
+    /// `(n_kv, slots, dists)` of the ring of `ring` rows.
+    fn get(&self, ring: usize) -> Result<(usize, GpuTensor, GpuTensor), String> {
+        let &(_, n_kv, s, d) = self
+            .rings
+            .iter()
+            .find(|r| r.0 == ring)
+            .ok_or_else(|| format!("inkling2 prefill: no row map for ring {ring}"))?;
+        let part = |off: usize| GpuTensor {
+            buf: self.buf.buf.byte_view(off, n_kv * 4),
+            shape: vec![n_kv * 4],
+            dtype: DType::Raw,
+        };
+        Ok((n_kv, part(s), part(d)))
     }
-    b.push_i32(n as i32);
-    b.push_i32(first as i32);
-    b.push_i32(p as i32);
-    b.push_i32(ring as i32);
-    launch(
-        gpu,
-        "ink_pf_kv_commit_f16",
-        [
-            grid_u32(((n - first) * nkv * hd).div_ceil(256), "kv commit")?,
-            1,
-            1,
-        ],
-        [256, 1, 1],
-        0,
-        b,
+
+    fn free(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.buf);
+    }
+}
+
+/// Attention of a one-row block (decode): commit the row's K/V first, then the
+/// split-KV FA2 decode attention of the scalar decode visit over the call's
+/// [`RowMaps`]. The blocked FA2 prefill kernel tiles queries only, so one row
+/// is one tile per head over every key (8.2 ms per token at 2K context against
+/// 1.2 ms for the decode kernels, `decode1-runs/runs/j1`).
+#[allow(clippy::too_many_arguments)]
+fn attn_one_row(
+    gpu: &mut Gpu,
+    cfg: &Inkling2Config,
+    layer: &Inkling2GpuLayer,
+    gs: &mut Inkling2GpuState,
+    ar: &mut Arena,
+    maps: &RowMaps,
+    visit: usize,
+    swa: bool,
+    p: usize,
+    q: T,
+    r: T,
+    sinks: T,
+    k_conv: T,
+    vc: T,
+    attn_heads: T,
+) -> Result<(), String> {
+    let nh = cfg.n_head;
+    let hd = cfg.head_dim;
+    check_pre_block_tags(gs, visit, swa, p)?;
+    let staged = kv_stage(gpu, cfg, ar, 1, k_conv, vc)?;
+    kv_commit(gpu, cfg, gs, ar, visit, p, 1, staged)?;
+    let (n_kv, slots, dists) = maps.get(gs.visit_rows[visit])?;
+    let rel_bias = ar.alloc(gpu, &[nh, n_kv], DType::F32, "rel_bias")?;
+    hip(
+        gpu.inkling2_rel_bias_gather_f32(
+            &view(ar.get(r), 0, &[nh, cfg.n_rel])?,
+            &layer.rel_table,
+            &view(ar.get(sinks), 0, &[nh])?,
+            &dists,
+            ar.get(rel_bias),
+            cfg.n_rel,
+            nh,
+            cfg.n_extent,
+            n_kv,
+        ),
+        "rel_bias",
     )?;
-    for i in first..n {
-        let pos = p + i;
-        gs.visit_pos_tags[visit][swa_slot(pos, ring)] = pos as u32;
+    let qv = view(ar.get(q), 0, &[nh, hd])?;
+    let out = view(ar.get(attn_heads), 0, &[nh * hd])?;
+    if gs.attn_fa2 {
+        hip(
+            gpu.inkling2_attn_decode_fa2(
+                &qv,
+                &gs.k_cache[visit],
+                &gs.v_cache[visit],
+                ar.get(rel_bias),
+                &slots,
+                &gs.fa2_lse,
+                &gs.fa2_oacc,
+                &out,
+                n_kv,
+                inkling2_attn_fa2_splits(n_kv),
+            ),
+            "attn fa2",
+        )
+    } else {
+        launch_attn(
+            gpu,
+            &qv,
+            &gs.k_cache[visit],
+            &gs.v_cache[visit],
+            ar.get(rel_bias),
+            &slots,
+            &out,
+            n_kv,
+            nh,
+            hd,
+        )
     }
-    gs.visit_cap[visit] = p + n;
-    Ok(())
 }
 
 /// Routed experts over the block: per-slot AWQ+FWHT producer, then the grouped
@@ -2565,13 +2785,22 @@ fn head_rows(
                 gpu.logit_softcap_f32(ar.get(logits), take * vocab, cfg.softcap),
                 "softcap",
             )?;
-            let host = hip(
-                gpu.download_f32(&view(ar.get(logits), 0, &[take * vocab])?),
-                "logits download",
-            )?;
-            for i in 0..take {
-                let row = &host[i * vocab..i * vocab + cfg.unpadded_vocab_size];
-                out.push((c.p + r0 + done + i, row.to_vec()));
+            if take == 1 {
+                // One row (decode, `Last`): download the unpadded row itself.
+                let row = hip(
+                    gpu.download_f32(&view(ar.get(logits), 0, &[cfg.unpadded_vocab_size])?),
+                    "logits download",
+                )?;
+                out.push((c.p + r0 + done, row));
+            } else {
+                let host = hip(
+                    gpu.download_f32(&view(ar.get(logits), 0, &[take * vocab])?),
+                    "logits download",
+                )?;
+                for i in 0..take {
+                    let row = &host[i * vocab..i * vocab + cfg.unpadded_vocab_size];
+                    out.push((c.p + r0 + done + i, row.to_vec()));
+                }
             }
             done += take;
         }

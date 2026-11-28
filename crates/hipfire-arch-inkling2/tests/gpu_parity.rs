@@ -38,7 +38,8 @@ use hipfire_arch_inkling2::forward::{
 use hipfire_arch_inkling2::gpu::{upload, Inkling2GpuState, Inkling2GpuWeights};
 use hipfire_arch_inkling2::weights::Inkling2Weights;
 use hipfire_arch_inkling2::{
-    forward_token_gpu, forward_token_gpu_capture, forward_token_gpu_trace,
+    forward_decode_gpu, forward_token_gpu, forward_token_gpu_capture, forward_token_gpu_trace,
+    prefill_supported,
 };
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
@@ -625,6 +626,20 @@ fn gate3_token0_logits() {
 #[test]
 #[ignore = "needs the 14 GB MQ4 artifact + a HIP GPU; slow CPU reference"]
 fn gate3b_multi_token_logits() {
+    gate3b("gate3b", forward_token_gpu, false);
+}
+
+/// Gate 3b on the product decode step (`forward_decode_gpu`: the blocked body
+/// at one row on typed-XTS gfx1201 loads), same tokens, reference and bars.
+#[test]
+#[ignore = "needs the typed-XTS artifact + gfx1201; slow CPU reference"]
+fn gate3b_multi_token_logits_decode() {
+    gate3b("gate3b-decode", forward_decode_gpu, true);
+}
+
+type DecodeStep = fn(&mut Inkling2Bundle, &mut Gpu, u32, usize) -> Result<Vec<f32>, String>;
+
+fn gate3b(label: &str, step: DecodeStep, blocked: bool) {
     const TOKENS: [u32; 4] = [5000, 12345, 777, 31274];
     const R_MIN: f32 = 0.99;
     let (cfg, weights) = open_artifact();
@@ -647,15 +662,21 @@ fn gate3b_multi_token_logits() {
     let mut gpu = test_gpu();
     let (gw, gs) = upload_test_bundle(&cfg, &weights, &mut gpu, 64);
     let mut bundle = make_bundle(cfg, weights, gw, gs);
+    if blocked {
+        assert!(
+            prefill_supported(&bundle, &gpu),
+            "{label}: the blocked decode body needs a typed-XTS load on gfx1201"
+        );
+    }
     let mut fails = Vec::new();
     for (pos, &t) in TOKENS.iter().enumerate() {
-        let got = forward_token_gpu(&mut bundle, &mut gpu, t, pos).expect("gpu logits");
+        let got = step(&mut bundle, &mut gpu, t, pos).expect("gpu logits");
         let w = &want[pos];
         assert_eq!(got.len(), w.len());
         let r = pearson(&got, w);
         let (am_got, am_want) = (argmax(&got), argmax(w));
         eprintln!(
-            "gate3b: pos {pos} tok {t}: r={r:.7} argmax gpu={am_got} cpu={am_want} max|d|={:.3e} mean|d|={:.3e}",
+            "{label}: pos {pos} tok {t}: r={r:.7} argmax gpu={am_got} cpu={am_want} max|d|={:.3e} mean|d|={:.3e}",
             max_abs(&got, w),
             mean_abs(&got, w)
         );
@@ -672,8 +693,8 @@ fn gate3b_multi_token_logits() {
     if let Some(gs) = bundle.gpu_state.take() {
         gs.free_gpu(&mut gpu);
     }
-    assert!(fails.is_empty(), "gate3b: {}", fails.join("; "));
-    eprintln!("gate3b: PASS");
+    assert!(fails.is_empty(), "{label}: {}", fails.join("; "));
+    eprintln!("{label}: PASS");
 }
 
 /// Gate 4: single-token tok/s, clearly labelled unoptimized.

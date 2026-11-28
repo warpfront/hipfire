@@ -2018,7 +2018,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             };
         }
         // Inkling-2-Mini (arch 24). One route: plain GPU AR over
-        // `forward_token_gpu`. No spec variant: the carrier admits no
+        // `forward_decode_gpu`. No spec variant: the carrier admits no
         // drafter/MTP/n-gram, so a speculator must NOT change the route —
         // an arch-24 turn is always plain AR.
         24 => return GenerationRoute::InklingAr,
