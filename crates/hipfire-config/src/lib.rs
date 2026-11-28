@@ -3206,7 +3206,7 @@ pub static FIELDS: &[ConfigField] = &[
         Kernel,
         true,
         "HIPFIRE_QWEN4_MOE_DOWN_R4",
-        "Qwen4 routed-MoE down projection, 4-row variant: auto (default) is on exact gfx1151 / gfx1201; true / false force it."
+        "Qwen4 routed-MoE down projection, 4-row variant: auto (default) is on exact gfx1100 / gfx1151 / gfx1201. False disables it; true still requires one of these architectures."
     ),
     process_auto_bool_field!(
         "kernel.qwen4_moe_scatter_scan",
@@ -3270,7 +3270,7 @@ pub static FIELDS: &[ConfigField] = &[
         Kernel,
         true,
         "HIPFIRE_QWEN4_PLE_FUSE",
-        "Qwen4 per-layer-embedding fusion: auto (default) is on exact gfx1151 / gfx1201; true / false force it."
+        "Qwen4 per-layer-embedding fusion: auto (default) is on exact gfx1100 / gfx1151 / gfx1201. False disables it; true still requires one of these architectures."
     ),
     process_auto_bool_field!(
         "kernel.qwen4_gdn_lanes",

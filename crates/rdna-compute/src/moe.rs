@@ -3605,7 +3605,7 @@ impl Gpu {
                 k_top,
             );
         }
-        // K = 640 on exact gfx1151, eager: four weight rows per wave reuse the
+        // K = 640 on exact gfx1100 / gfx1151 / gfx1201, eager: four weight rows per wave reuse the
         // pick's x (bitwise the one-row kernel).
         let r4 = k == 640
             && self.flags.qwen4_moe_down_r4_enabled()
