@@ -957,6 +957,7 @@ module	inkling2_attention_fa2_relb	non-core-family	Non-core family route: Inklin
 module	inkling2_attention_prefill	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 blocked prefill attention; rdna-compute/src/inkling2_attention_prefill.rs:362
 module	inkling2_clip	non-core-family	Non-core family route: Inkling-2-Mini (arch 24); rdna-compute/src/inkling2_clip.rs:274
 module	inkling2_control_blend	non-core-family	Non-core family route: Inkling-2-Mini (arch 24); rdna-compute/src/inkling2_control.rs:421
+module	inkling2_embed	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 blocked prefill embedding decode; rdna-compute/src/inkling2_embed.rs:131
 module	inkling2_fuse	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 blocked-body fused mix/norm/producer glue; rdna-compute/src/inkling2_fuse.rs:461
 module	inkling2_fuse_post	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 blocked-body fused attention epilogue / gate / conv glue; rdna-compute/src/inkling2_fuse_post.rs:308
 module	inkling2_fuse_row	non-core-family	Non-core family route: Inkling-2-Mini (arch 24), gfx1201 one-row fused projections and routing; rdna-compute/src/inkling2_fuse_row.rs:267

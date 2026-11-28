@@ -355,20 +355,30 @@ pub const PREFILL_ROUTES_DEFAULT: PrefillRoutes = PrefillRoutes {
 };
 
 /// Whether [`forward_prefill_gpu`] runs the blocked path for this load: gfx1201,
-/// typed-XTS layout (symmetric qt44 + AWQ sidecars, F16 router), Mini geometry.
+/// typed-XTS layout (symmetric qt44 + AWQ sidecars, F16 router), Mini geometry,
+/// and the load's [`PrefillScratch`].
 pub fn prefill_supported(bundle: &Inkling2Bundle, gpu: &Gpu) -> bool {
     let cfg = &bundle.config;
     let Some(gw) = bundle.gpu_weights.as_ref() else {
         return false;
     };
-    gpu.arch_caps.is_gfx1201()
-        && bundle.gpu_state.is_some()
+    prefill_geometry_supported(cfg, gpu)
+        && bundle
+            .gpu_state
+            .as_ref()
+            .is_some_and(|s| s.prefill_scratch.is_some())
         && gw.xts_routes.as_ref().is_some_and(|c| c.prefill.is_some())
         && !gw.layers.is_empty()
         && gw
             .layers
             .iter()
             .all(|l| l.xts.is_some() && l.router.gpu_dtype == DType::F16)
+}
+
+/// The device and model-geometry half of [`prefill_supported`] (what the load
+/// checks before it sizes a [`PrefillScratch`]).
+pub fn prefill_geometry_supported(cfg: &Inkling2Config, gpu: &Gpu) -> bool {
+    gpu.arch_caps.is_gfx1201()
         && cfg.n_head == 24
         && cfg.n_head_kv == 8
         && cfg.head_dim == 128
@@ -376,6 +386,140 @@ pub fn prefill_supported(bundle: &Inkling2Bundle, gpu: &Gpu) -> bool {
         && cfg.conv_kernel == 4
         && cfg.n_expert_used == 8
         && cfg.n_embd % 256 == 0
+}
+
+/// Persistent per-load buffers of the blocked prefill, sized for `rows` block
+/// rows: every per-visit buffer that outgrows the pool's parking limit
+/// (`rdna_compute::pool::MAX_PARKED_BYTES`, 64 MiB) at 2048-row blocks, plus
+/// the packed embed staging. Without it each visit would `hipMalloc` and
+/// `hipFree` (which synchronizes) every such buffer. Visits run in order on
+/// one stream, so one set serves all 48 visits and every block.
+///
+/// * `x_rot` `[rows * top_k, n_embd]`: the per-slot expert producer output. The
+///   block's F32 embed rows pass through it before their norm, and the
+///   unfused grouped down producer writes its SiTU rows there once the
+///   gate_up GEMM has read it.
+/// * `y_gu` `[m_total, 2 * inter]`: the grouped gate_up output; the unfused
+///   grouped down producer writes its rotated rows there once SiTU has read it.
+/// * `y_dn` `[m_total, n_embd]`: the grouped down output.
+/// * `msg` `[4, rows, n_embd]`: the loop-message mix of a pass > 0 visit.
+/// * `embed` `[rows, n_embd / 256 * 136]` bytes: the block's packed embed rows.
+///
+/// `m_total` is [`grouped_moe_m_total_bound`] of `rows * top_k` slots.
+pub struct PrefillScratch {
+    rows: usize,
+    x_rot: GpuTensor,
+    y_gu: GpuTensor,
+    y_dn: GpuTensor,
+    msg: GpuTensor,
+    embed: GpuTensor,
+}
+
+impl PrefillScratch {
+    /// `(x_rot, y_gu, y_dn, msg)` F32 element counts and the embed staging
+    /// bytes for `rows` block rows.
+    fn sizes(cfg: &Inkling2Config, rows: usize) -> ([usize; 4], usize) {
+        let e = cfg.n_embd;
+        let slots = rows * cfg.n_expert_used;
+        let m_total = grouped_moe_m_total_bound(slots, cfg.n_experts);
+        (
+            [
+                slots * e,
+                m_total * 2 * cfg.inter,
+                m_total * e,
+                4 * rows * e,
+            ],
+            rows * (e / 256) * 136,
+        )
+    }
+
+    /// Device bytes [`Self::new`] allocates for `rows` block rows.
+    pub fn bytes_for(cfg: &Inkling2Config, rows: usize) -> u64 {
+        let (f, embed) = Self::sizes(cfg, rows);
+        (f.iter().sum::<usize>() * 4 + embed) as u64
+    }
+
+    pub fn new(gpu: &mut Gpu, cfg: &Inkling2Config, rows: usize) -> Result<Self, String> {
+        if rows == 0 {
+            return Err("inkling2 prefill scratch: rows must be > 0".into());
+        }
+        let (f, embed) = Self::sizes(cfg, rows);
+        let mut got: Vec<GpuTensor> = Vec::with_capacity(5);
+        let shapes = [
+            (f[0], DType::F32, "x_rot"),
+            (f[1], DType::F32, "y_gu"),
+            (f[2], DType::F32, "y_dn"),
+            (f[3], DType::F32, "msg"),
+            (embed, DType::Raw, "embed staging"),
+        ];
+        for (n, dtype, what) in shapes {
+            match gpu.alloc_tensor(&[n], dtype) {
+                Ok(t) => got.push(t),
+                Err(e) => {
+                    for t in got {
+                        let _ = gpu.free_tensor(t);
+                    }
+                    return Err(format!(
+                        "inkling2 prefill scratch: alloc {what} ({rows} rows): {e:?}"
+                    ));
+                }
+            }
+        }
+        let mut it = got.into_iter();
+        let mut next = || it.next().expect("five scratch tensors");
+        Ok(Self {
+            rows,
+            x_rot: next(),
+            y_gu: next(),
+            y_dn: next(),
+            msg: next(),
+            embed: next(),
+        })
+    }
+
+    /// Block rows this scratch serves.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Device bytes held.
+    pub fn bytes(&self) -> u64 {
+        [&self.x_rot, &self.y_gu, &self.y_dn, &self.msg, &self.embed]
+            .iter()
+            .map(|t| t.buf.size() as u64)
+            .sum()
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        for t in [self.x_rot, self.y_gu, self.y_dn, self.msg, self.embed] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+impl Inkling2GpuState {
+    /// Re-size this load's [`PrefillScratch`] for `rows` block rows (developer
+    /// evidence: block sizes above the load's). The new scratch is allocated
+    /// before the old one is freed, so a failure keeps the old one.
+    pub fn resize_prefill_scratch(
+        &mut self,
+        gpu: &mut Gpu,
+        cfg: &Inkling2Config,
+        rows: usize,
+    ) -> Result<(), String> {
+        if self
+            .prefill_scratch
+            .as_ref()
+            .is_some_and(|s| s.rows == rows)
+        {
+            return Ok(());
+        }
+        let new = PrefillScratch::new(gpu, cfg, rows)?;
+        if let Some(old) = self.prefill_scratch.replace(new) {
+            old.free(gpu);
+        }
+        Ok(())
+    }
 }
 
 /// Prefill `ids` at positions `start_pos..start_pos + ids.len()` (must equal
@@ -505,31 +649,47 @@ pub fn forward_prefill_gpu_with(
             gs.seq_pos
         ));
     }
+    let Some(scratch) = gs.prefill_scratch.take() else {
+        return Err("inkling2 prefill: this load has no prefill scratch".into());
+    };
+    if block_rows.min(ids.len()) > scratch.rows {
+        let rows = scratch.rows;
+        gs.prefill_scratch = Some(scratch);
+        return Err(format!(
+            "inkling2 prefill: block_rows {block_rows} exceeds the load's prefill scratch \
+             ({rows} rows; Inkling2GpuState::resize_prefill_scratch)"
+        ));
+    }
     if let Some(t) = trace.as_mut() {
         t.clear();
         t.resize(cfg.loop_cfg.n_slot(), Vec::new());
     }
-    ensure_kernels(gpu)?;
-    ensure_pf_kernels(gpu)?;
-    let saved = pin_dense_route(gpu, routes.dense);
-    // Ordinary prefill intent: the quantized dense arms admit every block row
-    // count (a 1..63-row tail keeps its route instead of falling to F16).
-    let ordinary = gpu.ordinary_prefill_enter();
-    let r = prefill_blocks(
-        gpu,
-        &cfg,
-        gw,
-        gs,
-        ids,
-        start_pos,
-        &mut logits,
-        mode,
-        routes,
-        block_rows,
-        trace,
-    );
-    gpu.ordinary_prefill_exit(ordinary);
-    gpu.flags = saved;
+    let r = (|| {
+        ensure_kernels(gpu)?;
+        ensure_pf_kernels(gpu)?;
+        let saved = pin_dense_route(gpu, routes.dense);
+        // Ordinary prefill intent: the quantized dense arms admit every block row
+        // count (a 1..63-row tail keeps its route instead of falling to F16).
+        let ordinary = gpu.ordinary_prefill_enter();
+        let r = prefill_blocks(
+            gpu,
+            &cfg,
+            gw,
+            gs,
+            &scratch,
+            ids,
+            start_pos,
+            &mut logits,
+            mode,
+            routes,
+            block_rows,
+            trace,
+        );
+        gpu.ordinary_prefill_exit(ordinary);
+        gpu.flags = saved;
+        r
+    })();
+    gs.prefill_scratch = Some(scratch);
     r
 }
 
@@ -539,6 +699,7 @@ fn prefill_blocks(
     cfg: &Inkling2Config,
     gw: &Inkling2GpuWeights,
     gs: &mut Inkling2GpuState,
+    scratch: &PrefillScratch,
     ids: &[u32],
     start_pos: usize,
     logits: &mut PrefillLogits<'_>,
@@ -575,6 +736,7 @@ fn prefill_blocks(
         let ctx = BlockCtx {
             cfg,
             gw,
+            scratch,
             mode,
             routes,
             rows: take,
@@ -666,9 +828,12 @@ impl Arena {
             .take()
             .expect("inkling2 prefill: arena slot taken")
     }
+    /// Frees every owned slot; borrowed views (scratch views) are dropped only.
     fn free(self, gpu: &mut Gpu) {
         for t in self.ts.into_iter().flatten() {
-            let _ = gpu.free_tensor(t);
+            if !t.buf.is_borrowed() {
+                let _ = gpu.free_tensor(t);
+            }
         }
     }
 }
@@ -1146,6 +1311,7 @@ fn router_rows(
 struct BlockCtx<'a> {
     cfg: &'a Inkling2Config,
     gw: &'a Inkling2GpuWeights,
+    scratch: &'a PrefillScratch,
     mode: PrefillMode,
     routes: PrefillRoutes,
     rows: usize,
@@ -1284,7 +1450,7 @@ fn visit_body(
     let (msg_buf, attn_mixed) = match (&msgs, phys) {
         (Some(_), 0) => return Err("inkling2 prefill: phys 0 has no base".into()),
         (Some(_), _) => (
-            Some(ar.f32(gpu, 4 * ne, "msg_mix")?),
+            Some(ar.push(view(&c.scratch.msg, 0, &[4 * ne])?)),
             Some(ar.f32(gpu, 3 * ne, "attn_mix")?),
         ),
         (None, _) => (None, None),
@@ -2166,7 +2332,7 @@ fn experts_rows(
             }),
             "router topk",
         )?;
-        let x_rot = ar.alloc(gpu, &[slots, e], DType::F32, "xts_x_rot")?;
+        let x_rot = ar.push(view(&c.scratch.x_rot, 0, &[slots, e])?);
         hip(gpu.ensure_mq_signs(), "mq signs")?;
         let s1 = gpu
             .scratch
@@ -2278,7 +2444,7 @@ fn experts_rows(
             let sorted = ar.f32(gpu, m_total, "moe_sorted")?;
             let tiles = ar.f32(gpu, m_total / MOE_GROUPED_BLOCK_M, "moe_tiles")?;
             let inv = ar.f32(gpu, slots, "moe_inv")?;
-            let y_gu = ar.f32(gpu, m_total * 2 * inter, "moe_y_gu")?;
+            let y_gu = ar.push(view(&c.scratch.y_gu, 0, &[m_total * 2 * inter])?);
             let gu_tables = GroupedQt44Tables {
                 expert_weight_ptrs: &xl.gu_ptrs,
                 expert_tile_ids: ar.get(tiles),
@@ -2358,14 +2524,16 @@ fn experts_rows(
                 }
             }
             .map_err(|e2| format!("inkling2 prefill: grouped gate_up: {e2}"))?;
-            let y_dn = ar.f32(gpu, m_total * e, "moe_y_dn")?;
+            let y_dn = ar.push(view(&c.scratch.y_dn, 0, &[m_total * e])?);
             let fused =
                 tier == PrefillActTier::A8 && gpu.flags.gfx12_producer_quant_fused_enabled();
             let planes = if fused {
                 None
             } else {
-                let act = ar.alloc(gpu, &[slots, phys], DType::F32, "moe_act")?;
-                let rot = ar.alloc(gpu, &[slots, phys], DType::F32, "moe_rot")?;
+                // SiTU rows over `x_rot` (the gate_up GEMM has read it), rotated
+                // rows over `y_gu` (SiTU reads it before the rotation writes).
+                let act = ar.push(view(&c.scratch.x_rot, 0, &[slots, phys])?);
+                let rot = ar.push(view(&c.scratch.y_gu, 0, &[slots, phys])?);
                 Some((act, rot))
             };
             let dn_tables = GroupedQt44Tables {
@@ -2638,21 +2806,22 @@ fn drive_block(
             gw.cross_pass.len()
         ));
     }
-    // Embed: host row decode, one upload, batched token RMSNorm.
-    let mut rows_h = Vec::with_capacity(ne);
-    for &id in ids {
-        rows_h.extend_from_slice(&gw.embed_packed.row_f32(id)?);
-    }
-    let emb = hip(gpu.upload_f32(&rows_h, &[n, e]), "embed upload")?;
-    let tok = match gpu.alloc_tensor(&[ne], DType::F32) {
-        Ok(t) => t,
-        Err(e2) => {
-            let _ = gpu.free_tensor(emb);
-            return Err(format!("inkling2 prefill: tok alloc: {e2:?}"));
-        }
-    };
+    // Embed: the rows' packed bytes gathered on the host (no host decode), one
+    // upload into the scratch staging, the qt44 decode on the device (bitwise
+    // the host decoder) into `x_rot`'s head, batched token RMSNorm.
+    let mut packed = Vec::new();
+    gw.embed_packed.gather_rows(ids, &mut packed)?;
+    hip(
+        gpu.upload_stream_ordered(&c.scratch.embed.buf, &packed),
+        "embed upload",
+    )?;
+    let emb = view(&c.scratch.x_rot, 0, &[n, e])?;
+    hip(
+        gpu.inkling2_embed_qt44_rows(&c.scratch.embed, &emb, n, e),
+        "embed decode",
+    )?;
+    let tok = hip(gpu.alloc_tensor(&[ne], DType::F32), "tok alloc")?;
     let r = gpu.rmsnorm_batched(&emb, &gw.embed_norm, &tok, n, e, cfg.rms_norm_eps);
-    let _ = gpu.free_tensor(emb);
     o.x = Some(tok);
     hip(r, "embed norm")?;
     let mut visit = 0usize;

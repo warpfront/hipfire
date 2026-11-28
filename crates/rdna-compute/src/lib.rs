@@ -82,6 +82,7 @@ pub mod inkling2_attention;
 pub mod inkling2_attention_prefill;
 pub mod inkling2_clip;
 pub mod inkling2_control;
+pub mod inkling2_embed;
 pub mod inkling2_fuse;
 pub mod inkling2_fuse_post;
 pub mod inkling2_fuse_row;

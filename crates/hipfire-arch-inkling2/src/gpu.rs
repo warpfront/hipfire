@@ -665,8 +665,8 @@ pub struct EmbedPacked {
 }
 
 impl EmbedPacked {
-    /// Decode one row to 2304 F32 on demand (~9 KB of device traffic later).
-    pub fn row_f32(&self, token: u32) -> Result<Vec<f32>, String> {
+    /// Packed bytes of one qt44 row: `cols / 256` groups of 136 bytes.
+    fn packed_row(&self, token: u32) -> Result<&[u8], String> {
         if self.quant_type != 44 {
             return Err(format!(
                 "inkling2: embed row decode expects qt44, got qt={}",
@@ -681,18 +681,32 @@ impl EmbedPacked {
             ));
         }
         // K = 2304 = 9 x 256 groups, rows are group-aligned.
-        let groups_per_row = self.cols / 256;
-        let stride = groups_per_row * 136;
+        let stride = self.cols / 256 * 136;
         let off = row * stride;
-        let slice = self
-            .bytes
+        self.bytes
             .get(off..off + stride)
-            .ok_or_else(|| "inkling2: embed packed bytes truncated".to_string())?;
+            .ok_or_else(|| "inkling2: embed packed bytes truncated".to_string())
+    }
+
+    /// Decode one row to 2304 F32 on demand (~9 KB of device traffic later).
+    pub fn row_f32(&self, token: u32) -> Result<Vec<f32>, String> {
         Ok(hipfire_runtime::weight_backend::dequantize_weight_to_f32(
             self.quant_type,
-            slice,
+            self.packed_row(token)?,
             self.cols,
         ))
+    }
+
+    /// Packed rows of `tokens`, back to back into `out` (cleared first): the
+    /// staging bytes [`rdna_compute::Gpu::inkling2_embed_qt44_rows`] decodes on
+    /// the device, bitwise [`Self::row_f32`] per row. No host decode.
+    pub fn gather_rows(&self, tokens: &[u32], out: &mut Vec<u8>) -> Result<(), String> {
+        out.clear();
+        out.reserve(tokens.len() * self.cols / 256 * 136);
+        for &t in tokens {
+            out.extend_from_slice(self.packed_row(t)?);
+        }
+        Ok(())
     }
 }
 
@@ -706,6 +720,10 @@ pub struct VramSummary {
     pub max_seq: usize,
     pub full_visits: usize,
     pub swa_visits: usize,
+    /// Persistent blocked-prefill scratch ([`crate::gpu_prefill::PrefillScratch`])
+    /// and the block rows it is sized for (0 / 0 when the load has none).
+    pub prefill_scratch_bytes: u64,
+    pub prefill_block_rows: usize,
 }
 
 impl VramSummary {
@@ -714,13 +732,18 @@ impl VramSummary {
     }
 
     pub fn total_bytes(&self) -> u64 {
-        self.weight_bytes + self.kv_bytes + self.conv_bytes + VRAM_SLACK_BYTES
+        self.weight_bytes
+            + self.kv_bytes
+            + self.conv_bytes
+            + self.prefill_scratch_bytes
+            + VRAM_SLACK_BYTES
     }
 
     pub fn text(&self) -> String {
         format!(
             "inkling2 gpu load summary: weights {:.3} GiB ({} tensors, incl. down_proj pad +{:.3} GiB), \
-             KV {:.3} GiB ({} full + {} SWA visits, max_seq {}), conv {:.4} GiB, slack {:.3} GiB -> \
+             KV {:.3} GiB ({} full + {} SWA visits, max_seq {}), conv {:.4} GiB, \
+             prefill scratch {:.3} GiB ({} rows), slack {:.3} GiB -> \
              total {:.3} GiB (fits 24 GiB: {})",
             Self::gib(self.weight_bytes),
             self.weight_tensors,
@@ -730,6 +753,8 @@ impl VramSummary {
             self.swa_visits,
             self.max_seq,
             Self::gib(self.conv_bytes),
+            Self::gib(self.prefill_scratch_bytes),
+            self.prefill_block_rows,
             Self::gib(VRAM_SLACK_BYTES),
             Self::gib(self.total_bytes()),
             if self.total_bytes() < (24u64 << 30) {
@@ -1108,6 +1133,11 @@ pub struct Inkling2GpuState {
     /// Activation tier of each blocked-prefill GEMM site
     /// ([`crate::gpu_prefill::forward_prefill_gpu`]).
     pub prefill_routes: crate::gpu_prefill::PrefillRoutes,
+    /// Persistent blocked-prefill scratch of this load (`None` without the
+    /// blocked prefill): the per-visit buffers too big for the pool's parking
+    /// limit at the block size, and the packed embed staging. Counted in
+    /// [`VramSummary::prefill_scratch_bytes`].
+    pub prefill_scratch: Option<crate::gpu_prefill::PrefillScratch>,
 }
 
 impl Inkling2GpuState {
@@ -1249,6 +1279,7 @@ impl Inkling2GpuState {
             fa2_lse,
             fa2_oacc,
             prefill_routes: crate::gpu_prefill::PrefillRoutes::F16,
+            prefill_scratch: None,
         })
     }
 
@@ -1288,6 +1319,9 @@ impl Inkling2GpuState {
         }
         let _ = gpu.free_tensor(self.fa2_lse);
         let _ = gpu.free_tensor(self.fa2_oacc);
+        if let Some(s) = self.prefill_scratch {
+            s.free(gpu);
+        }
     }
 }
 
@@ -2031,7 +2065,28 @@ pub fn upload(
 
     // Per-visit state (own cleanup on failure; weights stay in the tx).
     let g = unsafe { &mut *tx.gpu };
-    let state = Inkling2GpuState::new_with_max_seq(g, cfg, max_seq)?;
+    let xts_routes = weights
+        .xts
+        .as_ref()
+        .map(|cert| xts_route_capability(cert, cfg, &*g));
+    let mut state = Inkling2GpuState::new_with_max_seq(g, cfg, max_seq)?;
+    if let Some(r) = xts_routes.as_ref().and_then(|c| c.prefill) {
+        state.prefill_routes = r;
+        // The blocked prefill's persistent scratch, sized for the product block.
+        if crate::gpu_prefill::prefill_geometry_supported(cfg, g) {
+            match crate::gpu_prefill::PrefillScratch::new(
+                g,
+                cfg,
+                crate::gpu_prefill::PREFILL_BLOCK_ROWS,
+            ) {
+                Ok(s) => state.prefill_scratch = Some(s),
+                Err(e) => {
+                    state.free_gpu(g);
+                    return Err(e);
+                }
+            }
+        }
+    }
 
     let full_visits = state.visit_rows.iter().filter(|&&r| r == max_seq).count();
     let swa_visits = state.visit_rows.len() - full_visits;
@@ -2135,15 +2190,9 @@ pub fn upload(
         max_seq,
         full_visits,
         swa_visits,
+        prefill_scratch_bytes: state.prefill_scratch.as_ref().map_or(0, |s| s.bytes()),
+        prefill_block_rows: state.prefill_scratch.as_ref().map_or(0, |s| s.rows()),
     };
-    let xts_routes = weights
-        .xts
-        .as_ref()
-        .map(|cert| xts_route_capability(cert, cfg, &*gpu));
-    let mut state = state;
-    if let Some(r) = xts_routes.as_ref().and_then(|c| c.prefill) {
-        state.prefill_routes = r;
-    }
     Ok((
         Inkling2GpuWeights {
             layers,
