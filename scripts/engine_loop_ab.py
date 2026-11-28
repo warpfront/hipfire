@@ -498,7 +498,8 @@ def compare(sc, a, b, spec_noise=False, positions=False):
             vx, vy = dx.get(key), dy.get(key)
             if vx == vy:
                 continue
-            # Intended diff 2: EOS is not counted in `tokens` on the engine.
+            # Intended diff 2: EOS is not counted in `tokens` on the engine,
+            # resident or lane (HIPF-572).
             if key == "tokens" and isinstance(vx, int) and vy == vx - 1 and dx.get("finish_reason") == "stop":
                 note(INTENDED, f"[{i}] tokens {vx}->{vy} (EOS not counted)")
             # Intended diff 3: a stop on the last budget token is `stop`.

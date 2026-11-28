@@ -1,0 +1,3 @@
+### Fixes: G12 engine loop, batch `done.tokens`
+
+- **An engine request in a lane now reports the same `done.tokens` as on the resident state (HIPF-572; `generation.engine_loop = engine` with `serve.vmm_batch`).** The lane `done` counted the lane stream, which holds the EOS id on Qwen4 ChatML routes. A request that stopped on EOS reported one token more in the batch than alone (Qwen4 MTP `tb16` 31 vs 30), so `usage.completion_tokens` changed when a request was batched. The lane `done` now takes the count of the request run, which does not count the EOS. Legacy still counts the EOS on the singleton and in the batch (engine-loop A/B intended diff 2).

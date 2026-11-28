@@ -146,7 +146,10 @@ These are reported as `intended` and do not fail the run:
    bitwise across arms: only `seeded_repro` (within an arm) and the
    `seeded_sweep` distribution are checked.
 2. **EOS not counted in `tokens`.** Engine `tokens` = legacy `tokens - 1` when
-   legacy finished with `stop`.
+   legacy finished with `stop`. This applies to every engine request, on the
+   resident state or in a lane (`serve.vmm_batch`): both count the request's
+   run, not the lane's stream (HIPF-572). Legacy counts the EOS on the
+   singleton and in the batch.
 3. **Stop on the last budget token** is `finish_reason: "stop"` on the engine,
    following the `qwen_dflash_hit_length_cap` semantics. Legacy `length` vs
    engine `stop` is allowed in `eos_budget`.

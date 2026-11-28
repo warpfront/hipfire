@@ -1290,7 +1290,7 @@ impl<'a> Ctx<'a> {
             None => (self.live(idx).lane_spec.take().map(|s| (s, false)), false),
         };
         let exit = match exit {
-            Exit::Finished(finish) => match self.finish(idx, place, finish, done_spec) {
+            Exit::Finished(finish) => match self.finish(idx, place, finish, generated, done_spec) {
                 Ok(()) => return Ok(()),
                 Err(error) => Exit::Failed(error),
             },
@@ -1404,6 +1404,7 @@ impl<'a> Ctx<'a> {
         idx: usize,
         place: Place,
         finish: Finish,
+        generated: usize,
         spec: Option<(SpecDone, bool)>,
     ) -> Result<(), String> {
         if place == Place::Resident {
@@ -1429,7 +1430,9 @@ impl<'a> Ctx<'a> {
         let metrics = DoneMetrics {
             prompt_tokens: live.prompt.len(),
             cached_tokens: live.reused,
-            generated: lane.streamed_tokens.len(),
+            // The run's count (EOS excluded), as on a singleton: the lane's
+            // stream also holds the EOS id.
+            generated,
             prefill_ms: millis(prompt_done - live.t0),
             decode_ms: millis(end - prompt_done),
             total_ms: millis(end - live.t0),
