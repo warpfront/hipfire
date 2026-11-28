@@ -7114,6 +7114,7 @@ pub fn generate_inkling(
     let mut generated_count: usize = 0;
     let prompt_len = prompt_ids.len();
     let decode_t0 = Instant::now();
+    let serve0 = inkling2::serve_stats(m.inkling2().unwrap());
     let mut frames = match tools.filter(|t| !t.is_empty()) {
         Some(t) => hipfire_runtime::emit_text::MessageFrameRouter::with_tools(
             frame_markers,
@@ -7187,6 +7188,25 @@ pub fn generate_inkling(
                 return;
             }
         }
+    }
+    // Served-route proof of this turn (stderr, one line): which backend the
+    // decode steps actually ran, as deltas of the load's counters.
+    {
+        let s1 = inkling2::serve_stats(m.inkling2().unwrap());
+        let c0 = serve0
+            .as_ref()
+            .map(|s| s.counts.clone())
+            .unwrap_or_default();
+        let c1 = s1.as_ref().map(|s| s.counts.clone()).unwrap_or_default();
+        eprintln!(
+            "[inkling2] turn decode route: steps={} graph_replays={} graph_arm_steps={} graph_capture_failed_steps={} eager={} sticky={:?}",
+            generated_count,
+            c1.graph_replays - c0.graph_replays,
+            c1.graph_arm_steps - c0.graph_arm_steps,
+            c1.graph_capture_failed_steps - c0.graph_capture_failed_steps,
+            c1.eager - c0.eager,
+            s1.and_then(|s| s.sticky)
+        );
     }
     frames.finish_into(&mut frame_events);
     hipfire_engine::emit::emit_channel_events(stdout, id, &mut frame_events);
