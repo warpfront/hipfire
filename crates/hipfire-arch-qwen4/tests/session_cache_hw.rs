@@ -34,8 +34,8 @@
 //! `dflash2_terminal_stop_inside_window_repairs_on_flash_next` checks the same
 //! repair on the DFlash2 route (draft named by
 //! `HIPFIRE_SESSION_CACHE_DFLASH2_DRAFT`): every keep inside a fully accepted
-//! window leaves the state byte-equal to the same rows forced in the repair's
-//! grouping (the replay as one block, then the flush row).
+//! window leaves the state byte-equal to the same history as AR decodes it
+//! and continues with AR's tokens.
 //!
 //! Each test loads Flash-Next (tens of GiB of pinned host memory), so run them
 //! one per process thread and only inside a fabric hold that declares that
@@ -76,9 +76,10 @@ use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::SourcePayload;
 use hipfire_runtime::serve_contract::CacheDomain;
 use hipfire_runtime::session_cache::{SessionCache, SessionRoute, SessionState, SnapshotParts};
-use hipfire_runtime::spec::{MtpDrafter, SpecStep, SpecTarget, Speculator};
+use hipfire_runtime::spec::{MtpDrafter, SpecAdvance, SpecStep, SpecTarget, Speculator};
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
+use rdna_compute::gdn_stream::GdnScanAlgorithm;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -170,29 +171,55 @@ fn assert_resolved_gdn_state(bundle: &Qwen4Bundle, request: &str, state_format: 
 }
 
 /// SHA-256 of every part of the live state at `position` on `route`: the
-/// metadata, each fixed part, then the valid rows of each row stream.
+/// metadata, each fixed part, then the valid rows of each row stream. A GDN
+/// stream carry's pending tiles digest only their first `pending_rows` rows:
+/// the rows past them are dead (whatever an earlier forward left there) and
+/// never read before they are rewritten.
 fn state_digests(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
     route: SessionRoute,
     position: usize,
 ) -> Vec<[u8; 32]> {
-    let recurrent_bytes: Vec<usize> = bundle
-        .state
-        .gdn
-        .iter()
-        .map(|layer| layer.recurrent.byte_size())
-        .collect();
+    // Per GDN layer: its first fixed part (the recurrent state) and size, and
+    // the live byte ranges of its carry's pending tiles, by buffer.
+    let mut first_part = 0;
+    let mut recurrent = Vec::new();
+    let mut live_ranges = Vec::new();
+    for layer in &bundle.state.gdn {
+        recurrent.push((first_part, layer.recurrent.byte_size()));
+        first_part += 2 + usize::from(layer.ef_residual.is_some());
+        if let Some(carry) = &layer.carry {
+            // tile_entry, pending_conv, pending_params.
+            first_part += 3;
+            // The WY16 tiles are row-major `[micro_rows, ..]` (conv) and
+            // `[2, micro_rows, ..]` (gate rows, then beta rows); other scan
+            // layouts digest whole.
+            if carry.plan.algorithm != GdnScanAlgorithm::Wy16 {
+                continue;
+            }
+            let tile = carry.plan.micro_rows;
+            let rows = carry.meta().pending_rows as usize;
+            let conv_row = carry.pending_conv.byte_size() / tile;
+            live_ranges.push((
+                std::ptr::from_ref(&carry.pending_conv.buf),
+                vec![(0, rows * conv_row)],
+            ));
+            let half = carry.pending_params.byte_size() / 2;
+            let params_row = half / tile;
+            live_ranges.push((
+                std::ptr::from_ref(&carry.pending_params.buf),
+                vec![(0, rows * params_row), (half, rows * params_row)],
+            ));
+        }
+    }
     let SnapshotParts { meta, layout } =
         SessionState::snapshot_parts(bundle, route, position).expect("state parts");
-    // Fixed parts are `[recurrent, conv]` per GDN layer first: the digested
-    // recurrent bytes are exactly the resolved format's state.
-    for (layer, bytes) in recurrent_bytes.iter().enumerate() {
+    // The digested recurrent bytes are exactly the resolved format's state.
+    for (layer, &(part, bytes)) in recurrent.iter().enumerate() {
         assert_eq!(
-            layout.fixed[2 * layer].bytes,
-            *bytes,
-            "snapshot part {} is not GDN layer {layer}'s recurrent state",
-            2 * layer
+            layout.fixed[part].bytes, bytes,
+            "snapshot part {part} is not GDN layer {layer}'s recurrent state"
         );
     }
     gpu.hip.device_synchronize().expect("sync");
@@ -208,11 +235,22 @@ fn state_digests(
                 .map(|stream| (stream.buf, 0, stream.rows * stream.row_bytes)),
         );
     for (buf, offset, bytes) in ranges {
-        let mut host = vec![0u8; bytes];
-        gpu.hip
-            .memcpy_dtoh_at(&mut host, buf, offset)
-            .expect("download state part");
-        digests.push(Sha256::digest(&host).into());
+        let whole = [(offset, bytes)];
+        let spans = live_ranges
+            .iter()
+            .find(|(live, _)| std::ptr::eq(*live, buf))
+            .map_or(&whole[..], |(_, spans)| &spans[..]);
+        let mut hash = Sha256::new();
+        for &(offset, bytes) in spans {
+            let mut host = vec![0u8; bytes];
+            if bytes > 0 {
+                gpu.hip
+                    .memcpy_dtoh_at(&mut host, buf, offset)
+                    .expect("download state part");
+            }
+            hash.update(&host);
+        }
+        digests.push(hash.finalize().into());
     }
     digests
 }
@@ -511,8 +549,21 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
         .unwrap_or_else(|| panic!("{MODEL_ENV} must name qwen3.8-flash-next-gptq3.mq4"));
     let mut hfq = HfqFile::open(&model).expect("open model");
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
-    let receipt = admit_hfqm_artifact(&hfq).expect("admission");
     let mut gpu = Gpu::init().expect("GPU");
+    // A split base (mq4-xts) keeps its PLE rows in a `.ple-q4` / `.ple-q8`
+    // sidecar beside it; an embedded-rows base resolves to itself.
+    hipfire_runtime::ple_sidecar::resolve_and_attach_ple_rows(
+        &mut hfq,
+        &model,
+        hipfire_config::memory::ple_format(),
+        &gpu.arch,
+        hipfire_runtime::ple_sidecar::ResolvePolicy {
+            derive_missing_q4: false,
+            progress: None,
+        },
+    )
+    .expect("PLE rows");
+    let receipt = admit_hfqm_artifact(&hfq).expect("admission");
     let domain = CacheDomain::for_model(&hfq, &tokenizer, None, "qwen4", gpu.device_id);
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
@@ -552,7 +603,7 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
     .expect("state format");
     let vocab = receipt.config.vocab_size;
     let backend = Qwen4KvBackend::automatic(&gpu);
-    let mut bundle = Qwen4Bundle::assemble_with_metadata(
+    let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
         receipt.config,
         &receipt.manifest.identity.recipe,
         transaction,
@@ -560,8 +611,10 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
         &mut gpu,
         MAX_SEQ,
         receipt.ple,
+        receipt.ple_rows,
         state_format,
         backend,
+        None,
     )
     .expect("assemble");
     bundle.set_turn_snapshots(turn_snapshots);
@@ -1366,13 +1419,14 @@ fn dflash2_window(
 }
 
 /// A terminal stop inside a fully accepted DFlash2 window on Qwen4
-/// (`Speculator::repair_terminal_prefix`: the target restores the retained
-/// pre-window ticket and replays the seed plus the first `n - 1` consumed
-/// tokens; the caller flushes the `n`-th) leaves the target state
-/// byte-identical to the same history forced in the repair's grouping (the
-/// pre-window rows one at a time, the replay as one block, then the flush
-/// row), for every keep `n` from the first row to the whole window, and the
-/// live continuation of the next turn (seed and first window) matches. It
+/// (`Speculator::repair_terminal_prefix`: the target keeps the seed plus the
+/// first `n - 1` consumed tokens of the retained window, from the verify's
+/// captured rows; the caller flushes the `n`-th) leaves the target state
+/// byte-identical to the same history as AR decodes it (every generated row
+/// through the target's decode route, the stop row through the same forced
+/// advance), for every keep `n` from the first row to the whole window, and
+/// the live continuation of the next turn (seed and first window) emits AR's
+/// tokens. It
 /// also checks the ticket's lifetime: a drafter refusal keeps it, a repair
 /// runs once, a forced advance or a target reset ends it (the target refuses
 /// and is unchanged), and the next window replaces it.
@@ -1389,6 +1443,7 @@ fn dflash2_terminal_stop_inside_window_repairs_on_flash_next() {
         mut bundle,
         mut gpu,
         tokenizer,
+        vocab,
         ..
     } = load(false, u64::MAX >> 1, None);
     let mut speculator = hipfire_runtime::dflash2_spec::build_dflash2_speculator(
@@ -1527,6 +1582,39 @@ fn dflash2_terminal_stop_inside_window_repairs_on_flash_next() {
             (seed, w.emit.to_vec())
         };
 
+    // The same continuation as AR decodes it on the target alone: the suffix
+    // through the target's own forced advance (the route the drafter's
+    // continuation prefill runs it on), its pick as the seed, then `count`
+    // greedy decode rows.
+    let logits = gpu.alloc_tensor(&[vocab], DType::F32).expect("AR logits");
+    let continue_ar = |bundle: &mut Qwen4Bundle, gpu: &mut Gpu, history: &[u32], count: usize| {
+        let seed = match SpecTarget::spec_advance(
+            bundle,
+            gpu,
+            &suffix,
+            history.len(),
+            false,
+            &never,
+            None,
+        )
+        .expect("AR continuation prefill")
+        {
+            SpecAdvance::Ready { last_argmax, .. } => last_argmax,
+            SpecAdvance::Aborted => panic!("AR continuation prefill aborted"),
+        };
+        bundle
+            .forward_token(gpu, seed, &logits, None)
+            .expect("AR continuation seed row");
+        let tokens: Vec<u32> = (0..count)
+            .map(|_| {
+                bundle
+                    .forward_token_or_argmax(gpu, None, &logits)
+                    .expect("AR continuation row")
+            })
+            .collect();
+        (seed, tokens)
+    };
+
     let mut mismatches = Vec::new();
     for n in 1..=emit.len() {
         rerun(spec, &mut bundle, &mut gpu);
@@ -1543,31 +1631,34 @@ fn dflash2_terminal_stop_inside_window_repairs_on_flash_next() {
         let got = state_digests(&mut bundle, &mut gpu, SessionRoute::Ar, history.len());
         let got_next = continue_live(spec, &mut bundle, &mut gpu, &history);
 
-        // Reference: the same history forced in the repair's grouping. Single
-        // rows are the DFlash2 verify's own rounding (row capture), so the
-        // pre-window rows go one at a time.
+        // Reference: the same history as AR decodes it. The prompt prefill is
+        // the run's own; every generated row goes through the target's decode
+        // route one at a time (the DFlash2 verify's armed rows and the
+        // repair's captured-row rollback reproduce it row by row) and the stop
+        // row through the target's forced advance, the route the run's flush
+        // takes. Rows teacher-forced through the drafter are no AR reference:
+        // on gfx11 they take the canonical GDN prefill stream, not decode.
         spec.prefill(&mut gpu, &mut bundle, &a, &a, 0, false, None, &never)
             .expect("reference prefill");
-        // The window's rows go through as the repair runs them: the replay as
-        // one block (an unarmed multi-row block rounds unlike single rows),
-        // then the flush.
-        let replay: Vec<u32> = std::iter::once(seed)
-            .chain(emit[..n - 1].iter().copied())
-            .collect();
-        let rows = before[..before.len() - 1]
-            .iter()
-            .enumerate()
-            .map(|(i, token)| (a.len() + i, std::slice::from_ref(token)))
-            .chain([(start, replay.as_slice()), (start + n, &emit[n - 1..n])]);
-        for (position, tokens) in rows {
-            assert!(
-                spec.on_forced_advance(&mut gpu, &mut bundle, tokens, position, &never)
-                    .expect("teacher-forced rows"),
-                "n {n}: the reference advance runs on the drafter"
-            );
+        for &token in before.iter().chain(&emit[..n - 1]) {
+            bundle
+                .forward_token(&mut gpu, token, &logits, None)
+                .expect("AR row");
         }
+        SpecTarget::spec_advance(
+            &mut bundle,
+            &mut gpu,
+            &emit[n - 1..n],
+            start + n,
+            false,
+            &never,
+            None,
+        )
+        .expect("reference stop row");
         let want = state_digests(&mut bundle, &mut gpu, SessionRoute::Ar, history.len());
-        let want_next = continue_live(spec, &mut bundle, &mut gpu, &history);
+        // Greedy speculative decoding emits AR's tokens: the repaired turn's
+        // seed and first window against the AR continuation.
+        let want_next = continue_ar(&mut bundle, &mut gpu, &history, got_next.1.len());
 
         let parts: Vec<usize> = (0..want.len().max(got.len()))
             .filter(|&i| want.get(i) != got.get(i))
@@ -1584,9 +1675,10 @@ fn dflash2_terminal_stop_inside_window_repairs_on_flash_next() {
     }
     assert!(
         mismatches.is_empty(),
-        "a repaired DFlash2 terminal differs from the teacher-forced reference \
-         (n, differing state parts (0 = metadata), repaired next, reference next): {mismatches:?}"
+        "a repaired DFlash2 terminal differs from AR \
+         (n, differing state parts (0 = metadata), repaired next, AR next): {mismatches:?}"
     );
+    gpu.free_tensor(logits).expect("free logits");
     speculator.free(&mut gpu);
     bundle.free_gpu(&mut gpu).expect("free bundle");
 }
