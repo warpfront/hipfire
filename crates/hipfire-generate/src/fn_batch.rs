@@ -2174,6 +2174,14 @@ pub fn drive_qwen4_lane_batch(
             if sched.active_count() == 0 && sched.inbox.is_empty() {
                 return Ok(());
             }
+            // Peak concurrent Running occupancy observed while each lane is live
+            // (`continuous_batch.max_active_lanes`), as in `drive_continuous_batch`.
+            let running_now = sched.running_count();
+            for lane in &mut sched.lanes {
+                if let BatchLane::Running(lane) = lane {
+                    lane.max_active_lanes = lane.max_active_lanes.max(running_now);
+                }
+            }
             let streamed: Vec<usize> = sched
                 .lanes
                 .iter()
