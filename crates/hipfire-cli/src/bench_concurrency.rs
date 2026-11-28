@@ -842,9 +842,14 @@ pub fn closed_loop(
                 // gen_start, reasoning, aborted, tool_calls, ...
                 _ => false,
             },
+            // The daemon's stdout is gone: no queued request can get a reply,
+            // and a write may still succeed into a pipe nobody answers.
             Ev::Closed => {
-                rec.err = Some("stream closed without done".to_owned());
-                true
+                cancel_all(&inflight);
+                bail!(
+                    "{label} k={k}: daemon stream closed without done (conversation {})",
+                    rec.conv
+                );
             }
         };
         if !terminal {

@@ -235,3 +235,76 @@ fn interrupt_leaves_an_unrelated_daemon_alone() {
     assert!(!owned_alive, "the owned daemon must be killed");
     let _ = fs::remove_dir_all(root);
 }
+
+/// The HIPF-651 stall: a wire tap in front of the daemon keeps reading stdin
+/// after the daemon's stdout is gone. A sweep that counted that EOF as one
+/// failed request then wrote the next queued request into the tap and waited
+/// out the 300 s stall deadline. Two queued requests at `k=1`.
+#[test]
+fn stdout_eof_during_generate_fails_the_sweep_without_another_request() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = root("stdout-eof");
+    let pid_file = root.join("daemon.pid");
+    let gens = root.join("generates");
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import json, os, signal, sys
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+reply = {{"configure": "configured", "ping": "pong", "diag": "diag", "load": "loaded"}}
+for line in sys.stdin:
+    kind = json.loads(line).get("type")
+    if kind == "generate":
+        with open({gens:?}, "a") as f:
+            f.write("g\n")
+        with open({pid_file:?}, "w") as f:
+            f.write(str(os.getpid()))
+        os.close(1)
+        continue
+    if kind in reply:
+        sys.stdout.write(json.dumps({{"type": reply[kind], "arch": "gfx1151", "vram_free_mb": 1, "retry_reset_eligible": False}}) + "\n")
+        sys.stdout.flush()
+"#,
+        gens = gens.display().to_string(),
+        pid_file = pid_file.display().to_string(),
+    );
+    let daemon = root.join("daemon-eof.py");
+    fs::write(&daemon, script).unwrap();
+    fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+    let model = fixture_model(&root);
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_hipfire"))
+        .env("HIPFIRE_HOME", &root)
+        .env("HIPFIRE_NO_REGISTRY_FETCH", "1")
+        .env("ROCR_VISIBLE_DEVICES", "-1")
+        .env("HIP_VISIBLE_DEVICES", "-1")
+        .env("HIPFIRE_LOCAL", "1")
+        .env("HIPFIRE_DAEMON_BIN", &daemon)
+        .arg("bench")
+        .arg(&model)
+        .args(["--runs", "1", "--concurrency", "1", "--backend", "noslots"])
+        .args(["--workload", "stateless", "-j"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let status = wait_for_exit(&mut cli, "daemon stdout EOF during generate");
+    if let Some(pid) = fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|t| t.trim().parse::<libc::pid_t>().ok())
+    {
+        if alive(pid) {
+            force_kill(pid);
+        }
+    }
+    assert!(!status.success(), "a lost daemon stream fails the sweep");
+    assert_eq!(
+        fs::read_to_string(&gens)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        1,
+        "no request is written after the daemon's stdout EOF"
+    );
+    let _ = fs::remove_dir_all(root);
+}
