@@ -871,6 +871,7 @@ fn embeds_unnamed_pointers(kernel: &str) -> bool {
     matches!(
         kernel,
         "inkling2_fz_mix_norm_rot_f32"
+            | "inkling2_fz_mix_norm_rot_split_f32"
             | "inkling2_attn_fa2_partial_pos_gfx1201"
             | "inkling2_fz_attn_post_decode_f32"
     )

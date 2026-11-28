@@ -27,6 +27,9 @@ pub const INKLING2_FUSE_MODULE: &str = "inkling2_fuse";
 
 /// Mix + norms + AWQ/FWHT producers ([`Gpu::inkling2_fz_mix_norm_rot`]).
 pub const INKLING2_FZ_MIX_NORM_ROT: &str = "inkling2_fz_mix_norm_rot_f32";
+/// One-row twin of [`INKLING2_FZ_MIX_NORM_ROT`] that deals the AWQ/FWHT
+/// producers over `grid.z` blocks (same arithmetic per output).
+pub const INKLING2_FZ_MIX_NORM_ROT_SPLIT: &str = "inkling2_fz_mix_norm_rot_split_f32";
 
 /// Threads per block, and the lane stride of every row reduction.
 pub const FZ_THREADS: usize = 256;
@@ -160,11 +163,15 @@ __device__ __forceinline__ void fz_rot_group(
 // Then: raw y (optional) and, for each target, the RMSNorm of y
 // (gamma: (y * gamma) * rsqrtf(ss / n + eps); gamma-less: y * (1 / sqrtf(ss / n + eps)),
 // ss the 256-lane tree of y*y) written to `out` and/or rotated per AWQ scale.
-extern "C" __global__ __launch_bounds__(FZ_T)
-void inkling2_fz_mix_norm_rot_f32(
-    FzStates st, int n_states,
+// SPLIT (one-row decode, `inkling2_fz_mix_norm_rot_split_f32`): gridDim.z blocks
+// per (b, q) each recompute y and the norms (same operations, same values);
+// block z == 0 writes raw/out and the (rot, group) tasks are dealt over the
+// z blocks' waves. Every output element is computed by the same code.
+template <bool SPLIT>
+__device__ __forceinline__ void fz_mix_norm_rot_body(
+    const FzStates& st, int n_states,
     const float* __restrict__ query,
-    FzQRows qs,
+    const FzQRows& qs,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     int rows, int n, float inv_sqrt_n, float mix_eps)
@@ -287,7 +294,7 @@ void inkling2_fz_mix_norm_rot_f32(
         }
     }
     const FzQRow& oq = qs.q[q];
-    if (oq.raw) {
+    if (oq.raw && (!SPLIT || blockIdx.z == 0)) {
         float* rr = oq.raw + (size_t)b * oq.raw_ld;
 #pragma unroll
         for (int j = 0; j < FZ_J; ++j) {
@@ -331,7 +338,7 @@ void inkling2_fz_mix_norm_rot_f32(
 #pragma unroll
             for (int j = 0; j < FZ_J; ++j) z[j] = y[j] * inv;
         }
-        if (tg.out) {
+        if (tg.out && (!SPLIT || blockIdx.z == 0)) {
             float* orow = tg.out + (size_t)b * tg.out_ld;
 #pragma unroll
             for (int j = 0; j < FZ_J; ++j) {
@@ -347,15 +354,43 @@ void inkling2_fz_mix_norm_rot_f32(
                 if (i < n) rowbuf[i] = z[j];
             }
             __syncthreads();
-            for (int r = 0; r < n_rot; ++r) {
-                float* dst = tg.rot[r] + (size_t)b * n;
-                for (int g = wave; g < groups; g += FZ_T / 32) {
-                    fz_rot_group(rowbuf, tg.awq[r], dst, signs1, signs2, g, lane);
+            if (SPLIT) {
+                const int zn = (int)gridDim.z;
+                const int tasks = n_rot * groups;
+                for (int task = (int)blockIdx.z + zn * wave; task < tasks; task += zn * (FZ_T / 32)) {
+                    const int r = task / groups;
+                    const int g = task - r * groups;
+                    fz_rot_group(rowbuf, tg.awq[r], tg.rot[r] + (size_t)b * n, signs1, signs2, g, lane);
+                }
+            } else {
+                for (int r = 0; r < n_rot; ++r) {
+                    float* dst = tg.rot[r] + (size_t)b * n;
+                    for (int g = wave; g < groups; g += FZ_T / 32) {
+                        fz_rot_group(rowbuf, tg.awq[r], dst, signs1, signs2, g, lane);
+                    }
                 }
             }
             __syncthreads();
         }
     }
+}
+
+#define FZ_MNR_PARAMS \
+    FzStates st, int n_states, const float* __restrict__ query, FzQRows qs, \
+    const float* __restrict__ signs1, const float* __restrict__ signs2, \
+    int rows, int n, float inv_sqrt_n, float mix_eps
+#define FZ_MNR_ARGS st, n_states, query, qs, signs1, signs2, rows, n, inv_sqrt_n, mix_eps
+
+extern "C" __global__ __launch_bounds__(FZ_T)
+void inkling2_fz_mix_norm_rot_f32(FZ_MNR_PARAMS)
+{
+    fz_mix_norm_rot_body<false>(FZ_MNR_ARGS);
+}
+
+extern "C" __global__ __launch_bounds__(FZ_T)
+void inkling2_fz_mix_norm_rot_split_f32(FZ_MNR_PARAMS)
+{
+    fz_mix_norm_rot_body<true>(FZ_MNR_ARGS);
 }
 "#
 );
@@ -458,11 +493,27 @@ impl Gpu {
         } else {
             (std::ptr::null(), std::ptr::null())
         };
-        self.ensure_kernel(
-            INKLING2_FUSE_MODULE,
-            INKLING2_FUSE_HIP_SRC,
-            INKLING2_FZ_MIX_NORM_ROT,
-        )?;
+        // One row (decode): deal each target's (rot, group) tasks over `z`
+        // blocks of 8 waves (the split twin, bitwise the same outputs).
+        let groups = n / 256;
+        let max_tasks = a
+            .out
+            .iter()
+            .flat_map(|o| o.targets.iter())
+            .map(|tg| tg.rots.len() * groups)
+            .max()
+            .unwrap_or(0);
+        let z = if rows == 1 {
+            max_tasks.div_ceil(FZ_THREADS / 32).max(1)
+        } else {
+            1
+        };
+        let sym = if z > 1 {
+            INKLING2_FZ_MIX_NORM_ROT_SPLIT
+        } else {
+            INKLING2_FZ_MIX_NORM_ROT
+        };
+        self.ensure_kernel(INKLING2_FUSE_MODULE, INKLING2_FUSE_HIP_SRC, sym)?;
         let p = |t: &GpuTensor| t.buf.as_ptr() as *const c_void;
         let null = std::ptr::null::<c_void>();
         let mut b = KernargBlob::new();
@@ -507,8 +558,8 @@ impl Gpu {
         b.pad_to(16);
         let rows_u = u32::try_from(rows).map_err(|_| HipError::new(0, "rows exceed u32"))?;
         self.launch_blob_recorded(
-            INKLING2_FZ_MIX_NORM_ROT,
-            [rows_u, qr as u32, 1],
+            sym,
+            [rows_u, qr as u32, z as u32],
             [FZ_THREADS as u32, 1, 1],
             0,
             b.as_mut_slice(),

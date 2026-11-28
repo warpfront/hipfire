@@ -12,6 +12,10 @@
 //!   the body of the lane-batched twin of `gemv_mq4g256v2_multirow_r2`
 //!   (`kernels/src/gemv_mq4g256v2_multirow_r2_lanes.hip`), byte-identical to
 //!   the singleton GEMV the one-row `weight_gemv_prerotated` launches.
+//! * [`INKLING2_FZ_GEMV_CONV_RES`]: the decode visit's o projection (the same
+//!   lanes body, so `y` is bitwise the singleton GEMV) with the attention post
+//!   conv + residual of `inkling2_fz_conv_res_f32` (one row, history shift)
+//!   done by the lane that stored each pair of channels: one launch for two.
 //! * [`INKLING2_FZ_ROUTE_ROW`]: the routing of one row: sigmoid + bias top-k
 //!   with renormalized weights (`ffn_moe_router_topk_f32`, kind 1), the
 //!   grouped scatter tables (`moe_scatter_fused_k8`; one row routes to
@@ -24,6 +28,7 @@ use std::ffi::c_void;
 
 use crate::dispatch::{Gpu, GpuTensor, ReplayLaunchBindings};
 use crate::inkling2_fuse::fz_awq_fwht_hip;
+use crate::inkling2_fuse_post::fz_conv_hip;
 use crate::scratch::{Int8MmqPrepared, Int8MmqReservation};
 use hip_bridge::{HipError, HipResult, KernargBlob};
 
@@ -35,6 +40,10 @@ pub const INKLING2_FZ_GEMV_SEGS: &str = "inkling2_fz_gemv_mq4v2_segs";
 
 /// One-row routing + slot producer + A8 sidecar ([`Gpu::inkling2_fz_route_row`]).
 pub const INKLING2_FZ_ROUTE_ROW: &str = "inkling2_fz_route_row_f32";
+
+/// One-row o projection + attention post conv + residual
+/// ([`Gpu::inkling2_fz_gemv_conv_res`]).
+pub const INKLING2_FZ_GEMV_CONV_RES: &str = "inkling2_fz_gemv_conv_res";
 
 /// Segments per [`Gpu::inkling2_fz_gemv_segs`] launch.
 pub const FZ_GEMV_SEGS: usize = 8;
@@ -50,6 +59,7 @@ pub const INKLING2_FUSE_ROW_HIP_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     fz_awq_fwht_hip!(),
+    fz_conv_hip!(),
     r#"
 
 struct FzGemvSegs {
@@ -66,6 +76,28 @@ extern "C" __global__ void inkling2_fz_gemv_mq4v2_segs(FzGemvSegs s, int K)
 {
     const int z = (int)blockIdx.z;
     gemv_mq4g256v2_multirow_r2_lanes_body(s.a[z], s.x[z], s.y[z], s.m[z], K);
+}
+
+// Grid [ceil(m/2)], block 32: the o projection (the lanes twin's body, so
+// `y` is bitwise the singleton GEMV's) and, by the lane that stored them, the
+// attention post conv + residual of its two channels: `inkling2_fz_conv_res_f32`
+// at one row with the history shift, the same `fz_conv` text.
+__launch_bounds__(32, 18)
+extern "C" __global__ void inkling2_fz_gemv_conv_res(
+    const char* __restrict__ A, const float* __restrict__ x, float* __restrict__ y,
+    int M, int K, const float* __restrict__ sw, float* state, int state_stride,
+    int col_off, float inv_scale, const float* __restrict__ res, float* __restrict__ out)
+{
+    gemv_mq4g256v2_multirow_r2_lanes_body(A, x, y, M, K);
+    const int row0 = (int)blockIdx.x << 1;
+    if (threadIdx.x != 0 || row0 >= M) return;
+    for (int ch = row0; ch < row0 + 2 && ch < M; ++ch) {
+        float x1, x2, xc;
+        const float c = fz_conv(y, M, sw, nullptr, 0, state, state_stride, col_off,
+                                M, 1, inv_scale, 0, ch, x1, x2, xc);
+        out[ch] = res ? res[ch] + c : c;
+        fz_conv_shift(state, state_stride, col_off, ch, x1, x2, xc);
+    }
 }
 
 #define FZR_THREADS 1024
@@ -192,12 +224,18 @@ extern "C" __global__ __launch_bounds__(FZR_THREADS) void inkling2_fz_route_row_
         for (int r = 0; r < top_k; ++r) chosen_w[r] = (chosen_score[r] / denom) * scale;
     }
     __syncthreads();
-    if (tid < top_k) {
+    // Grid [z]: every block computes the same top-k (same operations, same
+    // winner); block 0 alone writes the routing outputs and tables, and the
+    // phase-3 tasks are dealt over the blocks' waves (z == 1: the old order).
+    const int zb = (int)blockIdx.x;
+    const int zn = (int)gridDim.x;
+    if (zb == 0 && tid < top_k) {
         idx_out[tid] = chosen_idx[tid];
         w_out[tid] = chosen_w[tid];
     }
 
     // ---- 2. scatter tables ----
+    if (zb == 0) {
     for (int i = tid; i < m_total_max; i += FZR_THREADS) sorted_slot[i] = -1;
     for (int i = tid; i < m_total_max / block_m; i += FZR_THREADS) tile_ids[i] = -1;
     for (int e = tid; e < n_experts; e += FZR_THREADS) {
@@ -220,10 +258,11 @@ extern "C" __global__ __launch_bounds__(FZR_THREADS) void inkling2_fz_route_row_
         inverse_perm[tid] = rank * block_m;
         tile_ids[rank] = e;
     }
+    }
 
     // ---- 3. slot producer + A8 sidecar ----
     const int groups = K / 256;
-    for (int t = wave; t < top_k * groups; t += FZR_WAVES) {
+    for (int t = wave * zn + zb; t < top_k * groups; t += FZR_WAVES * zn) {
         const int s = t / groups;
         const int g = t - s * groups;
         const float* __restrict__ awq =
@@ -346,6 +385,70 @@ impl Gpu {
         )
     }
 
+    /// One row: `y [m] = W . x_rot` (bitwise the singleton
+    /// `gemv_mq4g256v2_multirow_r2`) and, in the same launch,
+    /// `out = res + conv(y)` with the history shift, bitwise
+    /// [`Gpu::inkling2_fz_conv_res`] at `rows == 1, state_update`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn inkling2_fz_gemv_conv_res(
+        &mut self,
+        w: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        static_w: &GpuTensor,
+        state: &GpuTensor,
+        state_stride: usize,
+        col_off: usize,
+        inv_scale: f32,
+        res: Option<&GpuTensor>,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let f32_len = |t: &GpuTensor| t.buf.size() / 4;
+        if m == 0
+            || m > i32::MAX as usize
+            || k == 0
+            || k % 256 != 0
+            || k > i32::MAX as usize
+            || w.buf.size() < m * (k / 256) * 136
+            || m * (k / 256) * 136 > u32::MAX as usize
+            || f32_len(x_rot) < k
+            || f32_len(y) < m
+            || f32_len(out) < m
+            || res.is_some_and(|r| f32_len(r) < m)
+            || f32_len(static_w) < 4 * m
+            || f32_len(state) < 2 * state_stride + col_off + m
+        {
+            return Err(HipError::new(0, "inkling2_fz_gemv_conv_res: operand shape"));
+        }
+        self.fz_row_ensure(INKLING2_FZ_GEMV_CONV_RES)?;
+        let p = |t: &GpuTensor| t.buf.as_ptr() as *const c_void;
+        let mut b = KernargBlob::new();
+        b.push_ptr(p(w));
+        b.push_ptr(p(x_rot));
+        b.push_ptr(p(y));
+        b.push_i32(m as i32);
+        b.push_i32(k as i32);
+        b.push_ptr(p(static_w));
+        b.push_ptr(p(state));
+        b.push_i32(state_stride as i32);
+        b.push_i32(col_off as i32);
+        b.push_f32(inv_scale);
+        b.push_ptr(res.map_or(std::ptr::null(), p));
+        b.push_ptr(p(out));
+        b.pad_to(16);
+        self.launch_blob_recorded(
+            INKLING2_FZ_GEMV_CONV_RES,
+            [m.div_ceil(2) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            b.as_mut_slice(),
+            ReplayLaunchBindings::NONE,
+        )
+    }
+
     /// One row's routing, scatter tables and gate/up A8 sidecar in one launch
     /// (module doc). Reserves the int8 MMQ sidecar for `top_k` rows of width
     /// `k` and returns it prepared; it stays valid until the next int8
@@ -419,9 +522,11 @@ impl Gpu {
         b.push_i32(a.m_total_max as i32);
         b.push_i32(a.block_m as i32);
         b.pad_to(16);
+        // One phase-3 task per wave: ceil(top_k * groups / 32) blocks.
+        let blocks = (tk * (k / 256)).div_ceil(32) as u32;
         self.launch_blob_recorded(
             INKLING2_FZ_ROUTE_ROW,
-            [1, 1, 1],
+            [blocks, 1, 1],
             [1024, 1, 1],
             0,
             b.as_mut_slice(),

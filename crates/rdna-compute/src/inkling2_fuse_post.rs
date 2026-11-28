@@ -159,10 +159,12 @@ void FZ_KNAME(
     };
 }
 
-pub const INKLING2_FUSE_POST_HIP_SRC: &str = concat!(
-    "#include <hip/hip_runtime.h>\n",
-    fz_awq_fwht_hip!(),
-    r#"
+/// The short-conv helpers (`fz_conv`, `fz_conv_shift`): one text shared by
+/// [`INKLING2_FUSE_POST_HIP_SRC`] and the fused o-projection epilogue of
+/// `inkling2_fuse_row`, so both compile the same arithmetic.
+macro_rules! fz_conv_hip {
+    () => {
+        r#"
 
 // `ink_pf_conv_rows_f32` of (row r, channel ch): x_{r-3..r} from `cur` and the
 // visit history, static taps (+ dynamic per-head taps when `dyn_w`), then
@@ -206,6 +208,17 @@ __device__ __forceinline__ void fz_conv_shift(
     state[(size_t)state_stride + col_off + ch] = x2;
     state[(size_t)state_stride * 2 + col_off + ch] = xc;
 }
+"#
+    };
+}
+pub(crate) use fz_conv_hip;
+
+pub const INKLING2_FUSE_POST_HIP_SRC: &str = concat!(
+    "#include <hip/hip_runtime.h>\n",
+    fz_awq_fwht_hip!(),
+    fz_conv_hip!(),
+    r#"
+
 
 struct FzPlanes8 { _Float16* p[8]; };
 

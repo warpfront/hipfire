@@ -54,7 +54,7 @@ use oracle::{
 };
 use rdna_compute::Gpu;
 
-const EXPECT_NODES: usize = 1024;
+const EXPECT_NODES: usize = 976;
 
 /// `HIPFIRE_AR_GRAPH` / `HIPFIRE_GRAPH` as the product resolves them, replaced
 /// on the device's shared flag set.
@@ -296,11 +296,11 @@ fn step(
             assert_eq!(route.backend(), DecodeBackend::Eager);
             assert_eq!(
                 fxg.launches, EXPECT_NODES as u64,
-                "pos {pos}: the recording token is one real 1024-launch body"
+                "pos {pos}: the recording token is one real 976-launch body"
             );
             assert_eq!(s1.counts.pm4_record_steps, s0.counts.pm4_record_steps + 1);
             assert_eq!(s1.pm4.recordings, s0.pm4.recordings + 1);
-            assert_eq!(s1.pm4.nodes, EXPECT_NODES, "pos {pos}: 1024-dispatch tape");
+            assert_eq!(s1.pm4.nodes, EXPECT_NODES, "pos {pos}: 976-dispatch tape");
             rig.key = Some(plan.key.clone());
             rig.captured += 1;
         }
@@ -337,7 +337,7 @@ fn step(
         assert_eq!(glaunch, 0, "pos {pos}: capture launches nothing");
         assert_eq!(s1.counts.graph_arm_steps, s0.counts.graph_arm_steps + 1);
         assert_eq!(s1.graph.captures, s0.graph.captures + 1);
-        assert_eq!(s1.graph.nodes, EXPECT_NODES, "pos {pos}: 1024-launch body");
+        assert_eq!(s1.graph.nodes, EXPECT_NODES, "pos {pos}: 976-launch body");
         rig.key = Some(plan.key.clone());
         rig.captured += 1;
     }

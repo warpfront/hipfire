@@ -2151,7 +2151,12 @@ fn visit_body(
         "gate producer",
     )?;
     let wo_out = ar.f32(gpu, ne, "wo_out")?;
-    linear_rot(gpu, &layer.wo, ar.get(rot_o), ar.get(wo_out), n, gemm)?;
+    // The frozen decode folds the post conv + residual into the o GEMV
+    // (`inkling2_fz_gemv_conv_res`, bitwise the two launches below).
+    let fold_o = c.frozen.is_some() && one_row_proj;
+    if !fold_o {
+        linear_rot(gpu, &layer.wo, ar.get(rot_o), ar.get(wo_out), n, gemm)?;
+    }
     // AttnRes bookkeeping: first visit of a block pushes x and takes the
     // conv output as cur; the others add it to x.
     let has_push = phys % cfg.attn_res_block == 0;
@@ -2173,22 +2178,50 @@ fn visit_body(
         None
     };
     let cur = ar.f32(gpu, ne, "cur")?;
-    hip(
-        gpu.inkling2_fz_conv_res(
-            ar.get(wo_out),
-            &layer.attn_post_conv,
-            &gs.conv[visit],
-            INKLING2_CONV_WIDTH,
-            2 * ekv,
-            e,
-            1.0 / 5.0f32.sqrt(),
-            if has_push { None } else { Some(x) },
-            ar.get(cur),
-            n,
-            n == 1,
-        ),
-        "attn post conv",
-    )?;
+    let res = if has_push { None } else { Some(x) };
+    if fold_o {
+        let wo = &layer.wo;
+        if wo.gpu_dtype != DType::MQ4G256V2 || wo.awq_scale.is_none() || wo.m != e {
+            return Err(format!(
+                "inkling2 decode: folded o needs MQ4G256V2 + AWQ with m {e}, got {:?} m {}",
+                wo.gpu_dtype, wo.m
+            ));
+        }
+        hip(
+            gpu.inkling2_fz_gemv_conv_res(
+                &wo.buf,
+                wo.m,
+                wo.k,
+                ar.get(rot_o),
+                ar.get(wo_out),
+                &layer.attn_post_conv,
+                &gs.conv[visit],
+                INKLING2_CONV_WIDTH,
+                2 * ekv,
+                1.0 / 5.0f32.sqrt(),
+                res,
+                ar.get(cur),
+            ),
+            "o projection + attn post conv",
+        )?;
+    } else {
+        hip(
+            gpu.inkling2_fz_conv_res(
+                ar.get(wo_out),
+                &layer.attn_post_conv,
+                &gs.conv[visit],
+                INKLING2_CONV_WIDTH,
+                2 * ekv,
+                e,
+                1.0 / 5.0f32.sqrt(),
+                res,
+                ar.get(cur),
+                n,
+                n == 1,
+            ),
+            "attn post conv",
+        )?;
+    }
     // --- MoE: mix over blocks + push + cur, control (pass > 0), norm ---
     if layer.mlp_query.buf.size() / 4 != e {
         return Err(format!(

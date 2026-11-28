@@ -23,8 +23,8 @@
 //! The graph arm is the real `DecodeGraph::forward`. Per step the test proves
 //! which route actually ran: a replay issues exactly ONE `hipGraphLaunch`
 //! (hip-bridge counter) and ZERO module launches, one H2D and one D2H; the
-//! capture step runs the eager token (1024 launches) plus the recording
-//! (1024 more, executing nothing) and issues no graph launch. The captured
+//! capture step runs the eager token (976 launches) plus the recording
+//! (976 more, executing nothing) and issues no graph launch. The captured
 //! node count (= graph-owned kernarg blobs = launches observed while recording)
 //! must equal the eager census.
 //!
@@ -53,7 +53,7 @@ use oracle::{
 };
 use rdna_compute::Gpu;
 
-const EXPECT_NODES: usize = 1024;
+const EXPECT_NODES: usize = 976;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Expect {
@@ -229,7 +229,7 @@ fn step(
             stats1.nodes, eager_launches as usize,
             "pos {pos}: captured nodes == eager census"
         );
-        assert_eq!(stats1.nodes, EXPECT_NODES, "pos {pos}: 1024-launch body");
+        assert_eq!(stats1.nodes, EXPECT_NODES, "pos {pos}: 976-launch body");
         assert_eq!(stats1.eager_launches, eager_launches);
         rig.key = Some(plan.key.clone());
         rig.captured += 1;
@@ -975,7 +975,7 @@ fn step4(
         Pm4Route::Recorded => {
             assert_eq!(
                 fxp.launches as usize, EXPECT_NODES,
-                "pos {pos}: the recording token is a real 1024-launch HIP token"
+                "pos {pos}: the recording token is a real 976-launch HIP token"
             );
             assert_eq!(obs.count, 0, "a recording token is not a retained replay");
             assert_eq!(stats1.recordings, stats0.recordings + 1);
@@ -1332,7 +1332,7 @@ fn recorded_sig(gpu: &Gpu) -> RecordedSig {
 
 /// Two recordings of the same bucket at different positions, with different
 /// staged contents, on the same allocations: identical kernel symbol, grid,
-/// block, LDS and padded kernarg bytes for all 1024 launches (no position or
+/// block, LDS and padded kernarg bytes for all 976 launches (no position or
 /// token baked), plus the capture census with the unique-symbol set.
 #[test]
 #[ignore = "needs the typed-XTS artifact on a gfx1201 card"]
@@ -1358,6 +1358,7 @@ fn pm4_recordings_are_byte_identical_and_census() {
     // the K/V plane tables) record with unknown effects: untyped, serialized.
     let embedded = [
         "inkling2_fz_mix_norm_rot_f32",
+        "inkling2_fz_mix_norm_rot_split_f32",
         "inkling2_attn_fa2_partial_pos_gfx1201",
         "inkling2_fz_attn_post_decode_f32",
     ];
@@ -1430,16 +1431,23 @@ fn pm4_gpu_side_timing_breakdown() {
     use std::time::Instant;
     let mut gpu = Gpu::init().expect("gpu");
     assert!(pm4_dev_opt_in(&gpu));
-    let mut b = load(&mut gpu, 400);
-    let toks = tokens(420);
+    // INKLING2_TIMING_CTX picks the decode context (default 128); INKLING2_TIMING_DUMP
+    // names a TSV of the per-dispatch order (index, kernel, median GPU µs over the
+    // profiled steps) for phase analysis.
+    let ctx: usize = std::env::var("INKLING2_TIMING_CTX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
+    let mut b = load(&mut gpu, ctx + 300);
+    let toks = tokens(ctx + 320);
     prewarm(&mut b, &mut gpu, &toks, 400);
     reset(&mut b, &mut gpu);
-    prefill(&mut b, &mut gpu, &toks[..128]);
+    prefill(&mut b, &mut gpu, &toks[..ctx]);
     let mut p = DecodePm4::new(true, false);
     let mut logits = Vec::new();
-    let mut next = toks[128];
+    let mut next = toks[ctx];
     let mut ids = vec![next];
-    for pos in 128..130 {
+    for pos in ctx..ctx + 2 {
         p.forward(&mut b, &mut gpu, next, pos, &mut logits).unwrap();
         next = argmax_row(&logits);
         ids.push(next);
@@ -1472,7 +1480,7 @@ fn pm4_gpu_side_timing_breakdown() {
         let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f64() * 1e3;
         (ms(t0, t1), ms(t1, t2), ms(t2, t3), span, spans)
     };
-    for pos in 130..176 {
+    for pos in ctx + 2..ctx + 48 {
         let (s, r, f, g, _) = step(&mut b, &mut gpu, pos, next, &mut logits, false);
         stage.push(s);
         replay.push(r);
@@ -1518,7 +1526,8 @@ fn pm4_gpu_side_timing_breakdown() {
     let (mut sums, mut ib) = (vec![], vec![]);
     let mut host = vec![];
     let nprof = 20usize;
-    for pos in 176..176 + nprof {
+    let mut per: Vec<Vec<u64>> = vec![vec![]; names.len()];
+    for pos in ctx + 48..ctx + 48 + nprof {
         let (s, r, f, g, spans) = step(&mut b, &mut gpu, pos, next, &mut logits, true);
         assert_eq!(spans.len(), names.len(), "one span per dispatch");
         let tot: f64 = spans.iter().map(|&x| x as f64).sum::<f64>() / 1e3;
@@ -1529,6 +1538,7 @@ fn pm4_gpu_side_timing_breakdown() {
             let e = by.entry(names[i].clone()).or_default();
             e.0 += 1;
             e.1 += x as f64 / 1e3;
+            per[i].push(x);
         }
         next = argmax_row(&logits);
     }
@@ -1544,6 +1554,31 @@ fn pm4_gpu_side_timing_breakdown() {
             us / nprof as f64,
             us / cnt as f64
         );
+    }
+    if let Ok(path) = std::env::var("INKLING2_TIMING_DUMP") {
+        // `wait`: the boundary before this dispatch waits for compute idle
+        // (span i runs from the timestamp after dispatch i-1 to the one after i).
+        let bounds = gpu
+            .replay
+            .prepared_pm4_dispatch_boundaries()
+            .map(<[_]>::to_vec);
+        let mut out = String::from("idx\tkernel\tmedian_us\twait\n");
+        for (i, v) in per.iter_mut().enumerate() {
+            v.sort_unstable();
+            let w = bounds.as_ref().and_then(|b| b.get(i)).map_or("?", |b| {
+                if b.wait_compute_idle {
+                    "1"
+                } else {
+                    "0"
+                }
+            });
+            out += &format!(
+                "{i}\t{}\t{:.2}\t{w}\n",
+                names[i],
+                v[v.len() / 2] as f64 / 1e3
+            );
+        }
+        std::fs::write(path, out).unwrap();
     }
     p.release(&mut gpu).unwrap();
 }
