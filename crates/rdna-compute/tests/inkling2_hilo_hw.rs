@@ -313,3 +313,76 @@ fn inkling2_hilo_projections_hw() {
     );
     gpu.free_tensor(t).unwrap();
 }
+
+/// The one-row (decode) launch of `inkling2_gemm_hilo_f32` writes, bit for bit, row 0 of
+/// the tiled launch over two rows (the same WMMA chains and wave-ordered sums).
+fn gemm_one_row_case(gpu: &mut Gpu, g: &mut Lcg, problems: usize, m: usize, k: usize) {
+    let ws: Vec<GpuTensor> = (0..problems)
+        .map(|_| up(gpu, &g.vec(m * k, 0.03)))
+        .collect();
+    let xs: Vec<GpuTensor> = (0..problems).map(|_| up(gpu, &g.vec(2 * k, 1.5))).collect();
+    let y2: Vec<GpuTensor> = (0..problems).map(|_| sentinel(gpu, 2 * m)).collect();
+    let y1: Vec<GpuTensor> = (0..problems).map(|_| sentinel(gpu, 2 * m)).collect();
+    fn probs<'a>(
+        ws: &'a [GpuTensor],
+        xs: &'a [GpuTensor],
+        ys: &'a [GpuTensor],
+    ) -> Vec<Inkling2HiloGemm<'a>> {
+        ws.iter()
+            .zip(xs)
+            .zip(ys)
+            .map(|((w, x), y)| Inkling2HiloGemm { w, x, y })
+            .collect()
+    }
+    let (p2, p1) = (probs(&ws, &xs, &y2), probs(&ws, &xs, &y1));
+    gpu.inkling2_gemm_hilo_f32(&p2, m, k, 2).expect("two rows");
+    gpu.inkling2_gemm_hilo_f32(&p1, m, k, 1).expect("one row");
+    gpu.hip.device_synchronize().expect("sync");
+    for p in 0..problems {
+        let (a, b) = (
+            gpu.download_f32(&y2[p]).unwrap(),
+            gpu.download_f32(&y1[p]).unwrap(),
+        );
+        for o in 0..m {
+            assert_eq!(
+                a[o].to_bits(),
+                b[o].to_bits(),
+                "gemm P {problems} m {m} k {k} p {p}: one row differs at {o}"
+            );
+        }
+        assert!(
+            b[m..].iter().all(|v| v.to_bits() == SENTINEL),
+            "gemm m {m}: one row wrote past its output"
+        );
+    }
+    let ms = median_ms(gpu, |gg| gg.inkling2_gemm_hilo_f32(&p1, m, k, 1).unwrap());
+    eprintln!(
+        "gemm  P {problems} m {m:5} k {k:5} n 1: bitwise row 0 of n 2; ms per launch {ms:.4}"
+    );
+    drop((p1, p2));
+    for t in ws.into_iter().chain(xs).chain(y2).chain(y1) {
+        gpu.free_tensor(t).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "needs a gfx12 GPU"]
+fn inkling2_hilo_one_row_bitwise_hw() {
+    let mut gpu = Gpu::init().expect("GPU required");
+    if !gpu.arch_caps.has_wmma_w32_gfx12() {
+        eprintln!("skip: {} has no gfx12 WMMA", gpu.arch);
+        return;
+    }
+    let mut g = Lcg(0x51ce_0001);
+    // Controller down (three and one per launch), dynamic taps, sinks, ragged M / one wave.
+    for &(p, m, k) in &[
+        (3, 64, 4608),
+        (1, 64, 4608),
+        (2, 32, 2304),
+        (1, 24, 2304),
+        (1, 80, 256),
+        (4, 40, 4096),
+    ] {
+        gemm_one_row_case(&mut gpu, &mut g, p, m, k);
+    }
+}

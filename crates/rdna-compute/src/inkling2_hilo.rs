@@ -209,23 +209,23 @@ __device__ __forceinline__ void hl_tile(
     }
 }
 
-// Y_z [N, M] = X_z [N, K] . W_z [M, K]^T, z = blockIdx.z, one (32 m) x (16 TN n)
+// Y_z [N, M] = X_z [N, K] . W_z [M, K]^T, z = blockIdx.z, one (16 TM m) x (16 TN n)
 // tile per workgroup.
-template <int TN>
+template <int TM, int TN, int U>
 __device__ __forceinline__ void hl_gemm(const HlPtrs& W, const HlPtrs& X, const HlPtrs& Y, int M, int K, int N, float* red)
 {
     const int z = blockIdx.z;
-    const int row0 = blockIdx.x * 32;
+    const int row0 = blockIdx.x * 16 * TM;
     const int col0 = blockIdx.y * 16 * TN;
     const float* w[1] = {W.p[z]};
-    float8_t acc[1][2][TN];
-    hl_tile<2, TN, 1, 4>(w, X.p[z], M, K, N, row0, col0, acc, red);
+    float8_t acc[1][TM][TN];
+    hl_tile<TM, TN, 1, U>(w, X.p[z], M, K, N, row0, col0, acc, red);
     if (threadIdx.y != 0) return;
     float* y = (float*)Y.p[z];
     const int lm = threadIdx.x & 15;
     const int kg = threadIdx.x >> 4;
 #pragma unroll
-    for (int tm = 0; tm < 2; ++tm) {
+    for (int tm = 0; tm < TM; ++tm) {
         const int m = row0 + tm * 16 + lm;
         if (m >= M) continue;
 #pragma unroll
@@ -244,7 +244,7 @@ __launch_bounds__(256)
 extern "C" __global__ void inkling2_gemm_hilo_f32(HlPtrs W, HlPtrs X, HlPtrs Y, int M, int K, int N)
 {
     extern __shared__ float red[];
-    hl_gemm<1>(W, X, Y, M, K, N, red);
+    hl_gemm<2, 1, 4>(W, X, Y, M, K, N, red);
 }
 
 // Grid (ceil(M / 32), ceil(N / 32), problems), block (32, split-K waves): half
@@ -253,7 +253,19 @@ __launch_bounds__(256)
 extern "C" __global__ void inkling2_gemm_hilo_f32_n32(HlPtrs W, HlPtrs X, HlPtrs Y, int M, int K, int N)
 {
     extern __shared__ float red[];
-    hl_gemm<2>(W, X, Y, M, K, N, red);
+    hl_gemm<2, 2, 4>(W, X, Y, M, K, N, red);
+}
+
+// One activation row (N == 1, decode). Grid (ceil(M / 16), 1, problems),
+// block (32, split-K waves): one 16-wide m tile per workgroup, twice the
+// workgroups of the 32-row tiles, and none of their dead column tiles. Every
+// output element sees the same WMMA chain over the same K slices and the same
+// wave-ordered sum as in the tiled kernels, so the row is bitwise theirs.
+__launch_bounds__(256)
+extern "C" __global__ void inkling2_gemm_hilo_f32_r1(HlPtrs W, HlPtrs X, HlPtrs Y, int M, int K, int N)
+{
+    extern __shared__ float red[];
+    hl_gemm<1, 1, 4>(W, X, Y, M, K, N, red);
 }
 
 // Controller tail over rows: a = G_z . g_z, f = F_z . g_z (both [N, M]), then
@@ -401,13 +413,17 @@ impl Gpu {
         }
         self.inkling2_hilo_check("inkling2_gemm_hilo_f32", problems.len(), m, k, n, &ext)?;
         self.bind_thread()?;
-        // M <= 32 is one workgroup row, so column tiles are the only source of
-        // waves (sinks, dynamic taps): 16-row tiles. Wider M (controller down)
-        // takes 32-row tiles, half the operand traffic per output.
-        let (sym, n_tile, accs) = if m >= 64 {
-            ("inkling2_gemm_hilo_f32_n32", 32, 32)
+        // One row (decode): 16-row m tiles, the only source of waves left
+        // (bitwise the tiled kernels' row). M <= 32 is one workgroup row, so
+        // column tiles are the only source of waves (sinks, dynamic taps):
+        // 16-row tiles. Wider M (controller down) takes 32-row tiles, half the
+        // operand traffic per output.
+        let (sym, m_tile, n_tile, accs) = if n == 1 {
+            ("inkling2_gemm_hilo_f32_r1", 16, 16, 8)
+        } else if m >= 64 {
+            ("inkling2_gemm_hilo_f32_n32", 32, 32, 32)
         } else {
-            ("inkling2_gemm_hilo_f32", 16, 16)
+            ("inkling2_gemm_hilo_f32", 32, 16, 16)
         };
         self.ensure_kernel(INKLING2_HILO_MODULE, INKLING2_HILO_HIP_SRC, sym)?;
         let w = HlPtrs::of(problems.iter().map(|p| p.w));
@@ -426,7 +442,7 @@ impl Gpu {
         self.launch_maybe_blob(
             sym,
             [
-                m.div_ceil(32) as u32,
+                m.div_ceil(m_tile) as u32,
                 n.div_ceil(n_tile) as u32,
                 problems.len() as u32,
             ],
