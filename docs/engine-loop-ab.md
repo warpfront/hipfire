@@ -248,12 +248,19 @@ still hold it after its bench returned.
   records the source SHA, daemon and CLI md5, fixture sha256, the bench
   params and, per engine arm and k>1 cell, the mean, n and per-run means. The
   Qwen4 MTP route and its baseline are in `benchmarks/engine-loop-ab/`.
-- `require_reuse`: every multi-turn follow-up must reuse a prefix (a refused
-  lane record still exempts it); a follow-up that reuses 0 fails the run instead of
-  marking it `pass-partial`. For a route whose conversations open with a long
-  prefix of their own, e.g. a `--bench-shape betterbench --bb-corpus` corpus
-  whose system messages are longer than 256 tokens (Gemma 4 records 256-token
-  boundaries, HIPF-632).
+- `require_reuse`: the cache cell is strict. Every multi-turn follow-up on the
+  engine arm and on `ref` must reuse a prefix, every first turn must start cold
+  (cached 0), both arms must hold the same requests, and each k>1 request must
+  equal its k=1 request. A refused lane record or earlier-turn reuse is
+  reported but exempts nothing. Without it, zero prefix hits only mark the run
+  `pass-partial`. Use it on a route whose conversations open with a long prefix
+  of their own, e.g. a `--bench-shape betterbench --bb-corpus` corpus whose
+  system messages are longer than 256 tokens (Gemma 4 records 256-token
+  boundaries, HIPF-632). The bench reuses each conversation's prompts in every
+  sample, so a first turn at k>1 is warm from the k=1 sample of the same
+  daemon: run one route per k (`"k": "1"`, `"2"`, `"4"`, a fresh bench and
+  daemon each) and judge the merged arms; the fairness sweep stays
+  interleaved.
 - `load`: params merged into every `load` request the bench sends, by the wire
   tap (the requests on `<wire>.in` show them; a leading `~` in a string value
   is expanded). For a load knob the bench lacks, e.g. the Gemma 4 EAGLE

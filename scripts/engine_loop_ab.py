@@ -829,7 +829,30 @@ def conc_self_test():
     assert unex["ok"] and unex["unexercised"]
     zero = cj(eng=conc_arm("engine", "noslots", cached=0), leg=conc_arm("legacy", "noslots", cached=0),
               c={"require_reuse": True})
-    assert zero["fails"] == ["engine-noslots: follow-up reused 0 2"], zero["fails"]
+    assert zero["fails"] == ["engine-noslots: follow-up reused 0 4"], zero["fails"]
+    # require_reuse is strict on each request and on ref too, never exempts (Loki HIPF-639 S2)
+    rr = {"require_reuse": True}
+    assert cj(c=rr)["ok"], cj(c=rr)
+    one = conc_arm("engine", "noslots")
+    one["reqs"]["multiturn/4/1/0/1"] = req("cd", cached=0)
+    assert "engine-noslots: follow-up reused 0 1" in cj(eng=one, c=rr)["fails"]
+    leg0 = conc_arm("legacy", "noslots")
+    leg0["reqs"]["multiturn/1/1/0/1"] = req("cd", cached=0, loop="legacy")
+    assert "engine-noslots: follow-up reused 0 1" in cj(leg=leg0, c=rr)["fails"]
+    gone = conc_arm("engine", "noslots")
+    del gone["reqs"]["multiturn/1/1/0/1"]
+    assert not cj(eng=gone, c=rr)["ok"]
+    ref_ = conc_arm("engine", "noslots", mt4=req("cd", cached=0))
+    ref_["refused"] = ["multiturn/4/1/0/1"]
+    assert not cj(eng=ref_, c=rr)["ok"]
+    def warm(loop):
+        a = conc_arm(loop, "noslots", mt4=req("xx", cached=5, loop=loop))
+        a["reqs"]["multiturn/4/1/0/0"] = req(cached=5, loop=loop)
+        return a
+    w = cj(eng=warm("engine"), leg=warm("legacy"), c={})
+    assert w["ok"], w  # same wrong k=4 ids on both loops, exempt after a warm first turn
+    w = cj(eng=warm("engine"), leg=warm("legacy"), c=rr)
+    assert "engine-noslots: C1 != CN 1" in w["fails"] and "engine-noslots: warm first turn 2" in w["fails"], w
     # spec: an AR fallback (no spec, or no window) fails; require_overlap: a serialized k>1 cell fails (HIPF-633)
     def spec_arm(loop, spec="gemma4_eagle", rounds=3, rejected=0):
         a = conc_arm(loop, "noslots")
@@ -1356,7 +1379,10 @@ def judge_conc(arms, c, expect_engine):
         loop_bad = (any(v not in (None, "legacy", "engine") for v in loops)
                     or (None in loops and any(v is not None for v in loops))
                     or (expect_engine and any(v != "engine" for v in loops)))
-        refused = set(a.get("refused", []))
+        # `require_reuse` (a route whose follow-ups share a long prefix with their own first
+        # turn, HIPF-632): refusals and earlier-turn reuse are reported, never exempt
+        strict = c.get("require_reuse")
+        refused = set() if strict else set(a.get("refused", []))
         r["c1_ne_cn"], r["c1_ne_cn_exempt"] = [], {}
         for k in c1_ne_cn(reqs):
             wl, kk, rnd, conv, turn = k.split("/")
@@ -1364,10 +1390,12 @@ def judge_conc(arms, c, expect_engine):
             why = ("refused" if k in refused else
                    next((f"{e} reused {cached(reqs.get(e))} > C1 {cached(reqs.get(at(e, 1)))}" for e in earlier
                          if cached(reqs.get(e)) > cached(reqs.get(at(e, 1)))), None))
-            if why:
+            if why and not strict:
                 r["c1_ne_cn_exempt"][k] = why
             else:
                 r["c1_ne_cn"].append(k)
+                if why:
+                    r["c1_ne_cn_exempt"][k] = why
         # G-tok: against the ref request with the same prefix reuse (same k first),
         # since a reused prefix and a cold prefill are not token-exact
         refs = {k: next((y for y in (rr.get(at(k, kk)) for kk in [k.split("/")[1], *ks])
@@ -1385,16 +1413,20 @@ def judge_conc(arms, c, expect_engine):
         # vs C1: legacy-noslots reuses nothing at k>1, so only C1 sees a lost record (Loki HIPF-586 S3)
         r["cache_below_c1"] = sorted(k for k in follow if k.split("/")[1] != "1" and k not in refused
                                      and cached(reqs[k]) < cached(reqs.get(at(k, 1))))
-        r["refused"] = sorted(k for k in follow if k in refused)
+        r["refused"] = sorted(k for k in follow if k in set(a.get("refused", [])))
         r["refusals_unmapped"] = a.get("refusals_unmapped", [])
         r["cache_hits"] = [sum(cached(reqs[k]) > 0 for k in follow), sum(cached(rr.get(k)) > 0 for k in follow),
                            len(follow)]
-        # `require_reuse` (a route whose follow-ups share a long prefix with their own first
-        # turn, HIPF-632): a follow-up that reuses nothing fails instead of going unexercised
-        r["reused_none"] = sorted(k for k in follow if k not in refused and not cached(reqs[k]))
-        if c.get("require_reuse") and not follow:
+        # strict: every follow-up of this arm and of ref reuses, both arms have the same requests,
+        # and every first turn starts cold (a warm first turn hides a lost own record, Loki HIPF-639)
+        r["reused_none"] = sorted({f"{t}:{k}" for t, rs in ((tag, reqs), ("ref", rr)) for k in rs
+                                   if k.startswith("multiturn/") and not k.endswith("/0") and not cached(rs[k])})
+        r["warm_first"] = sorted({f"{t}:{k}" for t, rs in ((tag, reqs), ("ref", rr)) for k in rs
+                                  if k.startswith("multiturn/") and k.endswith("/0") and cached(rs[k])})
+        r["key_mismatch"] = sorted(set(reqs) ^ set(rr))
+        if strict and not follow:
             fails.append(f"{tag}: require_reuse without multi-turn follow-ups")
-        elif follow and not r["cache_hits"][0] and not c.get("require_reuse"):
+        elif follow and not r["cache_hits"][0] and not strict:
             unexercised.append(f"{tag}: no multi-turn follow-up reused a prefix")
         # `require_overlap`: a k>1 cell of a batch arm with an overlap-rejected (serialized)
         # sample fails; the bench reports such a cell `ok` on a serialized_by_design backend
@@ -1448,7 +1480,9 @@ def judge_conc(arms, c, expect_engine):
         for name, bad in (("errors", r["errors"]), ("loop", loop_bad), ("C1 != CN", r["c1_ne_cn"]),
                           ("tokens != ref", r["ne_ref"]), ("cached_tokens < ref", r["cache_below_ref"]),
                           ("cached_tokens < C1", r["cache_below_c1"]),
-                          ("follow-up reused 0", c.get("require_reuse") and r["reused_none"]),
+                          ("follow-up reused 0", strict and r["reused_none"]),
+                          ("warm first turn", strict and r["warm_first"]),
+                          ("requests not in both arms", strict and r["key_mismatch"]),
                           ("G-spec", not all(r["g_spec"].values())),
                           ("lane tau", [k for k, v in r["lane_tau"].items() if not v["pass"]]),
                           ("target", [k for k, v in r["target"].items() if not v])):
