@@ -60,6 +60,7 @@ only.
   "max_tokens": 64,
   "perf_decode_tokens": 256,
   "spec_noise": true,
+  "eos_ids": [248046],
   "expect_engine": true
 }
 ```
@@ -93,6 +94,12 @@ own route files: Qwen4 native MTP via `"mtp_mode": "on"`, a DFlash drafter via
   (or a 1024-token stride snapshot), so short prompts reuse nothing (HIPF-598).
 - `perf_decode_gain` (default false): a G-perf decode gain above +2 % is
   `intended` (intended diff 7). Set it only on a Gemma 4 AR route.
+- `eos_ids` (default `[]`): the terminal EOS ids of the route's model, which a
+  committed-id stream ends with and the engine does not count in `tokens`
+  (intended diff 2). Set `[248046]` (`<|im_end|>`) on every Qwen4 route. A
+  Gemma 4 route needs none: its stream never commits the EOS. The `--batch`
+  and `--conc` gates check that every finished engine request has
+  `tokens` = its committed ids minus a terminal EOS id.
 
 ## Scenarios
 
@@ -145,11 +152,14 @@ These are reported as `intended` and do not fail the run:
    global `reset_cpu_sampler_rng`. Sampled output is therefore never compared
    bitwise across arms: only `seeded_repro` (within an arm) and the
    `seeded_sweep` distribution are checked.
-2. **EOS not counted in `tokens`.** Engine `tokens` = legacy `tokens - 1` when
-   legacy finished with `stop`. This applies to every engine request, on the
-   resident state or in a lane (`serve.vmm_batch`): both count the request's
-   run, not the lane's stream (HIPF-572). Legacy counts the EOS on the
-   singleton and in the batch.
+2. **Terminal EOS not counted in `tokens`.** When the committed ids of both
+   arms are equal and end with an id in the route's `eos_ids`, engine
+   `tokens` = legacy `tokens - 1` = the number of ids − 1. The finish reason
+   does not decide it: a `tool_calls` finish on EOS gets the allowance, and a
+   stop string or a length finish does not. This applies to every engine
+   request, on the resident state or in a lane (`serve.vmm_batch`), because
+   both count the request's run, not the lane's stream (HIPF-572). Legacy
+   counts the EOS on the singleton and in the batch.
 3. **Stop on the last budget token** is `finish_reason: "stop"` on the engine,
    following the `qwen_dflash_hit_length_cap` semantics. Legacy `length` vs
    engine `stop` is allowed in `eos_budget`.

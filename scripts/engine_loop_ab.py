@@ -330,7 +330,7 @@ def hist_len(r):
     return (d.get("cached_tokens") or 0) + (d.get("prefill_tokens") or 0) + n
 
 
-def batch_checks(rows, expect_engine, reuse_mode="turn", ref=None):
+def batch_checks(rows, expect_engine, reuse_mode="turn", ref=None, eos_ids=()):
     """The `--batch` gates on one arm's rows (the run gates the engine arm only;
     legacy fn-lanes keep no records). Pure: --self-test drives it with fakes.
     - every request ends in `done`; the aborted ones `aborted`, the others batched
@@ -345,7 +345,8 @@ def batch_checks(rows, expect_engine, reuse_mode="turn", ref=None):
     - a retry reuses at least its control (the abort lost nothing), and with the
       control's reuse gives the control's tokens and ids
     - expect_engine: the engine logged the D2 and D3 aborts on the resident state
-      (`resident_cancels`); a lane cancel passes the reuse gates but tests another path"""
+      (`resident_cancels`); a lane cancel passes the reuse gates but tests another path;
+      and every finished request counts its ids minus a terminal EOS (`eos_ids`)"""
     fails, unex, notes = [], [], []
     cached = lambda r: r["done"].get("cached_tokens") or 0
     same = lambda a, b: (a["events"], a["ids"]) == (b["events"], b["ids"])
@@ -394,6 +395,9 @@ def batch_checks(rows, expect_engine, reuse_mode="turn", ref=None):
             notes.append(f"{retry} reused {cached(rows[retry])}, control {ctrl} {cached(rows[ctrl])}: tokens not compared")
         elif not same(rows[retry], rows[ctrl]):
             fails.append(f"{retry} tokens differ from {ctrl} at the same reuse")
+    if expect_engine:
+        fails += [f"{k} done.tokens {rows[k]['done']['tokens']} != its ids minus a terminal EOS"
+                  for k in miscounted(rows, eos_ids)]
     if rows.get("daemon_rc") != 0:
         fails.append(f"daemon rc {rows.get('daemon_rc')}")
     if rows.get("refused"):  # the engine's own reason for a cold turn (e.g. a retired MTP lane)
@@ -443,7 +447,17 @@ def toks(r):
     return [t for t, _ in r.get("ids", [])]
 
 
-def compare(sc, a, b, spec_noise=False, positions=False):
+def miscounted(rows, eos_ids):
+    """Finished engine requests whose `done.tokens` is not their committed ids
+    minus a terminal EOS in `eos_ids` (intended diff 2: the engine counts the
+    same on the resident state and in a lane, HIPF-572). Rows without ids or a
+    count are skipped."""
+    return sorted(k for k, r in rows.items() if isinstance(r, dict) and r.get("type") == "done" and r.get("ids")
+                  and r["done"].get("finish_reason") != "aborted" and r["done"].get("tokens") is not None
+                  and r["done"]["tokens"] != len(r["ids"]) - (toks(r)[-1] in eos_ids))
+
+
+def compare(sc, a, b, spec_noise=False, positions=False, eos_ids=()):
     """Diff two result lists (a = legacy, b = engine). Returns (status, notes);
     notes are [kind, text]; status is diff|unexercised|intended|equal."""
     notes = []
@@ -508,10 +522,13 @@ def compare(sc, a, b, spec_noise=False, positions=False):
             vx, vy = dx.get(key), dy.get(key)
             if vx == vy:
                 continue
-            # Intended diff 2: EOS is not counted in `tokens` on the engine,
-            # resident or lane (HIPF-572).
-            if key == "tokens" and isinstance(vx, int) and vy == vx - 1 and dx.get("finish_reason") == "stop":
-                note(INTENDED, f"[{i}] tokens {vx}->{vy} (EOS not counted)")
+            # Intended diff 2: the engine does not count a terminal EOS in
+            # `tokens` (resident or lane, HIPF-572). Judged on the ids, not the
+            # finish reason: a stop string or a length finish gets no allowance.
+            ids = toks(x)
+            if (key == "tokens" and ids and ids == toks(y) and ids[-1] in eos_ids
+                    and (vx, vy) == (len(ids), len(ids) - 1)):
+                note(INTENDED, f"[{i}] tokens {vx}->{vy} (terminal EOS {ids[-1]} not counted)")
             # Intended diff 3: a stop on the last budget token is `stop`.
             elif key == "finish_reason" and sc == "eos_budget" and (vx, vy) == ("length", "stop"):
                 note(INTENDED, f"[{i}] finish_reason length->stop on last budget token")
@@ -573,7 +590,7 @@ def judge(res, route, tvd_max, perf=None):
         if sc == "daemon_rc":
             continue
         status, notes = compare(sc, res["legacy"][sc], res["engine"][sc], route.get("spec_noise", False),
-                                "drafter" in route.get("load", {}))
+                                "drafter" in route.get("load", {}), route.get("eos_ids", ()))
         scenarios[sc] = {"status": status, "notes": notes}
     sampled = sampled_checks(res)
     sampled["ok"] = (sampled["legacy_reproducible"] and sampled["engine_reproducible"]
@@ -648,7 +665,19 @@ def self_test():
     assert st("cold", [r("ab", floor={"x_ms": 1, "k": 2})], [r("ab", floor={"x_ms": 1, "k": 3})]) == "diff"
     assert st("cold", [r("ab", w=[{"t_ms": 1}])], [r("ab", w=[{"t_ms": 2}])]) == "equal"
     assert st("cold", same, [r("ac", tokens=3, finish_reason="stop")]) == "diff"
-    assert st("cold", same, [r("ab", tokens=2, finish_reason="stop")]) == "intended"
+    # Intended diff 2 needs the terminal id (HIPF-666 repro): a counted EOS
+    # (stop or tool_calls) is intended, an uncounted stop-string token is not.
+    def ids(*t):
+        return [[x, p] for p, x in enumerate(t)]
+    eos = {"eos_ids": [9]}
+    for fin in ("stop", "tool_calls"):
+        legacy = [{**r("ab", tokens=3, finish_reason=fin), "ids": ids(1, 2, 9)}]
+        engine = [{**r("ab", tokens=2, finish_reason=fin), "ids": ids(1, 2, 9)}]
+        assert st("cold", legacy, engine, **eos) == "intended"
+        assert st("cold", legacy, engine) == "diff"  # route declares no EOS id
+    legacy = [{**r("ab", tokens=3, finish_reason="stop"), "ids": ids(1, 2, 3)}]
+    assert st("cold", legacy, [{**r("ab", tokens=2, finish_reason="stop"), "ids": ids(1, 2, 3)}], **eos) == "diff"
+    assert st("cold", same, [r("ab", tokens=2, finish_reason="stop")], **eos) == "diff"  # no ids
     assert st("cold", same, [r("ab", tokens=1, finish_reason="stop")]) == "diff"
     assert st("cold", [r("ab", tokens=3, finish_reason="length")],
               [r("ab", tokens=2, finish_reason="length")]) == "diff"
@@ -694,7 +723,7 @@ def self_test():
     assert st("multi_turn", mt, mt) == "unexercised"
     assert st("multi_turn", mt, [mt[0], r("b", cached_tokens=0, tokens=-1)]) == "diff"
     mt2 = [r("a", cached_tokens=0), r("b", cached_tokens=0, tokens=3, finish_reason="stop")]
-    assert st("multi_turn", mt2, [mt2[0], r("b", cached_tokens=0, tokens=2, finish_reason="stop")]) == "unexercised"
+    assert st("multi_turn", mt2, [mt2[0], r("b", cached_tokens=0, tokens=3, finish_reason="stop")]) == "unexercised"
     # sampled requests: tokens free, prompt-side fields exact
     assert st("seeded_sweep", [r("ab", cached_tokens=0)], [r("xy", cached_tokens=0)]) == "equal"
     assert st("seeded_sweep", [r("ab", cached_tokens=0)], [r("xy", cached_tokens=5)]) == "diff"
@@ -897,6 +926,17 @@ def conc_self_test():
     assert not sj(shift)["ok"]
     assert not cj(eng=conc_arm("engine", "noslots", tau=2.9), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
     assert cj(eng=conc_arm("engine", "noslots", tau=2.98), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
+    # done.tokens (HIPF-572): ids minus a terminal EOS ("b" = 98) passes; the old lane
+    # count (EOS counted) fails, and so does an EOS the route does not declare
+    def counted(n):
+        x = req()
+        x["done"]["tokens"] = n
+        return x
+    arms = lambda n: {"legacy-noslots": conc_arm("legacy", "noslots"),
+                      "engine-noslots": conc_arm("engine", "noslots", k4=counted(n))}
+    assert judge_conc(arms(1), {}, True, [98])["ok"]
+    assert "engine-noslots: done.tokens 1" in judge_conc(arms(2), {}, True, [98])["fails"]
+    assert "engine-noslots: done.tokens 1" in judge_conc(arms(1), {}, True)["fails"]
     # k=1 bound is 2 % (HIPF-619 S1)
     assert not cj(eng=conc_arm("engine", "noslots", tau=2.93), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
     assert cj(eng=conc_arm("engine", "noslots", tau=2.95), leg=conc_arm("legacy", "noslots", tau=3.0), c={})["ok"]
@@ -1032,6 +1072,13 @@ def batch_self_test():
     good = batch_checks(rows(), True)
     assert good["ok"] and not good["unexercised"] and not good["notes"], good
     assert good["reuse"]["P1r"] == [7, 7]
+    p0 = row()
+    p0["done"]["tokens"] = 2  # the old lane count: EOS "b" (98) counted
+    assert batch_checks(rows(P0=p0), True, eos_ids=[98])["fails"] == [
+        "P0 done.tokens 2 != its ids minus a terminal EOS"]
+    p0["done"]["tokens"] = 1
+    assert batch_checks(rows(P0=p0), True, eos_ids=[98])["ok"]
+    assert batch_checks(rows(P0=p0), False, eos_ids=[])["ok"]  # the legacy reference is not counted
     assert batch_checks(rows(P1r=row("cd", cached=0)), True)["fails"] == [
         "P1r reused 0 < 7 (its committed turn 0)", "P1r reused 0 < control P~1 7 (the abort lost reuse)"]
     assert batch_checks(rows(**{"D~1": row("ef", cached=3)}), True)["fails"] == ["D~1 reused 3 < 7 (its committed turn 0)"]
@@ -1341,7 +1388,7 @@ def run_conc(args, route, out):
     return arms
 
 
-def judge_conc(arms, c, expect_engine):
+def judge_conc(arms, c, expect_engine, eos_ids=()):
     """Concurrency gates on every engine arm; legacy arms are reference rows
     (legacy fn-lanes are not row-exact by default, HIPF-469). Pure: --self-test
     drives it with fakes. Per engine arm:
@@ -1360,7 +1407,9 @@ def judge_conc(arms, c, expect_engine):
       lanes and legacy fn-lanes (HIPF-615)
     - lane tau (k>1, with `lane_tau`, a stored engine baseline): every request of the
       cell reports tau, and the mean over its runs is >= the baseline mean - 15 %
-    - target (k>1): out tok/s >= target - tol, TTFT p50 and p99 <= target + tol"""
+    - target (k>1): out tok/s >= target - tol, TTFT p50 and p99 <= target + tol
+    - count: every finished request's `done.tokens` is its ids minus a terminal EOS
+      (`eos_ids`)"""
     tol = c.get("tol_pct", 2.0) / 100
     ref = arms.get("-".join(c.get("ref", ["legacy", "noslots"])))
     target = arms.get("-".join(c["target"])) if c.get("target") else None
@@ -1392,6 +1441,7 @@ def judge_conc(arms, c, expect_engine):
         ks = sorted({x.split("/")[1] for x in rr}, key=int)
         r = report[tag] = {}
         r["errors"] = sorted(k for k, x in reqs.items() if x["type"] != "done")
+        r["miscounted"] = miscounted(reqs, eos_ids)
         loops = [x["done"].get("loop") for x in reqs.values() if x["type"] == "done"]
         r["loop"] = {str(v): loops.count(v) for v in set(loops)}
         loop_bad = (any(v not in (None, "legacy", "engine") for v in loops)
@@ -1496,6 +1546,7 @@ def judge_conc(arms, c, expect_engine):
                     and m["ttft_p50_ms"] <= t["ttft_p50_ms"] * (1 + tol)
                     and m["ttft_p99_ms"] <= t["ttft_p99_ms"] * (1 + tol))
         for name, bad in (("errors", r["errors"]), ("loop", loop_bad), ("C1 != CN", r["c1_ne_cn"]),
+                          ("done.tokens", r["miscounted"]),
                           ("tokens != ref", r["ne_ref"]), ("cached_tokens < ref", r["cache_below_ref"]),
                           ("cached_tokens < C1", r["cache_below_c1"]),
                           ("follow-up reused 0", strict and r["reused_none"]),
@@ -1643,7 +1694,7 @@ def main():
                            f"decode {m['decode_tok_s_delta_pct']}%")
     if conc_on:
         arms = run_conc(args, route, out)
-        conc = judge_conc(arms, route["conc"], route.get("expect_engine", False))
+        conc = judge_conc(arms, route["conc"], route.get("expect_engine", False), route.get("eos_ids", ()))
         unex += conc["unexercised"]
         summary.append("conc=" + ("pass" if conc["ok"] else "FAIL: " + "; ".join(conc["fails"])))
     if ab_on:
@@ -1653,7 +1704,8 @@ def main():
         brows = {arm: run_batch(args, route, arm, out) for arm in ARMS}
         # gated on the engine arm; legacy fn-lanes keep no lane records (reference row)
         mode = route.get("batch_reuse", "turn")
-        batch = {"engine": batch_checks(brows["engine"], route.get("expect_engine", False), mode, brows["legacy"]),
+        batch = {"engine": batch_checks(brows["engine"], route.get("expect_engine", False), mode, brows["legacy"],
+                                        route.get("eos_ids", ())),
                  "legacy_reference": batch_checks(brows["legacy"], False, mode), "arms": brows}
         unex += [f"batch: {u}" for u in batch["engine"]["unexercised"]]
         summary.append(f"batch reuse={batch['engine']['reuse']} "
