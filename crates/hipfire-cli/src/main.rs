@@ -847,6 +847,10 @@ pub(crate) struct BenchArgs {
     /// 48 `betterbench`); request i is prompt i modulo the shape's list.
     #[arg(long, value_name = "N")]
     num_prompts: Option<usize>,
+    /// `--concurrency` system message for every conversation (overrides
+    /// `prompt.system`); `{conv}` becomes the conversation's index.
+    #[arg(long)]
+    system: Option<String>,
     /// `--concurrency` sampling temperature (default 0 `steady`, 0.7
     /// `betterbench`).
     #[arg(long)]
@@ -7262,7 +7266,7 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry.clone())))
         .unwrap_or((None, None));
     let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
-    if let Some(system) = request_string(&resolved, "prompt.system", None)? {
+    if let Some(system) = request_string(&resolved, "prompt.system", args.system.clone())? {
         workload.inject_system(&system);
     }
 
@@ -8579,6 +8583,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             bench_shape: "steady".to_owned(),
             bb_corpus: None,
             num_prompts: None,
+            system: None,
             temperature: None,
             prompt: Vec::new(),
             prompt_file: None,
@@ -20043,6 +20048,7 @@ effort = "high"
             bench_shape: "steady".to_owned(),
             bb_corpus: None,
             num_prompts: None,
+            system: None,
             temperature: None,
             prompt,
             prompt_file,

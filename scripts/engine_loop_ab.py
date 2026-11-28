@@ -1237,6 +1237,8 @@ def run_conc(args, route, out):
         cmd = [args.hipfire, "bench", route["model"], "--concurrency", ",".join(map(str, points)),
                "--backend", backend, "--workload", workloads[0] if len(workloads) == 1 else "both",
                "--runs", str(runs), "-j", *c.get("args", [])]
+        if route.get("chat_system"):  # each bench conversation opens with its own system message
+            cmd += ["--system", chat_start(route, "{conv}")[0]["content"]]
         wait_gpu_released()
         host = host_state()
         with open(f"{base}.json", "w") as fo, open(f"{base}.log", "w") as fe:

@@ -225,10 +225,18 @@ pub struct Workload {
 
 impl Workload {
     /// Prepend `system` to every chat that has no system message, as
-    /// `hipfire serve` does with `prompt.system`.
+    /// `hipfire serve` does with `prompt.system`. `{conv}` in `system`
+    /// becomes the item's index (`w<i>` for warmups), so each conversation
+    /// can open with its own prefix.
     pub fn inject_system(&mut self, system: &str) {
-        for item in self.measure.iter_mut().chain(self.warmup.iter_mut()) {
-            crate::serve::complete::inject_default_system_message(&mut item.messages, Some(system));
+        for (items, tag) in [(&mut self.measure, ""), (&mut self.warmup, "w")] {
+            for (i, item) in items.iter_mut().enumerate() {
+                let text = system.replace("{conv}", &format!("{tag}{i}"));
+                crate::serve::complete::inject_default_system_message(
+                    &mut item.messages,
+                    Some(&text),
+                );
+            }
         }
     }
 }
@@ -1796,6 +1804,18 @@ mod tests {
         // N > 64 cycles the same multiset.
         let w = steady_workload(Some(66), 8).unwrap();
         assert_eq!(w.measure[64].messages, w.measure[0].messages);
+    }
+
+    #[test]
+    fn inject_system_names_each_conversation() {
+        let mut w = steady_workload(Some(66), 8).unwrap();
+        w.inject_system("Conversation {conv}.");
+        let sys = |i: &Item| i.messages[0]["content"].as_str().unwrap().to_owned();
+        assert_eq!(sys(&w.measure[0]), "Conversation 0.");
+        // a repeated prompt still opens its own conversation
+        assert_eq!(sys(&w.measure[64]), "Conversation 64.");
+        assert_eq!(sys(&w.warmup[0]), "Conversation w0.");
+        assert_eq!(w.measure[0].messages[1], w.measure[64].messages[1]);
     }
 
     #[test]
