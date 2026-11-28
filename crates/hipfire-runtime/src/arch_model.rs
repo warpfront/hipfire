@@ -170,6 +170,36 @@ pub trait ArchModel: Send + std::any::Any {
     /// is a no-op for models with no session side state.
     fn session_request_write_limit(&mut self, _through: usize) {}
 
+    /// The ids that end a turn as the model declares them, in the order the
+    /// family's stop set lists them. Empty: the model declares none here.
+    fn eos_ids(&self) -> Vec<u32> {
+        Vec::new()
+    }
+
+    /// The begin-of-sequence id the family's prompt renderer prepends.
+    fn bos_id(&self) -> Option<u32> {
+        None
+    }
+
+    /// The guard a served request holds over the model's external weight
+    /// rows, so the store counts as busy. `None`: no external rows.
+    fn serving_guard(&self) -> Option<crate::external_rows::ServingGuard> {
+        None
+    }
+
+    /// Whether this load staged the lanes the engine's N-request scheduler
+    /// serves ([`crate::mesh_family::MeshFamily::mesh_lanes`]).
+    fn engine_lanes_staged(&self) -> bool {
+        false
+    }
+
+    /// Whether a pipeline-parallel mesh that the bundle keeps itself is
+    /// active (Qwen4 PP). Default `false`, also for a model that owns its
+    /// mesh lifecycle ([`Self::owns_mesh_lifecycle`]).
+    fn pipeline_mesh(&self) -> bool {
+        false
+    }
+
     /// Downcast hatch for the architecture composition root.
     ///
     /// `hipfire-generate` legitimately needs the concrete bundle to call a

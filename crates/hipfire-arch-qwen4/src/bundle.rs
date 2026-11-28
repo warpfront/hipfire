@@ -6695,6 +6695,22 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
         "qwen4"
     }
 
+    fn eos_ids(&self) -> Vec<u32> {
+        vec![self.config.eos_token_id]
+    }
+
+    fn serving_guard(&self) -> Option<hipfire_runtime::external_rows::ServingGuard> {
+        self.ple_serving_guard()
+    }
+
+    fn engine_lanes_staged(&self) -> bool {
+        self.lane_topology() == "single" && self.lanes().is_some()
+    }
+
+    fn pipeline_mesh(&self) -> bool {
+        self.pp_mesh_active()
+    }
+
     fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
         None
     }

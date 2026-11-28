@@ -390,6 +390,16 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
     fn arch_key(&self) -> &'static str {
         "gemma4"
     }
+    /// The config's `<eos>`, then the end-of-turn id resolved at load.
+    fn eos_ids(&self) -> Vec<u32> {
+        vec![self.config.eos_token, self.eos_tok]
+    }
+    fn bos_id(&self) -> Option<u32> {
+        Some(self.config.bos_token)
+    }
+    fn engine_lanes_staged(&self) -> bool {
+        self.lanes.is_some()
+    }
     fn kv_cache_mut(&mut self) -> Option<&mut KvCache> {
         // Two caches (sliding + full) and no basis for preferring one.
         None

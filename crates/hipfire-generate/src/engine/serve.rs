@@ -568,9 +568,10 @@ impl Driver {
                 }
             };
             let eos = m
-                .qwen4()
-                .map(|bundle| bundle.config.eos_token_id)
-                .ok_or("engine lanes need a Qwen4 bundle")?;
+                .state
+                .as_deref()
+                .and_then(|state| state.eos_ids().first().copied())
+                .ok_or("engine lanes need a model that declares its eos")?;
             let stream = ChatMlStream::new(
                 &ChatMl {
                     started_in_think,
@@ -947,7 +948,8 @@ fn speculative(
     // `Err(None)`: no drafter; `Err(Some(reason))`: the request decodes AR.
     let drafter = drafter.ok_or(None)?;
     if route == GenerationRoute::Gemma4Ar {
-        let cache_cap = m.gemma4().ok_or(None)?.state.max_seq;
+        // The Gemma 4 load sizes its state to `max_seq` (`load_gemma4_bundle`).
+        let cache_cap = m.max_seq;
         if let Some(reason) = crate::dense::gemma4_eagle_declines(
             Some(drafter),
             false,
@@ -966,8 +968,12 @@ fn speculative(
     let inputs = crate::batch::batch_route_inputs(&req.original_msg, m, Some(drafter));
     match select_generation_route(&inputs) {
         GenerationRoute::Qwen4Spec => Ok(SpecRequest {
+            // A Qwen4 load: a pipeline mesh is its only `pp_gpus` load, and
+            // only Raon penalizes generated tokens alone.
             config: crate::qwen::qwen_spec_config(
-                m,
+                m.arch_id,
+                m.pp_gpus.is_some(),
+                false,
                 drafter,
                 gpu_arch,
                 sampler,

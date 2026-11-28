@@ -3445,7 +3445,10 @@ pub fn generate_dflash(
     // takeover, DFlash/DSpark, naive sampled mode or penalties); anything
     // else is refused here, before the prompt plan or any state mutation.
     // Handled (true): the caller must not also emit an AR response.
-    let pp_mesh = m.qwen4().is_some_and(|bundle| bundle.pp_mesh_active());
+    let pp_mesh = m
+        .state
+        .as_deref()
+        .is_some_and(|state| state.pipeline_mesh());
     if pp_mesh {
         let native_naive = m
             .speculator
@@ -3485,7 +3488,10 @@ pub fn generate_dflash(
     // DFlash is single-turn by construction — `seq_pos` is reset to 0
     // below before seed_target_hidden_from_prompt runs — so we never
     // need to guard on `seq_pos == 0` here.
-    let is_qwen4 = m.qwen4().is_some();
+    let is_qwen4 = m
+        .state
+        .as_deref()
+        .is_some_and(|state| state.arch_key() == "qwen4");
     // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
     // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
     // produces garbage (Plain only if the .hfq carries no template, e.g. an
@@ -3733,7 +3739,9 @@ pub fn generate_dflash(
     // `None` only without a speculator (the spec route requires one).
     let spec_config = m.speculator.as_deref().map(|drafter| {
         qwen_spec_config(
-            m,
+            m.arch_id,
+            pp_mesh,
+            !is_qwen4 && m.raon().is_some(),
             drafter,
             &gpu.arch,
             &sampler,
@@ -3747,7 +3755,11 @@ pub fn generate_dflash(
     if let Some(config) = spec_config.filter(|_| {
         is_qwen4 && crate::engine::runs_on_engine(crate::ar::GenerationRoute::Qwen4Spec)
     }) {
-        let eos = m.qwen4().map_or(0, |bundle| bundle.config.eos_token_id);
+        let eos = m
+            .state
+            .as_deref()
+            .and_then(|state| state.eos_ids().first().copied())
+            .unwrap_or(0);
         let protocol = crate::engine::chatml::ChatMl {
             started_in_think,
             tools: tools.is_some(),
@@ -4453,10 +4465,15 @@ fn spec_retire_done_fields(done: &mut serde_json::Value, run: &SpecRun) {
 /// sequence can end a native Qwen4 window strictly inside it: the drafter
 /// then keeps its pre-window snapshots reopenable for
 /// `repair_terminal_prefix`. Raon's AR producer penalizes generated tokens
-/// only; the speculative route follows. The Qwen spec routes emit no
-/// logprobs.
+/// only (`penalty_generated_only`); the speculative route follows. The Qwen
+/// spec routes emit no logprobs. The caller names the load's facts
+/// (`arch_id`, `pp_mesh`, `penalty_generated_only`), so the engine route
+/// reaches no bundle downcast.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_spec_config(
-    m: &LoadedModel,
+    arch_id: u32,
+    pp_mesh: bool,
+    penalty_generated_only: bool,
     drafter: &dyn Speculator,
     gpu_arch: &str,
     sampler: &SamplerConfig,
@@ -4465,7 +4482,6 @@ pub(crate) fn qwen_spec_config(
     cactus_delta: f32,
 ) -> SpecRequestConfig {
     let mtp = drafter.name() == "mtp";
-    let pp_mesh = m.qwen4().is_some_and(|bundle| bundle.pp_mesh_active());
     SpecRequestConfig {
         temp: sampler.temperature,
         top_p: sampler.top_p,
@@ -4475,14 +4491,14 @@ pub(crate) fn qwen_spec_config(
         rng_seed: seed,
         allow_ngram_modifier: mtp
             && !pp_mesh
-            && hipfire_config::mtp_ngram_enabled_for_arch(m.arch_id, gpu_arch),
+            && hipfire_config::mtp_ngram_enabled_for_arch(arch_id, gpu_arch),
         repeat_penalty: sampler.repeat_penalty,
         repeat_window: sampler.repeat_window,
         presence_penalty: sampler.presence_penalty,
         frequency_penalty: sampler.frequency_penalty,
         stop_sequences,
         logprobs: false,
-        penalty_generated_only: m.raon().is_some(),
+        penalty_generated_only,
     }
 }
 
@@ -11887,8 +11903,9 @@ pub fn generate_qwen4_ar(
 ) {
     let route = crate::ar::GenerationRoute::Qwen4Ar;
     let Some((vocab_size, eos_token)) = m
-        .qwen4()
-        .map(|bundle| (bundle.config.vocab_size, bundle.config.eos_token_id))
+        .state
+        .as_deref()
+        .and_then(|state| Some((state.vocab_size(), state.eos_ids().first().copied()?)))
     else {
         emit_active_attempt_error(
             stdout,

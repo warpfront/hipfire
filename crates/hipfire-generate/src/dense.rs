@@ -2281,7 +2281,11 @@ pub fn generate_gemma4(
         id,
         false,
     );
-    let Some(cfg_eos_tok) = m.gemma4().map(|bundle| bundle.config.eos_token) else {
+    let Some(cfg_eos_tok) = m
+        .state
+        .as_deref()
+        .and_then(|state| state.eos_ids().first().copied())
+    else {
         emit_error_with_id(stdout, id, "gemma4 bundle missing on arch_id=13 generate");
         return;
     };
@@ -2305,15 +2309,10 @@ pub fn generate_gemma4(
         return;
     }
     let stop_set = gemma4_stop_set(m);
-    let bundle = m
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Gemma4Bundle>())
-        .expect("the gemma4 bundle was resolved above");
 
     // Hard refusal: the prompt alone must fit (KV writes at pos >= max_seq
-    // would be out of bounds).
-    let cache_cap = bundle.state.max_seq;
+    // would be out of bounds). The load sizes the state to `max_seq`.
+    let cache_cap = m.max_seq;
     if prompt_ids.len() >= cache_cap {
         emit_error_with_id(
             stdout,
@@ -2346,7 +2345,10 @@ pub fn generate_gemma4(
     // Plan against the canonical render: the previous turn's prompt on the
     // prefill grid or a cached snapshot. Prefill resumes there and computes
     // only the rest.
-    let reused = hipfire_runtime::arch_model::ArchModel::session_plan(&*bundle, &prompt_ids, route);
+    let reused = m
+        .state
+        .as_deref()
+        .map_or(0, |state| state.session_plan(&prompt_ids, route));
     // G12: on the engine loop when the flag is set and the load admits it,
     // AR and EAGLE alike; a decline (nothing emitted) keeps the loops below.
     // Logprobs stay legacy.
@@ -2548,7 +2550,11 @@ pub(crate) fn gemma4_prompt_ids(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) -> Result<Vec<u32>, String> {
-    let bos_tok = m.gemma4().ok_or("gemma4 bundle missing")?.config.bos_token;
+    let bos_tok = m
+        .state
+        .as_deref()
+        .and_then(|state| state.bos_id())
+        .ok_or("gemma4 bundle missing")?;
     let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer not loaded")?;
     let tools_nonempty = tools.is_some_and(|t| !t.is_empty());
     let mut ids: Vec<u32> = if let Some(template) = m.chat_template.as_ref() {
@@ -2627,10 +2633,13 @@ pub(crate) fn gemma4_prompt_ids(
 /// config's `<eos>` (id 1), the documented 106, and `<|tool_response>`,
 /// which ends a tool-call turn (the client sends the response).
 pub(crate) fn gemma4_stop_set(m: &LoadedModel) -> Vec<u32> {
-    let Some(bundle) = m.gemma4() else {
-        return Vec::new();
-    };
-    let mut s = vec![bundle.config.eos_token, bundle.eos_tok];
+    let mut s = m
+        .state
+        .as_deref()
+        .map_or_else(Vec::new, |state| state.eos_ids());
+    if s.is_empty() {
+        return s;
+    }
     if !s.contains(&106) {
         s.push(106);
     }

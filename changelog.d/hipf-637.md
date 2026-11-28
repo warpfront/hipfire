@@ -1,0 +1,4 @@
+### Changes: G12 engine routes reach no bundle downcast
+
+- **The engine routes read model facts through `ArchModel`, not through a bundle downcast (HIPF-637).** `ArchModel` has five new methods with defaults: `eos_ids`, `bos_id`, `serving_guard`, `engine_lanes_staged` and `pipeline_mesh`. Qwen4 and Gemma 4 implement them. The engine lane admission, the Gemma 4 EAGLE context check, the Gemma 4 stop set and prompt BOS, the serving guard, `engine_lanes_route` and the Qwen spec request configuration use them. Output does not change.
+- The Qwen4 AR, Qwen4 speculative and Gemma 4 entries no longer downcast before they select the engine loop. The Gemma 4 entry reads `max_seq` from the load and plans the session through `ArchModel`. The direction ratchet `direction_bundle_downcasts` goes down by one.

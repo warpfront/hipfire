@@ -2979,28 +2979,23 @@ fn qwen4_lone_request_takes_lane_for(msg: &serde_json::Value, m: &LoadedModel) -
         })
 }
 
-/// The engine's N-request scheduler serves this load's staged lanes (G12):
-/// the engine loop runs Qwen4 AR and the load staged single-card lanes. A
-/// lone request enters it too: it decodes on the resident state, as the
-/// singleton does, until a peer arrives. Native-MTP lanes run the native MTP
-/// drafter's windows; other drafters' requests (DFlash2) verify on the
-/// resident state beside AR lanes.
-pub(crate) fn engine_serves_lanes(m: &LoadedModel) -> bool {
-    crate::engine::runs_on_engine(GenerationRoute::Qwen4Ar)
-        && m.qwen4()
-            .is_some_and(|b| b.lane_topology() == "single" && b.lanes().is_some())
-}
-
 /// The route whose staged lanes the engine's N-request scheduler serves on
-/// this load: Qwen4 AR ([`engine_serves_lanes`]) or Gemma 4 AR (its engine
-/// lanes, staged only on the engine loop; an EAGLE drafter's requests verify
-/// on the resident state).
+/// this load (G12): the load's AR route, when the model staged engine lanes
+/// (Qwen4 single-card lanes; Gemma 4 lanes, staged only on the engine loop)
+/// and that route runs on the engine. A lone request enters it too: it
+/// decodes on the resident state, as the singleton does, until a peer
+/// arrives. Native-MTP lanes run the native MTP drafter's windows; other
+/// drafters' requests (DFlash2, EAGLE) verify on the resident state.
 pub fn engine_lanes_route(m: &LoadedModel) -> Option<GenerationRoute> {
-    if engine_serves_lanes(m) {
-        return Some(GenerationRoute::Qwen4Ar);
+    if !m
+        .state
+        .as_deref()
+        .is_some_and(|state| state.engine_lanes_staged())
+    {
+        return None;
     }
-    (crate::engine::runs_on_engine(GenerationRoute::Gemma4Ar) && gemma4_engine_lanes_staged(m))
-        .then_some(GenerationRoute::Gemma4Ar)
+    let route = batch_generation_route(&serde_json::Value::Null, m, None);
+    crate::engine::runs_on_engine(route).then_some(route)
 }
 
 /// Qwen4 lane admission: greedy requests, or sampled ones when the store is
