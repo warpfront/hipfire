@@ -158,6 +158,7 @@ pub mod railgun_quarantine;
 pub mod railgun_window;
 pub mod rdna;
 pub mod replay;
+pub mod retained_keys;
 pub mod rope;
 pub mod router_fault;
 pub mod sampled_rows_compact;

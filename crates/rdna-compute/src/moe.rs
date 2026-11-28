@@ -1946,7 +1946,7 @@ impl Gpu {
         // token), recording and graph capture keep the incumbent symbol.
         let fast = self.route_rows(tokens) > 1
             && self.flags.qwen4_router_fast_enabled()
-            && !self.replay.is_recording()
+            && !self.replay.blocks_eager_verify_routes()
             && !self.graphs.capture_mode;
         let func: &str = if fast {
             "moe_router_softmax_top10_f32_fast"
@@ -3609,7 +3609,7 @@ impl Gpu {
         // pick's x (bitwise the one-row kernel).
         let r4 = k == 640
             && self.flags.qwen4_moe_down_r4_enabled()
-            && !self.replay.is_recording()
+            && !self.replay.blocks_eager_verify_routes()
             && !self.graphs.capture_mode;
         // DESIGN F1: drop-zero planar experts bind the planar twin module (same ABI, grid and
         // arithmetic); the physical row-tile PM twin reads the shipped layout only.

@@ -11314,6 +11314,41 @@ impl DonorLoan {
     }
 }
 
+/// Verify-body keys from `HIPFIRE_QWEN4_VERIFY_TAPE_ROWS=<rows>|<lo>-<hi>|<a>,<b>`
+/// (HIPF-297): one retained PM4 tape per (verify rows, GDN capture-ring half),
+/// owned by [`rdna_compute::retained_keys::RetainedKeys`].
+/// `HIPFIRE_QWEN4_VERIFY_TAPE_ROUTES=0` keeps the eager-only verify routes
+/// (lane-rows PM, router `_fast`, MoE down r4) out of the tapes;
+/// `HIPFIRE_QWEN4_VERIFY_TAPE_CAL_GAP` sets the positions between a key's two
+/// calibration recordings (default 1).
+/// ponytail: developer knob; HIPF-298 owns the default and the pre-warm.
+fn qwen4_verify_tapes_from_env() -> Option<rdna_compute::retained_keys::RetainedKeys> {
+    let spec = hipfire_config::developer_var("HIPFIRE_QWEN4_VERIFY_TAPE_ROWS").ok()?;
+    let mut rows = Vec::new();
+    for part in spec.split(',') {
+        let (lo, hi) = part.split_once('-').unwrap_or((part, part));
+        let (lo, hi) = (
+            lo.trim().parse::<usize>().ok()?,
+            hi.trim().parse::<usize>().ok()?,
+        );
+        for r in lo.max(2)..=hi {
+            if !rows.contains(&r) {
+                rows.push(r);
+            }
+        }
+    }
+    let routes = hipfire_config::developer_var("HIPFIRE_QWEN4_VERIFY_TAPE_ROUTES")
+        .map_or(true, |value| value != "0");
+    let cal_gap = hipfire_config::developer_var("HIPFIRE_QWEN4_VERIFY_TAPE_CAL_GAP")
+        .ok()
+        .and_then(|gap| gap.parse().ok())
+        .unwrap_or(1);
+    eprintln!("[qwen4-verify-tape] armed rows={rows:?} routes={routes} cal_gap={cal_gap}");
+    Some(rdna_compute::retained_keys::RetainedKeys::new(
+        rows, routes, cal_gap,
+    ))
+}
+
 /// Reusable production forward owner.  Construct it once per assembled bundle
 /// and use `forward_token`/`forward_chunk` repeatedly; both methods share the
 /// exact same chunk implementation.
@@ -11465,6 +11500,10 @@ pub struct Qwen4GpuForward {
     /// the duration of one prompt tile: [`Self::tile_moe`] then reads
     /// `moe_borrow[borrow_view]`.
     pub(crate) borrow_runtimes_active: bool,
+    /// Verify-body keys (`HIPFIRE_QWEN4_VERIFY_TAPE_ROWS`, HIPF-297).
+    pub(crate) verify_tape: Option<rdna_compute::retained_keys::RetainedKeys>,
+    /// The forward in flight runs on a `verify_tape` key's controller.
+    pub(crate) verify_tape_active: bool,
     /// The class view of the running prompt tile.
     pub(crate) borrow_view: usize,
     /// `Some` on an `HIPFIRE_EP_RESERVE_DECOUPLE=1` load: the 4096-row prompt plan,
@@ -13869,6 +13908,8 @@ impl Qwen4GpuForward {
             cache_replay_quiescent: Cell::new(true),
             borrow_class_rows,
             borrow_runtimes_active: false,
+            verify_tape: qwen4_verify_tapes_from_env(),
+            verify_tape_active: false,
             borrow_view: 0,
             decode_q8,
             route_trace,
@@ -17449,8 +17490,15 @@ impl Qwen4GpuForward {
         // verify remains eager but must reproduce the singleton AR arithmetic
         // that would run at this exact boundary, and so must a one-row forward
         // the retained route hands to HIP.
+        // HIPF-297 prototype: with a verify key armed, every decode tile takes
+        // the recorded arithmetic its tape bakes in, so replayed and eager
+        // windows agree (as Redline+MTP does through the AR tape).
         let verify_reference = qwen4_tile_verify_reference(self.prefill_scope, || {
-            self.ar_launch_reference(bundle, gpu)
+            if self.verify_tape.is_some() {
+                Qwen4ArLaunch::Recorded
+            } else {
+                self.ar_launch_reference(bundle, gpu)
+            }
         });
         #[cfg(feature = "lab")]
         if tokens.len() >= 2 && verify_reference.is_some() {
@@ -17472,6 +17520,25 @@ impl Qwen4GpuForward {
         let prior_rows_scope = gpu.lane_rows_scope;
         gpu.lane_rows_scope |= wide_verify > 0;
         let prior_verify_reference = gpu.set_qwen4_verify_reference(verify_reference);
+        // HIPF-297 prototype: an admitted verify forward runs on its key's
+        // controller; the AR controller is parked in the key meanwhile.
+        let slot = bundle
+            .state
+            .gdn
+            .first()
+            .map(|layer| layer.recurrent.buf.as_ptr() as usize);
+        let position = bundle.state.position;
+        let admitted = match (self.verify_tape.as_mut(), slot) {
+            (Some(tapes), Some(slot))
+                if !self.prefill_scope
+                    && wide_hidden_capture.is_some()
+                    && self.mesh_segment.is_none() =>
+            {
+                tapes.admit(gpu, tokens.len(), slot, position)
+            }
+            _ => false,
+        };
+        self.verify_tape_active = admitted;
         let result = self.forward_chunk_scoped(
             bundle,
             gpu,
@@ -17482,6 +17549,12 @@ impl Qwen4GpuForward {
             wide_hidden_capture,
             output_policy,
         );
+        if admitted {
+            self.verify_tape_active = false;
+            if let Some(tapes) = self.verify_tape.as_mut() {
+                tapes.release(gpu);
+            }
+        }
         Self::leave_tile_scopes(gpu, scopes);
         gpu.set_wide_verify_rows(prior_wide_verify);
         gpu.lane_rows_scope = prior_rows_scope;
@@ -17550,7 +17623,12 @@ impl Qwen4GpuForward {
         // The router fault row is the absolute token position for a prefill / verify
         // chunk. A one-token decode forward may be captured or retained, which bakes
         // the launch's row base in, so it reports row 0 (position = decode step).
-        gpu.set_router_row_base(if n > 1 { bundle.state.position } else { 0 });
+        // A recorded verify key replays at every position: its fault row is 0 too.
+        gpu.set_router_row_base(if n > 1 && !self.verify_tape_active {
+            bundle.state.position
+        } else {
+            0
+        });
         // Before anything can read a donor a failed staged forward left
         // overwritten (decode included).
         if let Some(stage) = self.expert_stage.as_ref() {
@@ -18606,7 +18684,7 @@ impl Qwen4GpuForward {
             let ple_split = steps
                 .iter()
                 .position(|step| matches!(step, Step::GroupedDepthwise(_)))
-                .filter(|_| n > 1 || device_token.is_some());
+                .filter(|_| (n > 1 && !self.verify_tape_active) || device_token.is_some());
             let deferred = ple_split.is_some();
             let mut readback = self.token_readback.as_mut();
             let history = &bundle.state.ple_history;
@@ -18701,7 +18779,7 @@ impl Qwen4GpuForward {
                 .flatten()
                 .map(|layer| format!("{:#x}", layer.recurrent.buf.as_ptr() as usize));
             let eligible = bundle.image_context.is_none()
-                && n == 1
+                && (n == 1 || self.verify_tape_active)
                 && gpu
                     .replay
                     .route_identity(QWEN4_GDN_SLOT_IDENTITY_KEY)
@@ -18712,7 +18790,7 @@ impl Qwen4GpuForward {
                 && config.profile.is_flash_next()
                 && !self.lane_scope
                 && !gpu.prefill_invariant_scope
-                && wide_hidden_capture.is_none()
+                && (wide_hidden_capture.is_none() || self.verify_tape_active)
                 && self.qsa_tap.is_none()
                 && !mesh_run
                 && self.cut_layers.is_none()
@@ -18755,11 +18833,17 @@ impl Qwen4GpuForward {
                 None
             };
             if shadow_route.is_none() {
-                let admission = qwen4_retained_admission(
-                    &gpu.replay,
-                    &gpu.arch,
-                    specialized_sealed_moe_retained_admission(),
-                );
+                // HIPF-297 prototype: the verify key skips the unvalidated-gfx11
+                // refusal of the AR tape; its own digest check is the gate.
+                let admission = if self.verify_tape_active {
+                    specialized_sealed_moe_retained_admission()
+                } else {
+                    qwen4_retained_admission(
+                        &gpu.replay,
+                        &gpu.arch,
+                        specialized_sealed_moe_retained_admission(),
+                    )
+                };
                 match retained_body_action(eligible, gpu.replay.state(), admission) {
                     RetainedBodyAction::Ineligible => {}
                     RetainedBodyAction::Refuse { reason } => {
@@ -18862,7 +18946,13 @@ impl Qwen4GpuForward {
                 // (`HIPFIRE_RAILGUN_CHECK`) is on.
                 self.cache_replay_quiescent.set(false);
                 match unsafe { gpu.replay_pm4_routed_checked(next_position) } {
-                    Ok(_) => { self.cache_replay_quiescent.set(true); true },
+                    Ok(_) => {
+                        self.cache_replay_quiescent.set(true);
+                        if self.verify_tape_active {
+                            eprintln!("[qwen4-verify-tape] replay rows={n} position={next_position}");
+                        }
+                        true
+                    },
                     Err(failure) => {
                         self.cache_replay_quiescent.set(failure.quiescence == rdna_compute::replay::ReplayQuiescence::Proven);
                         let reason = failure.error;
@@ -19177,6 +19267,12 @@ impl Qwen4GpuForward {
                         &destination,
                         wide_elements,
                     )?;
+                } else if self.verify_tape_active {
+                    // A device copy cannot enter the tape: a recorded kernel
+                    // copy, which a replay already ran.
+                    if !routed {
+                        gpu.copy_f32_buffer(&destination, &source, wide_elements)?;
+                    }
                 } else {
                     gpu.copy_d2d(&source, &destination, source.byte_size())?;
                 }
@@ -19322,7 +19418,14 @@ impl Qwen4GpuForward {
                 // that knows both ends of one recorded body, so the window can never
                 // outlive the forward that opened it.
                 if gpu.replay.should_auto_finalize_capture() {
-                    finish_qwen4_capture(gpu, diagnostic_capture);
+                    match self
+                        .verify_tape
+                        .as_mut()
+                        .filter(|_| self.verify_tape_active)
+                    {
+                        Some(tapes) => tapes.finish_capture(gpu, next_position),
+                        None => finish_qwen4_capture(gpu, diagnostic_capture),
+                    }
                 }
                 if traced {
                     self.write_route_trace(gpu, next_position)?;

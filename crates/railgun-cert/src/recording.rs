@@ -1449,7 +1449,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-lane-rows-pm",
         predicates: &[IsRecording, CaptureMode],
-        condition: "Gpu::lane_rows_pm_enabled (lane_rows_pm.rs): HIPFIRE_FN_LANE_PM_ROWS (gfx1151 default on, 0 kills), exact gfx1151, Gpu::lane_rows_scope (set by forward_lanes, the qwen4 speculative verify forward in forward_chunk_inner and the DFlash2 draft head dflash_lm_head) and `!is_recording() && !capture_mode`",
+        condition: "Gpu::lane_rows_pm_enabled (lane_rows_pm.rs): HIPFIRE_FN_LANE_PM_ROWS (gfx1151 default on, 0 kills), exact gfx1151, Gpu::lane_rows_scope (set by forward_lanes, the qwen4 speculative verify forward in forward_chunk_inner and the DFlash2 draft head dflash_lm_head) and `!blocks_eager_verify_routes() && !capture_mode` (`blocks_eager_verify_routes` is `is_recording()` unless the recording controller is a Qwen4 verify key, `RetainedKeys`, HIPF-297)",
         effect: KernelSelection,
         switches: "eager lane step, speculative verify and DFlash2 draft head: qwen4_lane_rows_pm (gemv_mq6g256v2_xbatch_pm, its x4 form, gemv_q8_0_k8_xbatch_pm, gemv_q8_0_k320_xbatch_pm) at rows 2..=8; recorded: incumbent rows kernels",
         kernels: &["gemm_mq6g256v2_f32_rows", "gemm_mq6g256v2_f32_rows_x4", "gemv_q8_0_k8_rows", "gemv_q8_0_staged_rows"],
@@ -1515,7 +1515,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-moe-down-r4",
         predicates: &[IsRecording, CaptureMode],
-        condition: "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded (moe.rs): K = 640, HIPFIRE_QWEN4_MOE_DOWN_R4 (exact gfx1151 default on, 0 kills) and `!is_recording() && !capture_mode`",
+        condition: "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded (moe.rs): K = 640, HIPFIRE_QWEN4_MOE_DOWN_R4 (exact gfx1151 default on, 0 kills) and `!blocks_eager_verify_routes() && !capture_mode` (`is_recording()` unless the recording controller is a Qwen4 verify key, HIPF-297)",
         effect: KernelSelection,
         switches: "eager: the _k640_r4 twin (four weight rows per wave, grid ceil(M/4)); recorded: the one-row incumbent",
         kernels: &["gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded"],
@@ -4065,7 +4065,7 @@ pub const SITES: &[Site] = &[
     Site {
         file: "rdna-compute/src/lane_rows_pm.rs",
         function: "lane_rows_pm_enabled",
-        occurrences: 2,
+        occurrences: 1,
         decisions: &["qwen4-lane-rows-pm"],
     },
     Site {
@@ -4130,7 +4130,23 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "rdna-compute/src/replay.rs",
+        function: "blocks_eager_verify_routes",
+        occurrences: 1,
+        decisions: &[
+            "qwen4-lane-rows-pm",
+            "qwen4-moe-down-r4",
+            "qwen4-opt-in-eager-fusions",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/replay.rs",
         function: "should_auto_finalize_capture",
+        occurrences: 1,
+        decisions: &["replay-recorder-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/retained_keys.rs",
+        function: "release",
         occurrences: 1,
         decisions: &["replay-recorder-lifecycle"],
     },
@@ -4305,7 +4321,7 @@ pub const SITES: &[Site] = &[
     Site {
         file: "rdna-compute/src/moe.rs",
         function: "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
-        occurrences: 2,
+        occurrences: 1,
         decisions: &["qwen4-moe-down-r4"],
     },
     Site {
@@ -4611,7 +4627,7 @@ pub const SITES: &[Site] = &[
     Site {
         file: "rdna-compute/src/moe.rs",
         function: "moe_router_softmax_top10_f32",
-        occurrences: 2,
+        occurrences: 1,
         decisions: &["qwen4-opt-in-eager-fusions"],
     },
     Site {
