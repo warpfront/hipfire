@@ -4527,7 +4527,7 @@ pub(crate) fn qwen_spec_engine_done(
         done["ar_tokens"] = t.ar_steps.into();
     }
     if s.drafter == "mtp" {
-        qwen_mtp_done_fields(done, t.accepted, Some(s.stats.clone()));
+        qwen_mtp_done_fields(done, t.accepted, s.stats);
     }
 }
 

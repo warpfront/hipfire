@@ -104,7 +104,10 @@ pub struct SpecDone {
     pub tally: Tally,
     /// The drafter's proposal width.
     pub block: usize,
-    pub stats: MtpRequestStats,
+    /// The drafter's request counters. `None` for a request that finished in
+    /// a window lane: the drafter saw only its resident part, and the lane
+    /// counts windows by other rules (HIPF-605).
+    pub stats: Option<MtpRequestStats>,
 }
 
 impl SpecDone {
@@ -116,7 +119,7 @@ impl SpecDone {
                 ..d.tally
             },
             block: d.drafter.block_size(),
-            stats: d.drafter.request_stats(),
+            stats: Some(d.drafter.request_stats()),
         }
     }
 }

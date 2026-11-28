@@ -1,0 +1,3 @@
+### Fixes: G12 engine loop, Qwen4 MTP window lanes
+
+- **A Qwen4 MTP request that finishes in an engine window lane no longer reports the counters of its resident part as the whole request (HIPF-605; `generation.engine_loop = engine` with `serve.vmm_batch`).** The `done` of such a request had `mtp_windows`, `floor_ar_windows`, `ar_windows`, `mtp_retired` and `ngram_mod_*` from the drafter before the park only (for example `mtp_windows 0` with `cycles 30`). The lane counts its windows by other rules, so a sum would mix two definitions. The `done` now omits these fields. `tau`, `cycles`, `accepted` and `ar_tokens` stay and cover the whole request. A resident request reports all fields as before.

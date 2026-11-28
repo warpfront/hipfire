@@ -1759,7 +1759,10 @@ impl Batch for Ctx<'_> {
         let mut d = run
             .take_window_drafting()
             .ok_or("a parked speculative request was not at a window boundary")?;
-        live.lane_spec = Some(SpecDone::of(&d));
+        live.lane_spec = Some(SpecDone {
+            stats: None,
+            ..SpecDone::of(&d)
+        });
         let gpu = &mut self.gpus.devices[0];
         let reset = d.drafter.reset(gpu);
         crate::common::fail_closed_invalidate_graphs_and_replay(gpu);
