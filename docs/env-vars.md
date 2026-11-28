@@ -1267,7 +1267,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ALLOW_UNIT_IMATRIX` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_API_KEY` | scripts/archive/lmx_continuous_batch.py, scripts/check_qwen4_vision.py | harness |
 | `HIPFIRE_ARCH` | scripts/kernel-tune-loop.sh | harness |
-| `HIPFIRE_AR_GRAPH` | crates/hipfire-arch-qwen35/examples/mq4_prefill_state_oracle.rs, crates/hipfire-arch-qwen35/examples/shared_weight_state_oracle.rs | experimental |
+| `HIPFIRE_AR_GRAPH` | crates/hipfire-arch-inkling2/src/decode_replay.rs, crates/hipfire-arch-inkling2/src/decode_serve.rs | experimental |
 | `HIPFIRE_AR_GRAPH_TRACE` | crates/hipfire-arch-qwen35/examples/mq4_prefill_state_oracle.rs, crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
 | `HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL` | crates/rdna-compute/src/attention.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
@@ -2643,7 +2643,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_REGISTRY_URL` | crates/hipfire-cli/src/main.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_RELEASES_LATEST_API` | scripts/install.sh, scripts/test_install_revision.py | harness |
 | `HIPFIRE_REMOTE` | scripts/archive/mi300x_bootstrap.sh | harness |
-| `HIPFIRE_REPLAY_BACKEND` | crates/hipfire-arch-qwen35/examples/mq4_prefill_state_oracle.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | stable |
+| `HIPFIRE_REPLAY_BACKEND` | crates/hipfire-arch-inkling2/src/decode_replay.rs, crates/hipfire-arch-inkling2/src/decode_serve.rs | stable |
 | `HIPFIRE_REPLAY_BINDINGS_VERIFY` | crates/rdna-compute/src/replay.rs | developer |
 | `HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE` | crates/hipfire-dispatch/src/pipeline/sealed_moe.rs | developer |
 | `HIPFIRE_REPLAY_GRAPH` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/rdna-compute/src/dflash_gdn_replay.rs | developer |
@@ -2667,7 +2667,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_REPLAY_ROUTE_PROOF` | crates/rdna-compute/src/replay.rs, scripts/archive/redline-greedy-parity.py | developer |
 | `HIPFIRE_REPLAY_ROUTE_PROOF_LOG` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/replay.rs | experimental |
 | `HIPFIRE_REPLAY_STABLE_TILING` | crates/rdna-compute/src/attention.rs | developer |
-| `HIPFIRE_REPLAY_TRANSPORT` | crates/hipfire-arch-qwen35/tests/pm4_staging_hold_hw.rs, crates/hipfire-arch-qwen4/examples/qwen4_g2_replay_gate.rs | experimental |
+| `HIPFIRE_REPLAY_TRANSPORT` | crates/hipfire-arch-inkling2/src/decode_replay.rs, crates/hipfire-arch-inkling2/tests/decode_replay_hw.rs | experimental |
 | `HIPFIRE_REPO` | scripts/archive/quantize-dspark.sh | harness |
 | `HIPFIRE_REPO_ROOT` | benchmarks/quality-baselines/harness/spe_ablation.sh, crates/rdna-compute/examples/hip_loop/generic.rs | harness |
 | `HIPFIRE_REQUIRE_INSTALLED_A3B_HFQ` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
