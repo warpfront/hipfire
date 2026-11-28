@@ -37,8 +37,9 @@ pub use gpu::{
 };
 pub use gpu_forward::{forward_token_gpu, forward_token_gpu_capture, forward_token_gpu_trace};
 pub use gpu_prefill::{
-    forward_decode_gpu, forward_prefill_gpu, forward_prefill_gpu_with, prefill_supported,
-    PrefillLogits, PrefillMode, PrefillRoutes, PREFILL_BLOCK_ROWS,
+    forward_decode_gpu, forward_prefill_gpu, forward_prefill_gpu_with, prefill_chunk_rows,
+    prefill_supported, PrefillBlockPlan, PrefillLogits, PrefillMode, PrefillRoutes,
+    PREFILL_BLOCK_RUNGS,
 };
 
 /// The verified Mini config.json metadata shape, shared by tests across modules.

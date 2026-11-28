@@ -3200,6 +3200,21 @@ fn bench(a: &Args) -> Result<(), String> {
     if !hipfire_arch_inkling2::prefill_supported(b, &gpu) {
         return Err("bench: blocked prefill not supported on this load".into());
     }
+    // The rung the load's VRAM budget chose (before any dev re-size).
+    let load_block_rows = hipfire_arch_inkling2::prefill_chunk_rows(b, &gpu);
+    let load_plan = b
+        .gpu_weights
+        .as_ref()
+        .and_then(|w| w.summary.prefill_plan)
+        .map(|p| {
+            serde_json::json!({
+                "rows": p.rows,
+                "scratch_bytes": p.scratch_bytes,
+                "working_set_bytes": p.working_set_bytes,
+                "budget_bytes": p.budget_bytes,
+                "refused": p.refused,
+            })
+        });
     if let Some(rows) = block_rows {
         // Size the load's prefill scratch for the dev block (untimed).
         let cfg = b.config.clone();
@@ -3217,6 +3232,10 @@ fn bench(a: &Args) -> Result<(), String> {
         .as_ref()
         .and_then(|s| s.prefill_scratch.as_ref())
         .map(|s| s.bytes());
+    // Pooled working set of the prefill: the device-free drop over the runs
+    // from a drained pool (every transient buffer is parked, none returned).
+    gpu.drain_pool();
+    let free_before = gpu.device_mem_info().ok().map(|(f, _)| f as i64);
     let mut run = |b: &mut hipfire_arch_inkling2::Inkling2Bundle| -> Result<(f64, String), String> {
         b.reset_session_state(&mut gpu)?;
         let mut last = Vec::new();
@@ -3265,6 +3284,9 @@ fn bench(a: &Args) -> Result<(), String> {
         );
         ms.push(t);
     }
+    let pool_bytes =
+        free_before.and_then(|f0| gpu.device_mem_info().ok().map(|(f1, _)| f0 - f1 as i64));
+    let parked_bytes = gpu.pool_parked_bytes();
     let mut sorted = ms.clone();
     sorted.sort_by(f64::total_cmp);
     let median = sorted[sorted.len() / 2];
@@ -3276,7 +3298,11 @@ fn bench(a: &Args) -> Result<(), String> {
         "n": n,
         "prefill_routes": executed,
         "block_rows": block_rows,
+        "load_block_rows": load_block_rows,
+        "load_prefill_plan": load_plan,
         "prefill_scratch_bytes": scratch_bytes,
+        "prefill_pool_bytes": pool_bytes,
+        "pool_parked_bytes": parked_bytes,
         "load_s": load_s,
         "warmup_ms": warm_ms,
         "ms": ms,

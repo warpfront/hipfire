@@ -724,6 +724,11 @@ pub struct VramSummary {
     /// and the block rows it is sized for (0 / 0 when the load has none).
     pub prefill_scratch_bytes: u64,
     pub prefill_block_rows: usize,
+    /// The rung choice behind `prefill_block_rows` (`None` without the
+    /// blocked prefill): its pooled working set (reserved, allocated by the
+    /// first prefill, not counted in [`Self::total_bytes`]) and the free VRAM
+    /// it was chosen against.
+    pub prefill_plan: Option<crate::gpu_prefill::PrefillBlockPlan>,
 }
 
 impl VramSummary {
@@ -731,6 +736,7 @@ impl VramSummary {
         b as f64 / (1u64 << 30) as f64
     }
 
+    /// Bytes resident after the load (what the measured load delta sees).
     pub fn total_bytes(&self) -> u64 {
         self.weight_bytes
             + self.kv_bytes
@@ -740,11 +746,22 @@ impl VramSummary {
     }
 
     pub fn text(&self) -> String {
+        let plan = match &self.prefill_plan {
+            Some(p) => format!(
+                "; + prefill working set {:.3} GiB at the first prefill (rung {} of {:?}, chosen against {} free)",
+                Self::gib(p.working_set_bytes),
+                p.rows,
+                crate::gpu_prefill::PREFILL_BLOCK_RUNGS,
+                p.budget_bytes
+                    .map_or("unknown".to_string(), |b| format!("{:.3} GiB", Self::gib(b))),
+            ),
+            None => String::new(),
+        };
         format!(
             "inkling2 gpu load summary: weights {:.3} GiB ({} tensors, incl. down_proj pad +{:.3} GiB), \
              KV {:.3} GiB ({} full + {} SWA visits, max_seq {}), conv {:.4} GiB, \
              prefill scratch {:.3} GiB ({} rows), slack {:.3} GiB -> \
-             total {:.3} GiB (fits 24 GiB: {})",
+             total {:.3} GiB (fits 24 GiB: {}){plan}",
             Self::gib(self.weight_bytes),
             self.weight_tensors,
             Self::gib(self.down_pad_extra_bytes),
@@ -2070,21 +2087,26 @@ pub fn upload(
         .as_ref()
         .map(|cert| xts_route_capability(cert, cfg, &*g));
     let mut state = Inkling2GpuState::new_with_max_seq(g, cfg, max_seq)?;
+    let mut prefill_plan = None;
     if let Some(r) = xts_routes.as_ref().and_then(|c| c.prefill) {
         state.prefill_routes = r;
-        // The blocked prefill's persistent scratch, sized for the product block.
+        // The blocked prefill's persistent scratch, sized for the widest block
+        // rung the VRAM left after the weights, KV and conv admits (parked
+        // pool buffers count as free: an allocation drains them first).
         if crate::gpu_prefill::prefill_geometry_supported(cfg, g) {
-            match crate::gpu_prefill::PrefillScratch::new(
-                g,
-                cfg,
-                crate::gpu_prefill::PREFILL_BLOCK_ROWS,
-            ) {
+            let budget = g
+                .device_mem_info()
+                .ok()
+                .map(|(free, _)| (free + g.pool_parked_bytes()) as u64);
+            let plan = crate::gpu_prefill::PrefillBlockPlan::choose(cfg, budget);
+            match crate::gpu_prefill::PrefillScratch::new(g, cfg, plan.rows) {
                 Ok(s) => state.prefill_scratch = Some(s),
                 Err(e) => {
                     state.free_gpu(g);
                     return Err(e);
                 }
             }
+            prefill_plan = Some(plan);
         }
     }
 
@@ -2192,6 +2214,7 @@ pub fn upload(
         swa_visits,
         prefill_scratch_bytes: state.prefill_scratch.as_ref().map_or(0, |s| s.bytes()),
         prefill_block_rows: state.prefill_scratch.as_ref().map_or(0, |s| s.rows()),
+        prefill_plan,
     };
     Ok((
         Inkling2GpuWeights {

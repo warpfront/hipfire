@@ -59,6 +59,13 @@ pub fn load_inkling2_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Inkli
                 }
             }
             eprintln!("  {summary}");
+            if let Some(line) = gpu_weights
+                .summary
+                .prefill_plan
+                .and_then(|p| p.fallback_line(&config))
+            {
+                eprintln!("  {line}");
+            }
             // Typed XTS layout only: one capability line (legacy prints nothing new).
             if let Some(routes) = gpu_weights.xts_route_capability() {
                 eprintln!("  {}", routes.load_line());

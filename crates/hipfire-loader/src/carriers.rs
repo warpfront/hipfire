@@ -13231,16 +13231,25 @@ impl Carrier for Inkling2Carrier {
         self.admit_options(ctx.draft_path, options)?;
         let bundle = hipfire_arch_inkling2::load_inkling2_bundle(src, ctx)?;
         // Load summary states the route that actually runs: F16 KV whatever
-        // the requested mode, one prompt row per forward (no chunking), and
-        // the executable context when the forward's full-attention τ limit
-        // is below the allocated max_seq.
+        // the requested mode, the prefill route (blocked at the rung the
+        // load's VRAM admitted, or one prompt row per forward where the
+        // blocked prefill is unsupported), and the executable context when
+        // the forward's full-attention τ limit is below the allocated max_seq.
         hipfire_config::load_summary::note(
             hipfire_config::load_summary::Facet::Kv,
             format!("{:?}", hipfire_arch_inkling2::INKLING2_KV_DTYPE).to_ascii_lowercase(),
         );
+        let block_rows = hipfire_arch_inkling2::prefill_chunk_rows(&bundle, ctx.gpu);
         hipfire_config::load_summary::note(
             hipfire_config::load_summary::Facet::Prefill,
-            "single-row (one prompt token per forward, no chunking)",
+            if block_rows > 1 {
+                format!(
+                    "blocked, {block_rows}-row blocks (widest of {:?} the free VRAM admits)",
+                    hipfire_arch_inkling2::PREFILL_BLOCK_RUNGS
+                )
+            } else {
+                "single-row (one prompt token per forward, no chunking)".to_string()
+            },
         );
         let position_limit = bundle
             .config

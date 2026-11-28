@@ -262,8 +262,112 @@ fn grid_u32(n: usize, what: &str) -> Result<u32, String> {
 // Public contract
 // ---------------------------------------------------------------------------
 
-/// Default rows per prefill block (one launch sequence through the 48 visits).
-pub const PREFILL_BLOCK_ROWS: usize = 512;
+/// Prefill block rungs (rows per launch sequence through the 48 visits),
+/// widest first. A load takes the widest rung its VRAM budget admits
+/// ([`PrefillBlockPlan::choose`]); 512 is the floor.
+pub const PREFILL_BLOCK_RUNGS: [usize; 3] = [2048, 1024, 512];
+
+/// Free VRAM a load keeps beyond the chosen rung's scratch and working set:
+/// decode transients, kernel/JIT state and allocator slack (the Qwen widened
+/// prefill's admission margin).
+pub const PREFILL_VRAM_HEADROOM_BYTES: u64 = 1 << 30;
+
+/// Pooled transient working set of the blocked prefill: what the first prefill
+/// leaves allocated beyond the [`PrefillScratch`]. The per-row part is the
+/// block's residual streams (the running state, the AttnRes blocks and the
+/// loop's saved copies) plus one visit's arena (attention, controller, router
+/// and expert-producer rows); every such buffer is at most 64 MiB at 2048
+/// rows, so the pool parks it and it stays resident between prompts. The fixed
+/// part is row-independent (kernel modules a prefill loads, routing tables,
+/// the head). Measured as the device-free drop over warm-up + 1 rep from a
+/// drained pool (`inkling_kld bench`, `prefill_pool_bytes`; artifact C,
+/// gfx1201, InkBlockPolicy j11511): 308 / 512 / 919 MB at 512 / 1024 / 2048
+/// rows, the same 919 MB at pp8192 (context-independent), i.e. ~104 MB plus
+/// 43.2 `[rows, n_embd]` F32 streams. The two constants below bound it with
+/// 13-17% margin at every rung.
+pub const PREFILL_WORKING_SET_FIXED_BYTES: u64 = 128 << 20;
+/// Per-row part of the working set, in `[rows, n_embd]` F32 streams
+/// ([`PREFILL_WORKING_SET_FIXED_BYTES`]).
+pub const PREFILL_WORKING_SET_STREAMS: usize = 48;
+
+/// The block size a load runs its blocked prefill at, and the VRAM accounting
+/// behind the choice (printed in the load summary).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefillBlockPlan {
+    /// The chosen rung.
+    pub rows: usize,
+    /// Persistent scratch at `rows` ([`PrefillScratch::bytes_for`]).
+    pub scratch_bytes: u64,
+    /// Pooled working set at `rows` ([`prefill_working_set_bytes`]).
+    pub working_set_bytes: u64,
+    /// Device-free bytes the choice was made against (weights, KV and conv
+    /// already resident; parked pool buffers count as free). `None` when the
+    /// device could not report it.
+    pub budget_bytes: Option<u64>,
+    /// Widest rung the budget refused, if any (logged as a fallback).
+    pub refused: Option<usize>,
+}
+
+/// Pooled working-set bytes of a `rows`-row block:
+/// [`PREFILL_WORKING_SET_FIXED_BYTES`] plus [`PREFILL_WORKING_SET_STREAMS`]
+/// streams of `[rows, n_embd]` F32.
+pub fn prefill_working_set_bytes(cfg: &Inkling2Config, rows: usize) -> u64 {
+    PREFILL_WORKING_SET_FIXED_BYTES + (PREFILL_WORKING_SET_STREAMS * rows * cfg.n_embd * 4) as u64
+}
+
+impl PrefillBlockPlan {
+    /// Device bytes a rung needs on top of what is resident: its scratch, its
+    /// working set and [`PREFILL_VRAM_HEADROOM_BYTES`].
+    pub fn need_bytes(cfg: &Inkling2Config, rows: usize) -> u64 {
+        PrefillScratch::bytes_for(cfg, rows)
+            + prefill_working_set_bytes(cfg, rows)
+            + PREFILL_VRAM_HEADROOM_BYTES
+    }
+
+    /// The widest of [`PREFILL_BLOCK_RUNGS`] whose [`Self::need_bytes`] fits
+    /// `budget`. With no reading, or when not even the floor fits, the floor
+    /// (512): its scratch allocation then decides the load as before.
+    pub fn choose(cfg: &Inkling2Config, budget: Option<u64>) -> Self {
+        let floor = PREFILL_BLOCK_RUNGS[PREFILL_BLOCK_RUNGS.len() - 1];
+        let rows = budget
+            .and_then(|b| {
+                PREFILL_BLOCK_RUNGS
+                    .iter()
+                    .copied()
+                    .find(|&r| Self::need_bytes(cfg, r) <= b)
+            })
+            .unwrap_or(floor);
+        Self {
+            rows,
+            scratch_bytes: PrefillScratch::bytes_for(cfg, rows),
+            working_set_bytes: prefill_working_set_bytes(cfg, rows),
+            budget_bytes: budget,
+            refused: (rows != PREFILL_BLOCK_RUNGS[0]).then_some(PREFILL_BLOCK_RUNGS[0]),
+        }
+    }
+
+    /// One log line for a load that did not get the widest rung.
+    pub fn fallback_line(&self, cfg: &Inkling2Config) -> Option<String> {
+        let widest = self.refused?;
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        Some(match self.budget_bytes {
+            Some(b) => format!(
+                "inkling2 prefill: {widest}-row blocks need {:.3} GiB (scratch {:.3} + working set {:.3} \
+                 + headroom {:.3}), {:.3} GiB free after the load: falling back to {}-row blocks",
+                gib(Self::need_bytes(cfg, widest)),
+                gib(PrefillScratch::bytes_for(cfg, widest)),
+                gib(prefill_working_set_bytes(cfg, widest)),
+                gib(PREFILL_VRAM_HEADROOM_BYTES),
+                gib(b),
+                self.rows
+            ),
+            None => format!(
+                "inkling2 prefill: device free memory unavailable: falling back to {}-row blocks",
+                self.rows
+            ),
+        })
+    }
+}
 
 /// Which rows of a prefill call produce logits.
 pub enum PrefillLogits<'a> {
@@ -522,10 +626,26 @@ impl Inkling2GpuState {
     }
 }
 
+/// Rows per [`forward_prefill_gpu`] call a caller that chunks a prompt (abort
+/// checks between chunks) should pass: the load's prefill block rows (the rung
+/// its VRAM budget admitted, [`PrefillBlockPlan`]) when [`prefill_supported`],
+/// otherwise 1 (the scalar loop).
+pub fn prefill_chunk_rows(bundle: &Inkling2Bundle, gpu: &Gpu) -> usize {
+    if !prefill_supported(bundle, gpu) {
+        return 1;
+    }
+    bundle
+        .gpu_state
+        .as_ref()
+        .and_then(|s| s.prefill_scratch.as_ref())
+        .map_or(1, PrefillScratch::rows)
+}
+
 /// Prefill `ids` at positions `start_pos..start_pos + ids.len()` (must equal
 /// the session cursor). Success advances every visit's KV/conv state and the
-/// cursor by exactly `ids.len()`. Blocked path when [`prefill_supported`],
-/// otherwise the scalar loop (one [`crate::forward_token_gpu`] per row).
+/// cursor by exactly `ids.len()`. Blocked path when [`prefill_supported`], in
+/// blocks of the load's prefill block rows ([`prefill_chunk_rows`]); otherwise
+/// the scalar loop (one [`crate::forward_token_gpu`] per row).
 pub fn forward_prefill_gpu(
     bundle: &mut Inkling2Bundle,
     gpu: &mut Gpu,
@@ -541,6 +661,7 @@ pub fn forward_prefill_gpu(
         .as_ref()
         .map(|s| s.prefill_routes)
         .unwrap_or(PrefillRoutes::F16);
+    let block_rows = prefill_chunk_rows(bundle, gpu);
     forward_prefill_gpu_with(
         bundle,
         gpu,
@@ -549,7 +670,7 @@ pub fn forward_prefill_gpu(
         logits,
         PrefillMode::BLOCKED,
         routes,
-        PREFILL_BLOCK_ROWS,
+        block_rows,
         None,
     )
 }
@@ -2943,10 +3064,14 @@ fn head_rows(
         let vocab = cfg.vocab_size;
         let mut out = Vec::with_capacity(rows);
         const HEAD_ROWS: usize = 64;
+        // One logits buffer for every 64-row chunk: each chunk is downloaded
+        // (synchronously) before the next overwrites it, so the scored head
+        // holds 64 rows of logits, not the whole block's.
+        let logits_buf = ar.f32(gpu, HEAD_ROWS.min(rows) * vocab, "logits")?;
         let mut done = 0;
         while done < rows {
             let take = HEAD_ROWS.min(rows - done);
-            let logits = ar.f32(gpu, take * vocab, "logits")?;
+            let logits = ar.push(view(ar.get(logits_buf), 0, &[take * vocab])?);
             let hv = view(ar.get(hidden), done * e, &[take, e])?;
             linear(gpu, &gw.unembed, &hv, ar.get(logits), take, c.mode.gemm)?;
             hip(
@@ -2976,4 +3101,37 @@ fn head_rows(
     })();
     ar.free(gpu);
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mini() -> Inkling2Config {
+        Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap()
+    }
+
+    #[test]
+    fn block_plan_takes_the_widest_rung_that_fits() {
+        let cfg = mini();
+        let need = |r| PrefillBlockPlan::need_bytes(&cfg, r);
+        assert!(need(512) < need(1024) && need(1024) < need(2048));
+        let pick = |b: Option<u64>| PrefillBlockPlan::choose(&cfg, b);
+        assert_eq!(pick(Some(32 << 30)).rows, 2048);
+        assert_eq!(pick(Some(32 << 30)).refused, None);
+        assert_eq!(pick(Some(need(2048))).rows, 2048);
+        let p = pick(Some(need(2048) - 1));
+        assert_eq!((p.rows, p.refused), (1024, Some(2048)));
+        assert_eq!(
+            p.scratch_bytes + p.working_set_bytes + PREFILL_VRAM_HEADROOM_BYTES,
+            need(1024)
+        );
+        assert_eq!(pick(Some(need(1024) - 1)).rows, 512);
+        // Below the floor's need, and with no reading: the floor.
+        assert_eq!(pick(Some(0)).rows, 512);
+        let p = pick(None);
+        assert_eq!((p.rows, p.refused), (512, Some(2048)));
+        assert!(p.fallback_line(&cfg).unwrap().contains("512-row"));
+        assert!(pick(Some(32 << 30)).fallback_line(&cfg).is_none());
+    }
 }

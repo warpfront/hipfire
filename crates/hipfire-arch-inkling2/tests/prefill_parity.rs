@@ -5,16 +5,33 @@
 //! Blocked-prefill oracle (`forward_prefill_gpu`) against the scalar loop
 //! (`forward_token_gpu` per row) on the typed-XTS artifact, gfx1201.
 //!
-//! One process, three arms over the same `N_TOK` prompt rows on one load:
+//! One process, three arms over the same prompt rows on one load:
 //! 1. scalar: one `forward_token_gpu` per row (visit traces and logits at the
 //!    probe rows), then the final state and `DECODE` continuation logits;
-//! 2. row-exact prefill (`PrefillMode::RowExact`, odd block size so blocks end
-//!    mid-sequence and the last block is partial): must equal arm 1 **bit for
+//! 2. row-exact prefill (`PrefillMode::RowExact`): must equal arm 1 **bit for
 //!    bit**: every probe row's 48 `visit_out`, every probe row's logits, KV
 //!    bytes, conv history, position tags, cursors, and the decode logits;
 //! 3. blocked prefill (`PrefillMode::Blocked`, product arithmetic): the same
 //!    structural state exactly (tags, cursors, `seq_pos`), numeric state and
 //!    logits within an envelope relative to accepted arithmetic (below).
+//!
+//! Two tests, each its own process (`--exact`):
+//! * `blocked_prefill_oracle` (1100 rows): row-exact at an odd block (200, so
+//!   blocks end mid-sequence and the last one is partial), the decode-route
+//!   noise reference, the single-site arms, and blocked/512 and blocked/200.
+//! * `blocked_prefill_oracle_rungs` (2600 rows): the load's block-size rungs
+//!   (`PREFILL_BLOCK_RUNGS`). Row-exact at 1024 and 2048 (bitwise, as arm 2),
+//!   the grouped-only reference, then gated blocked arms at 512, 1024 and
+//!   2048. The 1024 and 2048 arms prefill in two calls, `[0, SPLIT)` then
+//!   `[SPLIT, 2600)`, so a block starts mid-ring with pre-block keys in the
+//!   SWA cache: at 2048 the second call's first block spans `[300, 2348)`,
+//!   wider than the 1024-row SWA ring (keys before the block from the cache,
+//!   in-block keys from staging, only the trailing 1024 rows written back),
+//!   and both rungs end on a partial tail (`[2348, 2600)`). Each wide blocked
+//!   arm also reports whether it equals blocked/512 bit for bit
+//!   (informational: the split moves the FA2 key tiling, so it need not). The
+//!   scalar-attention noise reference stays in the first test: its VRAM grows
+//!   with context and 2600 rows do not fit beside the other arms.
 //!
 //! **Blocked-arm envelope.** The prompt is random tokens, so a probe row can sit
 //! on a near-tie that any accepted arithmetic change flips, and different
@@ -29,19 +46,27 @@
 //! `mean KL <= 1.5 * mean KL_ref` (the 1e-4 floor covers near-zero rows).
 //! Absolute floors catch gross breakage regardless: finite logits and
 //! r >= 0.99 at every probe row, argmax agreement >= 95%, decode r >= 0.995.
+//! The rungs test gates the pooled bars and the floors; its per-row r bar is
+//! printed, not gated: over 25 probes on 2600 rows it fails the accepted
+//! blocked/512 arithmetic itself (row 2347: r 0.99827 vs 0.99899) while 1024
+//! and 2048 flip a different row (2047: r 0.99884 vs 0.99898), with pooled KL
+//! max 1.042e-2 / mean 1.078e-3 (512) and 1.042e-2 / 1.049e-3 (wide) against
+//! bars 1.537e-2 / 1.172e-3; the planted fault lands at 5.2e-2 / 1.8e-2
+//! (InkBlockPolicy o1, 2026-11-28).
 //!
 //! **Planted fault.** `INKLING2_ORACLE_PLANT=ctrl-swap` swaps the gain and forget
 //! weights of every controller of the first core layer before the gated arms
 //! (the scalar reference keeps the true weights); the gate must then fail on
-//! blocked/512 and blocked/200.
+//! every gated blocked arm.
 //!
-//! Probe rows span block boundaries, positions 1023/1024/1025 (relative-bias
-//! extent and the first SWA ring wrap at 1024 rows) and the partial tail.
+//! Probe rows span block boundaries (200, 300, 512, 1324, 2048, 2348),
+//! positions 1023/1024/1025 (relative-bias extent and the first SWA ring wrap
+//! at 1024 rows) and the partial tail.
 //!
 //! ```sh
 //! INKLING2_MQ4=.../inkling2-mini-xts-c.hfq HIPFIRE_GRAPH=0 \
 //!   cargo test --release -p hipfire-arch-inkling2 --test prefill_parity -- \
-//!   --ignored --nocapture --exact blocked_prefill_oracle
+//!   --ignored --nocapture --exact blocked_prefill_oracle   # or blocked_prefill_oracle_rungs
 //! ```
 
 use hipfire_arch_inkling2::arch_model::{Inkling2Bundle, Inkling2State};
@@ -49,24 +74,45 @@ use hipfire_arch_inkling2::config::Inkling2Config;
 use hipfire_arch_inkling2::gpu::upload;
 use hipfire_arch_inkling2::weights::Inkling2Weights;
 use hipfire_arch_inkling2::{
-    forward_prefill_gpu_with, forward_token_gpu, forward_token_gpu_trace, prefill_supported,
-    PrefillLogits, PrefillMode, PrefillRoutes,
+    forward_prefill_gpu_with, forward_token_gpu, forward_token_gpu_trace, prefill_chunk_rows,
+    prefill_supported, PrefillLogits, PrefillMode, PrefillRoutes, PREFILL_BLOCK_RUNGS,
 };
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
 
-const N_TOK: usize = 1100;
-const MAX_SEQ: usize = 1152;
 const DECODE: usize = 6;
 const EXACT_BLOCK: usize = 200;
-const PROBES: [usize; 16] = [
-    0, 1, 2, 3, 199, 200, 201, 511, 512, 999, 1000, 1022, 1023, 1024, 1025, 1099,
-];
+/// First call's rows for the two-call (1024 / 2048 rung) arms.
+const SPLIT: usize = 300;
 
-fn tokens() -> Vec<u32> {
+/// One oracle's prompt length, KV rows and probe rows (ascending).
+struct Case {
+    n_tok: usize,
+    max_seq: usize,
+    probes: &'static [usize],
+}
+
+const ORIGINAL: Case = Case {
+    n_tok: 1100,
+    max_seq: 1152,
+    probes: &[
+        0, 1, 2, 3, 199, 200, 201, 511, 512, 999, 1000, 1022, 1023, 1024, 1025, 1099,
+    ],
+};
+
+const RUNGS: Case = Case {
+    n_tok: 2600,
+    max_seq: 2688,
+    probes: &[
+        0, 1, 2, 3, 299, 300, 301, 511, 512, 999, 1000, 1022, 1023, 1024, 1025, 1323, 1324, 1325,
+        2047, 2048, 2049, 2347, 2348, 2349, 2599,
+    ],
+};
+
+fn tokens(c: &Case) -> Vec<u32> {
     // Deterministic ids inside the vocabulary (LCG); content is irrelevant to parity.
     let mut s = 0x1234_5678_9abc_def0u64;
-    (0..N_TOK)
+    (0..c.n_tok)
         .map(|_| {
             s = s
                 .wrapping_mul(6364136223846793005)
@@ -76,7 +122,7 @@ fn tokens() -> Vec<u32> {
         .collect()
 }
 
-fn load(gpu: &mut Gpu) -> Inkling2Bundle {
+fn load(gpu: &mut Gpu, c: &Case) -> Inkling2Bundle {
     assert_eq!(
         std::env::var("HIPFIRE_GRAPH").as_deref(),
         Ok("0"),
@@ -86,7 +132,7 @@ fn load(gpu: &mut Gpu) -> Inkling2Bundle {
     let hfq = HfqFile::open(std::path::Path::new(&art)).expect("open artifact");
     let cfg = Inkling2Config::from_metadata_json(&hfq.metadata_json).expect("config");
     let weights = Inkling2Weights::load(&hfq, &cfg).expect("weights");
-    let (gw, gs) = upload(&weights, &cfg, gpu, MAX_SEQ).expect("upload");
+    let (gw, gs) = upload(&weights, &cfg, gpu, c.max_seq).expect("upload");
     Inkling2Bundle {
         config: cfg,
         weights,
@@ -153,19 +199,19 @@ fn snapshot(b: &Inkling2Bundle, gpu: &Gpu, arm: &mut Arm) {
     arm.seq_pos = gs.seq_pos;
 }
 
-fn decode(b: &mut Inkling2Bundle, gpu: &mut Gpu, toks: &[u32], arm: &mut Arm) {
+fn decode(b: &mut Inkling2Bundle, gpu: &mut Gpu, c: &Case, toks: &[u32], arm: &mut Arm) {
     for (d, &t) in toks.iter().enumerate() {
-        let l = forward_token_gpu(b, gpu, t, N_TOK + d).expect("decode");
+        let l = forward_token_gpu(b, gpu, t, c.n_tok + d).expect("decode");
         arm.decode.push(l);
     }
 }
 
-fn run_scalar(b: &mut Inkling2Bundle, gpu: &mut Gpu, toks: &[u32]) -> Arm {
+fn run_scalar(b: &mut Inkling2Bundle, gpu: &mut Gpu, c: &Case, toks: &[u32]) -> Arm {
     reset(b, gpu);
     let mut arm = Arm::default();
     let t0 = std::time::Instant::now();
     for (pos, &t) in toks.iter().enumerate() {
-        let l = if PROBES.contains(&pos) {
+        let l = if c.probes.contains(&pos) {
             let (l, tr) = forward_token_gpu_trace(b, gpu, t, pos).expect("scalar trace");
             arm.visits.push(tr);
             arm.logits.push(l.clone());
@@ -180,12 +226,17 @@ fn run_scalar(b: &mut Inkling2Bundle, gpu: &mut Gpu, toks: &[u32]) -> Arm {
     arm
 }
 
+/// Prefill `toks` in `block`-row blocks: one call, or with `split > 0` two
+/// calls `[0, split)` and `[split, len)` (the second call's blocks start
+/// mid-ring).
 fn run_prefill(
     b: &mut Inkling2Bundle,
     gpu: &mut Gpu,
+    c: &Case,
     toks: &[u32],
     mode: PrefillMode,
     block: usize,
+    split: usize,
 ) -> Arm {
     reset(b, gpu);
     let mut arm = Arm::default();
@@ -193,42 +244,51 @@ fn run_prefill(
     let e = b.config.n_embd;
     let mut probe_logits = Vec::new();
     let mut argmaxes = Vec::new();
+    let calls: Vec<(usize, usize)> = if split == 0 {
+        vec![(0, toks.len())]
+    } else {
+        vec![(0, split), (split, toks.len())]
+    };
     let t0 = std::time::Instant::now();
-    {
-        let mut sink = |pos: usize, row: &[f32]| -> Result<(), String> {
-            if PROBES.contains(&pos) {
-                probe_logits.push(row.to_vec());
-            }
-            argmaxes.push(argmax(row));
-            Ok(())
-        };
-        forward_prefill_gpu_with(
-            b,
-            gpu,
-            toks,
-            0,
-            PrefillLogits::Rows {
-                from: 0,
-                sink: &mut sink,
-            },
-            mode,
-            PrefillRoutes::F16,
-            block,
-            Some(&mut trace),
-        )
-        .expect("prefill");
+    for (start, end) in calls {
+        {
+            let mut sink = |pos: usize, row: &[f32]| -> Result<(), String> {
+                if c.probes.contains(&pos) {
+                    probe_logits.push(row.to_vec());
+                }
+                argmaxes.push(argmax(row));
+                Ok(())
+            };
+            forward_prefill_gpu_with(
+                b,
+                gpu,
+                &toks[start..end],
+                start,
+                PrefillLogits::Rows {
+                    from: 0,
+                    sink: &mut sink,
+                },
+                mode,
+                PrefillRoutes::F16,
+                block,
+                Some(&mut trace),
+            )
+            .expect("prefill");
+        }
+        // The trace holds this call's rows only.
+        for &p in c.probes.iter().filter(|&&p| (start..end).contains(&p)) {
+            let r = p - start;
+            arm.visits.push(
+                trace
+                    .iter()
+                    .map(|v| v[r * e..(r + 1) * e].to_vec())
+                    .collect(),
+            );
+        }
     }
     arm.seconds = t0.elapsed().as_secs_f64();
     arm.logits = probe_logits;
     arm.argmax = argmaxes;
-    for &p in &PROBES {
-        arm.visits.push(
-            trace
-                .iter()
-                .map(|v| v[p * e..(p + 1) * e].to_vec())
-                .collect(),
-        );
-    }
     drop(trace);
     snapshot(b, gpu, &mut arm);
     arm
@@ -293,8 +353,8 @@ fn f16_bits_max_diff(a: &[u8], b: &[u8]) -> f32 {
 }
 
 /// Bitwise comparison; returns the first mismatch description.
-fn exact_mismatch(s: &Arm, x: &Arm) -> Option<String> {
-    for (i, &p) in PROBES.iter().enumerate() {
+fn exact_mismatch(c: &Case, s: &Arm, x: &Arm) -> Option<String> {
+    for (i, &p) in c.probes.iter().enumerate() {
         for v in 0..s.visits[i].len() {
             if s.visits[i][v] != x.visits[i][v] {
                 return Some(format!(
@@ -334,13 +394,20 @@ fn exact_mismatch(s: &Arm, x: &Arm) -> Option<String> {
 
 /// Prints the arm's metrics, pushes structural and absolute-floor breaches to
 /// `fails`, and returns `(r, KL)` per probe row for the envelope gate.
-fn report(scalar: &Arm, got: &Arm, label: &str, fails: &mut Vec<String>) -> Vec<(f64, f64)> {
+fn report(
+    c: &Case,
+    scalar: &Arm,
+    got: &Arm,
+    label: &str,
+    fails: &mut Vec<String>,
+) -> Vec<(f64, f64)> {
+    let n_tok = c.n_tok;
     if got.tags != scalar.tags || got.caps != scalar.caps || got.seq_pos != scalar.seq_pos {
         fails.push(format!("{label}: tags / cursors / seq_pos differ"));
     }
-    let mut rows = Vec::with_capacity(PROBES.len());
+    let mut rows = Vec::with_capacity(c.probes.len());
     let mut worst_visit = (0.0f64, 0usize, 0usize);
-    for (i, &p) in PROBES.iter().enumerate() {
+    for (i, &p) in c.probes.iter().enumerate() {
         let (vr, vi) = (0..scalar.visits[i].len())
             .map(|v| (rel_rms(&got.visits[i][v], &scalar.visits[i][v]), v))
             .fold((0.0f64, 0usize), |a, b| if b.0 > a.0 { b } else { a });
@@ -368,11 +435,11 @@ fn report(scalar: &Arm, got: &Arm, label: &str, fails: &mut Vec<String>) -> Vec<
         .filter(|(a, b)| a == b)
         .count();
     eprintln!(
-        "  {label}: argmax agreement {agree}/{N_TOK}; worst probe visit rel-rms {:.3e} (row {}, visit {})",
+        "  {label}: argmax agreement {agree}/{n_tok}; worst probe visit rel-rms {:.3e} (row {}, visit {})",
         worst_visit.0, worst_visit.1, worst_visit.2
     );
-    if agree * 100 < N_TOK * 95 {
-        fails.push(format!("{label}: argmax agreement {agree}/{N_TOK}"));
+    if agree * 100 < n_tok * 95 {
+        fails.push(format!("{label}: argmax agreement {agree}/{n_tok}"));
     }
     let kv_worst = (0..scalar.kv.len())
         .map(|v| f16_bits_max_diff(&scalar.kv[v], &got.kv[v]))
@@ -398,24 +465,90 @@ fn report(scalar: &Arm, got: &Arm, label: &str, fails: &mut Vec<String>) -> Vec<
     rows
 }
 
-#[test]
-#[ignore = "needs the typed-XTS Inkling-2 artifact + gfx1201"]
-fn blocked_prefill_oracle() {
+/// The envelope gate of a blocked arm against the grouped-only reference
+/// (`rows` and `grouped` are [`report`]'s per-probe `(r, KL)`): the pooled KL
+/// bars, and with `per_row` the per-probe `r >= r_ref - 0.001` bar (otherwise
+/// its breaches are printed, not gated).
+fn envelope(
+    c: &Case,
+    label: &str,
+    rows: &[(f64, f64)],
+    grouped: &[(f64, f64)],
+    per_row: bool,
+    fails: &mut Vec<String>,
+) {
+    assert_eq!(
+        grouped.len(),
+        c.probes.len(),
+        "grouped-only runs before the gated arms"
+    );
+    for (i, &p) in c.probes.iter().enumerate() {
+        let (r, r_min) = (rows[i].0, grouped[i].0 - 0.001);
+        if !(r >= r_min) {
+            let m = format!("{label} row {p}: r {r:.7} < {r_min:.7}");
+            if per_row {
+                fails.push(m);
+            } else {
+                eprintln!("  (per-row, not gated) {m}");
+            }
+        }
+    }
+    let max_kl = |v: &[(f64, f64)]| v.iter().map(|x| x.1).fold(0.0f64, f64::max);
+    let mean_kl = |v: &[(f64, f64)]| v.iter().map(|x| x.1).sum::<f64>() / v.len() as f64;
+    let (kmax, kmax_bar) = (max_kl(rows), 1e-4f64.max(1.5 * max_kl(grouped)));
+    let (kmean, kmean_bar) = (mean_kl(rows), 1.5 * mean_kl(grouped));
+    eprintln!(
+        "  {label}: pooled KL max {kmax:.3e} (bar {kmax_bar:.3e}), mean {kmean:.3e} (bar {kmean_bar:.3e})"
+    );
+    if !(kmax <= kmax_bar && kmean <= kmean_bar) {
+        fails.push(format!(
+            "{label}: pooled KL max {kmax:.3e} / mean {kmean:.3e} over bars {kmax_bar:.3e} / {kmean_bar:.3e}"
+        ));
+    }
+}
+
+/// Swaps gain and forget on every controller of the first core layer when
+/// `INKLING2_ORACLE_PLANT=ctrl-swap` (once; it stays for every later arm).
+fn plant(b: &mut Inkling2Bundle, armed: &mut Option<String>) {
+    if armed.take().as_deref() != Some("ctrl-swap") {
+        return;
+    }
+    let gw = b.gpu_weights.as_mut().unwrap();
+    if let Some(cs) = gw.layers.iter_mut().find_map(|l| l.controllers.as_mut()) {
+        eprintln!("PLANTED: gain/forget swapped on every controller of the first core layer");
+        for ctrl in cs.iter_mut() {
+            std::mem::swap(&mut ctrl.gain, &mut ctrl.forget);
+        }
+    }
+}
+
+/// Load, the scalar arm and its fixed greedy continuation.
+fn setup(c: &Case) -> (Gpu, Inkling2Bundle, Vec<u32>, Arm, Vec<u32>) {
     let mut gpu = Gpu::init().expect("gpu init");
-    let mut b = load(&mut gpu);
+    let mut b = load(&mut gpu, c);
     assert!(
         prefill_supported(&b, &gpu),
         "blocked prefill not supported on this load"
     );
-    let toks = tokens();
+    let toks = tokens(c);
+    // The load's rung (VRAM-budgeted), then the scratch for the widest rung.
+    let load_rows = prefill_chunk_rows(&b, &gpu);
+    let widest = PREFILL_BLOCK_RUNGS[0];
+    let cfg = b.config.clone();
+    b.gpu_state
+        .as_mut()
+        .unwrap()
+        .resize_prefill_scratch(&mut gpu, &cfg, widest)
+        .expect("prefill scratch at the widest rung");
+    eprintln!("load rung: {load_rows}-row blocks; oracle scratch: {widest} rows");
 
-    let mut scalar = run_scalar(&mut b, &mut gpu, &toks);
+    let mut scalar = run_scalar(&mut b, &mut gpu, c, &toks);
     let cont: Vec<u32> = {
         // Fixed continuation: the scalar arm's greedy picks.
         let mut v = vec![*scalar.argmax.last().unwrap() as u32];
         let mut tmp = Arm::default();
         for d in 0..DECODE {
-            let l = forward_token_gpu(&mut b, &mut gpu, v[d], N_TOK + d).expect("decode");
+            let l = forward_token_gpu(&mut b, &mut gpu, v[d], c.n_tok + d).expect("decode");
             v.push(argmax(&l) as u32);
             tmp.decode.push(l);
         }
@@ -423,104 +556,71 @@ fn blocked_prefill_oracle() {
         v.truncate(DECODE);
         v
     };
-    eprintln!("scalar: {N_TOK} rows in {:.1}s", scalar.seconds);
+    eprintln!("scalar: {} rows in {:.1}s", c.n_tok, scalar.seconds);
+    (gpu, b, toks, scalar, cont)
+}
 
-    let mut exact = run_prefill(&mut b, &mut gpu, &toks, PrefillMode::ROW_EXACT, EXACT_BLOCK);
-    decode(&mut b, &mut gpu, &cont, &mut exact);
+/// Row-exact prefill at `block` (two calls when `split > 0`): bitwise the scalar loop.
+#[allow(clippy::too_many_arguments)]
+fn row_exact(
+    b: &mut Inkling2Bundle,
+    gpu: &mut Gpu,
+    c: &Case,
+    toks: &[u32],
+    cont: &[u32],
+    scalar: &Arm,
+    block: usize,
+    split: usize,
+    fails: &mut Vec<String>,
+) {
+    let mut exact = run_prefill(b, gpu, c, toks, PrefillMode::ROW_EXACT, block, split);
+    decode(b, gpu, c, cont, &mut exact);
     eprintln!(
-        "row-exact prefill: {:.1}s (block {EXACT_BLOCK})",
+        "row-exact prefill: {:.1}s (block {block}, split {split})",
         exact.seconds
     );
-    let exact_fail = exact_mismatch(&scalar, &exact);
-    match &exact_fail {
+    match exact_mismatch(c, scalar, &exact) {
         None => eprintln!(
-            "row-exact: BITWISE equal to the scalar loop (visits, logits, KV, conv, tags, decode)"
+            "row-exact/{block}: BITWISE equal to the scalar loop (visits, logits, KV, conv, tags, decode)"
         ),
-        Some(m) => eprintln!("row-exact: MISMATCH {m}"),
+        Some(m) => {
+            eprintln!("row-exact/{block}: MISMATCH {m}");
+            fails.push(format!("row-exact/{block}: {m}"));
+        }
     }
+}
 
-    let mut fails = Vec::new();
-    if let Some(m) = exact_fail {
-        fails.push(format!("row-exact: {m}"));
-    }
-    // Noise reference: the accepted decode-route change (FA2 vs the scalar
-    // attention kernel, `attn_fa2 = false`) on the same prompt, same metrics.
-    // (printed for scale; the envelope reference is the grouped-only arm)
-    {
-        b.gpu_state.as_mut().unwrap().attn_fa2 = false;
-        let mut s0 = run_scalar(&mut b, &mut gpu, &toks);
-        decode(&mut b, &mut gpu, &cont, &mut s0);
-        b.gpu_state.as_mut().unwrap().attn_fa2 = true;
-        eprintln!("reference: scalar loop with the scalar attention kernel vs FA2 decode");
-        report(&scalar, &s0, "noise-ref", &mut Vec::new());
-    }
-    let only = |gemm, grouped, blocked_attn| PrefillMode {
+fn only(gemm: bool, grouped: bool, blocked_attn: bool) -> PrefillMode {
+    PrefillMode {
         gemm,
         grouped,
         blocked_attn,
-    };
-    let arms = [
-        ("attn-only", only(false, false, true), 200usize, false),
-        ("gemm-only", only(true, false, false), 200, false),
-        ("grouped-only", only(false, true, false), 200, false),
-        ("blocked", PrefillMode::BLOCKED, 512, true),
-        ("blocked", PrefillMode::BLOCKED, 200, true),
-    ];
-    let mut grouped: Vec<(f64, f64)> = Vec::new();
-    // Planted once: it stays in place for both gated arms.
-    let mut plant = std::env::var("INKLING2_ORACLE_PLANT").ok();
-    for (name, mode, block, gate) in arms {
-        if gate && plant.take().as_deref() == Some("ctrl-swap") {
-            let gw = b.gpu_weights.as_mut().unwrap();
-            if let Some(cs) = gw.layers.iter_mut().find_map(|l| l.controllers.as_mut()) {
-                eprintln!(
-                    "PLANTED: gain/forget swapped on every controller of the first core layer"
-                );
-                for c in cs.iter_mut() {
-                    std::mem::swap(&mut c.gain, &mut c.forget);
-                }
-            }
-        }
-        let mut blk = run_prefill(&mut b, &mut gpu, &toks, mode, block);
-        decode(&mut b, &mut gpu, &cont, &mut blk);
-        eprintln!(
-            "{name} prefill (block {block}): {:.2}s = {:.0} rows/s",
-            blk.seconds,
-            N_TOK as f64 / blk.seconds
-        );
-        let label = format!("{name}/{block}");
-        let mut arm_fails = Vec::new();
-        let rows = report(&scalar, &blk, &label, &mut arm_fails);
-        if name == "grouped-only" {
-            grouped = rows.clone();
-        }
-        if gate {
-            assert_eq!(
-                grouped.len(),
-                PROBES.len(),
-                "grouped-only runs before the gated arms"
-            );
-            for (i, &p) in PROBES.iter().enumerate() {
-                let (r, r_min) = (rows[i].0, grouped[i].0 - 0.001);
-                if !(r >= r_min) {
-                    arm_fails.push(format!("{label} row {p}: r {r:.7} < {r_min:.7}"));
-                }
-            }
-            let max_kl = |v: &[(f64, f64)]| v.iter().map(|x| x.1).fold(0.0f64, f64::max);
-            let mean_kl = |v: &[(f64, f64)]| v.iter().map(|x| x.1).sum::<f64>() / v.len() as f64;
-            let (kmax, kmax_bar) = (max_kl(&rows), 1e-4f64.max(1.5 * max_kl(&grouped)));
-            let (kmean, kmean_bar) = (mean_kl(&rows), 1.5 * mean_kl(&grouped));
-            eprintln!(
-                "  {label}: pooled KL max {kmax:.3e} (bar {kmax_bar:.3e}), mean {kmean:.3e} (bar {kmean_bar:.3e})"
-            );
-            if !(kmax <= kmax_bar && kmean <= kmean_bar) {
-                arm_fails.push(format!(
-                    "{label}: pooled KL max {kmax:.3e} / mean {kmean:.3e} over bars {kmax_bar:.3e} / {kmean_bar:.3e}"
-                ));
-            }
-            fails.extend(arm_fails);
-        }
     }
+}
+
+/// One prefill arm, decoded and reported: `(arm, per-probe (r, KL), floor breaches)`.
+fn arm(
+    b: &mut Inkling2Bundle,
+    gpu: &mut Gpu,
+    c: &Case,
+    toks: &[u32],
+    cont: &[u32],
+    scalar: &Arm,
+    (name, mode, block, split): (&str, PrefillMode, usize, usize),
+) -> (Arm, Vec<(f64, f64)>, Vec<String>) {
+    let mut blk = run_prefill(b, gpu, c, toks, mode, block, split);
+    decode(b, gpu, c, cont, &mut blk);
+    eprintln!(
+        "{name} prefill (block {block}, split {split}): {:.2}s = {:.0} rows/s",
+        blk.seconds,
+        c.n_tok as f64 / blk.seconds
+    );
+    let mut fails = Vec::new();
+    let rows = report(c, scalar, &blk, &format!("{name}/{block}"), &mut fails);
+    (blk, rows, fails)
+}
+
+fn finish(mut gpu: Gpu, mut b: Inkling2Bundle, fails: Vec<String>) {
     if let Some(gw) = b.gpu_weights.take() {
         gw.free_gpu(&mut gpu);
     }
@@ -529,4 +629,120 @@ fn blocked_prefill_oracle() {
     }
     assert!(fails.is_empty(), "prefill oracle: {}", fails.join("; "));
     eprintln!("prefill oracle: PASS");
+}
+
+#[test]
+#[ignore = "needs the typed-XTS Inkling-2 artifact + gfx1201"]
+fn blocked_prefill_oracle() {
+    let c = &ORIGINAL;
+    let (mut gpu, mut b, toks, scalar, cont) = setup(c);
+    let mut fails = Vec::new();
+    row_exact(
+        &mut b,
+        &mut gpu,
+        c,
+        &toks,
+        &cont,
+        &scalar,
+        EXACT_BLOCK,
+        0,
+        &mut fails,
+    );
+    // Noise reference: the accepted decode-route change (FA2 vs the scalar
+    // attention kernel, `attn_fa2 = false`) on the same prompt, same metrics.
+    // (printed for scale; the envelope reference is the grouped-only arm)
+    {
+        b.gpu_state.as_mut().unwrap().attn_fa2 = false;
+        let mut s0 = run_scalar(&mut b, &mut gpu, c, &toks);
+        decode(&mut b, &mut gpu, c, &cont, &mut s0);
+        b.gpu_state.as_mut().unwrap().attn_fa2 = true;
+        eprintln!("reference: scalar loop with the scalar attention kernel vs FA2 decode");
+        report(c, &scalar, &s0, "noise-ref", &mut Vec::new());
+    }
+    let arms = [
+        ("attn-only", only(false, false, true), 200, false),
+        ("gemm-only", only(true, false, false), 200, false),
+        ("grouped-only", only(false, true, false), 200, false),
+        ("blocked", PrefillMode::BLOCKED, 512, true),
+        ("blocked", PrefillMode::BLOCKED, 200, true),
+    ];
+    let mut grouped: Vec<(f64, f64)> = Vec::new();
+    let mut planted = std::env::var("INKLING2_ORACLE_PLANT").ok();
+    for (name, mode, block, gate) in arms {
+        if gate {
+            plant(&mut b, &mut planted);
+        }
+        let (_, rows, arm_fails) = arm(
+            &mut b,
+            &mut gpu,
+            c,
+            &toks,
+            &cont,
+            &scalar,
+            (name, mode, block, 0),
+        );
+        if name == "grouped-only" {
+            grouped = rows.clone();
+        }
+        if gate {
+            fails.extend(arm_fails);
+            envelope(
+                c,
+                &format!("{name}/{block}"),
+                &rows,
+                &grouped,
+                true,
+                &mut fails,
+            );
+        }
+    }
+    finish(gpu, b, fails);
+}
+
+#[test]
+#[ignore = "needs the typed-XTS Inkling-2 artifact + gfx1201"]
+fn blocked_prefill_oracle_rungs() {
+    let c = &RUNGS;
+    let (mut gpu, mut b, toks, scalar, cont) = setup(c);
+    let mut fails = Vec::new();
+    for block in [1024, 2048] {
+        row_exact(
+            &mut b, &mut gpu, c, &toks, &cont, &scalar, block, SPLIT, &mut fails,
+        );
+    }
+    let (_, grouped, _) = arm(
+        &mut b,
+        &mut gpu,
+        c,
+        &toks,
+        &cont,
+        &scalar,
+        ("grouped-only", only(false, true, false), 200, 0),
+    );
+    let mut planted = std::env::var("INKLING2_ORACLE_PLANT").ok();
+    plant(&mut b, &mut planted);
+    // blocked/512 first: the wide rungs are compared with it bit for bit.
+    let mut blocked512: Option<Arm> = None;
+    for (block, split) in [(512, 0), (1024, SPLIT), (2048, SPLIT)] {
+        let label = format!("blocked/{block}");
+        let (blk, rows, arm_fails) = arm(
+            &mut b,
+            &mut gpu,
+            c,
+            &toks,
+            &cont,
+            &scalar,
+            ("blocked", PrefillMode::BLOCKED, block, split),
+        );
+        fails.extend(arm_fails);
+        envelope(c, &label, &rows, &grouped, false, &mut fails);
+        match blocked512.as_ref() {
+            None => blocked512 = Some(blk),
+            Some(b512) => match exact_mismatch(c, b512, &blk) {
+                None => eprintln!("  {label}: BITWISE equal to blocked/512"),
+                Some(m) => eprintln!("  {label}: differs from blocked/512: {m}"),
+            },
+        }
+    }
+    finish(gpu, b, fails);
 }
