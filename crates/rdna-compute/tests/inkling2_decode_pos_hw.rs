@@ -92,7 +92,11 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
 
 fn f16_plane(rng: &mut Lcg, rows: usize, scale: f32) -> Vec<u8> {
     (0..rows * D)
-        .flat_map(|_| half::f16::from_f32(rng.unit() * scale).to_bits().to_le_bytes())
+        .flat_map(|_| {
+            half::f16::from_f32(rng.unit() * scale)
+                .to_bits()
+                .to_le_bytes()
+        })
         .collect()
 }
 
@@ -195,7 +199,9 @@ impl PostFx {
     fn new(gpu: &mut Gpu, ring: usize, dynw: bool) -> Self {
         let z = |gpu: &mut Gpu, n: usize| f32t(gpu, &vec![0.0f32; n]);
         let planes = |gpu: &mut Gpu| -> Vec<GpuTensor> {
-            (0..KVH).map(|_| raw(gpu, &vec![0u8; ring * D * 2])).collect()
+            (0..KVH)
+                .map(|_| raw(gpu, &vec![0u8; ring * D * 2]))
+                .collect()
         };
         let mut arm = |gpu: &mut Gpu| PostArm {
             q: z(gpu, H * D),
@@ -399,7 +405,11 @@ fn post_case(gpu: &mut Gpu, fx: &PostFx, pos: usize, rng: &mut Lcg) {
             let (b0, b1) = (get(gpu, p0), get(gpu, p1));
             assert_bytes_eq(&format!("{what} {h}"), &ctx, &b0, &b1);
             let row = slot * D * 2..(slot + 1) * D * 2;
-            assert_ne!(&b1[row.clone()], &init[row.clone()], "{what} {h} not written");
+            assert_ne!(
+                &b1[row.clone()],
+                &init[row.clone()],
+                "{what} {h} not written"
+            );
             assert_bytes_eq(
                 &format!("{what} {h} head"),
                 &ctx,
@@ -562,7 +572,11 @@ impl Fa2Fx {
 fn bucket_cap(n_full: usize, ring: usize) -> usize {
     let cuts = [128usize, 192, 2048, 4096, 8192];
     let hi = *cuts.iter().find(|&&c| n_full <= c).unwrap_or(&n_full);
-    let lo = cuts.iter().rev().find(|&&c| c < n_full).map_or(1, |&c| c + 1);
+    let lo = cuts
+        .iter()
+        .rev()
+        .find(|&&c| c < n_full)
+        .map_or(1, |&c| c + 1);
     (lo..=hi)
         .map(|n| inkling2_attn_fa2_splits(n.min(ring)))
         .max()
@@ -577,7 +591,14 @@ fn poison_f32(len: usize, tag: u32) -> Vec<u8> {
         .collect()
 }
 
-fn fa2_case(gpu: &mut Gpu, fx: &Fa2Fx, pos: usize, v_neg_zero: bool, tag: &str, checked: &mut usize) {
+fn fa2_case(
+    gpu: &mut Gpu,
+    fx: &Fa2Fx,
+    pos: usize,
+    v_neg_zero: bool,
+    tag: &str,
+    checked: &mut usize,
+) {
     let ring = fx.ring;
     let n = (pos + 1).min(ring);
     let start = pos + 1 - n;
@@ -730,7 +751,10 @@ fn fa2_pos_matches_map_launcher_split_rule_sweep_gfx1201() {
                 .chain(4090..=4110)
                 .collect(),
         ),
-        (2053, (0..=200).chain(1020..=1030).chain(2040..=2052).collect()),
+        (
+            2053,
+            (0..=200).chain(1020..=1030).chain(2040..=2052).collect(),
+        ),
     ];
     for (ring, positions) in ranges {
         let fx = Fa2Fx::new(&mut gpu, ring, &mut rng);
@@ -865,7 +889,10 @@ fn converted_blob_sites_reach_the_recorder_gfx1201() {
     // route row
     let (ne, tk, bm) = (8usize, 2usize, 16usize);
     let mt = tk * bm;
-    let logits = f32t(&mut gpu, &(0..ne).map(|i| i as f32 * 0.1).collect::<Vec<_>>());
+    let logits = f32t(
+        &mut gpu,
+        &(0..ne).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+    );
     let topk_idx = f32t(&mut gpu, &vec![0.0f32; tk]);
     let topk_w = f32t(&mut gpu, &vec![0.0f32; tk]);
     let counts = f32t(&mut gpu, &vec![0.0f32; ne]);

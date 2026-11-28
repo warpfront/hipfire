@@ -693,18 +693,20 @@ impl Gpu {
     /// return before touching LDS or scratch), the merge grid `[24, 1, 1]`;
     /// both derive the actual split count from the device position. Fails
     /// closed off gfx1201.
-    pub fn inkling2_attn_decode_fa2_pos(
-        &mut self,
-        a: &Inkling2Fa2DecodePos<'_>,
-    ) -> HipResult<()> {
+    pub fn inkling2_attn_decode_fa2_pos(&mut self, a: &Inkling2Fa2DecodePos<'_>) -> HipResult<()> {
         self.bind_thread()?;
-        let bad = |m: String| Err(HipError::new(0, &format!("inkling2_attn_decode_fa2_pos: {m}")));
+        let bad = |m: String| {
+            Err(HipError::new(
+                0,
+                &format!("inkling2_attn_decode_fa2_pos: {m}"),
+            ))
+        };
         let (h, kvh, d) = (
             INKLING2_ATTN_HEADS,
             INKLING2_ATTN_KV_HEADS,
             INKLING2_ATTN_HEAD_DIM,
         );
-        if self.arch != "gfx1201" {
+        if !self.arch_caps.is_gfx1201() {
             return bad(format!("gfx1201 only, not {}", self.arch));
         }
         if a.k_cache.len() != kvh || a.v_cache.len() != kvh {
@@ -729,7 +731,10 @@ impl Gpu {
             || a.addr.pos.buf.size() < 4
             || f32_len(a.lse) < cap * h
             || f32_len(a.oacc) < cap * h * d
-            || a.k_cache.iter().chain(a.v_cache).any(|t| t.buf.size() < plane_bytes)
+            || a.k_cache
+                .iter()
+                .chain(a.v_cache)
+                .any(|t| t.buf.size() < plane_bytes)
         {
             return bad("operand too small".into());
         }
